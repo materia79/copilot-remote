@@ -1,3 +1,5 @@
+import { getActiveSession } from '../runtime/session-registry.mjs';
+
 export function createQuestionBridge({
   api,
   dbg,
@@ -55,6 +57,7 @@ export function createQuestionBridge({
     const activeMsg = getActiveMessage();
     const choices = extractQuestionChoices(request);
     const allowFreeform = extractAllowFreeform(request);
+    const activeSession = getActiveSession();
     const questionPayload = {
       queueId: activeMsg?.id,
       messageId: activeMsg?.id,
@@ -63,6 +66,7 @@ export function createQuestionBridge({
       prompt: extractQuestionPrompt(request),
       choices,
       allowFreeform: allowFreeform ?? !choices.length,
+      sdk_session_id: activeSession?.sdkSessionId || undefined,
       context: {
         source: "onUserInputRequest",
         rationale: "Agent requested clarification to continue this turn.",

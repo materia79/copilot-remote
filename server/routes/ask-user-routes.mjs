@@ -1,9 +1,13 @@
 'use strict';
 
+import { FEATURES } from '../features.mjs';
+import { createAskUserRoutingService } from '../services/ask-user-routing-service.mjs';
+
 export function registerAskUserRoutes(app, deps) {
   const {
     auth,
     io,
+    db,
     stmts,
     runtimeState,
     uuidv4,
@@ -18,6 +22,8 @@ export function registerAskUserRoutes(app, deps) {
     normalizeRelayMode,
     DEFAULT_RELAY_MODE,
   } = deps;
+
+  const askUserRoutingService = createAskUserRoutingService(db, FEATURES);
 
   app.get('/api/relay-questions', auth, (req, res) => {
     const conversationId = req.query.conversationId ? String(req.query.conversationId) : null;
@@ -67,6 +73,7 @@ export function registerAskUserRoutes(app, deps) {
       promptText,
       normalizedChoices.length ? JSON.stringify(normalizedChoices) : null,
       requestJson,
+      req.body.sdk_session_id || null,
       now,
       expiresAt,
     );
@@ -78,20 +85,23 @@ export function registerAskUserRoutes(app, deps) {
   });
 
   app.post('/api/relay-question/:id/answer', auth, (req, res) => {
-    const { answer } = req.body;
+    const id = String(req.params.id || '').trim();
+    const { answer, sdk_session_id } = req.body;
     const text = String(answer || '').trim();
     if (!text) return res.status(400).json({ error: 'Empty answer' });
 
-    const row = stmts.getQuestion.get(req.params.id);
+    const row = stmts.getQuestion.get(id);
     if (!row) return res.status(404).json({ error: 'Not found' });
     if (row.status !== 'pending') return res.status(409).json({ error: `Question already ${row.status}` });
 
-    const now = new Date().toISOString();
-    const result = stmts.answerQuestion.run(text, now, row.id);
-    if (result.changes === 0) return res.status(409).json({ error: 'Question is no longer pending' });
+    const result = askUserRoutingService.routeAnswer({ question_id: id, sdk_session_id, answer: text });
+    if (!result.ok) {
+      if (result.error === 'session mismatch') return res.status(403).json({ error: result.error });
+      return res.status(400).json({ error: result.error });
+    }
 
-    const question = formatQuestionRow(stmts.getQuestion.get(row.id));
-    console.log(`[${ts()}] QUESTION  ${row.id.slice(0,8)} answered len=${text.length}`);
+    const question = formatQuestionRow(stmts.getQuestion.get(id));
+    console.log(`[${ts()}] QUESTION  ${id.slice(0,8)} answered len=${text.length}`);
     io.emit('relay_question_updated', { question });
     res.json({ ok: true, question });
   });

@@ -23,6 +23,8 @@ import { createQuestionRepository } from './repositories/question-repository.mjs
 import { registerSessionsRoutes } from './routes/sessions-routes.mjs';
 import { registerMessagesRoutes } from './routes/messages-routes.mjs';
 import { registerAskUserRoutes } from './routes/ask-user-routes.mjs';
+import { createDeleteArchiveService } from './services/delete-archive-service.mjs';
+import { FEATURES } from './features.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -444,6 +446,7 @@ db.exec(`
     title      TEXT NOT NULL,
     sdk_session_id TEXT,
     archived   INTEGER NOT NULL DEFAULT 0,
+    status     TEXT NOT NULL DEFAULT 'active',
     compacted_into TEXT,
     compacted_from TEXT,
     summary_seed TEXT,
@@ -511,6 +514,7 @@ db.exec(`
     request         TEXT,
     status          TEXT NOT NULL DEFAULT 'pending',
     answer          TEXT,
+    sdk_session_id  TEXT,
     created_at      TEXT NOT NULL,
     answered_at     TEXT,
     expires_at      TEXT NOT NULL,
@@ -633,8 +637,16 @@ if (!conversationColumns.includes('summary_seed')) {
 if (!conversationColumns.includes('seed_pending')) {
   db.exec(`ALTER TABLE conversations ADD COLUMN seed_pending INTEGER NOT NULL DEFAULT 0`);
 }
+if (!conversationColumns.includes('status')) {
+  db.exec(`ALTER TABLE conversations ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`);
+}
 
 db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_sessions_sdk_session_id ON runtime_sessions(sdk_session_id) WHERE sdk_session_id IS NOT NULL AND sdk_session_id != ''`);
+
+const relayQuestionColumns = db.prepare(`PRAGMA table_info(relay_questions)`).all().map((c) => c.name);
+if (relayQuestionColumns.length && !relayQuestionColumns.includes('sdk_session_id')) {
+  db.exec(`ALTER TABLE relay_questions ADD COLUMN sdk_session_id TEXT`);
+}
 
 // ─── Prepared Statements ──────────────────────────────────────────────────────
 const stmts = {
@@ -642,6 +654,17 @@ const stmts = {
   ...createMessageRepository(db),
   ...createQuestionRepository(db),
 };
+
+const deleteArchiveService = createDeleteArchiveService(db, FEATURES, null);
+void deleteArchiveService.retryPendingDeletesOnStartup()
+  .then((result) => {
+    if (result?.pendingCount > 0) {
+      console.log(`Startup delete retry processed ${result.pendingCount} tombstoned conversation(s).`);
+    }
+  })
+  .catch((error) => {
+    console.warn(`Startup delete retry failed: ${error?.message || error}`);
+  });
 
 function queueCounts() {
   const rows = stmts.countStatus.all();

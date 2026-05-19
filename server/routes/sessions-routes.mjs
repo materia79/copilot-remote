@@ -2,6 +2,7 @@
 
 import { FEATURES } from '../features.mjs';
 import { createSdkSessionSyncService } from '../services/sdk-session-sync-service.mjs';
+import { createDeleteArchiveService } from '../services/delete-archive-service.mjs';
 
 export function registerSessionsRoutes(app, deps) {
   const {
@@ -40,10 +41,12 @@ export function registerSessionsRoutes(app, deps) {
     remotePath,
   } = deps;
   const sdkSessionSyncService = createSdkSessionSyncService(db, FEATURES);
+  const deleteArchiveService = createDeleteArchiveService(db, FEATURES, null);
 
   // GET /api/conversations — list all conversations
   app.get('/api/conversations', auth, (req, res) => {
-    const rows = stmts.listConvs.all();
+    const includeArchived = String(req.query.archived || '').trim().toLowerCase() === 'true';
+    const rows = stmts.listConvs.all(includeArchived ? 1 : 0);
     const conversations = rows.map(r => ({
       id:           r.id,
       title:        r.title,
@@ -215,17 +218,47 @@ export function registerSessionsRoutes(app, deps) {
   });
 
   // DELETE /api/conversation/:id — delete conversation
-  app.delete('/api/conversation/:id', auth, (req, res) => {
-    const id = req.params.id;
-    if (!stmts.getConv.get(id)) return res.status(404).json({ error: 'Not found' });
-    const orphanedUploads = collectOrphanedUploadsFromConversation(id);
-    stmts.deleteConvQuestions.run(id);
-    stmts.deleteConvActivity.run(id);
-    stmts.deleteConvQ.run(id);
-    stmts.deleteConv.run(id);  // cascades to messages via FK
-    deleteOrphanedUploads(orphanedUploads);
-    io.emit('conversation_deleted', { conversationId: id });
-    res.json({ ok: true });
+  app.delete('/api/conversation/:id', auth, async (req, res) => {
+    const id = String(req.params.id || '').trim();
+    if (!id) return res.status(400).json({ error: 'Missing conversation id' });
+
+    const existing = stmts.getConvAnyStatus.get(id);
+    if (!existing) return res.json({ ok: true, alreadyDeleted: true });
+
+    try {
+      const orphanedUploads = collectOrphanedUploadsFromConversation(id);
+      const result = await deleteArchiveService.deleteConversation(id);
+      if (result?.ok && result.deleted) {
+        deleteOrphanedUploads(orphanedUploads);
+        io.emit('conversation_deleted', { conversationId: id });
+        return res.json({ ok: true });
+      }
+      if (result?.ok && result.tombstoned) {
+        io.emit('conversation_delete_pending', { conversationId: id });
+        return res.json({ ok: true, pending: true });
+      }
+      return res.status(400).json({ error: result?.error || 'Delete failed' });
+    } catch (error) {
+      console.warn(`[archive] Delete failed for ${id}: ${error?.message || error}`);
+      return res.status(500).json({ error: 'Failed to delete conversation' });
+    }
+  });
+
+  // POST /api/conversation/:id/archive — archive conversation
+  app.post('/api/conversation/:id/archive', auth, async (req, res) => {
+    const id = String(req.params.id || '').trim();
+    if (!id) return res.status(400).json({ error: 'Missing conversation id' });
+    try {
+      const result = await deleteArchiveService.archiveConversation(id);
+      if (result?.ok) {
+        io.emit('conversation_archived', { conversationId: id });
+        return res.json({ ok: true });
+      }
+      return res.status(400).json({ error: result?.error || 'Archive failed' });
+    } catch (error) {
+      console.warn(`[archive] Archive failed for ${id}: ${error?.message || error}`);
+      return res.status(500).json({ error: 'Failed to archive conversation' });
+    }
   });
 
   // GET /api/status — overall status

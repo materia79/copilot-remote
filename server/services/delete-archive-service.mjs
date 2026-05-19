@@ -1,0 +1,146 @@
+const DEFAULT_DELETE_RETRIES = 3;
+const RETRY_DELAYS_MS = [250, 500];
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizeConversationId(value) {
+  return String(value || '').trim();
+}
+
+function hasSdkDeleteLifecycle(features) {
+  return Boolean(features && features.sdkDeleteLifecycle);
+}
+
+function createSdkDeleteSessionCaller(sdkClient) {
+  if (sdkClient && typeof sdkClient.deleteSession === 'function') {
+    return sdkClient.deleteSession.bind(sdkClient);
+  }
+  let warned = false;
+  return async (sessionId) => {
+    if (!warned) {
+      warned = true;
+      console.warn(`[delete-archive] SDK deleteSession() is unavailable; skipping remote delete lifecycle.`);
+    }
+    return { ok: true, skipped: true, sessionId };
+  };
+}
+
+export function createDeleteArchiveService(db, features, sdkClient) {
+  const callDeleteSession = createSdkDeleteSessionCaller(sdkClient);
+
+  const stmts = {
+    getConversation: db.prepare(`
+      SELECT c.id, c.status, rs.id AS sdk_session_id
+      FROM conversations c
+      LEFT JOIN runtime_sessions rs ON rs.conversation_id = c.id
+      WHERE c.id = ?
+      LIMIT 1
+    `),
+    markDeleted: db.prepare(`UPDATE conversations SET status = 'deleted', updated_at = datetime('now') WHERE id = ?`),
+    markArchived: db.prepare(`UPDATE conversations SET archived = 1, updated_at = datetime('now') WHERE id = ?`),
+    listDeletedWithSdkSession: db.prepare(`
+      SELECT c.id, rs.id AS sdk_session_id
+      FROM conversations c
+      LEFT JOIN runtime_sessions rs ON rs.conversation_id = c.id
+      WHERE c.status = 'deleted'
+      ORDER BY c.updated_at ASC
+    `),
+    hardDeleteConversation: db.transaction((conversationId) => {
+      db.prepare(`DELETE FROM relay_questions WHERE conversation_id = ?`).run(conversationId);
+      db.prepare(`DELETE FROM queue WHERE conversation_id = ?`).run(conversationId);
+      db.prepare(`DELETE FROM messages WHERE conversation_id = ?`).run(conversationId);
+      db.prepare(`DELETE FROM runtime_sessions WHERE conversation_id = ?`).run(conversationId);
+      db.prepare(`DELETE FROM conversations WHERE id = ?`).run(conversationId);
+    }),
+  };
+
+  async function deleteSdkSessionWithRetries(sdkSessionId, conversationId) {
+    let lastError = null;
+    for (let attempt = 1; attempt <= DEFAULT_DELETE_RETRIES; attempt += 1) {
+      try {
+        await callDeleteSession(sdkSessionId);
+        return { ok: true };
+      } catch (error) {
+        lastError = error;
+        const suffix = attempt >= DEFAULT_DELETE_RETRIES ? ' (no more retries)' : '';
+        console.warn(
+          `[delete-archive] SDK delete failed for conversation=${conversationId}, session=${sdkSessionId}, attempt=${attempt}/${DEFAULT_DELETE_RETRIES}${suffix}: ${error?.message || error}`
+        );
+        if (attempt < DEFAULT_DELETE_RETRIES) {
+          await sleep(RETRY_DELAYS_MS[attempt - 1] || RETRY_DELAYS_MS[RETRY_DELAYS_MS.length - 1] || 0);
+        }
+      }
+    }
+    return { ok: false, error: lastError };
+  }
+
+  async function hardDeleteConversation(conversationId) {
+    stmts.hardDeleteConversation(conversationId);
+  }
+
+  async function deleteConversation(conversationId) {
+    const id = normalizeConversationId(conversationId);
+    if (!id) return { ok: false, error: 'Missing conversation id' };
+
+    const row = stmts.getConversation.get(id);
+    if (!row) return { ok: true, alreadyDeleted: true };
+    if (row.status === 'deleted') return { ok: true, alreadyDeleted: true, tombstoned: true };
+
+    stmts.markDeleted.run(id);
+
+    const lifecycleEnabled = hasSdkDeleteLifecycle(features);
+    const sdkSessionId = String(row.sdk_session_id || '').trim();
+
+    if (!lifecycleEnabled || !sdkSessionId) {
+      await hardDeleteConversation(id);
+      return { ok: true, deleted: true, tombstoned: true, lifecycleEnabled };
+    }
+
+    const sdkDeleteResult = await deleteSdkSessionWithRetries(sdkSessionId, id);
+    if (sdkDeleteResult.ok) {
+      await hardDeleteConversation(id);
+      return { ok: true, deleted: true, tombstoned: true, sdkDeleted: true, lifecycleEnabled };
+    }
+
+    console.warn(`[delete-archive] Leaving tombstoned conversation=${id}; SDK delete failed. Will retry on next startup.`);
+    return { ok: true, deleted: false, tombstoned: true, sdkDeleted: false, lifecycleEnabled };
+  }
+
+  async function archiveConversation(conversationId) {
+    const id = normalizeConversationId(conversationId);
+    if (!id) return { ok: false, error: 'Missing conversation id' };
+
+    const row = stmts.getConversation.get(id);
+    if (!row) return { ok: true, alreadyDeleted: true };
+    if (row.status === 'deleted') return { ok: true, alreadyDeleted: true, tombstoned: true };
+
+    stmts.markArchived.run(id);
+    return { ok: true, archived: true };
+  }
+
+  async function retryPendingDeletesOnStartup() {
+    const pendingRows = stmts.listDeletedWithSdkSession.all();
+    for (const row of pendingRows) {
+      if (!row || !row.id) continue;
+      const id = String(row.id).trim();
+      if (!id) continue;
+      const sdkSessionId = String(row.sdk_session_id || '').trim();
+      const lifecycleEnabled = hasSdkDeleteLifecycle(features);
+      if (!lifecycleEnabled || !sdkSessionId) {
+        await hardDeleteConversation(id);
+        continue;
+      }
+      const sdkDeleteResult = await deleteSdkSessionWithRetries(sdkSessionId, id);
+      if (sdkDeleteResult.ok) {
+        await hardDeleteConversation(id);
+      } else {
+        console.warn(`[delete-archive] Startup retry failed for conversation=${id}; tombstone retained for next restart.`);
+      }
+    }
+    return { ok: true, pendingCount: pendingRows.length };
+  }
+
+  return { deleteConversation, archiveConversation, retryPendingDeletesOnStartup };
+}
