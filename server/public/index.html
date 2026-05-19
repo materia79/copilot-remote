@@ -292,22 +292,39 @@
   }
 
   .msg-bubble {
+    display: inline-block; width: fit-content;
     padding: 12px 16px; border-radius: 16px; line-height: 1.5;
     max-width: 100%; min-width: 0; overflow-wrap: anywhere; word-break: break-word;
+  }
+  .msg-bubble.msg-bubble-media-only {
+    display: inline-flex;
+    flex-direction: column;
+    width: fit-content;
+    max-width: 100%;
   }
   .msg.user      .msg-bubble { background: var(--user-bg); border-bottom-right-radius: 4px; }
   .msg.assistant .msg-bubble { background: var(--bot-bg); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
   .msg-attachments {
-    display: grid; gap: 8px; margin-top: 10px;
+    display: inline-flex; flex-direction: column; align-items: flex-start;
+    gap: 8px; margin-top: 10px; width: fit-content; max-width: 100%;
   }
   .msg-attachment {
     border: 1px solid var(--border); border-radius: 12px; overflow: hidden; background: rgba(0,0,0,0.12);
+  }
+  .msg-attachment.msg-attachment-image {
+    align-self: flex-start;
+    display: inline-block;
+    max-width: min(100%, 360px);
+  }
+  .msg-attachment.msg-attachment-image img {
+    display: block; width: 100%; height: auto; cursor: pointer;
   }
   .msg-attachment img {
     display: block; width: 100%; max-width: 360px; height: auto; cursor: pointer;
   }
   .msg-attachment-meta {
     padding: 6px 10px; font-size: 0.75rem; color: var(--muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
 
   /* markdown inside assistant bubble */
@@ -1267,10 +1284,10 @@
         <textarea id="msg-input" placeholder="Message Copilot…" rows="1" onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
         <button id="repo-browser-input-btn" onclick="openRepoBrowser()" title="Open file explorer" aria-label="Open file explorer">🗂️</button>
         <select id="mode-select" title="Mode">
-          <option value="plan">plan</option>
-          <option value="ask">ask</option>
-          <option value="agent" selected>agent</option>
-          <option value="autopilot">autopilot</option>
+          <option value="agent" selected>Agent</option>
+          <option value="ask">Ask</option>
+          <option value="plan">Plan</option>
+          <option value="autopilot">Autopilot</option>
         </select>
         <select id="model-select" title="Model">
           <option value="">Loading models…</option>
@@ -2743,10 +2760,14 @@ function appendMessage(msg, scroll=true, msgId=null, force=false) {
   const activities = Array.isArray(msg.activities) ? msg.activities.filter(Boolean).slice(0, 48) : [];
   const attachmentHtml = attachments.length ? renderAttachmentMarkup(attachments) : '';
   const activityHtml = activities.length ? renderActivityMarkup(activities) : '';
+  const hasVisibleText = Boolean(String(msg.text || '').trim());
+  const bubbleClass = (!hasVisibleText && attachments.length && !activities.length)
+    ? 'msg-bubble msg-bubble-media-only'
+    : 'msg-bubble';
 
   div.innerHTML = `
     <div class="msg-label">${label}${modelTag}${modeTag} · ${fmtDate(msg.timestamp)}</div>
-    <div class="msg-bubble">${content}${attachmentHtml}${activityHtml}</div>`;
+    <div class="${bubbleClass}">${content}${attachmentHtml}${activityHtml}</div>`;
 
   linkifyWorkspaceMentionsInNode(div.querySelector('.msg-bubble'));
 
@@ -2887,8 +2908,8 @@ function renderAttachmentMarkup(attachments) {
         const jsType = escHtml(JSON.stringify(att?.type || 'image/jpeg'));
         const openHandler = `openUploadedAttachmentViewer(${jsName},${jsUrl},${jsType})`;
         return `
-          <div class="msg-attachment">
-            <img src="${escHtml(rawUrl)}" alt="${name}" loading="lazy" onclick="${openHandler}">
+          <div class="msg-attachment msg-attachment-image">
+            <img src="${escHtml(rawUrl)}" alt="${name}" loading="lazy" onclick="${openHandler}" onload="(function(i){var c=i.closest('.msg-attachment');if(c&&i.naturalWidth>0){c.style.width=i.naturalWidth+'px';}})(this)">
             <div class="msg-attachment-meta"><a href="#" onclick="${openHandler};return false;">${name}</a> · ${type}${sizeText} · <a href="#" onclick="${openHandler};return false;">open</a></div>
           </div>`;
       }
