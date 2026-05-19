@@ -724,6 +724,190 @@ function formatPercent(value) {
   return n === null ? 'unavailable' : `${n}%`;
 }
 
+function formatCompactTokens(value) {
+  const n = toNullableInt(value);
+  if (n === null) return 'unavailable';
+  if (Math.abs(n) < 1000) return String(n);
+  return `${(n / 1000).toFixed(1)}k`;
+}
+
+function getByPath(source, parts) {
+  let cur = source;
+  for (const part of parts) {
+    if (!cur || typeof cur !== 'object') return undefined;
+    cur = cur[part];
+  }
+  return cur;
+}
+
+function findFirstNumericByKey(obj, candidateKeys) {
+  if (!obj || typeof obj !== 'object') return null;
+  const wanted = new Set((candidateKeys || []).map((k) => String(k || '').trim()).filter(Boolean));
+  if (!wanted.size) return null;
+
+  const stack = [obj];
+  while (stack.length) {
+    const current = stack.pop();
+    if (!current || typeof current !== 'object') continue;
+    for (const [key, value] of Object.entries(current)) {
+      if (value && typeof value === 'object') {
+        stack.push(value);
+      }
+      if (!wanted.has(key)) continue;
+      const n = Number(value);
+      if (Number.isFinite(n)) return n;
+    }
+  }
+  return null;
+}
+
+function resolveContextLimitTokens(modelId, data, modelUsage) {
+  const directCandidates = [
+    getByPath(data, ['maxContextTokens']),
+    getByPath(data, ['contextWindow']),
+    getByPath(data, ['maxTokens']),
+    getByPath(data, ['contextLimitTokens']),
+    getByPath(data, ['max_context_tokens']),
+    getByPath(data, ['tokenBudget']),
+    getByPath(modelUsage, ['maxContextTokens']),
+    getByPath(modelUsage, ['contextWindow']),
+    getByPath(modelUsage, ['maxTokens']),
+  ];
+  for (const value of directCandidates) {
+    const n = Number(value);
+    if (Number.isFinite(n) && n > 0) return Math.round(n);
+  }
+
+  const model = String(modelId || '').trim().toLowerCase();
+  const modelFallbackLimits = {
+    'claude-sonnet-4.6': 160000,
+    'claude-haiku-4.5': 160000,
+    'gpt-5.4': 256000,
+    'gpt-5.4-mini': 256000,
+    'gpt-5.3-codex': 256000,
+  };
+  return modelFallbackLimits[model] || null;
+}
+
+function buildUsageGrid({ systemPct, messagesPct, freePct, bufferPct }) {
+  const pctToCount = (pct) => {
+    const n = Number(pct);
+    if (!Number.isFinite(n) || n <= 0) return 0;
+    return Math.max(0, Math.min(100, Math.round(n)));
+  };
+
+  let systemCount = pctToCount(systemPct);
+  let messagesCount = pctToCount(messagesPct);
+  let freeCount = pctToCount(freePct);
+  let bufferCount = pctToCount(bufferPct);
+
+  let total = systemCount + messagesCount + freeCount + bufferCount;
+  if (total > 100) {
+    const scale = 100 / total;
+    systemCount = Math.round(systemCount * scale);
+    messagesCount = Math.round(messagesCount * scale);
+    freeCount = Math.round(freeCount * scale);
+    bufferCount = Math.round(bufferCount * scale);
+    total = systemCount + messagesCount + freeCount + bufferCount;
+  }
+  while (total < 100) {
+    if (bufferCount >= freeCount) freeCount += 1;
+    else bufferCount += 1;
+    total += 1;
+  }
+
+  const cells = [
+    ...Array(systemCount).fill('o'),
+    ...Array(messagesCount).fill('O'),
+    ...Array(freeCount).fill('.'),
+    ...Array(bufferCount).fill('@'),
+  ];
+  const rows = [];
+  for (let i = 0; i < 10; i++) {
+    rows.push(cells.slice(i * 10, (i + 1) * 10).join(' '));
+  }
+  return rows;
+}
+
+function buildContextUsageBlock(snapshot, runtimeSession, extraEntries = []) {
+  const model = contextField(snapshot?.model || runtimeSession?.model);
+  const usedTotal = toNullableInt(snapshot?.used_total_tokens);
+  const contextLimit = toNullableInt(snapshot?.max_context_tokens);
+  const usedPct = toNullablePercent(snapshot?.used_percent);
+  const systemTools = toNullableInt(snapshot?.system_tools_tokens);
+  const messages = toNullableInt(snapshot?.messages_tokens);
+  const freeTokens = toNullableInt(snapshot?.free_tokens);
+  const bufferTokens = toNullableInt(snapshot?.buffer_tokens);
+  const cacheRead = toNullableInt(snapshot?.cache_read_tokens);
+  const cacheWrite = toNullableInt(snapshot?.cache_write_tokens);
+
+  const safePct = (part, total) => {
+    const a = Number(part);
+    const b = Number(total);
+    if (!Number.isFinite(a) || !Number.isFinite(b) || b <= 0) return null;
+    return Math.round((a / b) * 10000) / 100;
+  };
+
+  const gridRows = buildUsageGrid({
+    systemPct: safePct(systemTools, contextLimit),
+    messagesPct: safePct(messages, contextLimit),
+    freePct: safePct(freeTokens, contextLimit),
+    bufferPct: safePct(bufferTokens, contextLimit),
+  });
+
+  const labelWidth = 13;
+  const fmtLabel = (label) => `${String(label || '').trim()}:`.padEnd(labelWidth, ' ');
+  const fmtMetric = (icon, label, value, pct = null) => {
+    const base = `${icon} ${fmtLabel(label)} ${value}`;
+    if (pct === null || pct === undefined || pct === '') return base;
+    return `${base} (${pct})`;
+  };
+
+  const rightLines = [
+    `${model}`,
+    `${formatCompactTokens(usedTotal)}/${formatCompactTokens(contextLimit)} tokens (${formatPercent(usedPct)}),`,
+    '',
+    fmtMetric('o', 'System/Tools', formatCompactTokens(systemTools), formatPercent(safePct(systemTools, contextLimit))),
+    fmtMetric('O', 'Messages', formatCompactTokens(messages), formatPercent(safePct(messages, contextLimit))),
+    fmtMetric('.', 'Free Space', formatCompactTokens(freeTokens), formatPercent(safePct(freeTokens, contextLimit))),
+    fmtMetric('@', 'Buffer', formatCompactTokens(bufferTokens), formatPercent(safePct(bufferTokens, contextLimit))),
+    fmtMetric('R', 'Cache Read', formatCompactTokens(cacheRead)),
+    fmtMetric('W', 'Cache Write', formatCompactTokens(cacheWrite)),
+  ];
+
+  const extras = Array.isArray(extraEntries) ? extraEntries : [];
+  if (extras.length) {
+    while (rightLines.length < gridRows.length) {
+      rightLines.push('');
+    }
+    rightLines.push('');
+    for (const entry of extras) {
+      const label = String(entry?.label || '').trim();
+      const value = String(entry?.value || '').trim();
+      if (!label || !value) continue;
+      if (entry?.multiline) {
+        rightLines.push(`${fmtLabel(label)}`);
+        rightLines.push(`  ${value}`);
+      } else {
+        rightLines.push(`${fmtLabel(label)} ${value}`);
+      }
+    }
+  }
+
+  const leftWidth = Math.max(0, ...gridRows.map((row) => String(row || '').length));
+  const rowCount = Math.max(gridRows.length, rightLines.length);
+  const merged = [];
+  for (let i = 0; i < rowCount; i += 1) {
+    const left = String(gridRows[i] || '').padEnd(leftWidth, ' ');
+    const hasLeft = String(gridRows[i] || '').trim().length > 0;
+    const right = String(rightLines[i] || '');
+    if (right) merged.push(hasLeft ? `${left}   ${right}`.trimEnd() : right);
+    else merged.push(left.trimEnd());
+  }
+
+  return ['```text', ...merged, '```'].join('\n');
+}
+
 function contextField(value) {
   const text = String(value || '').trim();
   return text || 'unavailable';
@@ -775,11 +959,12 @@ function extractSessionIdFromEventsPath(eventsPath) {
   return parent || null;
 }
 
-function readContextFromSessionEvents(runtimeSessionId) {
+function readContextFromSessionEvents(runtimeSessionId, runtimeSessionKey = null) {
   const sessionId = String(runtimeSessionId || '').trim();
-  if (!sessionId) return { snapshot: null, eventsPath: null, error: 'Missing runtime session ID' };
+  const sessionKey = String(runtimeSessionKey || runtimeSessionId || '').trim();
+  if (!sessionKey) return { snapshot: null, eventsPath: null, error: 'Missing runtime session ID' };
   const root = resolveSessionStateRoot();
-  const expectedEventsPath = path.join(root, sessionId, 'events.jsonl');
+  const expectedEventsPath = path.join(root, sessionKey, 'events.jsonl');
   let eventsPath = expectedEventsPath;
   let lookupWarning = null;
   if (!fs.existsSync(eventsPath)) {
@@ -788,7 +973,7 @@ function readContextFromSessionEvents(runtimeSessionId) {
       return { snapshot: null, eventsPath, error: `Session events file not found at ${expectedEventsPath}` };
     }
     eventsPath = latestEventsPath;
-    lookupWarning = `Session events file not found for runtime ID ${sessionId}; using latest session events file instead.`;
+    lookupWarning = `Session events file not found for runtime ID ${sessionKey};\n  using latest session events file instead.`;
   }
 
   let content = '';
@@ -810,29 +995,77 @@ function readContextFromSessionEvents(runtimeSessionId) {
       Number.isFinite(Number(data.systemTokens)) ||
       Number.isFinite(Number(data.conversationTokens)) ||
       Number.isFinite(Number(data.toolDefinitionsTokens));
-    if (!hasContextFields) continue;
+    const hasUsageSignals = hasContextFields
+      || Number.isFinite(Number(data.inputTokens))
+      || Number.isFinite(Number(data.outputTokens))
+      || Number.isFinite(Number(data.reasoningTokens))
+      || Number.isFinite(Number(data.cacheReadTokens))
+      || Number.isFinite(Number(data.cacheWriteTokens));
+    if (!hasUsageSignals) continue;
 
-    const currentModel = String(data.currentModel || '').trim() || null;
+    const currentModel = String(data.currentModel || data.model || data.newModel || '').trim() || null;
     const copilotSessionId = extractSessionIdFromEventsPath(eventsPath) || sessionId;
     const modelUsage = currentModel && data.modelMetrics?.[currentModel]?.usage && typeof data.modelMetrics[currentModel].usage === 'object'
       ? data.modelMetrics[currentModel].usage
       : null;
+    const systemTokens = toNullableInt(data.systemTokens);
+    const conversationTokens = toNullableInt(data.conversationTokens);
+    const toolsTokens = toNullableInt(data.toolDefinitionsTokens);
+    const usedTotalTokens = toNullableInt(data.currentTokens)
+      ?? toNullableInt(findFirstNumericByKey(data, ['usedTokens', 'totalTokens', 'usedTotalTokens']))
+      ?? ((systemTokens !== null || conversationTokens !== null || toolsTokens !== null)
+        ? (Number(systemTokens || 0) + Number(conversationTokens || 0) + Number(toolsTokens || 0))
+        : null);
+    const contextLimitTokens = resolveContextLimitTokens(currentModel, data, modelUsage);
+    const usedPercent = toNullablePercent(data.usedPercent)
+      ?? toNullablePercent(findFirstNumericByKey(data, ['usedPercent', 'contextUsagePercent', 'tokenUsagePercent']))
+      ?? ((usedTotalTokens !== null && contextLimitTokens !== null && contextLimitTokens > 0)
+        ? Math.round((usedTotalTokens / contextLimitTokens) * 10000) / 100
+        : null);
+    const freeTokens = toNullableInt(data.freeTokens)
+      ?? toNullableInt(data.remainingTokens)
+      ?? toNullableInt(findFirstNumericByKey(data, ['freeTokens', 'remainingTokens', 'availableTokens']))
+      ?? ((usedTotalTokens !== null && contextLimitTokens !== null)
+        ? Math.max(0, contextLimitTokens - usedTotalTokens)
+        : null);
+    const bufferTokens = toNullableInt(data.bufferTokens)
+      ?? toNullableInt(findFirstNumericByKey(data, ['bufferTokens', 'safeBufferTokens']))
+      ?? null;
+    const systemToolsTokens = ((systemTokens !== null || toolsTokens !== null)
+      ? Number(systemTokens || 0) + Number(toolsTokens || 0)
+      : null);
+    const cacheReadTokens = toNullableInt(modelUsage?.cacheReadTokens)
+      ?? toNullableInt(data.cacheReadTokens)
+      ?? toNullableInt(data.compactionTokensUsed?.cacheReadTokens)
+      ?? null;
+    const cacheWriteTokens = toNullableInt(modelUsage?.cacheWriteTokens)
+      ?? toNullableInt(data.cacheWriteTokens)
+      ?? toNullableInt(data.compactionTokensUsed?.cacheWriteTokens)
+      ?? null;
+    const partialMetricsWarning = !hasContextFields
+      ? 'Legacy context-window metrics are unavailable in current session events; showing partial token data only.'
+      : null;
     return {
       eventsPath,
-      error: lookupWarning,
+      error: lookupWarning || partialMetricsWarning,
       snapshot: {
         runtime_session_id: sessionId,
         copilot_session_id: copilotSessionId,
         model: currentModel,
-        used_total_tokens: toNullableInt(data.currentTokens),
-        system_tokens: toNullableInt(data.systemTokens),
-        messages_tokens: toNullableInt(data.conversationTokens),
-        tools_tokens: toNullableInt(data.toolDefinitionsTokens),
-        used_prompt_tokens: toNullableInt(modelUsage?.inputTokens),
-        used_completion_tokens: toNullableInt(modelUsage?.outputTokens),
+        used_total_tokens: usedTotalTokens,
+        max_context_tokens: contextLimitTokens,
+        used_percent: usedPercent,
+        free_tokens: freeTokens,
+        buffer_tokens: bufferTokens,
+        system_tokens: systemTokens,
+        messages_tokens: conversationTokens,
+        tools_tokens: toolsTokens,
+        system_tools_tokens: toNullableInt(systemToolsTokens),
+        used_prompt_tokens: toNullableInt(modelUsage?.inputTokens) ?? toNullableInt(data.inputTokens),
+        used_completion_tokens: toNullableInt(modelUsage?.outputTokens) ?? toNullableInt(data.outputTokens),
         reasoning_tokens: toNullableInt(modelUsage?.reasoningTokens),
-        cache_read_tokens: toNullableInt(modelUsage?.cacheReadTokens),
-        cache_write_tokens: toNullableInt(modelUsage?.cacheWriteTokens),
+        cache_read_tokens: cacheReadTokens,
+        cache_write_tokens: cacheWriteTokens,
         captured_at: String(event.timestamp || '').trim() || null,
       },
     };
@@ -842,66 +1075,46 @@ function readContextFromSessionEvents(runtimeSessionId) {
 }
 
 function buildContextResponseText({ snapshot, runtimeSession, conversationId, eventsPath, error }) {
+  const hasText = (value) => {
+    const text = String(value || '').trim();
+    return !!text && text.toLowerCase() !== 'unavailable';
+  };
+  const detailEntries = [];
+  const pushDetail = (label, value) => {
+    if (!hasText(value)) return;
+    detailEntries.push({ label, value: String(value).trim(), multiline: false });
+  };
+  const pushDetailCount = (label, value) => {
+    const n = toNullableInt(value);
+    if (n === null) return;
+    detailEntries.push({ label, value: formatCompactTokens(n), multiline: false });
+  };
+
   if (!snapshot) {
-    const fallbackModel = String(runtimeSession?.model || '').trim() || 'unavailable';
-    const fallbackSessionId = String(runtimeSession?.id || '').trim() || 'unavailable';
-    return [
-      '### Context window snapshot',
-      '',
-      '| Field | Value |',
-      '|---|---|',
-      `| Conversation ID | \`${conversationId}\` |`,
-      `| Runtime session ID | \`${fallbackSessionId}\` |`,
-      `| Copilot session ID | unavailable |`,
-      `| Model | \`${fallbackModel}\` |`,
-      '| Used tokens | unavailable |',
-      '| Context limit | unavailable |',
-      '| Usage | unavailable |',
-      '| Free buffer | unavailable |',
-      '| Prompt/input tokens | unavailable |',
-      '| Completion/output tokens | unavailable |',
-      '| Reasoning tokens | unavailable |',
-      '| Cache read tokens | unavailable |',
-      '| Cache write tokens | unavailable |',
-      '| System tokens | unavailable |',
-      '| Tools tokens | unavailable |',
-      '| Messages tokens | unavailable |',
-      '| Captured at | unavailable |',
-      `| Events source | \`${contextField(eventsPath)}\` |`,
-      `| Note | ${contextField(error)} |`,
-      '',
-      '_No context event snapshot available for this session yet._',
-    ].join('\n');
+    const fallbackSnapshot = {
+      ...snapshot,
+      model: String(runtimeSession?.model || '').trim() || null,
+    };
+    if (hasText(conversationId)) pushDetail('Conversation ID', conversationId);
+    if (hasText(runtimeSession?.id)) pushDetail('Runtime session ID', runtimeSession.id);
+    if (hasText(eventsPath)) detailEntries.push({ label: 'Events source', value: contextField(eventsPath), multiline: true });
+    if (hasText(error)) detailEntries.push({ label: 'Note', value: contextField(error), multiline: true });
+    return buildContextUsageBlock(fallbackSnapshot, runtimeSession, detailEntries);
   }
 
-  const runtimeSessionId = contextField(snapshot.runtime_session_id || runtimeSession?.id);
-  return [
-    '### Context window snapshot',
-    '',
-    '| Field | Value |',
-    '|---|---|',
-    `| Conversation ID | \`${conversationId}\` |`,
-    `| Runtime session ID | \`${runtimeSessionId}\` |`,
-    `| Copilot session ID | \`${contextField(snapshot.copilot_session_id)}\` |`,
-    `| Model | \`${contextField(snapshot.model || runtimeSession?.model)}\` |`,
-    `| Used tokens | ${formatCount(snapshot.used_total_tokens)} |`,
-    `| Context limit | ${formatCount(snapshot.max_context_tokens)} |`,
-    `| Usage | ${formatPercent(snapshot.used_percent)} |`,
-    `| Free buffer | ${formatCount(snapshot.free_tokens)} |`,
-    `| Prompt/input tokens | ${formatCount(snapshot.used_prompt_tokens)} |`,
-    `| Completion/output tokens | ${formatCount(snapshot.used_completion_tokens)} |`,
-    `| Reasoning tokens | ${formatCount(snapshot.reasoning_tokens)} |`,
-    `| Cache read tokens | ${formatCount(snapshot.cache_read_tokens)} |`,
-    `| Cache write tokens | ${formatCount(snapshot.cache_write_tokens)} |`,
-    `| System tokens | ${formatCount(snapshot.system_tokens)} |`,
-    `| Tools tokens | ${formatCount(snapshot.tools_tokens)} |`,
-    `| Messages tokens | ${formatCount(snapshot.messages_tokens)} |`,
-    `| Captured at | ${contextField(snapshot.captured_at)} |`,
-    `| Events source | \`${contextField(eventsPath)}\` |`,
-    `| Note | ${contextField(error)} |`,
-    '',
-    '_Values are read from Copilot session-state events (`events.jsonl`). Missing fields are shown as unavailable._',
-  ].join('\n');
+  pushDetail('Conversation ID', conversationId);
+  pushDetail('Runtime session ID', contextField(snapshot.runtime_session_id || runtimeSession?.id));
+  pushDetail('Copilot session ID', contextField(snapshot.copilot_session_id));
+  pushDetailCount('Prompt/Input', snapshot.used_prompt_tokens);
+  pushDetailCount('Completion/Output', snapshot.used_completion_tokens);
+  pushDetailCount('Reasoning', snapshot.reasoning_tokens);
+  pushDetailCount('System', snapshot.system_tokens);
+  pushDetailCount('Tools', snapshot.tools_tokens);
+  pushDetail('Captured', contextField(snapshot.captured_at));
+  if (hasText(eventsPath)) detailEntries.push({ label: 'Events source', value: contextField(eventsPath), multiline: true });
+  if (hasText(error)) detailEntries.push({ label: 'Note', value: contextField(error), multiline: true });
+
+  return buildContextUsageBlock(snapshot, runtimeSession, detailEntries);
 }
 
 function computeRetryDelayMs(retryCount) {
@@ -2499,7 +2712,7 @@ app.post('/api/message', auth, (req, res) => {
     getOrCreateConversation(convId, '/context');
     const now = new Date().toISOString();
     const runtimeSession = ensureRuntimeSessionBinding(convId, String(model || '').trim() || null, now);
-    const parsed = readContextFromSessionEvents(runtimeSession?.id || null);
+    const parsed = readContextFromSessionEvents(runtimeSession?.id || null, runtimeSession?.runtime_key || runtimeSession?.id || null);
     const responseText = buildContextResponseText({
       snapshot: parsed.snapshot,
       runtimeSession,
@@ -2643,7 +2856,7 @@ app.get('/api/context/:conversationId', auth, (req, res) => {
   const conversationId = String(req.params.conversationId || '').trim();
   if (!conversationId) return res.status(400).json({ error: 'Missing conversationId' });
   const runtimeSession = stmts.getRuntimeSessionByConversation.get(conversationId) || null;
-  const parsed = readContextFromSessionEvents(runtimeSession?.id || null);
+  const parsed = readContextFromSessionEvents(runtimeSession?.id || null, runtimeSession?.runtime_key || runtimeSession?.id || null);
 
   res.json({
     conversationId,
@@ -2665,7 +2878,7 @@ app.get('/api/context', auth, (req, res) => {
   const explicitConversationId = String(req.query.conversationId || '').trim();
   if (explicitConversationId) {
     const runtimeSession = stmts.getRuntimeSessionByConversation.get(explicitConversationId) || null;
-    const parsed = readContextFromSessionEvents(runtimeSession?.id || null);
+    const parsed = readContextFromSessionEvents(runtimeSession?.id || null, runtimeSession?.runtime_key || runtimeSession?.id || null);
     return res.json({
       conversationId: explicitConversationId,
       runtimeSessionId: runtimeSession?.id || null,
@@ -2685,7 +2898,7 @@ app.get('/api/context', auth, (req, res) => {
   const runtimeSessions = stmts.listRuntimeSessions.all();
   const latest = runtimeSessions.length ? runtimeSessions[0] : null;
   const runtimeSession = latest?.id ? (stmts.getRuntimeSessionById.get(latest.id) || latest) : null;
-  const parsed = readContextFromSessionEvents(runtimeSession?.id || null);
+  const parsed = readContextFromSessionEvents(runtimeSession?.id || null, runtimeSession?.runtime_key || runtimeSession?.id || null);
   const conversationId = String(runtimeSession?.conversation_id || '').trim() || null;
   return res.json({
     conversationId,
