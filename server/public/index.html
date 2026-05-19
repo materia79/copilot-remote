@@ -382,7 +382,10 @@
     background: var(--bg2);
   }
   #attachment-preview {
-    display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 10px;
+    display: none; gap: 10px; flex-wrap: wrap; margin-bottom: 10px;
+  }
+  #attachment-preview.visible {
+    display: flex;
   }
   .attachment-preview-item {
     position: relative; width: 88px; border: 1px solid var(--border); border-radius: 10px;
@@ -1010,7 +1013,27 @@
     }
     .conv-meta { font-size: 0.76rem; margin-top: 5px; }
     .conv-delete { opacity: 1; right: 4px; font-size: 0.9rem; }
-    #chat-header { padding: calc(10px + env(safe-area-inset-top, 0px)) 12px 10px; gap: 8px; }
+    #chat-header {
+      padding: calc(10px + env(safe-area-inset-top, 0px)) 10px 10px;
+      gap: 6px 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    #sidebar-toggle { order: 1; }
+    #session-pill {
+      order: 2;
+      margin-right: auto;
+      max-width: calc(100vw - 172px);
+    }
+    #compact-btn { order: 3; }
+    #cli-status-text { order: 4; }
+    #pending-question-banner { order: 5; }
+    #chat-title {
+      order: 6;
+      flex: 1 0 100%;
+      width: 100%;
+      margin: 0 0 2px;
+    }
     #sidebar-toggle { font-size: 1.05rem; padding: 2px 6px; }
     #chat-title { font-size: 0.96rem; }
     #pending-question-banner { font-size: 0.68rem; padding: 3px 8px; }
@@ -1019,7 +1042,7 @@
     #fullscreen-btn { min-width: 32px; height: 30px; padding: 0 6px; border-radius: 8px; font-size: 0.82rem; }
     #install-btn { min-width: 32px; height: 30px; padding: 0 6px; border-radius: 8px; font-size: 0.82rem; }
     #compact-btn { min-width: 32px; height: 30px; padding: 0 8px; border-radius: 8px; font-size: 0.74rem; }
-    #input-area { padding: 10px 10px calc(10px + env(safe-area-inset-bottom, 0px)); }
+    #input-area { padding: 4px 10px calc(10px + env(safe-area-inset-bottom, 0px)); }
     .input-row { flex-wrap: wrap; gap: 8px; align-items: stretch; }
     #repo-browser-input-btn,
     #attach-btn {
@@ -2691,6 +2714,7 @@ function renderAttachmentPreview() {
   const el = document.getElementById('attachment-preview');
   if (!selectedAttachments.length) {
     el.innerHTML = '';
+    el.classList.remove('visible');
     return;
   }
 
@@ -2701,6 +2725,7 @@ function renderAttachmentPreview() {
       <div class="attachment-preview-meta">${escHtml(att.name)}${att.size ? ` · ${formatBytes(att.size)}` : ''}</div>
     </div>
   `).join('');
+  el.classList.add('visible');
 }
 
 function removeAttachment(idx) {

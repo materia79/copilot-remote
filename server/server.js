@@ -3380,7 +3380,7 @@ function spawnSshTunnel() {
   proc.on('spawn', () => {
     tunnelState.connected = true;
     tunnelState.connectedSince = new Date().toISOString();
-    tunnelLog(`Tunnel up → ${user}@${host}  remote port ${remotePort}`);
+    tunnelLog(`Tunnel up to ${user}@${host} remote port ${remotePort}`);
     io.emit('ssh_tunnel_status', { connected: true, host, remotePort });
   });
 
@@ -3508,16 +3508,16 @@ function buildRelayReadyBannerData() {
     listenHost,
     lines: [
       '╔══════════════════════════════════════════════════════════════╗',
-      '║         Copilot Web Proxy  -  Ready                         ║',
+      '║         Copilot Web Proxy  -  Ready                          ║',
       '╠══════════════════════════════════════════════════════════════╣',
-      `║  Local:      ${localUrl.padEnd(46)}║`,
-      `║  Network:    ${String(networkText || '').padEnd(46)}║`,
-      ...(remoteUrl ? [`║  Remote:     ${remoteUrl.padEnd(46)}║`] : []),
-      ...(remoteUrl ? [`║  Tunnel:     ${(`mode=${tunnelRemoteBindMode}`).padEnd(46)}║`] : []),
-      `║  Auth:       ${authText.padEnd(46)}║`,
+      `║  Local:      ${localUrl.padEnd(47)} ║`,
+      `║  Network:    ${String(networkText || '').padEnd(47)} ║`,
+      ...(remoteUrl ? [`║  Remote:     ${remoteUrl.padEnd(47)} ║`] : []),
+      ...(remoteUrl ? [`║  Tunnel:     ${(`mode=${tunnelRemoteBindMode}`).padEnd(47)} ║`] : []),
+      `║  Auth:       ${authText.padEnd(47)} ║`,
       '╠══════════════════════════════════════════════════════════════╣',
       '║  CLI polling URL (for monitoring mode):                      ║',
-      `║  GET:        ${pollingUrl.padEnd(46)}║`,
+      `║  GET:        ${pollingUrl.padEnd(47)} ║`,
       '╚══════════════════════════════════════════════════════════════╝',
     ],
   };
@@ -3538,7 +3538,7 @@ httpServer.listen(config.port, listenHost, () => {
 
   // Start SSH tunnel after server is listening
   if (tunnelEnabled) {
-    tunnelLog(`SSH tunnel enabled (${tunnelRemoteBindMode}) → ${tunnelConfig.user}@${tunnelConfig.host}:${tunnelConfig.remotePort}`);
+    tunnelLog(`SSH tunnel enabled (${tunnelRemoteBindMode}) to ${tunnelConfig.user}@${tunnelConfig.host}:${tunnelConfig.remotePort}`);
     spawnSshTunnel();
   }
 });
