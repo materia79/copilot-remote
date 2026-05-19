@@ -1,6 +1,6 @@
 'use strict';
 
-export function createAskUserRoutingService(db, features) {
+export function createAskUserRoutingService(db) {
   const findQuestion = db.prepare(`SELECT * FROM relay_questions WHERE id = ?`);
   const updateAnswered = db.prepare(`
     UPDATE relay_questions
@@ -17,7 +17,7 @@ export function createAskUserRoutingService(db, features) {
     const row = findQuestion.get(question_id);
     if (!row) return { ok: false, error: 'Question not found' };
 
-    if (features.askUserSessionScoped && sdk_session_id) {
+    if (sdk_session_id) {
       const rowSession = String(row.sdk_session_id || '').trim();
       const incomingSession = String(sdk_session_id || '').trim();
       if (rowSession && incomingSession && rowSession !== incomingSession) {

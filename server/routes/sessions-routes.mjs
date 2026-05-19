@@ -1,6 +1,5 @@
 'use strict';
 
-import { FEATURES } from '../features.mjs';
 import { createSdkSessionSyncService } from '../services/sdk-session-sync-service.mjs';
 import { createDeleteArchiveService } from '../services/delete-archive-service.mjs';
 
@@ -14,6 +13,7 @@ export function registerSessionsRoutes(app, deps) {
     config,
     parseAttachments,
     hydrateAttachment,
+    relayActivityForResponse,
     buildContextResponseText,
     readContextFromSessionEvents,
     inFlightStateForConversation,
@@ -40,8 +40,8 @@ export function registerSessionsRoutes(app, deps) {
     DEFAULT_MODEL,
     remotePath,
   } = deps;
-  const sdkSessionSyncService = createSdkSessionSyncService(db, FEATURES);
-  const deleteArchiveService = createDeleteArchiveService(db, FEATURES, null);
+  const sdkSessionSyncService = createSdkSessionSyncService(db);
+  const deleteArchiveService = createDeleteArchiveService(db, null);
 
   // GET /api/conversations — list all conversations
   app.get('/api/conversations', auth, (req, res) => {
@@ -49,6 +49,7 @@ export function registerSessionsRoutes(app, deps) {
     const rows = stmts.listConvs.all(includeArchived ? 1 : 0);
     const conversations = rows.map(r => ({
       id:           r.id,
+      sdkSessionId: r.sdk_session_id || null,
       title:        r.title,
       archived:     Number(r.archived || 0) === 1,
       compactedInto: r.compacted_into || null,
@@ -81,10 +82,6 @@ export function registerSessionsRoutes(app, deps) {
   });
 
   app.post('/api/session-sync', auth, (req, res) => {
-    if (!FEATURES.sdkSessionSourceOfTruth) {
-      return res.status(204).end();
-    }
-
     const body = req.body || {};
     const sdkSessionId = String(body.sdk_session_id || '').trim();
     const conversationId = String(body.conversation_id || '').trim();
@@ -104,7 +101,10 @@ export function registerSessionsRoutes(app, deps) {
   app.get('/api/context/:conversationId', auth, (req, res) => {
     const conversationId = String(req.params.conversationId || '').trim();
     if (!conversationId) return res.status(400).json({ error: 'Missing conversationId' });
-    const runtimeSession = stmts.getRuntimeSessionByConversation.get(conversationId) || null;
+    // Prefer canonical sdk_session_id routing when available; keep conversation-id lookup for compatibility.
+    const runtimeSession = stmts.getRuntimeSessionBySdkSessionId.get(conversationId)
+      || stmts.getRuntimeSessionByConversation.get(conversationId)
+      || null;
     const parsed = readContextFromSessionEvents(runtimeSession?.id || null, runtimeSession?.runtime_key || runtimeSession?.id || null);
 
     res.json({
@@ -126,7 +126,9 @@ export function registerSessionsRoutes(app, deps) {
   app.get('/api/context', auth, (req, res) => {
     const explicitConversationId = String(req.query.conversationId || '').trim();
     if (explicitConversationId) {
-      const runtimeSession = stmts.getRuntimeSessionByConversation.get(explicitConversationId) || null;
+      const runtimeSession = stmts.getRuntimeSessionBySdkSessionId.get(explicitConversationId)
+        || stmts.getRuntimeSessionByConversation.get(explicitConversationId)
+        || null;
       const parsed = readContextFromSessionEvents(runtimeSession?.id || null, runtimeSession?.runtime_key || runtimeSession?.id || null);
       return res.json({
         conversationId: explicitConversationId,

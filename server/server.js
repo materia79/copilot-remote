@@ -24,7 +24,6 @@ import { registerSessionsRoutes } from './routes/sessions-routes.mjs';
 import { registerMessagesRoutes } from './routes/messages-routes.mjs';
 import { registerAskUserRoutes } from './routes/ask-user-routes.mjs';
 import { createDeleteArchiveService } from './services/delete-archive-service.mjs';
-import { FEATURES } from './features.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -655,7 +654,7 @@ const stmts = {
   ...createQuestionRepository(db),
 };
 
-const deleteArchiveService = createDeleteArchiveService(db, FEATURES, null);
+const deleteArchiveService = createDeleteArchiveService(db, null);
 void deleteArchiveService.retryPendingDeletesOnStartup()
   .then((result) => {
     if (result?.pendingCount > 0) {
@@ -2187,7 +2186,10 @@ const sharedRouteDeps = {
   ts,
   MAX_UPLOAD_BYTES,
   MAX_UPLOAD_ATTACHMENTS,
+  MAX_REPO_TREE_NODES,
+  MAX_REQUEUE_RETRIES,
   MAX_IMAGE_DATA_URL_LENGTH,
+  MAX_WORKSPACE_PREVIEW_BYTES,
   MAX_REFERENCE_IMAGE_ATTACHMENT_BYTES,
   remotePath,
   parseBooleanQueryFlag,
@@ -2201,6 +2203,7 @@ const sharedRouteDeps = {
   toDriveWebPath,
   readWorkspaceFileMeta,
   resolveWorkspaceFilePath,
+  normalizeWorkspaceRelativePath,
   previewLanguageForWorkspaceFile,
   readWorkspaceFilePreviewBuffer,
   isLikelyBinaryPreviewBuffer,
@@ -2232,6 +2235,7 @@ const sharedRouteDeps = {
   recoverProcessingOlderThan,
   addMsIso,
   computeRetryDelayMs,
+  resolveRequestedModel,
   normalizeRelayMode,
   DEFAULT_RELAY_MODE,
   DEFAULT_MODEL,

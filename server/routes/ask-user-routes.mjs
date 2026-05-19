@@ -1,6 +1,5 @@
 'use strict';
 
-import { FEATURES } from '../features.mjs';
 import { createAskUserRoutingService } from '../services/ask-user-routing-service.mjs';
 
 export function registerAskUserRoutes(app, deps) {
@@ -23,7 +22,7 @@ export function registerAskUserRoutes(app, deps) {
     DEFAULT_RELAY_MODE,
   } = deps;
 
-  const askUserRoutingService = createAskUserRoutingService(db, FEATURES);
+  const askUserRoutingService = createAskUserRoutingService(db);
 
   app.get('/api/relay-questions', auth, (req, res) => {
     const conversationId = req.query.conversationId ? String(req.query.conversationId) : null;

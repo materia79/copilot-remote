@@ -7,12 +7,7 @@ import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 
-const DEFAULT_FEATURES = Object.freeze({
-  sdkSessionSourceOfTruth: false,
-  sdkSessionReadPath: false,
-  sdkDeleteLifecycle: false,
-  askUserSessionScoped: false,
-});
+const DEFAULT_FEATURES = Object.freeze({});
 
 function readFeaturesFromConfig() {
   if (!fs.existsSync(CONFIG_PATH)) {
@@ -27,7 +22,7 @@ function readFeaturesFromConfig() {
     }
 
     return Object.fromEntries(
-      Object.keys(DEFAULT_FEATURES).map((key) => [key, Boolean(configured[key])]),
+      Object.entries(configured).map(([key, value]) => [String(key), Boolean(value)]),
     );
   } catch {
     return {};

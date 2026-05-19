@@ -9,10 +9,6 @@ function normalizeConversationId(value) {
   return String(value || '').trim();
 }
 
-function hasSdkDeleteLifecycle(features) {
-  return Boolean(features && features.sdkDeleteLifecycle);
-}
-
 function createSdkDeleteSessionCaller(sdkClient) {
   if (sdkClient && typeof sdkClient.deleteSession === 'function') {
     return sdkClient.deleteSession.bind(sdkClient);
@@ -27,23 +23,21 @@ function createSdkDeleteSessionCaller(sdkClient) {
   };
 }
 
-export function createDeleteArchiveService(db, features, sdkClient) {
+export function createDeleteArchiveService(db, sdkClient) {
   const callDeleteSession = createSdkDeleteSessionCaller(sdkClient);
 
   const stmts = {
     getConversation: db.prepare(`
-      SELECT c.id, c.status, rs.id AS sdk_session_id
+      SELECT c.id, c.status, c.sdk_session_id
       FROM conversations c
-      LEFT JOIN runtime_sessions rs ON rs.conversation_id = c.id
       WHERE c.id = ?
       LIMIT 1
     `),
     markDeleted: db.prepare(`UPDATE conversations SET status = 'deleted', updated_at = datetime('now') WHERE id = ?`),
     markArchived: db.prepare(`UPDATE conversations SET archived = 1, updated_at = datetime('now') WHERE id = ?`),
     listDeletedWithSdkSession: db.prepare(`
-      SELECT c.id, rs.id AS sdk_session_id
+      SELECT c.id, c.sdk_session_id
       FROM conversations c
-      LEFT JOIN runtime_sessions rs ON rs.conversation_id = c.id
       WHERE c.status = 'deleted'
       ORDER BY c.updated_at ASC
     `),
@@ -90,22 +84,21 @@ export function createDeleteArchiveService(db, features, sdkClient) {
 
     stmts.markDeleted.run(id);
 
-    const lifecycleEnabled = hasSdkDeleteLifecycle(features);
     const sdkSessionId = String(row.sdk_session_id || '').trim();
 
-    if (!lifecycleEnabled || !sdkSessionId) {
+    if (!sdkSessionId) {
       await hardDeleteConversation(id);
-      return { ok: true, deleted: true, tombstoned: true, lifecycleEnabled };
+      return { ok: true, deleted: true, tombstoned: true };
     }
 
     const sdkDeleteResult = await deleteSdkSessionWithRetries(sdkSessionId, id);
     if (sdkDeleteResult.ok) {
       await hardDeleteConversation(id);
-      return { ok: true, deleted: true, tombstoned: true, sdkDeleted: true, lifecycleEnabled };
+      return { ok: true, deleted: true, tombstoned: true, sdkDeleted: true };
     }
 
     console.warn(`[delete-archive] Leaving tombstoned conversation=${id}; SDK delete failed. Will retry on next startup.`);
-    return { ok: true, deleted: false, tombstoned: true, sdkDeleted: false, lifecycleEnabled };
+    return { ok: true, deleted: false, tombstoned: true, sdkDeleted: false };
   }
 
   async function archiveConversation(conversationId) {
@@ -127,8 +120,7 @@ export function createDeleteArchiveService(db, features, sdkClient) {
       const id = String(row.id).trim();
       if (!id) continue;
       const sdkSessionId = String(row.sdk_session_id || '').trim();
-      const lifecycleEnabled = hasSdkDeleteLifecycle(features);
-      if (!lifecycleEnabled || !sdkSessionId) {
+      if (!sdkSessionId) {
         await hardDeleteConversation(id);
         continue;
       }

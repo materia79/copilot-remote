@@ -753,6 +753,13 @@ async function initApp() {
   setupViewportTracking();
   document.getElementById('auth-gate').style.display = 'none';
   document.getElementById('app').classList.add('visible');
+  const chatTitle = document.getElementById('chat-title');
+  if (chatTitle && chatTitle.dataset.fullscreenBound !== '1') {
+    chatTitle.dataset.fullscreenBound = '1';
+    chatTitle.addEventListener('click', () => {
+      toggleFullscreen().catch(() => {});
+    });
+  }
   initModeSelector();
   initModelSelector();
   await refreshWorkspaceRootHints();
@@ -858,6 +865,7 @@ window.handleRelayQuestionKey = handleRelayQuestionKey;
 window.openPendingQuestionFromBanner = openPendingQuestionFromBanner;
 window.compactCurrentConversation = compactCurrentConversation;
 window.sendMessage = sendMessage;
+window.appendMessage = appendMessage;
 window.handleKey = handleKey;
 window.autoResize = autoResize;
 window.closeSummaryModal = closeSummaryModal;

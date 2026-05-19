@@ -1,4 +1,4 @@
-import { BASE, TOKEN, authHeaders, updateWorkspaceRootHints, applyContextUsageBar, readContextUsageRatio, currentConvId } from './store.js';
+import { BASE, TOKEN, authHeaders, updateWorkspaceRootHints, applyContextUsageBar, readContextUsageRatio, currentConvId, conversations } from './store.js';
 
 export async function apiFetch(url, opts = {}) {
   try {
@@ -59,8 +59,17 @@ export async function loadUsageSummary() {
 
 export async function loadContextSummary(convId = null) {
   const trimmedConvId = String(convId || '').trim();
-  const endpoint = trimmedConvId ? `/api/context/${encodeURIComponent(trimmedConvId)}` : '/api/context';
+  const lookupId = resolveContextLookupId(trimmedConvId);
+  const endpoint = lookupId ? `/api/context/${encodeURIComponent(lookupId)}` : '/api/context';
   return apiFetch(endpoint);
+}
+
+function resolveContextLookupId(conversationId) {
+  const convId = String(conversationId || '').trim();
+  if (!convId) return '';
+  const conversation = conversations[convId];
+  const sdkSessionId = String(conversation?.sdkSessionId || conversation?.sdk_session_id || '').trim();
+  return sdkSessionId || convId;
 }
 
 export async function loadModelCatalog() {
@@ -190,7 +199,8 @@ export async function refreshContextUsageBar(conversationId, requestSeq = ++cont
     applyContextUsageBar(null);
     return;
   }
-  const payload = await apiFetch(`/api/context/${encodeURIComponent(convId)}`);
+  const lookupId = resolveContextLookupId(convId) || convId;
+  const payload = await apiFetch(`/api/context/${encodeURIComponent(lookupId)}`);
   if (!payload) return;
   if (requestSeq !== contextUsageRefreshSeq) return;
   if (String(currentConvId || '').trim() !== convId) return;

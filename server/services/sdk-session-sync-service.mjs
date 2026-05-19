@@ -1,8 +1,6 @@
 'use strict';
 
-export function createSdkSessionSyncService(db, features) {
-  void features;
-
+export function createSdkSessionSyncService(db) {
   const updateConversationSession = db.prepare(
     `UPDATE conversations SET sdk_session_id = ? WHERE id = ?`,
   );
