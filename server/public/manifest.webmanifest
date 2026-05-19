@@ -1,0 +1,25 @@
+{
+  "name": "Copilot Remote",
+  "short_name": "Copilot",
+  "description": "Installable Copilot Remote web app with standalone launcher support.",
+  "start_url": "./",
+  "scope": "./",
+  "display_override": ["fullscreen", "standalone"],
+  "display": "standalone",
+  "background_color": "#0d1117",
+  "theme_color": "#0d1117",
+  "icons": [
+    {
+      "src": "app-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "favicon.ico",
+      "sizes": "any",
+      "type": "image/x-icon",
+      "purpose": "any"
+    }
+  ]
+}

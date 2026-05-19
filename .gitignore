@@ -1,0 +1,11 @@
+.vscode/
+node_modules/
+server/data/
+server/logs/
+server/config.json
+server/*.log
+server/uploads/*
+!server/uploads/README.md
+!server/uploads/image_input.md
+test-results/
+tests/

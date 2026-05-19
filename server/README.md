@@ -1,0 +1,414 @@
+# Copilot Web Proxy
+
+A Node.js web server that lets you chat with your GitHub Copilot CLI from any device via a browser.
+
+## Setup
+
+```bash
+npm install
+```
+
+This project now runs in package-wide ESM mode (`"type": "module"` in `package.json`).
+
+## Starting the Server
+
+If you run `gh copilot` from this repository and the `.github/extensions/web-relay/extension.mjs`
+extension loads, the extension now auto-starts `server.js` when needed and stops the managed
+server when that Copilot session ends.
+
+> **Single-owner rule:** Use either extension-managed polling **or** standalone `relay.mjs`, never both at the same time.
+
+Tell the Copilot CLI agent: **"launch the server"**
+
+Or start Copilot with no manual prompt typing:
+
+```bash
+npm run copilot:relay
+```
+
+That runs `gh copilot -- --allow-all -i "launch the server"` from the repo root, so the
+extension is discovered and the relay starts immediately.
+
+Or manually:
+
+```bash
+npm start
+```
+
+This starts both the web server and relay automatically.
+Stopping the main process (Ctrl+C / closing the terminal) also stops the relay.
+
+If you want CLI-extension mode (your active Copilot CLI session does the work),
+start only the web server manually:
+
+```bash
+npm run start:server
+```
+
+If you want the server to auto-restart after crashes/exits (Windows),
+use the respawn watchdog:
+
+```bash
+npm run start:server:respawn
+```
+
+On Linux/macOS, use:
+
+```bash
+npm run start:server:respawn:posix
+```
+
+Mode summary:
+
+- `npm start`: server + standalone SDK relay (manual development / local end-to-end testing)
+- `npm run start:server`: server only (use with `.github/extensions/web-relay/extension.mjs` in CLI session)
+- `npm run start:server:respawn`: server-only manual watchdog fallback (`respawn.bat`)
+- `npm run start:server:respawn:posix`: server-only manual watchdog fallback (`respawn.sh`)
+
+### Runtime safety checklist (avoid duplicate relay workers)
+
+1. Stop stale detached watchdog/relay processes before restart.
+2. Keep exactly one listener on port `3333`.
+3. In extension-managed mode, do not run `npm start` or `node relay.mjs`.
+4. Verify `/api/status` shows `cliOnline: true` and queue counts are moving or zero.
+
+Script necessity note:
+
+- Extension-managed relay does not call npm scripts directly; it starts `server.js` itself.
+- Extension-managed relay supervision now includes bounded auto-restart while the CLI session is active.
+- Keep `npm start` for manual local development (starts server + standalone relay).
+- Keep `npm run start:server` for server-only manual runs and extension-parity testing.
+- Treat `npm run start:server:respawn` / `npm run start:server:respawn:posix` as manual fallback only (not the default extension-managed path).
+
+## Global extension install (user-scoped)
+
+Copilot also scans a user extensions directory, so you can make this extension available
+across repositories:
+
+```text
+C:\Users\<you>\.copilot\extensions\web-relay\extension.mjs
+```
+
+For global install, copy the full `web-relay` extension folder there and set one of these
+environment variables so it can find your relay server files:
+
+- `COPILOT_WEB_RELAY_SERVER_DIR` (recommended) → absolute path to the `server` folder
+- `COPILOT_WEB_RELAY_ROOT` → repo root that contains `server\`
+- Optional overrides: `COPILOT_WEB_RELAY_CONFIG`, `COPILOT_WEB_RELAY_TOOLS`, `COPILOT_WEB_RELAY_LOG_DIR`
+
+Project-local extensions still take precedence if the same extension name exists in both locations.
+
+The startup banner shows your access URLs and token.
+
+## Accessing the UI
+
+Open in any browser:
+```
+http://<your-pc-ip>:3333/
+```
+
+If `localhostOnly` is enabled in `config.json`, the server listens only on loopback and you must use:
+
+```
+http://localhost:3333/
+```
+
+`localhostOnly` affects only the local relay listener. SSH reverse tunnel exposure is configured separately with `sshTunnel.remoteBind`.
+
+Sign in once with the token prompt; the browser stores the session in an HttpOnly cookie.
+The workspace browser is locked to the Copilot CLI startup CWD (or to
+`COPILOT_WORKSPACE_ROOT` when explicitly set), so the active repo root stays stable
+for the whole session. Plain `cd ...` chat commands do not retarget `Browse files`.
+
+## Install as an app
+
+The UI is now a Progressive Web App. On Android Chrome, use the browser menu to choose
+**Install app** or **Add to Home screen**. Installed app mode now prefers fullscreen launch
+where supported (with standalone fallback), and hides install/fullscreen header buttons.
+
+When opened in a regular browser tab, the in-app **Install** button remains available
+in the chat header (shown as `⬇` on small screens).
+
+If you host the relay behind a subpath, open the URL with a trailing slash so the PWA scope matches correctly for install prompts.
+
+## Model Selection
+
+The composer includes a model picker next to the Send button.
+Models are now populated dynamically from the active Copilot CLI runtime using
+raw model IDs (no relay-specific aliases). The selected model ID is sent as-is
+for each message.
+
+Behavior notes:
+
+- The picker refreshes from live CLI model discovery when relay status changes.
+- Selection is persisted in browser storage and reused if still available.
+- If live discovery is temporarily unavailable, the relay can use cached/current
+  model state and shows a warning banner.
+- In extension-managed mode, the relay still switches model per message and
+  reports the active model used in the response.
+
+## Relay Mode Selection
+
+The composer also includes a per-message mode picker:
+
+- `plan`
+- `ask`
+- `agent`
+- `autopilot`
+
+Mode is stored with each queued message so the relay can change behavior per turn.
+Clarification prompts from the CLI are forwarded back into the browser as question
+cards with a reply box.
+
+Question bridge rule:
+
+- User-facing questions/clarifications must use `ask_user` so they flow through
+  the relay question bridge and render as web question cards/buttons.
+- This applies in `autopilot` too: still call `ask_user` for clarification, and
+  the relay layer will surface the question card even if the direct question hook
+  is bypassed.
+- Plain-text assistant questions are not considered bridge-backed questions.
+- Relay now includes a fallback: if a turn clearly ends with a plain-text follow-up
+  question and choices but no `ask_user` bridge was used, it auto-converts that
+  question into a relay question card, waits for the answer, and resumes the turn.
+
+## How It Works
+
+```
+[Browser] ←── WebSocket ──→ [server.js :3333] ←── HTTP poll ──→ [Copilot CLI session]
+```
+
+1. Browser sends a message → stored in server queue
+2. CLI agent polls `GET /api/pending` every few seconds
+3. When a message is found, the CLI processes it and posts the response to `POST /api/response`  
+4. Server broadcasts response via Socket.io → appears in browser instantly
+
+## Monitoring Mode (CLI)
+
+After launching the server, the CLI enters a polling loop:
+- Checks `/api/pending` every ~3 seconds
+- Processes any message with full PC access (file system, commands, etc.)
+- Posts the response back
+- CLI appears **online** (green dot) in the web UI while polling
+- While working, relay tool activity is streamed into the pending assistant bubble
+  (for example `Search (glob)` and `Search (grep)`).
+- Tool activity is now also kept with the assistant message as a collapsible
+  **Tool activity** section after the response arrives.
+- Clarification prompts from `ask_user`/user-input requests are forwarded as
+  question cards in the conversation; answering the card resumes the waiting turn.
+- Answered relay question cards stay visible in the conversation journal, including
+  the answer you submitted.
+
+### Session activation behavior (important)
+
+In extension-managed mode, the web server can already be running while the CLI is still
+shown as offline. Polling starts when the Copilot session becomes active (`onSessionStart`),
+which usually happens after your first prompt in the CLI.
+
+This means the following startup sequence is expected:
+1. Open `http://localhost:3333` and briefly see "CLI is offline"
+2. Send one message in the CLI
+3. Extension starts polling and queued web messages begin processing
+
+| Symptom | Check |
+|---|---|
+| UI says "CLI is offline" | Verify `/api/status` works with the auth cookie or `Authorization: Bearer <token>` and shows `cliOnline: true` |
+| UI flaps online/offline after restart | Ensure you are not mixing extension-managed mode with standalone `relay.mjs`, and confirm only one relay process owns port `3333` |
+| No response after sending | Tail `server\ext-debug.log` and confirm `onSessionStart fired` + `startPolling called` |
+| Wrong model used | Check logs for `Model selected: requested=... active=...` |
+| Question card stuck | Answer in the card UI; logs should show `relay question created` and `relay question answered` |
+| Tunnel not connecting | Check server console for `[ssh-tunnel]` lines; confirm SSH key auth works without password |
+| Tunnel keeps reconnecting | VPS `sshd_config` needs `GatewayPorts no` (default) — Caddy handles the public port |
+
+## API Reference
+
+All authenticated routes accept an HttpOnly auth cookie or an `Authorization: Bearer <token>` header.
+
+`GET /api/status` now also includes `readyBanner`, a preformatted relay-info payload used by the CLI extension to print the access window directly in the Copilot CLI client when relay connectivity is established.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/message` | Send a message from the browser |
+| POST | `/api/upload` | Upload binary file content (deduped by SHA-256) |
+| GET | `/api/upload/:sha256/content` | Stream stored upload content by hash |
+| GET | `/api/files/*` | Stream a workspace file by repo-relative path (token required) |
+| GET | `/api/files-preview/*` | Return structured preview JSON for markdown/code/text/image files |
+| GET | `/api/repo/tree` | Return repository tree snapshot (supports `includeHidden` and `includeHeavy`) |
+| GET | `/api/drives/roots` | Return browsable drive roots (local fixed + removable) for explorer drive mode |
+| GET | `/api/drives/list` | Lazy-load entries for a drive directory (`path`, optional `includeHidden`) |
+| GET | `/api/drives/file` | Stream a drive file by absolute drive path query (`path`) |
+| GET | `/api/drives/files-preview` | Return structured preview JSON for a drive file (`path`) |
+| GET | `/api/conversations` | List all conversations |
+| GET | `/api/sessions` | List runtime sessions bound 1:1 to conversations |
+| GET | `/api/conversation/:id` | Get full conversation with messages |
+| POST | `/api/conversation/:id/compact` | Compact a conversation into a new one with carry-over summary seed |
+| DELETE | `/api/conversation/:id` | Delete a conversation |
+| GET | `/api/pending` | (CLI) Fetch next pending message |
+| POST | `/api/response` | (CLI) Submit response for a message |
+| POST | `/api/activity` | (CLI) Push in-flight tool activity for current message |
+| POST | `/api/relay/pause` | Pause dequeueing and drop currently queued messages |
+| POST | `/api/relay/resume` | Resume dequeueing after pause |
+| GET | `/api/relay-questions` | (CLI/UI) List relay questions by `status` (for example `pending` or `answered`) |
+| GET | `/api/relay-question/:id` | (CLI) Fetch a single relay question |
+| POST | `/api/relay-question` | (CLI) Create a relay question for the browser |
+| POST | `/api/relay-question/:id/answer` | (UI) Submit an answer for a relay question |
+| POST | `/api/relay-question/:id/timeout` | (CLI/UI) Mark a relay question timed out |
+| POST | `/api/heartbeat` | (CLI) Keep CLI status alive |
+| GET | `/api/status` | Overall status |
+| GET | `/api/models` | Live/cached model catalog used by the UI picker |
+| POST | `/api/models/snapshot` | (CLI/relay) Publish discovered model snapshot |
+| GET | `/api/context/:conversationId` | Parse and return context metrics from session-state events for a conversation |
+| GET | `/api/context` | Parse and return context metrics for latest (or query-selected) runtime session |
+| GET | `/api/usage` | Live Copilot usage snapshot |
+
+### Upload storage model
+
+- Physical blobs are stored in `server/uploads/<sha256>` (content-addressed).
+- Metadata (`original_name`, `mime_type`, `size_bytes`) is stored in SQLite.
+- Message/conversation references are tracked in SQLite; when a conversation is deleted,
+  unreferenced blobs are garbage-collected from disk automatically.
+- Image attachments are forwarded to the Copilot SDK as multimodal attachments
+  (`file` when a disk path is available, otherwise inline `blob`).
+- Non-image uploads continue to be exposed as file references.
+
+### Chat file reference tokens
+
+- The web explorer/file preview can copy references as backticked tokens:
+  - ``@file:<path>``
+  - ``@folder:<path>``
+- Folder tokens use the full folder path.
+- File tokens use the full file path shown by the preview/browser context.
+- Tokens are root-agnostic: workspace paths are repo-relative, drive paths keep `C:/...` form.
+
+### Reference-driven inspection helper
+
+- Messages containing `@file:` tokens are parsed server-side before queueing.
+- Text/markdown references stay as plain references (no binary payload attached).
+- Small image references (up to ~1 MB) are attached to the pending turn so vision-capable
+  models receive real image input.
+- Oversized image references are left as plain text references to avoid oversized request payloads.
+
+### Workspace file bridge
+
+- Use `/api/files/<repo-relative-path>` to open workspace files in a new tab. The browser sends the auth cookie automatically.
+- Use `/api/files-preview/<repo-relative-path>` for structured preview JSON (`kind`, `language`, `content`, `truncated`, `size`).
+- Use `/api/repo/tree?includeHidden=0&includeHeavy=0` for a full tree snapshot (toggleable hidden/heavy paths).
+- Use `/api/drives/roots` + `/api/drives/list?path=<drive-path>&includeHidden=0|1` for lazy-loaded drive browsing (separate from workspace heavy mode).
+- Use `/api/drives/file?path=<drive-path>` and `/api/drives/files-preview?path=<drive-path>` for drive file raw/preview access.
+- Requests are auth-protected and restricted to files inside the workspace root.
+- Drive browsing is auth-protected and restricted to local fixed/removable roots discovered on the host.
+- Traversal or non-file paths are rejected.
+- The web UI opens workspace mentions in an in-app preview dialog with **Preview / Raw** mode buttons.
+- Markdown preview supports optional embedded-HTML mode with script/event-handler stripping and a visible warning.
+- The floating **📁 Browse files** button opens the explorer with **Workspace** and **Drives** roots, tree navigation, list/icon folder views, and image thumbnails.
+
+## Relay Tool Guidance
+
+The CLI extension (`.github/extensions/web-relay/extension.mjs`) loads `relay-tools.md`
+for shared tool guidance.
+
+The browser UI keeps the usage button in the sidebar header, and that button continues to
+call `/api/usage` directly.
+
+## Config (`config.json`)
+
+```json
+{
+  "authToken": "<your-token>",
+  "port": 3333,
+  "localhostOnly": true,
+  "pollIntervalMs": 3000,
+  "processingTimeoutMs": 600000,
+  "conversationSessionMode": "isolated",
+  "sshTunnel": {
+    "enabled": false,
+    "remoteBind": "loopback",
+    "user": "ubuntu",
+    "host": "relay.example.com",
+    "remotePort": 4444,
+    "identityFile": "~/.ssh/id_rsa"
+  }
+}
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `authToken` | *(required)* | Token for all API / UI access |
+| `port` | `3333` | HTTP/WebSocket listen port |
+| `localhostOnly` | `true` | Bind only to loopback (`127.0.0.1`) and block LAN/WAN access |
+| `pollIntervalMs` | `3000` | CLI poll interval (ms) |
+| `processingTimeoutMs` | `600000` | Max response wait time (ms) |
+| `conversationSessionMode` | `isolated` | SDK session strategy (`isolated` or `shared`) |
+| `sshTunnel.enabled` | `false` | Start reverse tunnel on server boot |
+| `sshTunnel.remoteBind` | `loopback` | Remote bind mode for SSH `-R` (`loopback` or `public`) |
+| `sshTunnel.user` | — | SSH user on VPS |
+| `sshTunnel.host` | — | VPS hostname / IP |
+| `sshTunnel.remotePort` | — | Port opened on the VPS |
+| `sshTunnel.identityFile` | *(optional)* | SSH private key path (`~` expanded); uses ssh-agent if omitted |
+
+## SSH Reverse Tunnel
+
+When `sshTunnel.enabled` is `true`, `server.js` spawns:
+
+```
+ssh -N -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+  -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+  -o ExitOnForwardFailure=yes \
+  -R <remoteSpec> <user>@<host>
+```
+
+`sshTunnel.remoteBind` controls `<remoteSpec>`:
+- `loopback` => `<remotePort>:127.0.0.1:<port>` (loopback bind, best with Caddy `reverse_proxy localhost:<remotePort>`)
+- `public` => `*:<remotePort>:127.0.0.1:<port>`
+`ExitOnForwardFailure=yes` ensures the tunnel process exits immediately if remote port forwarding fails, allowing clean auto-retry instead of a false "connected" state.
+
+**Auto-reconnect** — if the tunnel exits for any reason it is rescheduled with
+exponential backoff (5 s → 10 s → 20 s → 40 s → 60 s cap, no retry limit).
+The counter resets after a connection is stable for >30 s.
+
+**Caddy VPS config:**
+
+```
+relay.example.com {
+    reverse_proxy localhost:4444
+}
+```
+
+**`/api/status`** now includes:
+
+```json
+"sshTunnel": {
+  "enabled": true,
+  "connected": true,
+  "host": "relay.example.com",
+  "remotePort": 4444,
+  "remoteBindMode": "loopback",
+  "reconnectAttempts": 0,
+  "connectedSince": "2026-05-18T01:00:00.000Z"
+}
+```
+
+
+
+### `/context` command behavior
+
+- Sending `/context` in web relay is handled directly by `server.js` (it is not enqueued to normal Copilot turn processing).
+- The server reads `<session-state-root>/<runtimeSessionId>/events.jsonl` for the bound runtime session.
+- Session-state root resolution order:
+  1. `COPILOT_SESSION_STATE_DIR` (if set)
+  2. `%USERPROFILE%\.copilot\session-state` (Windows)
+  3. `$HOME/.copilot/session-state` (Linux/macOS)
+  4. `os.homedir()` fallback
+- The response is built from the newest event that contains token context fields (typically `session.shutdown`).
+- If no `events.jsonl` exists for the bound runtime session ID, relay falls back to the newest available session-state `events.jsonl` and includes a note in the response.
+- Fields not present in events are returned as `unavailable`.
+
+## Files
+
+| File | Description |
+|------|-------------|
+| `server.js` | Main server |
+| `public/index.html` | Web chat UI |
+| `config.json` | Auth token and settings (gitignored) |
+| `data/copilot.db` | Persisted conversations and queue storage (gitignored) |
+| `relay-tools.md` | Markdown tool guidance loaded by the relay extension |

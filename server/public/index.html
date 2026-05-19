@@ -1,0 +1,4055 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="theme-color" content="#0d1117">
+<meta name="application-name" content="Copilot Remote">
+<meta name="apple-mobile-web-app-title" content="Copilot Remote">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<script>
+  const __APP_BASE = window.location.pathname.replace(/\/+$/, '');
+  document.write(`<link rel="manifest" href="${__APP_BASE}/manifest.webmanifest">`);
+  document.write(`<link rel="icon" href="${__APP_BASE}/favicon.ico">`);
+  document.write(`<link rel="apple-touch-icon" href="${__APP_BASE}/app-icon.svg">`);
+</script>
+<title>Copilot Remote</title>
+<script>document.write('<scr'+'ipt src="'+window.location.pathname.replace(/\/+$/,'')+'/socket.io/socket.io.js"><\/scr'+'ipt>');</script>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #0d1117;
+    --bg2:       #161b22;
+    --bg3:       #21262d;
+    --border:    #30363d;
+    --text:      #e6edf3;
+    --muted:     #8b949e;
+    --accent:    #58a6ff;
+    --user-bg:   #1f6feb;
+    --bot-bg:    #21262d;
+    --danger:    #f85149;
+    --success:   #3fb950;
+    --warn:      #d29922;
+  }
+
+  html, body {
+    height: 100%;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 15px;
+  }
+  body {
+    overflow: hidden;
+  }
+  :root {
+    --app-height: 100vh;
+  }
+
+  /* ── Auth Gate ── */
+  #auth-gate {
+    display: flex; align-items: center; justify-content: center;
+    height: var(--app-height); padding: 24px;
+  }
+  .auth-box {
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 12px;
+    padding: 40px 32px; width: 100%; max-width: 400px; text-align: center;
+  }
+  .auth-box h1 { font-size: 1.5rem; margin-bottom: 8px; }
+  .auth-box p  { color: var(--muted); margin-bottom: 24px; font-size: 0.9rem; }
+  .auth-box input {
+    width: 100%; padding: 12px 16px; font-size: 1rem;
+    background: var(--bg3); border: 1px solid var(--border); border-radius: 8px;
+    color: var(--text); margin-bottom: 12px; outline: none;
+  }
+  .auth-box input:focus { border-color: var(--accent); }
+  .auth-box button {
+    width: 100%; padding: 12px; font-size: 1rem; font-weight: 600;
+    background: var(--accent); color: #000; border: none; border-radius: 8px; cursor: pointer;
+  }
+  .auth-error { color: var(--danger); font-size: 0.85rem; margin-top: 8px; }
+
+  /* ── Main Layout ── */
+  #app { display: none; height: var(--app-height); min-height: var(--app-height); flex-direction: row; }
+  #app.visible { display: flex; }
+
+  /* ── Sidebar ── */
+  #sidebar {
+    width: 280px; min-width: 280px; background: var(--bg2); border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; height: 100%; overflow: hidden;
+    transition: transform 0.25s ease;
+  }
+
+  .sidebar-header {
+    padding: 16px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 10px;
+  }
+  .sidebar-header h2 { font-size: 1rem; font-weight: 600; flex: 1; }
+  #cli-dot {
+    width: 10px; height: 10px; border-radius: 50%; background: var(--danger);
+    flex-shrink: 0; transition: background 0.3s;
+  }
+  #cli-dot.online { background: var(--success); }
+
+  #new-conv-btn {
+    margin: 12px; padding: 10px 14px; background: var(--accent); color: #000;
+    border: none; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 0.9rem;
+  }
+  #new-conv-btn:hover { opacity: 0.85; }
+
+  #conv-list { flex: 1; overflow-y: auto; padding: 0 8px 8px; }
+  .conv-item {
+    padding: 10px 12px; border-radius: 8px; cursor: pointer; margin-bottom: 2px;
+    border: 1px solid transparent; position: relative;
+  }
+  .conv-item:hover { background: var(--bg3); }
+  .conv-item.active { background: var(--bg3); border-color: var(--border); }
+  .conv-title { font-size: 0.9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-right: 24px; }
+  .conv-meta  { font-size: 0.75rem; color: var(--muted); margin-top: 2px; }
+  .conv-delete {
+    position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+    background: none; border: none; color: var(--muted); cursor: pointer; font-size: 1rem;
+    opacity: 0; transition: opacity 0.15s; padding: 4px;
+  }
+  .conv-item:hover .conv-delete { opacity: 1; }
+  .conv-delete:hover { color: var(--danger); }
+  .conv-open-questions {
+    display: inline-flex;
+    margin-left: 6px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    border: 1px solid rgba(88, 166, 255, 0.45);
+    background: rgba(88, 166, 255, 0.12);
+    color: var(--accent);
+    font-size: 0.68rem;
+    font-weight: 600;
+    vertical-align: middle;
+  }
+
+  /* ── Main Chat ── */
+  #main {
+    flex: 1; display: flex; flex-direction: column; height: 100%; overflow: hidden;
+  }
+
+  #chat-header {
+    padding: calc(14px + env(safe-area-inset-top, 0px)) 18px 14px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 12px; background: var(--bg2);
+  }
+  #sidebar-toggle {
+    display: none; background: none; border: none; color: var(--text);
+    font-size: 1.3rem; cursor: pointer; padding: 4px 8px; margin: -4px 0;
+  }
+  #chat-title { font-weight: 600; font-size: 1rem; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #pending-question-banner {
+    display: none;
+    border: 1px solid rgba(88, 166, 255, 0.45);
+    background: rgba(88, 166, 255, 0.12);
+    color: var(--text);
+    border-radius: 999px;
+    padding: 4px 10px;
+    font-size: 0.75rem;
+    cursor: pointer;
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+  #pending-question-banner.visible {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  #session-pill {
+    display: none;
+    font-size: 0.72rem;
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 8px;
+    flex-shrink: 0;
+  }
+  #session-pill.visible { display: inline-flex; }
+  #cli-status-text { font-size: 0.8rem; color: var(--muted); flex-shrink: 0; }
+  #fullscreen-btn {
+    display: none;
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 8px;
+    min-width: 38px;
+    height: 32px;
+    padding: 0 8px;
+    font-size: 0.95rem;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  #fullscreen-btn:active { transform: translateY(1px); }
+  #compact-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 8px;
+    min-width: 38px;
+    height: 32px;
+    padding: 0 10px;
+    font-size: 0.82rem;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  #install-btn {
+    display: none;
+    align-items: center;
+    justify-content: center;
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 8px;
+    min-width: 38px;
+    height: 32px;
+    padding: 0 10px;
+    font-size: 0.82rem;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  #compact-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  body.installed-app #install-btn,
+  body.installed-app #fullscreen-btn {
+    display: none !important;
+  }
+
+  #messages {
+    flex: 1; overflow-y: auto; padding: 20px 16px;
+    display: flex; flex-direction: column; gap: 12px;
+    overscroll-behavior-y: contain;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-y;
+  }
+
+  #pull-refresh-indicator {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    display: flex;
+    justify-content: center;
+    pointer-events: none;
+    opacity: 0;
+    transform: translateY(-8px);
+    transition: opacity 0.15s ease, transform 0.15s ease;
+  }
+  #pull-refresh-indicator.visible {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  #pull-refresh-indicator.ready {
+    color: var(--accent);
+  }
+  #pull-refresh-indicator span {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 auto 2px;
+    padding: 6px 12px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: rgba(13, 17, 23, 0.92);
+    color: var(--muted);
+    font-size: 0.8rem;
+  }
+
+  .empty-state {
+    flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    color: var(--muted); text-align: center; padding: 24px;
+  }
+  .empty-state .icon { font-size: 3rem; margin-bottom: 12px; }
+  .empty-state h3 { font-size: 1.1rem; margin-bottom: 8px; color: var(--text); }
+  .empty-state p { font-size: 0.9rem; line-height: 1.5; }
+
+  .msg {
+    display: flex;
+    flex-direction: column;
+    max-width: 82%;
+    min-width: 0;
+  }
+  .msg.user  { align-self: flex-end; align-items: flex-end; }
+  .msg.assistant { align-self: flex-start; align-items: flex-start; }
+
+  .msg-label { font-size: 0.72rem; color: var(--muted); margin-bottom: 4px; padding: 0 4px; }
+  .msg-model {
+    display: inline-block; font-size: 0.68rem; background: var(--bg3);
+    border: 1px solid var(--border); border-radius: 4px; padding: 0 5px;
+    color: var(--accent); margin-left: 4px; vertical-align: middle;
+  }
+
+  .msg-bubble {
+    padding: 12px 16px; border-radius: 16px; line-height: 1.5;
+    max-width: 100%; min-width: 0; overflow-wrap: anywhere; word-break: break-word;
+  }
+  .msg.user      .msg-bubble { background: var(--user-bg); border-bottom-right-radius: 4px; }
+  .msg.assistant .msg-bubble { background: var(--bot-bg); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+  .msg-attachments {
+    display: grid; gap: 8px; margin-top: 10px;
+  }
+  .msg-attachment {
+    border: 1px solid var(--border); border-radius: 12px; overflow: hidden; background: rgba(0,0,0,0.12);
+  }
+  .msg-attachment img {
+    display: block; width: 100%; max-width: 360px; height: auto;
+  }
+  .msg-attachment-meta {
+    padding: 6px 10px; font-size: 0.75rem; color: var(--muted);
+  }
+
+  /* markdown inside assistant bubble */
+  .msg-bubble p   { margin-bottom: 0.5em; }
+  .msg-bubble p:last-child { margin-bottom: 0; }
+  .msg-bubble h1, .msg-bubble h2, .msg-bubble h3 { margin: 0.5em 0 0.25em; }
+  .msg-bubble ul, .msg-bubble ol { padding-left: 1.4em; margin-bottom: 0.5em; }
+  .msg-bubble pre { margin: 0.5em 0; border-radius: 8px; overflow: auto; }
+  .msg-bubble code:not(pre code) {
+    background: #30363d; padding: 2px 6px; border-radius: 4px; font-size: 0.875em;
+  }
+  .msg-bubble a { color: var(--accent); }
+  .msg-bubble table { border-collapse: collapse; width: 100%; margin: 0.5em 0; font-size: 0.88em; }
+  .msg-bubble th, .msg-bubble td { border: 1px solid var(--border); padding: 6px 10px; }
+  .msg-bubble th { background: var(--bg3); }
+  .msg-bubble * { max-width: 100%; overflow-wrap: anywhere; word-break: break-word; }
+  .msg-bubble pre,
+  .msg-bubble code,
+  .msg-bubble pre *,
+  .msg-bubble code * {
+    overflow-wrap: normal;
+    word-break: normal;
+  }
+
+  .thinking-bubble {
+    background: var(--bot-bg); border: 1px solid var(--border); border-radius: 16px;
+    border-bottom-left-radius: 4px; padding: 12px 18px;
+    max-width: 100%;
+    min-width: 0;
+  }
+  .thinking-activity {
+    margin-top: 8px; font-size: 0.82rem; color: var(--muted);
+    display: flex; flex-direction: column; gap: 4px;
+    min-width: 0;
+  }
+  .thinking-activity-item {
+    min-width: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  .msg-activity {
+    margin-top: 10px; border-top: 1px dashed var(--border); padding-top: 8px;
+  }
+  .msg-activity summary {
+    cursor: pointer; color: var(--muted); font-size: 0.78rem;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  .msg-activity-list {
+    margin-top: 8px; display: flex; flex-direction: column; gap: 4px;
+    min-width: 0;
+  }
+  .msg-activity-item {
+    color: var(--muted);
+    font-size: 0.78rem;
+    min-width: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  .dots span { display: inline-block; width: 6px; height: 6px; margin: 0 2px;
+    border-radius: 50%; background: var(--muted); animation: bounce 1.2s infinite; }
+  .dots span:nth-child(2) { animation-delay: 0.2s; }
+  .dots span:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes bounce { 0%,60%,100%{transform:translateY(0)} 30%{transform:translateY(-6px)} }
+
+  /* ── Input Area ── */
+  #input-area {
+    padding: 14px 16px calc(14px + env(safe-area-inset-bottom, 0px));
+    border-top: 1px solid var(--border);
+    background: var(--bg2);
+  }
+  #attachment-preview {
+    display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 10px;
+  }
+  .attachment-preview-item {
+    position: relative; width: 88px; border: 1px solid var(--border); border-radius: 10px;
+    overflow: hidden; background: var(--bg3);
+  }
+  .attachment-preview-item img {
+    width: 100%; height: 88px; display: block; object-fit: cover;
+  }
+  .attachment-preview-meta {
+    padding: 6px 8px; font-size: 0.72rem; color: var(--muted); white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  .attachment-preview-remove {
+    position: absolute; top: 4px; right: 4px; width: 22px; height: 22px;
+    border: none; border-radius: 999px; background: rgba(0,0,0,0.65); color: var(--text);
+    cursor: pointer; line-height: 22px; font-size: 0.85rem;
+  }
+  #offline-banner {
+    display: none; background: #2d1a00; border: 1px solid var(--warn); color: var(--warn);
+    border-radius: 8px; padding: 8px 14px; margin-bottom: 10px; font-size: 0.85rem; text-align: center;
+  }
+  #offline-banner.visible { display: block; }
+  #model-banner {
+    display: none;
+    background: rgba(210, 153, 34, 0.15);
+    border: 1px solid var(--warn);
+    color: var(--warn);
+    border-radius: 8px;
+    padding: 6px 10px;
+    margin-bottom: 10px;
+    font-size: 0.8rem;
+    text-align: center;
+  }
+  #model-banner.visible { display: block; }
+
+  .input-row { display: flex; gap: 10px; align-items: flex-end; }
+  #repo-browser-input-btn {
+    display: none;
+    width: 46px; height: 46px; border: 1px solid var(--border); border-radius: 12px;
+    background: var(--bg3); color: var(--text); cursor: pointer; font-size: 1rem;
+    flex-shrink: 0;
+  }
+  #attach-btn {
+    width: 46px; height: 46px; border: 1px solid var(--border); border-radius: 12px;
+    background: var(--bg3); color: var(--text); cursor: pointer; font-size: 1rem;
+    flex-shrink: 0;
+  }
+  #repo-browser-input-btn:hover { border-color: var(--accent); color: var(--accent); }
+  #msg-input {
+    flex: 1; padding: 12px 16px; font-size: 0.95rem;
+    background: var(--bg3); border: 1px solid var(--border); border-radius: 12px;
+    color: var(--text); resize: none; outline: none; min-height: 46px; max-height: 160px;
+    line-height: 1.4; font-family: inherit;
+  }
+  #msg-input:focus { border-color: var(--accent); }
+  #send-btn {
+    padding: 12px 20px; background: var(--accent); color: #000;
+    border: none; border-radius: 12px; cursor: pointer; font-weight: 700; font-size: 0.95rem;
+    flex-shrink: 0; height: 46px;
+  }
+  #model-select {
+    background: var(--bg3); border: 1px solid var(--border); color: var(--text);
+    border-radius: 12px; height: 46px; padding: 0 12px; font-size: 0.9rem;
+    min-width: 140px; outline: none;
+  }
+  #model-select:focus { border-color: var(--accent); }
+  #mode-select {
+    background: var(--bg3); border: 1px solid var(--border); color: var(--text);
+    border-radius: 12px; height: 46px; padding: 0 12px; font-size: 0.9rem;
+    min-width: 120px; outline: none;
+  }
+  #mode-select:focus { border-color: var(--accent); }
+  #send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  #send-btn:not(:disabled):hover { opacity: 0.85; }
+
+  .workspace-file-link { text-decoration: underline; }
+  .workspace-file-link:hover { opacity: 0.9; }
+
+  #file-preview-modal {
+    position: fixed; inset: 0; z-index: 11000;
+    display: none; align-items: center; justify-content: center;
+    background: rgba(0, 0, 0, 0.65);
+    padding: 18px;
+  }
+  #file-preview-modal.visible { display: flex; }
+  .file-preview-dialog {
+    width: min(1100px, 100%);
+    max-height: min(90vh, 900px);
+    display: flex;
+    flex-direction: column;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+  }
+  .file-preview-header {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg3);
+  }
+  .file-preview-title {
+    min-width: 0;
+    font-size: 0.92rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .file-preview-title-copyable {
+    cursor: copy;
+    text-decoration: underline;
+    text-decoration-style: dashed;
+    text-underline-offset: 3px;
+  }
+  .file-preview-close {
+    border: 1px solid var(--border);
+    background: var(--bg2);
+    color: var(--text);
+    border-radius: 8px;
+    width: 32px;
+    height: 32px;
+    cursor: pointer;
+  }
+  .file-preview-toolbar {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  .file-preview-btn {
+    border: 1px solid var(--border);
+    background: var(--bg3);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 6px 10px;
+    font-size: 0.82rem;
+    cursor: pointer;
+  }
+  .file-preview-btn.active {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .file-preview-warning {
+    display: none;
+    margin-left: auto;
+    font-size: 0.78rem;
+    color: var(--warn);
+  }
+  .file-preview-warning.visible { display: inline; }
+  .file-preview-meta {
+    padding: 8px 14px;
+    font-size: 0.78rem;
+    color: var(--muted);
+    border-bottom: 1px dashed var(--border);
+  }
+  .file-preview-body {
+    flex: 1;
+    overflow: auto;
+    padding: 12px 14px;
+  }
+  .file-preview-markdown {
+    line-height: 1.5;
+  }
+  .file-preview-markdown p { margin-bottom: 0.55em; }
+  .file-preview-markdown h1, .file-preview-markdown h2, .file-preview-markdown h3 { margin: 0.6em 0 0.35em; }
+  .file-preview-markdown ul, .file-preview-markdown ol { margin-left: 1.3em; margin-bottom: 0.55em; }
+  .file-preview-markdown table { border-collapse: collapse; width: 100%; margin: 0.55em 0; font-size: 0.88em; }
+  .file-preview-markdown th, .file-preview-markdown td { border: 1px solid var(--border); padding: 6px 9px; }
+  .file-preview-markdown th { background: var(--bg3); }
+  .file-preview-markdown pre,
+  .file-preview-code pre {
+    background: #0b0f14;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px;
+    overflow: auto;
+  }
+  .file-preview-code code,
+  .file-preview-markdown code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.86rem;
+  }
+  .file-preview-image {
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+  }
+  .file-preview-image img {
+    max-width: 100%;
+    height: auto;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: #0b0f14;
+  }
+  .file-preview-note {
+    font-size: 0.82rem;
+    color: var(--muted);
+    margin-top: 10px;
+  }
+
+  #repo-browser-fab {
+    display: none;
+    position: fixed;
+    right: 14px;
+    bottom: calc(78px + env(safe-area-inset-bottom, 0px));
+    z-index: 60;
+    border: 1px solid var(--border);
+    background: var(--bg3);
+    color: var(--text);
+    border-radius: 999px;
+    padding: 10px 14px;
+    font-size: 0.85rem;
+    cursor: pointer;
+    box-shadow: 0 6px 24px rgba(0,0,0,0.28);
+  }
+  #repo-browser-fab:hover { border-color: var(--accent); color: var(--accent); }
+
+  #repo-browser-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 10001;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.72);
+    padding: 14px;
+  }
+  #repo-browser-modal.visible { display: flex; }
+  .repo-browser-dialog {
+    width: min(1200px, 100%);
+    max-height: min(92vh, 920px);
+    display: flex;
+    flex-direction: column;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+  }
+  .repo-browser-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg3);
+  }
+  .repo-browser-title {
+    font-size: 0.92rem;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .repo-browser-close {
+    width: 32px;
+    height: 32px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg2);
+    color: var(--text);
+    cursor: pointer;
+  }
+  .repo-browser-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  .repo-browser-btn {
+    border: 1px solid var(--border);
+    background: var(--bg3);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 6px 10px;
+    font-size: 0.82rem;
+    cursor: pointer;
+  }
+  .repo-browser-btn.active {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .repo-browser-layout {
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: minmax(240px, 320px) minmax(0, 1fr);
+  }
+  .repo-pane {
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .repo-pane + .repo-pane {
+    border-left: 1px solid var(--border);
+  }
+  .repo-pane-head {
+    padding: 8px 12px;
+    font-size: 0.8rem;
+    color: var(--muted);
+    border-bottom: 1px dashed var(--border);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .repo-pane-head-fill { flex: 1; min-width: 0; }
+  .repo-pane-head-status { flex: 0 0 auto; white-space: nowrap; }
+  .repo-tree-focus-btn {
+    border: 1px solid var(--border);
+    background: var(--bg2);
+    color: var(--muted);
+    border-radius: 6px;
+    padding: 2px 7px;
+    font-size: 0.74rem;
+    cursor: pointer;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .repo-tree-focus-btn:hover { border-color: var(--accent); color: var(--accent); }
+  #repo-tree {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 8px;
+    min-width: 0;
+  }
+  .repo-tree-node { margin-left: 4px; min-width: 0; }
+  .repo-tree-summary {
+    list-style: none;
+    cursor: pointer;
+    border-radius: 8px;
+    padding: 6px 8px;
+    font-size: 0.82rem;
+    color: var(--text);
+    display: block;
+    max-width: 100%;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .repo-tree-summary::-webkit-details-marker { display: none; }
+  .repo-tree-summary:hover { background: rgba(255,255,255,0.05); }
+  .repo-tree-summary.active { background: rgba(88, 166, 255, 0.16); border: 1px solid rgba(88,166,255,0.42); }
+  .repo-tree-file {
+    display: block;
+    width: 100%;
+    text-align: left;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--text);
+    border-radius: 8px;
+    padding: 6px 8px;
+    font-size: 0.8rem;
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .repo-tree-file:hover { background: rgba(255,255,255,0.05); }
+  .repo-tree-children { margin-left: 10px; min-width: 0; overflow-x: hidden; }
+
+  #repo-folder {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 10px;
+    min-width: 0;
+  }
+  .repo-breadcrumb {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+    margin-bottom: 10px;
+    font-size: 0.8rem;
+    color: var(--muted);
+  }
+  .repo-pane-head.repo-breadcrumb {
+    min-width: 0;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
+    white-space: nowrap;
+    margin-bottom: 0;
+  }
+  .repo-breadcrumb > span { flex: 0 0 auto; }
+  .repo-crumb {
+    border: 1px solid var(--border);
+    background: var(--bg3);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 0.78rem;
+    cursor: pointer;
+  }
+  .repo-copy-ref-btn {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.74rem;
+    color: var(--muted);
+  }
+  .repo-folder-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .repo-folder-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 10px;
+  }
+  .repo-entry-row {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 8px 10px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 8px;
+    background: rgba(255,255,255,0.02);
+  }
+  .repo-entry-main {
+    min-width: 0;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .repo-entry-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 0.84rem;
+  }
+  .repo-entry-meta {
+    color: var(--muted);
+    font-size: 0.74rem;
+  }
+  .repo-entry-actions {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+  .repo-entry-action {
+    border: 1px solid var(--border);
+    background: var(--bg3);
+    color: var(--text);
+    border-radius: 7px;
+    padding: 4px 8px;
+    font-size: 0.76rem;
+    text-decoration: none;
+    cursor: pointer;
+  }
+  .repo-card {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 8px;
+    background: rgba(255,255,255,0.02);
+    display: grid;
+    gap: 8px;
+  }
+  .repo-card-thumb {
+    width: 100%;
+    aspect-ratio: 4 / 3;
+    border-radius: 8px;
+    overflow: hidden;
+    background: #0b0f14;
+    border: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted);
+    font-size: 1.3rem;
+  }
+  .repo-card-thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+  .repo-card-name {
+    font-size: 0.82rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .repo-empty {
+    color: var(--muted);
+    font-size: 0.82rem;
+    padding: 10px 6px;
+  }
+
+  .msg-mode {
+    display: inline-block; font-size: 0.68rem; background: var(--bg3);
+    border: 1px solid var(--border); border-radius: 4px; padding: 0 5px;
+    color: var(--success); margin-left: 4px; vertical-align: middle;
+  }
+
+  .relay-question-card {
+    background: rgba(88, 166, 255, 0.06);
+    border: 1px solid rgba(88, 166, 255, 0.35);
+    border-radius: 16px;
+    padding: 12px 14px;
+    display: grid;
+    gap: 10px;
+  }
+  .relay-question-container {
+    align-self: flex-start;
+    max-width: 82%;
+  }
+  .relay-question-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--muted);
+    font-size: 0.75rem;
+  }
+  .relay-question-body {
+    line-height: 1.5;
+    color: var(--text);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .relay-question-context {
+    border: 1px dashed var(--border);
+    border-radius: 10px;
+    padding: 8px 10px;
+    font-size: 0.78rem;
+    color: var(--muted);
+    background: rgba(255,255,255,0.02);
+    white-space: pre-wrap;
+  }
+  .relay-question-choices {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .relay-question-choice,
+  .relay-question-submit {
+    border: 1px solid var(--border);
+    background: var(--bg3);
+    color: var(--text);
+    border-radius: 999px;
+    padding: 8px 12px;
+    cursor: pointer;
+    font-size: 0.88rem;
+  }
+  .relay-question-submit {
+    background: var(--accent);
+    color: #000;
+    font-weight: 700;
+  }
+  .relay-question-reply {
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
+    flex-wrap: wrap;
+  }
+  .relay-question-reply textarea {
+    flex: 1;
+    min-width: 180px;
+    min-height: 72px;
+    resize: vertical;
+    padding: 10px 12px;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: var(--bg3);
+    color: var(--text);
+    outline: none;
+    font: inherit;
+  }
+  .relay-question-status {
+    font-size: 0.75rem;
+    color: var(--muted);
+  }
+  .relay-question-timed-out {
+    border-color: rgba(248, 81, 73, 0.5);
+    background: rgba(248, 81, 73, 0.08);
+  }
+
+  /* ── Mobile ── */
+  #sidebar-overlay {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 10;
+  }
+
+  @media (max-width: 680px) {
+    html, body { font-size: clamp(12px, 3.4vw, 14px); }
+    #sidebar {
+      position: fixed; top: 0; left: 0; height: 100%; z-index: 20;
+      transform: translateX(-100%);
+    }
+    #sidebar.open { transform: translateX(0); }
+    #sidebar-toggle { display: block; }
+    #fullscreen-btn { display: inline-flex; align-items: center; justify-content: center; }
+    #sidebar-overlay { display: block; opacity: 0; pointer-events: none; transition: opacity 0.25s; }
+    #sidebar-overlay.visible { opacity: 1; pointer-events: all; }
+    #messages { padding: 12px 10px; gap: 10px; }
+    .msg { max-width: 95%; }
+    .msg-label { font-size: 0.76rem; }
+    .msg-bubble { font-size: clamp(1rem, 3.8vw, 1.1rem); line-height: 1.52; padding: 10px 11px; }
+    .msg-bubble pre { font-size: 0.8rem; }
+    .msg-bubble table {
+      display: block;
+      width: max-content;
+      max-width: 100%;
+      overflow-x: auto;
+      white-space: nowrap;
+      -webkit-overflow-scrolling: touch;
+    }
+    .sidebar-header { padding: 12px; gap: 8px; }
+    #new-conv-btn { margin: 10px; padding: 9px 12px; border-radius: 8px; font-size: 0.88rem; }
+    #conv-list { padding: 0 5px 8px; }
+    .conv-item { padding: 10px 11px; border-radius: 8px; }
+    .conv-title {
+      white-space: normal;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      line-clamp: 2;
+      -webkit-box-orient: vertical;
+      line-height: 1.28;
+      max-height: 2.56em;
+      padding-right: 22px;
+    }
+    .conv-meta { font-size: 0.76rem; margin-top: 5px; }
+    .conv-delete { opacity: 1; right: 4px; font-size: 0.9rem; }
+    #chat-header { padding: calc(10px + env(safe-area-inset-top, 0px)) 12px 10px; gap: 8px; }
+    #sidebar-toggle { font-size: 1.05rem; padding: 2px 6px; }
+    #chat-title { font-size: 0.96rem; }
+    #pending-question-banner { font-size: 0.68rem; padding: 3px 8px; }
+    #session-pill { font-size: 0.68rem; padding: 2px 6px; }
+    #cli-status-text { font-size: 0.76rem; }
+    #fullscreen-btn { min-width: 32px; height: 30px; padding: 0 6px; border-radius: 8px; font-size: 0.82rem; }
+    #install-btn { min-width: 32px; height: 30px; padding: 0 6px; border-radius: 8px; font-size: 0.82rem; }
+    #compact-btn { min-width: 32px; height: 30px; padding: 0 8px; border-radius: 8px; font-size: 0.74rem; }
+    #input-area { padding: 10px 10px calc(10px + env(safe-area-inset-bottom, 0px)); }
+    .input-row { flex-wrap: wrap; gap: 8px; align-items: stretch; }
+    #repo-browser-input-btn,
+    #attach-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      font-size: 0.95rem;
+      padding: 0;
+    }
+    #repo-browser-input-btn {
+      order: -4;
+      flex: 0 0 40px;
+    }
+    #msg-input {
+      min-width: 0; min-height: 42px; max-height: 42vh; border-radius: 10px;
+      padding: 10px 12px; font-size: clamp(1rem, 4.2vw, 1.12rem);
+    }
+    #send-btn {
+      height: 40px; border-radius: 10px; padding: 10px 14px; font-size: 0.9rem;
+    }
+    #mode-select {
+      order: -3;
+      flex: 1 1 calc(100% - 48px);
+      width: calc(100% - 48px);
+      min-width: 0;
+      height: 40px;
+      border-radius: 10px;
+      padding: 0 10px;
+      font-size: 0.88rem;
+    }
+    #attach-btn {
+      order: -2;
+      flex: 0 0 40px;
+    }
+    #model-select {
+      order: -1;
+      flex: 1 1 calc(100% - 48px);
+      width: calc(100% - 48px);
+      min-width: 0;
+      height: 40px;
+      border-radius: 10px;
+      padding: 0 10px;
+      font-size: 0.88rem;
+    }
+    .relay-question-card { border-radius: 12px; padding: 10px 11px; gap: 8px; }
+    .relay-question-choice, .relay-question-submit { padding: 7px 10px; font-size: 0.82rem; }
+    .relay-question-reply textarea { min-height: 60px; padding: 9px 10px; border-radius: 10px; }
+    #repo-browser-fab {
+      display: none !important;
+    }
+    body.keyboard-open #repo-browser-fab {
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(10px);
+    }
+    #repo-browser-modal { padding: 8px; }
+    .repo-browser-dialog {
+      width: 100%;
+      max-height: calc(var(--app-height) - 16px);
+      border-radius: 10px;
+    }
+    .repo-browser-toolbar {
+      flex-wrap: nowrap;
+      overflow-x: auto;
+      overflow-y: hidden;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: thin;
+    }
+    .repo-browser-toolbar .repo-browser-btn {
+      flex: 0 0 auto;
+      white-space: nowrap;
+    }
+    .repo-browser-layout {
+      grid-template-columns: 1fr;
+      grid-template-rows: minmax(180px, 36vh) minmax(0, 1fr);
+    }
+    .repo-pane + .repo-pane {
+      border-left: none;
+      border-top: 1px solid var(--border);
+    }
+    .repo-folder-grid {
+      grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    }
+    .repo-entry-row {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .repo-entry-actions {
+      justify-content: flex-start;
+    }
+  }
+
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<!-- Auth Gate -->
+<div id="auth-gate">
+  <div class="auth-box">
+    <h1>🤖 Copilot Remote</h1>
+    <p>Enter your access token to connect</p>
+    <input id="token-input" type="password" placeholder="Access token" autofocus onkeydown="if(event.key==='Enter')doAuth()">
+    <button onclick="doAuth()">Connect</button>
+    <div id="auth-error" class="auth-error"></div>
+  </div>
+</div>
+
+<!-- Sidebar overlay (mobile) -->
+<div id="sidebar-overlay" onclick="closeSidebar()"></div>
+
+<!-- Main App -->
+<div id="app">
+  <div id="sidebar">
+    <div class="sidebar-header">
+      <span id="cli-dot" title="CLI status"></span>
+      <h2>Copilot Remote</h2>
+      <button id="usage-btn" onclick="showUsage()" title="Check Copilot usage" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:1.1rem;padding:4px;">📊</button>
+    </div>
+    <button id="new-conv-btn" onclick="newConversation()">+ New Conversation</button>
+    <div id="conv-list"></div>
+  </div>
+
+  <div id="main">
+    <div id="chat-header">
+      <button id="sidebar-toggle" onclick="openSidebar()">☰</button>
+      <span id="chat-title">Select or start a conversation</span>
+      <button id="pending-question-banner" onclick="openPendingQuestionFromBanner()" title="Open pending question"></button>
+      <span id="session-pill"></span>
+      <button id="install-btn" onclick="promptInstallApp()" title="Install app to home screen">Install</button>
+      <button id="compact-btn" onclick="compactCurrentConversation()" title="Compact conversation into a fresh session" disabled>Compact</button>
+      <button id="fullscreen-btn" onclick="toggleFullscreen()" title="Toggle fullscreen">⛶</button>
+      <span id="cli-status-text">CLI offline</span>
+    </div>
+    <div id="messages">
+      <div id="pull-refresh-indicator" aria-hidden="true"><span>↻ Pull down to refresh</span></div>
+      <div class="empty-state">
+        <div class="icon">💬</div>
+        <h3>No conversation selected</h3>
+        <p>Click <b>+ New Conversation</b> to start chatting with your Copilot CLI</p>
+      </div>
+    </div>
+    <div id="input-area">
+      <div id="offline-banner">⚠️ CLI is offline — messages will queue until it reconnects</div>
+      <div id="model-banner"></div>
+      <div id="attachment-preview"></div>
+      <div class="input-row">
+        <input id="image-input" type="file" multiple hidden onchange="handleAttachmentInput(this.files); this.value='';">
+        <button id="attach-btn" onclick="document.getElementById('image-input').click()" title="Attach file">📎</button>
+        <textarea id="msg-input" placeholder="Message Copilot…" rows="1" onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+        <button id="repo-browser-input-btn" onclick="openRepoBrowser()" title="Open file explorer" aria-label="Open file explorer">🗂️</button>
+        <select id="mode-select" title="Mode">
+          <option value="plan">plan</option>
+          <option value="ask">ask</option>
+          <option value="agent" selected>agent</option>
+          <option value="autopilot">autopilot</option>
+        </select>
+        <select id="model-select" title="Model">
+          <option value="">Loading models…</option>
+        </select>
+        <button id="send-btn" onclick="sendMessage()">Send</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<button id="repo-browser-fab" onclick="openRepoBrowser()" title="Open repository browser">📁 Browse files</button>
+
+<div id="repo-browser-modal" aria-hidden="true">
+  <div class="repo-browser-dialog" role="dialog" aria-modal="true" aria-label="Repository browser">
+    <div class="repo-browser-header">
+      <div class="repo-browser-title">Repository Browser</div>
+      <button class="repo-browser-close" onclick="closeRepoBrowser()" aria-label="Close repository browser">×</button>
+    </div>
+    <div class="repo-browser-toolbar">
+      <button id="repo-root-workspace-btn" class="repo-browser-btn active" onclick="setRepoBrowserRoot('workspace')">Workspace</button>
+      <button id="repo-root-drives-btn" class="repo-browser-btn" onclick="setRepoBrowserRoot('drives')">Drives</button>
+      <button id="repo-view-list-btn" class="repo-browser-btn active" onclick="setRepoBrowserViewMode('list')">List</button>
+      <button id="repo-view-grid-btn" class="repo-browser-btn" onclick="setRepoBrowserViewMode('grid')">Icons</button>
+      <button id="repo-toggle-hidden-btn" class="repo-browser-btn" onclick="toggleRepoBrowserHidden()">Hidden: Off</button>
+      <button id="repo-toggle-heavy-btn" class="repo-browser-btn" onclick="toggleRepoBrowserHeavy()">Heavy: Off</button>
+      <button class="repo-browser-btn" onclick="refreshRepoBrowser()">Refresh</button>
+    </div>
+    <div class="repo-browser-layout">
+      <section class="repo-pane">
+        <div class="repo-pane-head">
+          <span class="repo-pane-head-fill">File tree</span>
+          <button class="repo-tree-focus-btn" onclick="focusRepoTree()" title="Collapse tree to current folder">⌖ Focus</button>
+          <span id="repo-tree-status" class="repo-pane-head-status"></span>
+        </div>
+        <div id="repo-tree"></div>
+      </section>
+      <section class="repo-pane">
+        <div id="repo-folder-breadcrumb" class="repo-pane-head repo-breadcrumb"></div>
+        <div id="repo-folder"></div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<!-- Workspace file preview modal -->
+<div id="file-preview-modal" aria-hidden="true">
+  <div class="file-preview-dialog" role="dialog" aria-modal="true" aria-label="File preview">
+    <div class="file-preview-header">
+      <div id="file-preview-title" class="file-preview-title">File preview</div>
+      <button class="file-preview-close" onclick="closeFilePreview()" aria-label="Close preview">×</button>
+    </div>
+    <div class="file-preview-toolbar">
+      <button id="file-preview-mode-preview" class="file-preview-btn active" onclick="setFilePreviewMode('preview')">Preview</button>
+      <button id="file-preview-mode-raw" class="file-preview-btn" onclick="setFilePreviewMode('raw')">Raw</button>
+      <button id="file-preview-html-toggle" class="file-preview-btn" onclick="toggleFilePreviewHtml()">Enable embedded HTML</button>
+      <a id="file-preview-open-raw" class="file-preview-btn" target="_blank" rel="noopener noreferrer">Open raw tab</a>
+      <span id="file-preview-warning" class="file-preview-warning">⚠ Embedded HTML enabled (scripts still blocked)</span>
+    </div>
+    <div id="file-preview-meta" class="file-preview-meta"></div>
+    <div id="file-preview-body" class="file-preview-body"></div>
+  </div>
+</div>
+
+<script>
+// ─── Globals ──────────────────────────────────────────────────────────────────
+// Detect subpath prefix from the URL at runtime — no config needed.
+// e.g. https://foo.bar.org/beer/ → BASE = '/beer'
+//      http://localhost:3333/    → BASE = ''
+const BASE = window.location.pathname.replace(/\/+$/, '');
+let TOKEN = '';
+let socket = null;
+let currentConvId = null;
+let CLIENT_ID = sessionStorage.getItem('copilot_client_id');
+if (!CLIENT_ID) {
+  CLIENT_ID = generateId();
+  sessionStorage.setItem('copilot_client_id', CLIENT_ID);
+}
+
+function setCurrentConv(id) {
+  currentConvId = id;
+  if (id) localStorage.setItem('copilot_last_conv', id);
+  else localStorage.removeItem('copilot_last_conv');
+  updateCompactButton();
+}
+const seenMessageIds = new Set();
+const pendingUserMessageIds = new Set();
+let cliOnline = false;
+let conversations = {};  // id → {id,title,...}
+let selectedAttachments = [];
+const MODEL_STORAGE_KEY = 'copilot_selected_model';
+const MODE_STORAGE_KEY = 'copilot_selected_mode';
+const FALLBACK_MODEL = 'gpt-5.4-mini';
+const FALLBACK_MODE = 'agent';
+const MODEL_LABELS = {
+  'gpt-5.4': 'GPT-5.4',
+  'gpt-5.4-mini': 'GPT-5.4 Mini',
+  'gpt-5.3-codex': 'GPT-5.3 Codex',
+  'claude-sonnet-4.6': 'Claude Sonnet 4.6',
+  'claude-haiku-4.5': 'Claude Haiku 4.5',
+};
+const CURATED_MODELS = [
+  'gpt-5.4',
+  'gpt-5.4-mini',
+  'gpt-5.3-codex',
+  'claude-sonnet-4.6',
+  'claude-haiku-4.5',
+];
+let modelCatalogState = {
+  models: [FALLBACK_MODEL],
+  currentModel: FALLBACK_MODEL,
+  defaultModel: FALLBACK_MODEL,
+  stale: false,
+  warning: null,
+  refreshedAt: null,
+};
+let relayQuestions = new Map();
+let relayActivities = new Map();
+let thinkingMessageId = null;
+let relayQuestionPollTimer = null;
+let viewportBaseHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+let deferredInstallPrompt = null;
+const INSTALLED_DISPLAY_MODE_QUERIES = ['(display-mode: standalone)', '(display-mode: fullscreen)'];
+let installedFullscreenRetryPending = false;
+let installedFullscreenRetryBound = false;
+let relayQuestionRenderHash = '';
+let relayQuestionDrafts = new Map();
+let pullRefreshState = {
+  active: false,
+  ready: false,
+  startY: 0,
+  refreshing: false,
+};
+let compactInFlight = false;
+const PULL_REFRESH_THRESHOLD = 72;
+const PULL_REFRESH_MAX = 120;
+const RELAY_QUESTION_POLL_MS = 3000;
+const MAX_UPLOAD_ATTACHMENTS = 6;
+const FILE_PREVIEW_MAX_BYTES = 512 * 1024;
+const REPO_IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico', 'bmp', 'avif']);
+const WORKSPACE_FILE_EXTENSIONS = new Set([
+  'md', 'txt', 'json', 'js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx', 'css', 'html', 'xml', 'yml', 'yaml',
+  'toml', 'ini', 'csv', 'sql', 'ps1', 'sh', 'bat', 'go', 'py', 'java', 'rb', 'php', 'c', 'h', 'cpp',
+  'hpp', 'rs', 'lock', 'log', 'svg', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'pdf',
+]);
+let workspaceRootName = '';
+let workspaceRootEntrySet = new Set([
+  '.github',
+  'server',
+  'tests',
+  'readme.md',
+  'package.json',
+  'package-lock.json',
+]);
+let filePreviewState = {
+  path: '',
+  source: 'workspace',
+  mode: 'preview',
+  allowHtml: false,
+  loading: false,
+  error: '',
+  payload: null,
+};
+let repoBrowserState = {
+  open: false,
+  loading: false,
+  activeRoot: 'workspace',
+  workspaceIncludeHidden: false,
+  workspaceIncludeHeavy: false,
+  drivesIncludeHidden: false,
+  viewMode: 'list',
+  rootName: 'repo',
+  tree: null,
+  nodeMap: new Map(),
+  currentPath: '',
+  truncated: false,
+  nodeCount: 0,
+  maxNodes: 0,
+  loadingPath: '',
+  error: '',
+};
+
+function generateId() {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0;
+    return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+  });
+}
+
+marked.setOptions({ breaks: true });
+
+function updateWorkspaceRootHints(payload) {
+  const rootName = String(payload?.workspaceRootName || '').trim().toLowerCase();
+  const entries = Array.isArray(payload?.workspaceRootEntries) ? payload.workspaceRootEntries : [];
+  workspaceRootName = rootName;
+  if (entries.length) {
+    workspaceRootEntrySet = new Set(entries.map((entry) => String(entry || '').trim().toLowerCase()).filter(Boolean));
+  }
+}
+
+// ─── Auth ─────────────────────────────────────────────────────────────────────
+function getTokenFromUrl() {
+  return new URLSearchParams(window.location.search).get('token');
+}
+
+function stripTokenFromUrl() {
+  const url = new URL(window.location.href);
+  if (!url.searchParams.has('token')) return;
+  url.searchParams.delete('token');
+  history.replaceState(null, document.title, `${url.pathname}${url.search}${url.hash}`);
+}
+
+function ensureTrailingSlashPath() {
+  const url = new URL(window.location.href);
+  const path = url.pathname || '/';
+  if (path === '/' || path.endsWith('/')) return false;
+  const lastSegment = path.split('/').filter(Boolean).pop() || '';
+  if (lastSegment.includes('.')) return false;
+  url.pathname = `${path}/`;
+  window.location.replace(url.toString());
+  return true;
+}
+
+function authHeaders() {
+  return TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {};
+}
+
+async function verifyExistingSession() {
+  try {
+    const r = await fetch(`${BASE}/api/status`);
+    if (!r.ok) return false;
+    const payload = await r.json().catch(() => null);
+    if (payload) updateWorkspaceRootHints(payload);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function doAuth() {
+  const val = document.getElementById('token-input').value.trim() || getTokenFromUrl();
+  if (!val) return showAuthError('Please enter a token');
+  const ok = await verifyToken(val);
+  if (ok) {
+    initApp();
+  } else {
+    showAuthError('Invalid token');
+  }
+}
+
+async function verifyToken(t) {
+  try {
+    const r = await fetch(`${BASE}/api/status`, {
+      headers: { Authorization: `Bearer ${t}` },
+    });
+    if (!r.ok) return false;
+    const payload = await r.json().catch(() => null);
+    if (payload) updateWorkspaceRootHints(payload);
+    return true;
+  } catch { return false; }
+}
+
+async function refreshWorkspaceRootHints() {
+  const status = await apiFetch('/api/status');
+  if (status) updateWorkspaceRootHints(status);
+}
+
+function showAuthError(msg) {
+  document.getElementById('auth-error').textContent = msg;
+}
+
+// ─── Init ─────────────────────────────────────────────────────────────────────
+async function initApp() {
+  setupViewportTracking();
+  document.getElementById('auth-gate').style.display = 'none';
+  document.getElementById('app').classList.add('visible');
+  document.getElementById('repo-browser-fab').style.display = 'inline-flex';
+
+  initModeSelector();
+  initModelSelector();
+  await refreshWorkspaceRootHints();
+  await refreshModelCatalog(true);
+  initFullscreenButton();
+  initInstallButton();
+  initPullToRefresh();
+  connectSocket();
+  startRelayQuestionPolling();
+  await loadConversations();
+  await loadRelayQuestions(currentConvId);
+  updateCompactButton();
+
+  document.getElementById('msg-input').focus();
+}
+
+function startRelayQuestionPolling() {
+  if (relayQuestionPollTimer) return;
+  relayQuestionPollTimer = setInterval(() => {
+    loadRelayQuestions(currentConvId).catch(() => {});
+  }, RELAY_QUESTION_POLL_MS);
+}
+
+function setupViewportTracking() {
+  syncViewportMetrics();
+
+  const update = () => {
+    syncViewportMetrics();
+  };
+
+  window.addEventListener('resize', update, { passive: true });
+  window.addEventListener('orientationchange', update, { passive: true });
+
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', update, { passive: true });
+    window.visualViewport.addEventListener('scroll', update, { passive: true });
+  }
+
+  const input = document.getElementById('msg-input');
+  if (input && input.dataset.viewportBound !== '1') {
+    input.dataset.viewportBound = '1';
+    input.addEventListener('focus', () => {
+      document.body.classList.add('keyboard-open');
+      syncViewportMetrics();
+    }, { passive: true });
+    input.addEventListener('blur', () => {
+      document.body.classList.remove('keyboard-open');
+      syncViewportMetrics();
+    }, { passive: true });
+  }
+}
+
+function syncViewportMetrics() {
+  const layoutHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+  const vv = window.visualViewport;
+  let appHeight = layoutHeight;
+
+  if (vv) {
+    const visibleHeight = Math.max(0, vv.height || 0);
+    const offsetTop = Math.max(0, vv.offsetTop || 0);
+    const baselineCandidate = Math.max(layoutHeight, visibleHeight + offsetTop);
+    if (baselineCandidate > viewportBaseHeight) viewportBaseHeight = baselineCandidate;
+    appHeight = visibleHeight || layoutHeight;
+  } else if (layoutHeight > viewportBaseHeight) {
+    viewportBaseHeight = layoutHeight;
+  }
+
+  document.documentElement.style.setProperty('--app-height', `${Math.max(0, Math.round(appHeight))}px`);
+}
+
+function initPullToRefresh() {
+  const el = document.getElementById('messages');
+  if (!el || el.dataset.pullRefreshBound === '1') return;
+  el.dataset.pullRefreshBound = '1';
+
+  el.addEventListener('touchstart', onMessagesTouchStart, { passive: true });
+  el.addEventListener('touchmove', onMessagesTouchMove, { passive: false });
+  el.addEventListener('touchend', onMessagesTouchEnd, { passive: true });
+  el.addEventListener('touchcancel', onMessagesTouchEnd, { passive: true });
+}
+
+function onMessagesTouchStart(event) {
+  const el = event.currentTarget;
+  if (!el || el.scrollTop > 0 || pullRefreshState.refreshing) return;
+  const touch = event.touches?.[0];
+  if (!touch) return;
+
+  pullRefreshState = {
+    active: true,
+    ready: false,
+    startY: touch.clientY,
+    refreshing: pullRefreshState.refreshing,
+  };
+  setPullRefreshIndicator(0, 'Pull down to refresh');
+}
+
+function onMessagesTouchMove(event) {
+  if (!pullRefreshState.active) return;
+
+  const el = event.currentTarget;
+  if (!el || el.scrollTop > 0) {
+    resetPullRefreshIndicator();
+    return;
+  }
+
+  const touch = event.touches?.[0];
+  if (!touch) return;
+
+  const delta = touch.clientY - pullRefreshState.startY;
+  if (delta <= 0) {
+    resetPullRefreshIndicator();
+    return;
+  }
+
+  const distance = Math.min(delta, PULL_REFRESH_MAX);
+  const ready = distance >= PULL_REFRESH_THRESHOLD;
+  pullRefreshState.ready = ready;
+
+  setPullRefreshIndicator(distance, ready ? 'Release to refresh' : 'Pull down to refresh', ready);
+
+  if (delta > 6) {
+    event.preventDefault();
+  }
+}
+
+async function onMessagesTouchEnd() {
+  if (!pullRefreshState.active) return;
+  const shouldRefresh = pullRefreshState.ready && !pullRefreshState.refreshing;
+  pullRefreshState.active = false;
+  pullRefreshState.ready = false;
+
+  if (!shouldRefresh) {
+    resetPullRefreshIndicator();
+    return;
+  }
+
+  pullRefreshState.refreshing = true;
+  setPullRefreshIndicator(PULL_REFRESH_THRESHOLD, 'Refreshing…', true);
+  try {
+    await refreshCurrentView();
+  } finally {
+    pullRefreshState.refreshing = false;
+    resetPullRefreshIndicator();
+  }
+}
+
+function setPullRefreshIndicator(distance, label, ready=false) {
+  const el = document.getElementById('pull-refresh-indicator');
+  if (!el) return;
+
+  const span = el.querySelector('span');
+  if (span) span.textContent = label;
+
+  el.classList.add('visible');
+  el.classList.toggle('ready', !!ready);
+  el.style.transform = `translateY(${Math.min(distance / 2, 28)}px)`;
+}
+
+function resetPullRefreshIndicator() {
+  const el = document.getElementById('pull-refresh-indicator');
+  if (!el) return;
+  const span = el.querySelector('span');
+  if (span) span.textContent = 'Pull down to refresh';
+  el.classList.remove('visible', 'ready');
+  el.style.transform = '';
+}
+
+async function refreshCurrentView() {
+  const currentId = currentConvId;
+  const messagesEl = document.getElementById('messages');
+  const scrollTop = messagesEl?.scrollTop || 0;
+
+  await refreshConversations();
+
+  if (!currentId) {
+    renderMessages([], false);
+    restoreInFlightThinking(null);
+    return;
+  }
+
+  const r = await apiFetch(`/api/conversation/${currentId}`);
+  if (r) {
+    renderMessages(r.messages, false);
+    restoreInFlightThinking(r.inFlight || null);
+  } else {
+    restoreInFlightThinking(null);
+  }
+  await loadRelayQuestions(currentId);
+  if (messagesEl) messagesEl.scrollTop = scrollTop;
+}
+
+function initFullscreenButton() {
+  const syncFullscreenUi = () => {
+    syncInstalledAppUiState();
+    updateFullscreenButton();
+    ensureInstalledAppFullscreen().catch(() => {});
+  };
+  document.addEventListener('fullscreenchange', syncFullscreenUi);
+  window.addEventListener('resize', syncFullscreenUi);
+  for (const query of INSTALLED_DISPLAY_MODE_QUERIES) {
+    const media = window.matchMedia(query);
+    if (media && typeof media.addEventListener === 'function') {
+      media.addEventListener('change', syncFullscreenUi);
+    }
+  }
+  updateFullscreenButton();
+  ensureInstalledAppFullscreen().catch(() => {});
+}
+
+function matchesDisplayMode(query) {
+  try {
+    return !!window.matchMedia(query).matches;
+  } catch {
+    return false;
+  }
+}
+
+function isInstalledAppMode() {
+  return matchesDisplayMode('(display-mode: standalone)')
+    || matchesDisplayMode('(display-mode: fullscreen)')
+    || window.navigator.standalone === true;
+}
+
+function isStandaloneMode() {
+  return isInstalledAppMode();
+}
+
+function isManifestFullscreenMode() {
+  return matchesDisplayMode('(display-mode: fullscreen)');
+}
+
+function syncInstalledAppUiState() {
+  document.body.classList.toggle('installed-app', isInstalledAppMode());
+}
+
+function clearInstalledFullscreenRetryListeners() {
+  installedFullscreenRetryPending = false;
+  if (!installedFullscreenRetryBound) return;
+  const retryHandler = window.__installedFullscreenRetryHandler;
+  if (retryHandler) {
+    window.removeEventListener('pointerdown', retryHandler);
+    window.removeEventListener('touchstart', retryHandler);
+    window.removeEventListener('keydown', retryHandler);
+  }
+  window.__installedFullscreenRetryHandler = null;
+  installedFullscreenRetryBound = false;
+}
+
+function queueInstalledFullscreenRetry() {
+  installedFullscreenRetryPending = true;
+  if (installedFullscreenRetryBound) return;
+  const retryHandler = () => {
+    if (!installedFullscreenRetryPending) return;
+    ensureInstalledAppFullscreen({ userGesture: true }).catch(() => {});
+  };
+  window.__installedFullscreenRetryHandler = retryHandler;
+  window.addEventListener('pointerdown', retryHandler, { passive: true });
+  window.addEventListener('touchstart', retryHandler, { passive: true });
+  window.addEventListener('keydown', retryHandler, { passive: true });
+  installedFullscreenRetryBound = true;
+}
+
+async function ensureInstalledAppFullscreen(options = {}) {
+  syncInstalledAppUiState();
+  if (!isInstalledAppMode()) {
+    clearInstalledFullscreenRetryListeners();
+    return false;
+  }
+  if (isManifestFullscreenMode() || document.fullscreenElement) {
+    clearInstalledFullscreenRetryListeners();
+    return true;
+  }
+  if (!canToggleFullscreen()) return false;
+
+  const fromUserGesture = !!options.userGesture;
+  if (!fromUserGesture && navigator.userActivation && navigator.userActivation.isActive === false) {
+    queueInstalledFullscreenRetry();
+    return false;
+  }
+
+  try {
+    await document.documentElement.requestFullscreen();
+    clearInstalledFullscreenRetryListeners();
+    return true;
+  } catch (_) {
+    queueInstalledFullscreenRetry();
+    return false;
+  } finally {
+    updateFullscreenButton();
+  }
+}
+
+function canToggleFullscreen() {
+  return !!document.documentElement.requestFullscreen || !!document.fullscreenElement;
+}
+
+function getInstallHelpMessage() {
+  const ua = String(navigator.userAgent || '').toLowerCase();
+  if (/iphone|ipad|ipod/.test(ua)) {
+    return 'To install on iPhone/iPad: open this page in Safari, tap Share, then choose "Add to Home Screen".';
+  }
+  if (/android/.test(ua)) {
+    return 'To install on Android: open the browser menu (⋮) and choose "Install app" or "Add to Home screen".';
+  }
+  return 'To install: open your browser menu and choose "Install app" or "Add to Home screen".';
+}
+
+function updateInstallButton() {
+  const btn = document.getElementById('install-btn');
+  if (!btn) return;
+  syncInstalledAppUiState();
+
+  if (isInstalledAppMode()) {
+    btn.style.display = 'none';
+    return;
+  }
+
+  const mobile = window.matchMedia('(max-width: 680px)').matches;
+  btn.textContent = mobile ? '⬇' : 'Install';
+  btn.style.display = 'inline-flex';
+  btn.title = deferredInstallPrompt
+    ? 'Install app to home screen'
+    : 'Show install instructions';
+}
+
+async function promptInstallApp() {
+  if (isInstalledAppMode()) return;
+
+  if (deferredInstallPrompt) {
+    try {
+      deferredInstallPrompt.prompt();
+      const choice = await deferredInstallPrompt.userChoice.catch(() => null);
+      if (choice?.outcome === 'accepted') {
+        showTransientRelayNotice('Install accepted. The app will appear on your home screen.');
+      }
+    } finally {
+      deferredInstallPrompt = null;
+      updateInstallButton();
+    }
+    return;
+  }
+
+  alert(getInstallHelpMessage());
+}
+
+function initInstallButton() {
+  if (window.__installButtonBound) {
+    updateInstallButton();
+    ensureInstalledAppFullscreen().catch(() => {});
+    return;
+  }
+  window.__installButtonBound = true;
+
+  window.addEventListener('beforeinstallprompt', (event) => {
+    event.preventDefault();
+    deferredInstallPrompt = event;
+    updateInstallButton();
+    updateFullscreenButton();
+  });
+
+  window.addEventListener('appinstalled', () => {
+    deferredInstallPrompt = null;
+    updateInstallButton();
+    updateFullscreenButton();
+    ensureInstalledAppFullscreen().catch(() => {});
+    showTransientRelayNotice('App installed.');
+  });
+
+  window.addEventListener('resize', () => {
+    updateInstallButton();
+    updateFullscreenButton();
+  }, { passive: true });
+
+  for (const query of INSTALLED_DISPLAY_MODE_QUERIES) {
+    const media = window.matchMedia(query);
+    if (media && typeof media.addEventListener === 'function') {
+      media.addEventListener('change', () => {
+        updateInstallButton();
+        updateFullscreenButton();
+        ensureInstalledAppFullscreen().catch(() => {});
+      });
+    }
+  }
+
+  updateInstallButton();
+  updateFullscreenButton();
+  ensureInstalledAppFullscreen().catch(() => {});
+}
+
+async function toggleFullscreen() {
+  if (isInstalledAppMode()) {
+    ensureInstalledAppFullscreen({ userGesture: true }).catch(() => {});
+    return;
+  }
+  if (!canToggleFullscreen()) return;
+  try {
+    if (document.fullscreenElement) {
+      await document.exitFullscreen();
+    } else {
+      await document.documentElement.requestFullscreen();
+    }
+  } catch (_) {
+    // Ignore browser restrictions (e.g. unsupported/platform-limited fullscreen).
+  } finally {
+    updateFullscreenButton();
+  }
+}
+
+function updateFullscreenButton() {
+  const btn = document.getElementById('fullscreen-btn');
+  if (!btn) return;
+  syncInstalledAppUiState();
+
+  if (isInstalledAppMode()) {
+    btn.style.display = 'none';
+    return;
+  }
+
+  const mobile = window.matchMedia('(max-width: 680px)').matches;
+  if (!mobile) {
+    btn.style.display = 'none';
+    return;
+  }
+
+  const full = !!document.fullscreenElement;
+  const supported = canToggleFullscreen();
+  btn.style.display = 'inline-flex';
+  btn.disabled = !supported;
+
+  if (full) {
+    btn.textContent = '⤢';
+    btn.title = 'Exit fullscreen';
+  } else {
+    btn.textContent = '⛶';
+    btn.title = supported ? 'Enter fullscreen' : 'Fullscreen not supported on this browser';
+  }
+}
+
+function initModelSelector() {
+  const select = document.getElementById('model-select');
+  if (!select) return;
+  if (!select.dataset.bound) {
+    select.dataset.bound = '1';
+    select.addEventListener('change', () => {
+      localStorage.setItem(MODEL_STORAGE_KEY, select.value);
+    });
+  }
+}
+
+function setModelBanner(message) {
+  const el = document.getElementById('model-banner');
+  if (!el) return;
+  const text = String(message || '').trim();
+  if (!text) {
+    el.textContent = '';
+    el.classList.remove('visible');
+    return;
+  }
+  el.textContent = text;
+  el.classList.add('visible');
+}
+
+function showTransientRelayNotice(message, ms = 4000) {
+  const text = String(message || '').trim();
+  if (!text) return;
+  setModelBanner(text);
+  setTimeout(() => {
+    const el = document.getElementById('model-banner');
+    if (!el) return;
+    if (String(el.textContent || '').trim() === text) {
+      setModelBanner('');
+    }
+  }, Math.max(1500, Number(ms) || 4000));
+}
+
+function getPreferredModelSelection(availableModels) {
+  const saved = localStorage.getItem(MODEL_STORAGE_KEY);
+  const current = modelCatalogState.currentModel || '';
+  const fallback = modelCatalogState.defaultModel || FALLBACK_MODEL;
+  const options = [saved, current, fallback, availableModels[0]].filter(Boolean);
+  return options.find((id) => availableModels.includes(id)) || '';
+}
+
+function modelLabel(modelId) {
+  const id = String(modelId || '').trim();
+  return MODEL_LABELS[id] || id;
+}
+
+function applyModelCatalogState(payload) {
+  const select = document.getElementById('model-select');
+  if (!select) return;
+  const models = Array.isArray(payload?.models)
+    ? payload.models.map((m) => String(m || '').trim()).filter(Boolean)
+    : [];
+  const currentModel = String(payload?.currentModel || '').trim();
+  const defaultModel = String(payload?.defaultModel || '').trim();
+  const deduped = Array.from(new Set([...CURATED_MODELS, currentModel, defaultModel, ...models].filter(Boolean)));
+  const nextModels = deduped.length ? deduped : [FALLBACK_MODEL];
+
+  modelCatalogState = {
+    models: nextModels,
+    currentModel: currentModel || nextModels[0] || FALLBACK_MODEL,
+    defaultModel: defaultModel || nextModels[0] || FALLBACK_MODEL,
+    stale: !!payload?.stale,
+    warning: payload?.warning ? String(payload.warning) : null,
+    refreshedAt: payload?.refreshedAt || null,
+  };
+
+  const selectedBefore = select.value;
+  select.innerHTML = '';
+  for (const modelId of nextModels) {
+    const opt = document.createElement('option');
+    opt.value = modelId;
+    opt.textContent = modelLabel(modelId);
+    select.appendChild(opt);
+  }
+
+  const preferred = [selectedBefore, getPreferredModelSelection(nextModels)].find((value) => value && nextModels.includes(value)) || nextModels[0];
+  select.value = preferred;
+  localStorage.setItem(MODEL_STORAGE_KEY, preferred);
+
+  if (modelCatalogState.warning) {
+    setModelBanner(`⚠️ ${modelCatalogState.warning}`);
+  } else if (modelCatalogState.stale) {
+    setModelBanner('⚠️ Model list is cached from CLI; selection may be stale.');
+  } else {
+    setModelBanner('');
+  }
+}
+
+async function refreshModelCatalog(force=false) {
+  const r = await apiFetch('/api/models');
+  if (!r) {
+    if (force) setModelBanner('⚠️ Could not refresh live model list; using current selection.');
+    return;
+  }
+  applyModelCatalogState(r);
+}
+
+function selectedModelValue() {
+  const select = document.getElementById('model-select');
+  const value = String(select?.value || '').trim();
+  if (value) return value;
+  return modelCatalogState.currentModel || modelCatalogState.defaultModel || FALLBACK_MODEL;
+}
+
+function initModeSelector() {
+  const select = document.getElementById('mode-select');
+  const saved = localStorage.getItem(MODE_STORAGE_KEY);
+  const available = Array.from(select.options).map(o => o.value);
+  if (saved && available.includes(saved)) {
+    select.value = saved;
+  } else if (!saved && available.includes(FALLBACK_MODE)) {
+    select.value = FALLBACK_MODE;
+  }
+  select.addEventListener('change', () => {
+    localStorage.setItem(MODE_STORAGE_KEY, select.value);
+  });
+}
+
+function connectSocket() {
+  socket = io({ path: BASE + '/socket.io/', auth: TOKEN ? { token: TOKEN, clientId: CLIENT_ID } : { clientId: CLIENT_ID } });
+
+  socket.on('connect', () => {
+    console.log('Socket connected');
+    refreshModelCatalog().catch(() => {});
+  });
+  socket.on('connect_error', (e) => console.error('Socket error:', e.message));
+
+  socket.on('cli_status', ({ online }) => {
+    cliOnline = online;
+    updateCliStatus();
+    if (online) refreshModelCatalog().catch(() => {});
+  });
+
+  socket.on('models_updated', (payload) => {
+    applyModelCatalogState(payload || {});
+  });
+
+  socket.on('workspace_root_changed', (payload) => {
+    updateWorkspaceRootHints(payload || {});
+    if (repoBrowserState.activeRoot !== 'workspace') return;
+    repoBrowserState.currentPath = '';
+    if (repoBrowserState.open) {
+      void loadRepoBrowserTree();
+    }
+  });
+
+  socket.on('user_message', ({ conversationId, messageId, senderClientId, message }) => {
+    // Ignore our own broadcasts; the message is already rendered optimistically.
+    if (senderClientId && senderClientId === CLIENT_ID) {
+      pendingUserMessageIds.delete(messageId);
+      return;
+    }
+    // Skip echoes for messages we already rendered locally.
+    if (messageId && (pendingUserMessageIds.has(messageId) || seenMessageIds.has(messageId))) {
+      pendingUserMessageIds.delete(messageId);
+      return;
+    }
+    if (conversationId === currentConvId) appendMessage(message, true, messageId);
+  });
+
+  socket.on('assistant_message', ({ conversationId, message, messageId, sourceMessageId }) => {
+    removeThinking();
+    if ((!message?.activities || !message.activities.length) && sourceMessageId) {
+      const cached = relayActivities.get(sourceMessageId) || [];
+      if (cached.length) message.activities = cached.slice(0, 48);
+    }
+    if (messageId && seenMessageIds.has(messageId)) return;
+    if (conversationId === currentConvId) appendMessage(message, true, messageId || null);
+    if (sourceMessageId) relayActivities.delete(sourceMessageId);
+  });
+
+  socket.on('relay_question', ({ question }) => {
+    upsertRelayQuestion(question);
+  });
+
+  socket.on('relay_question_updated', ({ question }) => {
+    upsertRelayQuestion(question);
+  });
+
+  socket.on('relay_question_changed', () => {
+    loadRelayQuestions(currentConvId);
+  });
+
+  socket.on('relay_activity', ({ conversationId, messageId, text }) => {
+    if (!messageId || !text) return;
+    const items = relayActivities.get(messageId) || [];
+    const last = items[items.length - 1];
+    if (last !== text) {
+      const next = items.concat(text).slice(-24);
+      relayActivities.set(messageId, next);
+    }
+
+    if (conversationId === currentConvId && messageId === thinkingMessageId) {
+      appendThinkingActivity(text);
+    }
+  });
+
+  socket.on('conversation_compacted', async ({ sourceConversationId, targetConversationId }) => {
+    if (!sourceConversationId || !targetConversationId) return;
+    await refreshConversations();
+    if (currentConvId === sourceConversationId) {
+      await openConversation(targetConversationId);
+    } else {
+      updateCompactButton();
+    }
+  });
+
+  socket.on('message_status', ({ messageId, conversationId, status }) => {
+    if (conversationId === currentConvId && status === 'processing') {
+      thinkingMessageId = messageId || null;
+      showThinking();
+      renderThinkingActivities();
+    }
+    if (conversationId === currentConvId && (status === 'done' || status === 'failed' || status === 'dropped')) {
+      thinkingMessageId = null;
+      removeThinking();
+    }
+  });
+
+  socket.on('conversation_deleted', ({ conversationId }) => {
+    const questionIdsForConversation = new Set();
+    for (const [id, question] of relayQuestions.entries()) {
+      if (question?.conversationId === conversationId) {
+        questionIdsForConversation.add(id);
+      }
+    }
+    delete conversations[conversationId];
+    for (const [id, question] of relayQuestions.entries()) {
+      if (question?.conversationId === conversationId) {
+        relayQuestions.delete(id);
+      }
+    }
+    for (const id of questionIdsForConversation) {
+      relayQuestionDrafts.delete(id);
+    }
+    updatePendingQuestionBanner();
+    renderConvList();
+    if (currentConvId === conversationId) {
+      setCurrentConv(null);
+      renderMessages([]);
+      document.getElementById('chat-title').textContent = 'Select or start a conversation';
+      updateSessionPill(null, null);
+      updateCompactButton();
+    } else {
+      updateCompactButton();
+    }
+  });
+}
+
+// ─── Conversations ────────────────────────────────────────────────────────────
+async function loadConversations() {
+  await refreshConversations();
+  const lastId = localStorage.getItem('copilot_last_conv');
+  if (lastId && conversations[lastId]) await openConversation(lastId);
+}
+
+async function refreshConversations() {
+  const r = await apiFetch('/api/conversations');
+  if (!r) return;
+  conversations = {};
+  for (const c of r.conversations) conversations[c.id] = c;
+  renderConvList();
+  updateCompactButton();
+}
+
+function renderConvList() {
+  const list = document.getElementById('conv-list');
+  const sorted = Object.values(conversations).sort((a,b) => new Date(b.updatedAt)-new Date(a.updatedAt));
+  const pendingByConversation = getPendingQuestionCountsByConversation();
+  if (sorted.length === 0) {
+    list.innerHTML = '<div style="padding:12px;color:var(--muted);font-size:0.85rem;text-align:center">No conversations yet</div>';
+    return;
+  }
+  list.innerHTML = sorted.map(c => `
+    <div class="conv-item${c.id===currentConvId?' active':''}" onclick="openConversation('${c.id}')">
+      <div class="conv-title">${escHtml(c.title)}${c.archived ? ' <span style="font-size:0.68rem;color:var(--muted)">(archived)</span>' : ''}${pendingByConversation[c.id] ? ` <span class="conv-open-questions">${pendingByConversation[c.id]} open</span>` : ''}</div>
+      <div class="conv-meta">${fmtDate(c.updatedAt)} · ${c.messageCount} msg${c.messageCount!==1?'s':''}${c.runtimeSessionId ? ` · S:${escHtml(String(c.runtimeSessionId).slice(0,8))}` : ''}</div>
+      <button class="conv-delete" onclick="deleteConv(event,'${c.id}')" title="Delete">🗑</button>
+    </div>`).join('');
+}
+
+async function openConversation(id) {
+  setCurrentConv(id);
+  closeSidebar();
+  clearAttachments();
+  document.getElementById('chat-title').textContent = conversations[id]?.title || id;
+  updateSessionPill(conversations[id], null);
+  updateCompactButton();
+  renderConvList();
+
+  const r = await apiFetch(`/api/conversation/${id}`);
+  if (r) {
+    renderMessages(r.messages);
+    restoreInFlightThinking(r.inFlight || null);
+    updateSessionPill(conversations[id], r.runtimeSession || null);
+  } else {
+    restoreInFlightThinking(null);
+  }
+  await loadRelayQuestions(id);
+  document.getElementById('msg-input').focus();
+}
+
+async function newConversation() {
+  setCurrentConv(null);
+  closeSidebar();
+  clearAttachments();
+  document.getElementById('chat-title').textContent = 'New Conversation';
+  updateSessionPill(null, null);
+  updateCompactButton();
+  renderMessages([]);
+  renderConvList();
+  document.getElementById('msg-input').focus();
+}
+
+async function deleteConv(e, id) {
+  e.stopPropagation();
+  if (!confirm('Delete this conversation?')) return;
+  await apiFetch(`/api/conversation/${id}`, { method: 'DELETE' });
+  delete conversations[id];
+  renderConvList();
+  if (currentConvId === id) {
+    setCurrentConv(null);
+    clearAttachments();
+    renderMessages([]);
+    document.getElementById('chat-title').textContent = 'Select or start a conversation';
+    updateSessionPill(null, null);
+    updateCompactButton();
+  }
+}
+
+function updateSessionPill(conversation, runtimeSession) {
+  const pill = document.getElementById('session-pill');
+  if (!pill) return;
+  const runtimeId = String(runtimeSession?.id || conversation?.runtimeSessionId || '').trim();
+  if (!runtimeId) {
+    pill.textContent = '';
+    pill.classList.remove('visible');
+    return;
+  }
+  const strategy = String(runtimeSession?.strategy || conversation?.runtimeSessionStrategy || '').trim();
+  const strategyText = strategy ? ` (${strategy})` : '';
+  pill.textContent = `Session ${runtimeId.slice(0, 8)}${strategyText}`;
+  pill.classList.add('visible');
+}
+
+function updateCompactButton() {
+  const btn = document.getElementById('compact-btn');
+  if (!btn) return;
+  const conv = currentConvId ? conversations[currentConvId] : null;
+  const canCompact = !!(currentConvId && conv && !conv.archived && !compactInFlight);
+  btn.disabled = !canCompact;
+  btn.title = canCompact
+    ? 'Compact conversation into a fresh session'
+    : (compactInFlight ? 'Compacting conversation…' : 'Open an active conversation to compact');
+}
+
+async function compactCurrentConversation() {
+  if (!currentConvId || compactInFlight) return;
+  const id = currentConvId;
+  const conv = conversations[id];
+  if (!conv || conv.archived) return;
+  if (!confirm('Compact this conversation into a new one with carry-over summary?')) return;
+
+  compactInFlight = true;
+  updateCompactButton();
+  try {
+    const r = await apiFetch(`/api/conversation/${id}/compact`, { method: 'POST' });
+    if (!r?.compactedConversationId) throw new Error('Compaction failed');
+    await refreshConversations();
+    await openConversation(r.compactedConversationId);
+  } catch (e) {
+    alert(e.message || 'Failed to compact conversation');
+  } finally {
+    compactInFlight = false;
+    updateCompactButton();
+  }
+}
+
+// ─── Messages ─────────────────────────────────────────────────────────────────
+function renderMessages(msgs, scroll=true) {
+  const el = document.getElementById('messages');
+  if (!msgs || msgs.length === 0) {
+    el.innerHTML = `<div id="pull-refresh-indicator" aria-hidden="true"><span>↻ Pull down to refresh</span></div>
+      <div class="empty-state">
+      <div class="icon">${currentConvId ? '💬' : '🚀'}</div>
+      <h3>${currentConvId ? 'No messages yet' : 'New Conversation'}</h3>
+      <p>${currentConvId ? 'Start the conversation below' : 'Type your first message below'}</p>
+    </div>`;
+    renderRelayQuestions();
+    return;
+  }
+  el.innerHTML = '';
+  el.insertAdjacentHTML('afterbegin', '<div id="pull-refresh-indicator" aria-hidden="true"><span>↻ Pull down to refresh</span></div>');
+  for (const m of msgs) appendMessage(m, false, m.id || null, true);
+  renderRelayQuestions();
+  if (scroll) scrollBottom();
+}
+
+function upsertRelayQuestion(question) {
+  if (!question || !question.id) return;
+  relayQuestions.set(question.id, question);
+  updatePendingQuestionBanner();
+  renderConvList();
+  renderRelayQuestions();
+}
+
+async function loadRelayQuestions(conversationId) {
+  // Only reload pending questions. Answered questions are already reflected in the
+  // message activity log (Tool (ask_user): user answered "...") and should not be
+  // re-appended as standalone cards on page refresh (which made old answered cards
+  // appear as the "most recent" message).
+  const pendingRes = await apiFetch('/api/relay-questions?status=pending');
+  if (!pendingRes) return;
+  const pending = Array.isArray(pendingRes?.questions) ? pendingRes.questions.filter((q) => q && q.id) : [];
+  // Merge pending from server with any answered questions already known in this session
+  // (tracked via relay_question_updated WebSocket events), so in-session answered cards
+  // are preserved until the user navigates away.
+  const next = new Map(pending.map((q) => [q.id, q]));
+  for (const [id, q] of relayQuestions.entries()) {
+    if (q.status === 'answered' && !next.has(id)) next.set(id, q);
+  }
+  for (const questionId of relayQuestionDrafts.keys()) {
+    const question = next.get(questionId);
+    if (!question || question.status !== 'pending') {
+      relayQuestionDrafts.delete(questionId);
+    }
+  }
+  relayQuestions = next;
+  updatePendingQuestionBanner();
+  renderConvList();
+
+  if (!conversationId && pending.length) {
+    const latest = pending
+      .slice()
+      .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))[0];
+    const targetConversationId = String(latest?.conversationId || '').trim();
+    if (targetConversationId && targetConversationId !== currentConvId && conversations[targetConversationId]) {
+      await openConversation(targetConversationId);
+      return;
+    }
+  }
+
+  renderRelayQuestions();
+}
+
+function getPendingRelayQuestions() {
+  return Array.from(relayQuestions.values())
+    .filter((q) => q && q.id && q.status === 'pending')
+    .sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0));
+}
+
+function getPendingQuestionCountsByConversation() {
+  const counts = Object.create(null);
+  for (const question of getPendingRelayQuestions()) {
+    const conversationId = String(question?.conversationId || '').trim();
+    if (!conversationId) continue;
+    counts[conversationId] = (counts[conversationId] || 0) + 1;
+  }
+  return counts;
+}
+
+function updatePendingQuestionBanner() {
+  const banner = document.getElementById('pending-question-banner');
+  if (!banner) return;
+  const pending = getPendingRelayQuestions();
+  if (!pending.length) {
+    banner.textContent = '';
+    banner.classList.remove('visible');
+    banner.disabled = true;
+    return;
+  }
+
+  const latest = pending[pending.length - 1];
+  const targetConversationId = String(latest?.conversationId || '').trim();
+  banner.dataset.targetConversationId = targetConversationId;
+  banner.dataset.targetQuestionId = String(latest?.id || '').trim();
+  const count = pending.length;
+  const currentCount = currentConvId ? pending.filter((q) => q?.conversationId === currentConvId).length : 0;
+  const convTitle = escHtml(conversations[targetConversationId]?.title || targetConversationId || 'conversation');
+  banner.innerHTML = currentCount > 0
+    ? `❓ ${count} open question${count === 1 ? '' : 's'}`
+    : `❓ ${count} open question${count === 1 ? '' : 's'} · latest in ${convTitle}`;
+  banner.classList.add('visible');
+  banner.disabled = false;
+}
+
+async function openPendingQuestionFromBanner() {
+  const banner = document.getElementById('pending-question-banner');
+  if (!banner) return;
+  const targetConversationId = String(banner.dataset.targetConversationId || '').trim();
+  const pending = getPendingRelayQuestions();
+  const fallbackConversationId = String(pending[pending.length - 1]?.conversationId || '').trim();
+  const nextConversationId = targetConversationId || fallbackConversationId;
+  if (!nextConversationId) return;
+  if (nextConversationId !== currentConvId && conversations[nextConversationId]) {
+    await openConversation(nextConversationId);
+    return;
+  }
+  renderRelayQuestions();
+  scrollBottom();
+}
+
+function renderRelayQuestions() {
+  const el = document.getElementById('messages');
+  if (!el) return;
+  // Only render pending questions as interactive cards.  Answered questions are
+  // already recorded in the originating message's tool-activity log
+  // ("Tool (ask_user): user answered '...'"), so re-rendering them here would
+  // duplicate the information AND cause them to re-appear as "most recent message"
+  // on every page refresh.
+  const questions = Array.from(relayQuestions.values())
+    .filter((q) => q && q.conversationId === currentConvId && q.status === 'pending')
+    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+
+  const nextHash = JSON.stringify(
+    questions.map((q) => ({
+      id: q.id,
+      status: q.status,
+      prompt: q.prompt || '',
+      answer: q.answer || '',
+      answeredAt: q.answeredAt || '',
+      createdAt: q.createdAt || '',
+      choices: Array.isArray(q.choices) ? q.choices : [],
+    }))
+  );
+  const existingCards = el.querySelectorAll('.relay-question-container');
+  if (relayQuestionRenderHash === nextHash && existingCards.length === questions.length) return;
+  relayQuestionRenderHash = nextHash;
+
+  existingCards.forEach((node) => node.remove());
+  if (!questions.length) return;
+
+  for (const question of questions) {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'msg relay-question-container';
+    wrapper.dataset.questionId = question.id;
+
+    const modeTag = question.mode ? ` <span class="msg-mode">${escHtml(question.mode)}</span>` : '';
+    const contextText = String(question?.context?.rationale || '').trim();
+    const contextHtml = contextText ? `<div class="relay-question-context">${renderLinkedPlainText(contextText)}</div>` : '';
+    const choices = Array.isArray(question.choices) ? question.choices : [];
+    const choiceHtml = choices.length
+      ? (question.status === 'pending'
+          ? `<div class="relay-question-choices">${
+              choices.map((choice) => `<button class="relay-question-choice" data-choice="${escHtml(choice)}" onclick="submitRelayQuestionChoice('${question.id}', this.dataset.choice)">${escHtml(choice)}</button>`).join('')
+            }</div>`
+          : `<div class="relay-question-choices">${
+              choices.map((choice) => `<button class="relay-question-choice" disabled>${escHtml(choice)}</button>`).join('')
+            }</div>`)
+      : '';
+    const showReplyControls = question.status === 'pending';
+    const draftText = String(relayQuestionDrafts.get(question.id) || '');
+    const replyHtml = showReplyControls
+      ? `<div class="relay-question-reply">
+          <textarea id="relay-question-input-${question.id}" placeholder="Type a reply… (Ctrl/Cmd+Enter to send)" onkeydown="handleRelayQuestionKey(event, '${question.id}')" oninput="onRelayQuestionDraftInput('${question.id}', this.value)">${escHtml(draftText)}</textarea>
+          <button class="relay-question-submit" onclick="submitRelayQuestionAnswer('${question.id}')">Reply</button>
+        </div>`
+      : '';
+    const answeredHtml = question.status === 'answered' && question.answer
+      ? `<div class="relay-question-context"><strong>Your answer:</strong> ${escHtml(question.answer)}</div>`
+      : '';
+    const statusText = question.status === 'answered'
+      ? `Answered${question.answeredAt ? ` · ${fmtDate(question.answeredAt)}` : ''}`
+      : `${question.expiresAt ? `Expires ${fmtDate(question.expiresAt)} · ` : ''}Waiting for your answer`;
+
+    wrapper.innerHTML = `
+      <div class="relay-question-card${question.status === 'timed_out' ? ' relay-question-timed-out' : ''}">
+        <div class="relay-question-head">Copilot question${modeTag} · ${fmtDate(question.createdAt)}</div>
+        <div class="relay-question-body">${renderLinkedPlainText(question.prompt || '')}</div>
+        ${contextHtml}
+        ${answeredHtml}
+        ${choiceHtml}
+        ${replyHtml}
+        <div class="relay-question-status">${statusText}</div>
+      </div>`;
+
+    el.appendChild(wrapper);
+  }
+
+  scrollBottom();
+}
+
+async function submitRelayQuestionChoice(questionId, choice) {
+  await submitRelayQuestionAnswer(questionId, choice);
+}
+
+async function submitRelayQuestionAnswer(questionId, presetAnswer=null) {
+  const input = document.getElementById(`relay-question-input-${questionId}`);
+  const answer = String(presetAnswer != null ? presetAnswer : (input?.value || '')).trim();
+  if (!answer) return;
+
+  const card = document.querySelector(`.relay-question-container[data-question-id="${questionId}"]`);
+  const controls = card ? card.querySelectorAll('button, textarea') : [];
+  controls.forEach((el) => { el.disabled = true; });
+
+  try {
+    const r = await apiFetch(`/api/relay-question/${questionId}/answer`, {
+      method: 'POST',
+      body: JSON.stringify({ answer }),
+    });
+
+    if (!r?.question) throw new Error('Failed to submit relay question answer');
+    relayQuestionDrafts.delete(questionId);
+    relayQuestions.set(questionId, r.question);
+    updatePendingQuestionBanner();
+    renderConvList();
+    renderRelayQuestions();
+    showTransientRelayNotice(`✅ Answer received: ${answer} · Agent continuing…`, 7000);
+  } catch (e) {
+    controls.forEach((el) => { el.disabled = false; });
+    alert(e.message || 'Failed to submit relay question answer');
+  }
+}
+
+function onRelayQuestionDraftInput(questionId, value) {
+  relayQuestionDrafts.set(String(questionId || ''), String(value || ''));
+}
+
+function handleRelayQuestionKey(e, questionId) {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault();
+    submitRelayQuestionAnswer(questionId);
+  }
+}
+
+function appendMessage(msg, scroll=true, msgId=null, force=false) {
+  // Remove empty-state if present
+  const el = document.getElementById('messages');
+  const empty = el.querySelector('.empty-state');
+  if (empty) empty.remove();
+
+  if (msgId) {
+    const existing = el.querySelector(`[data-message-id="${msgId}"]`);
+    if (existing) return existing;
+    if (!force && seenMessageIds.has(msgId)) return;
+    seenMessageIds.add(msgId);
+  }
+
+  const div = document.createElement('div');
+  div.className = `msg ${msg.role}`;
+  if (msgId) div.dataset.messageId = msgId;
+
+  const label = msg.role === 'user' ? 'You' : 'Copilot';
+  const modelTag = (msg.role === 'assistant' && msg.model)
+    ? ` <span class="msg-model">${escHtml(msg.model)}</span>` : '';
+  const modeTag = msg.mode
+    ? ` <span class="msg-mode">${escHtml(msg.mode)}</span>` : '';
+  const content = msg.role === 'assistant'
+    ? marked.parse(msg.text || '')
+    : (msg.text ? `<p>${escHtml(msg.text)}</p>` : '');
+  const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
+  const activities = Array.isArray(msg.activities) ? msg.activities.filter(Boolean).slice(0, 48) : [];
+  const attachmentHtml = attachments.length ? renderAttachmentMarkup(attachments) : '';
+  const activityHtml = activities.length ? renderActivityMarkup(activities) : '';
+
+  div.innerHTML = `
+    <div class="msg-label">${label}${modelTag}${modeTag} · ${fmtDate(msg.timestamp)}</div>
+    <div class="msg-bubble">${content}${attachmentHtml}${activityHtml}</div>`;
+
+  linkifyWorkspaceMentionsInNode(div.querySelector('.msg-bubble'));
+
+  // Apply syntax highlighting to any code blocks
+  div.querySelectorAll('pre code').forEach(b => hljs.highlightElement(b));
+
+  el.appendChild(div);
+  if (scroll) scrollBottom();
+}
+
+function decorateActivityText(text) {
+  const value = String(text || '').trim();
+  if (!value) return '';
+  if (/^[\u{1F300}-\u{1FAFF}\u2600-\u27BF]/u.test(value)) return value;
+  if (value.startsWith('● ')) return `🔄 ${value.slice(2).trim()}`;
+  if (/^Model selected:/i.test(value)) return `🧠 ${value}`;
+  if (/^Search \((glob|grep)\)/i.test(value)) return `🔍 ${value}`;
+  if (/^Tool \(ask_user\)/i.test(value)) return `❓ ${value}`;
+  if (/^Tool \((powershell|bash|shell|terminal)\)/i.test(value)) return `🔧 ${value}`;
+  if (/^Tool \((sql|sqlite)\)/i.test(value)) return `🗄️ ${value}`;
+  if (/^Tool \(/i.test(value)) return `🛠️ ${value}`;
+  return `ℹ️ ${value}`;
+}
+
+function renderActivityMarkup(activities) {
+  const progress = activities.filter((item) => String(item || "").trim().startsWith('● '));
+  const tools = activities.filter((item) => !String(item || "").trim().startsWith('● '));
+  const progressHtml = progress.length
+    ? `<div class="msg-activity-list">${progress.map((item) => `<div class="msg-activity-item">${escHtml(decorateActivityText(item))}</div>`).join('')}</div>`
+    : '';
+  const toolsHtml = tools.length
+    ? `
+      <details class="msg-activity">
+        <summary>🔧 Tool activity (${tools.length})</summary>
+        <div class="msg-activity-list">${tools.map((item) => `<div class="msg-activity-item">${escHtml(decorateActivityText(item))}</div>`).join('')}</div>
+      </details>`
+    : '';
+  return `
+    ${progressHtml}
+    ${toolsHtml}`;
+}
+
+function showThinking() {
+  removeThinking();
+  const el = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.className = 'msg assistant';
+  div.id = 'thinking-indicator';
+  div.innerHTML = `
+    <div class="msg-label">Copilot</div>
+    <div class="thinking-bubble">
+      <div class="dots"><span></span><span></span><span></span></div>
+      <div id="thinking-activity" class="thinking-activity"></div>
+    </div>`;
+  el.appendChild(div);
+  scrollBottom();
+}
+
+function removeThinking() {
+  document.getElementById('thinking-indicator')?.remove();
+}
+
+function renderThinkingActivities() {
+  const items = thinkingMessageId ? (relayActivities.get(thinkingMessageId) || []) : [];
+  const box = document.getElementById('thinking-activity');
+  if (!box) return;
+  box.innerHTML = '';
+  for (const item of items) appendThinkingActivity(item, false);
+}
+
+function restoreInFlightThinking(inFlight) {
+  const messageId = String(inFlight?.messageId || '').trim();
+  const status = String(inFlight?.status || '').trim().toLowerCase();
+  if (!messageId || status !== 'processing') {
+    thinkingMessageId = null;
+    removeThinking();
+    return;
+  }
+  const activities = Array.isArray(inFlight.activities)
+    ? inFlight.activities.map((entry) => String(entry || '').trim()).filter(Boolean).slice(-24)
+    : [];
+  relayActivities.set(messageId, activities);
+  thinkingMessageId = messageId;
+  showThinking();
+  renderThinkingActivities();
+}
+
+function appendThinkingActivity(text, autoScroll=true) {
+  const box = document.getElementById('thinking-activity');
+  if (!box || !text) return;
+  const last = box.lastElementChild?.textContent || '';
+  const decorated = decorateActivityText(text);
+  if (last === decorated) return;
+  const row = document.createElement('div');
+  row.className = 'thinking-activity-item';
+  row.textContent = decorated;
+  box.appendChild(row);
+  if (autoScroll) scrollBottom();
+}
+
+function renderAttachmentMarkup(attachments) {
+  return `<div class="msg-attachments">${
+    attachments.map((att) => {
+      const name = escHtml(att?.name || 'attachment');
+      const type = escHtml(att?.type || 'file');
+      const src = att?.dataUrl || att?.contentUrl || '';
+      const isImage = String(att?.type || '').startsWith('image/');
+      const sizeText = Number(att?.size || 0) > 0 ? ` · ${formatBytes(Number(att.size || 0))}` : '';
+      const link = src ? `<a href="${escHtml(src)}" target="_blank" rel="noopener noreferrer">open</a>` : '';
+      if (isImage && src) {
+        return `
+          <div class="msg-attachment">
+            <img src="${src}" alt="${name}" loading="lazy">
+            <div class="msg-attachment-meta">${name} · ${type}${sizeText}${link ? ` · ${link}` : ''}</div>
+          </div>`;
+      }
+      return `
+        <div class="msg-attachment">
+          <div class="msg-attachment-meta">📎 ${name} · ${type}${sizeText}${link ? ` · ${link}` : ''}</div>
+        </div>`;
+    }).join('')
+  }</div>`;
+}
+
+function renderAttachmentPreview() {
+  const el = document.getElementById('attachment-preview');
+  if (!selectedAttachments.length) {
+    el.innerHTML = '';
+    return;
+  }
+
+  el.innerHTML = selectedAttachments.map((att, idx) => `
+    <div class="attachment-preview-item">
+      <button class="attachment-preview-remove" onclick="removeAttachment(${idx})" title="Remove">×</button>
+      ${att.isImage && att.previewUrl ? `<img src="${att.previewUrl}" alt="${escHtml(att.name)}">` : `<div class="attachment-preview-meta" style="height:88px;display:flex;align-items:center;justify-content:center">📎</div>`}
+      <div class="attachment-preview-meta">${escHtml(att.name)}${att.size ? ` · ${formatBytes(att.size)}` : ''}</div>
+    </div>
+  `).join('');
+}
+
+function removeAttachment(idx) {
+  const [removed] = selectedAttachments.splice(idx, 1);
+  if (removed?.previewUrl) URL.revokeObjectURL(removed.previewUrl);
+  renderAttachmentPreview();
+}
+
+function clearAttachments() {
+  for (const att of selectedAttachments) {
+    if (att?.previewUrl) URL.revokeObjectURL(att.previewUrl);
+  }
+  selectedAttachments = [];
+  renderAttachmentPreview();
+}
+
+async function handleAttachmentInput(files) {
+  const inputFiles = Array.from(files || []);
+  if (!inputFiles.length) return;
+
+  const next = [];
+  for (const file of inputFiles) {
+    next.push({
+      name: file.name,
+      type: file.type || 'application/octet-stream',
+      size: Number(file.size || 0),
+      file,
+      isImage: String(file.type || '').startsWith('image/'),
+      previewUrl: String(file.type || '').startsWith('image/') ? URL.createObjectURL(file) : '',
+    });
+  }
+
+  const merged = selectedAttachments.concat(next);
+  const dropped = merged.slice(MAX_UPLOAD_ATTACHMENTS);
+  for (const att of dropped) {
+    if (att?.previewUrl) URL.revokeObjectURL(att.previewUrl);
+  }
+  selectedAttachments = merged.slice(0, MAX_UPLOAD_ATTACHMENTS);
+  renderAttachmentPreview();
+}
+
+async function uploadAttachments(files) {
+  const items = Array.isArray(files) ? files : [];
+  const uploaded = [];
+  for (const item of items) {
+    if (!item?.file) continue;
+    const url = `${BASE}/api/upload`;
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: {
+        ...authHeaders(),
+        'X-File-Name': encodeURIComponent(String(item.name || item.file.name || 'upload')),
+        'X-File-Type': String(item.type || item.file.type || 'application/octet-stream'),
+      },
+      body: item.file,
+    });
+    if (!r.ok) {
+      const text = await r.text().catch(() => '');
+      throw new Error(text || `Upload failed (${r.status})`);
+    }
+    const payload = await r.json();
+    if (!payload?.attachment) throw new Error('Upload returned no attachment');
+    uploaded.push(payload.attachment);
+  }
+  return uploaded;
+}
+
+function isMobileComposerViewport() {
+  return window.matchMedia('(max-width: 680px)').matches;
+}
+
+function releaseComposerFocusAfterSend(input) {
+  if (!input || !isMobileComposerViewport()) return;
+  try { input.blur(); } catch {}
+  document.body.classList.remove('keyboard-open');
+  syncViewportMetrics();
+}
+
+function scrollBottomAfterSend() {
+  scrollBottom();
+  requestAnimationFrame(() => {
+    scrollBottom();
+  });
+  setTimeout(() => {
+    scrollBottom();
+  }, 120);
+}
+
+// ─── Send ─────────────────────────────────────────────────────────────────────
+async function sendMessage() {
+  const input = document.getElementById('msg-input');
+  const text = input.value.trim();
+  if (!text && selectedAttachments.length === 0) return;
+  const mobileSend = isMobileComposerViewport();
+
+  if (text.toLowerCase() === '/compact' && selectedAttachments.length === 0) {
+    input.value = '';
+    autoResize(input);
+    releaseComposerFocusAfterSend(input);
+    await compactCurrentConversation();
+    scrollBottomAfterSend();
+    return;
+  }
+
+  input.value = '';
+  autoResize(input);
+  releaseComposerFocusAfterSend(input);
+  document.getElementById('send-btn').disabled = true;
+
+  let attachments = [];
+  try {
+    attachments = await uploadAttachments(selectedAttachments.slice());
+  } catch (e) {
+    document.getElementById('send-btn').disabled = false;
+    alert(e.message || 'File upload failed');
+    return;
+  }
+
+  const isNew = !currentConvId;
+  const msgTimestamp = new Date().toISOString();
+  const selectedModel = selectedModelValue();
+  const selectedMode = document.getElementById('mode-select').value || FALLBACK_MODE;
+  const titleSeed = text || (attachments[0]?.name || 'Attachment');
+
+  // Generate the message ID client-side so the optimistic render can suppress
+  // the server echo for the same message.
+  const clientMessageId = generateId();
+  pendingUserMessageIds.add(clientMessageId);
+
+  // Show the user's message immediately before the API round-trip
+  appendMessage({ role: 'user', text, model: selectedModel, mode: selectedMode, timestamp: msgTimestamp, attachments }, true, clientMessageId, true);
+  scrollBottomAfterSend();
+
+  const body = {
+    messageId: clientMessageId,
+    clientId: CLIENT_ID,
+    text,
+    model: selectedModel,
+    relayMode: selectedMode,
+    conversationId: currentConvId || undefined,
+    newConversation: isNew || undefined,
+    attachments,
+  };
+
+  const r = await apiFetch('/api/message', { method: 'POST', body: JSON.stringify(body) });
+
+  if (r) {
+    if (r.workspaceRootName || r.workspaceRootEntries || r.workspaceRootPath) {
+      updateWorkspaceRootHints(r);
+      if (repoBrowserState.open && repoBrowserState.activeRoot === 'workspace') {
+        repoBrowserState.currentPath = '';
+        await loadRepoBrowserTree();
+      }
+    }
+    if (r.compactedConversationId) {
+      await refreshConversations();
+      await openConversation(r.compactedConversationId);
+      document.getElementById('send-btn').disabled = false;
+      clearAttachments();
+      if (!mobileSend) input.focus();
+      scrollBottomAfterSend();
+      return;
+    }
+    if (r.warning) setModelBanner(`⚠️ ${r.warning}`);
+    if (r.workspaceRootWarning) setModelBanner(`⚠️ ${r.workspaceRootWarning}`);
+    const skippedRefs = Array.isArray(r.skippedReferenceAttachments) ? r.skippedReferenceAttachments : [];
+    if (skippedRefs.length) {
+      const firstReason = String(skippedRefs[0]?.reason || 'reference skipped');
+      setModelBanner(`⚠️ Some referenced images were not attached (${firstReason}).`);
+    }
+    if (isNew || !currentConvId) {
+      setCurrentConv(r.conversationId);
+      // Add to conversations list
+      conversations[r.conversationId] = {
+        id: r.conversationId, title: titleSeed.slice(0,60),
+        updatedAt: new Date().toISOString(), messageCount: 1,
+        runtimeSessionId: r.runtimeSessionId || null,
+      };
+      document.getElementById('chat-title').textContent = titleSeed.slice(0,60);
+      updateCompactButton();
+      renderConvList();
+    }
+    // Show thinking only if CLI is online; otherwise just show queued note
+    if (cliOnline) showThinking();
+  }
+
+  document.getElementById('send-btn').disabled = false;
+  clearAttachments();
+  if (!mobileSend) input.focus();
+  scrollBottomAfterSend();
+}
+
+async function showUsage() {
+  const btn = document.getElementById('usage-btn');
+  btn.textContent = '⏳';
+  btn.disabled = true;
+  try {
+    const r = await fetch(`${BASE}/api/usage`, { headers: { ...authHeaders() } });
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    const pct = d.premiumInteractions.percentRemaining != null
+      ? ` (${d.premiumInteractions.percentRemaining.toFixed(1)}% left)`
+      : '';
+    const msg = `📊 Copilot Usage — resets ${d.resetDate}\n\n` +
+      `Chat/Completions: ${d.chat.unlimited ? 'Unlimited ✅' : `${d.chat.remaining} remaining`}\n` +
+      `Premium interactions: ${d.premiumInteractions.remaining} / ${d.premiumInteractions.entitlement} remaining${pct}`;
+    alert(msg);
+  } catch (e) {
+    alert('Failed to fetch usage: ' + e.message);
+  } finally {
+    btn.textContent = '📊';
+    btn.disabled = false;
+  }
+}
+
+function handleKey(e) {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault();
+    sendMessage();
+  }
+}
+
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 160) + 'px';
+  syncViewportMetrics();
+}
+
+// ─── CLI Status ───────────────────────────────────────────────────────────────
+function updateCliStatus() {
+  document.getElementById('cli-dot').className = cliOnline ? 'online' : '';
+  document.getElementById('cli-status-text').textContent = cliOnline ? 'CLI online' : 'CLI offline';
+  const banner = document.getElementById('offline-banner');
+  if (cliOnline) banner.classList.remove('visible');
+  else banner.classList.add('visible');
+}
+
+// ─── Sidebar (mobile) ────────────────────────────────────────────────────────
+function openSidebar() {
+  document.getElementById('sidebar').classList.add('open');
+  document.getElementById('sidebar-overlay').classList.add('visible');
+}
+function closeSidebar() {
+  document.getElementById('sidebar').classList.remove('open');
+  document.getElementById('sidebar-overlay').classList.remove('visible');
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+async function apiFetch(url, opts={}) {
+  try {
+    const r = await fetch(`${BASE}${url}`, {
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders(),
+        ...(opts.headers||{}),
+      },
+      ...opts,
+    });
+    if (!r.ok) { console.error('API error', r.status, url); return null; }
+    return r.json();
+  } catch (e) { console.error('Fetch error', e); return null; }
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (!Number.isFinite(value) || value <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let size = value;
+  let idx = 0;
+  while (size >= 1024 && idx < units.length - 1) {
+    size /= 1024;
+    idx += 1;
+  }
+  const rounded = idx === 0 ? Math.round(size) : Math.round(size * 10) / 10;
+  return `${rounded} ${units[idx]}`;
+}
+
+function fmtDate(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  const now = new Date();
+  if (d.toDateString() === now.toDateString()) {
+    return d.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
+  }
+  return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' +
+         d.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
+}
+
+function workspaceMentionRegex() {
+  return /(?:[A-Za-z]:[\\/])?(?:\.{1,2}[\\/])?(?:[A-Za-z0-9._-]+[\\/])*[A-Za-z0-9._-]+\.[A-Za-z0-9]{1,16}/g;
+}
+
+function normalizeWorkspaceMentionPath(rawText) {
+  const original = String(rawText || '');
+  const cleaned = original
+    .trim()
+    .replace(/^['"`([{<]+/, '')
+    .replace(/[)\]}>:;,.!?'"`]+$/, '')
+    .replace(/\\/g, '/')
+    .replace(/^\/+/, '')
+    .replace(/\/+/g, '/');
+  if (!cleaned) return '';
+  const lowered = cleaned.toLowerCase();
+  if (lowered.startsWith('http://') || lowered.startsWith('https://') || lowered.startsWith('api/')) return '';
+  const hadDrivePrefix = /^[A-Za-z]:[\\/]/.test(original.trim());
+  const hadLeadingSlash = /^[\\/]/.test(original.trim());
+  let parts = cleaned.split('/').filter(Boolean);
+  if (!parts.length) return '';
+  if (/^[a-z]:$/i.test(parts[0])) {
+    parts = parts.slice(1);
+  }
+  if (!parts.length) return '';
+  if (workspaceRootName) {
+    const idx = parts.findIndex((part) => part.toLowerCase() === workspaceRootName);
+    if (idx >= 0) {
+      parts = parts.slice(idx + 1);
+    }
+  }
+  if (!parts.length) return '';
+  if ((hadDrivePrefix || hadLeadingSlash) && !workspaceRootEntrySet.has(parts[0].toLowerCase())) {
+    const firstRootIdx = parts.findIndex((part) => workspaceRootEntrySet.has(part.toLowerCase()));
+    if (firstRootIdx > 0) {
+      parts = parts.slice(firstRootIdx);
+    }
+  }
+  if (!parts.length) return '';
+  if (parts.some((part) => part === '.' || part === '..')) return '';
+  return parts.join('/');
+}
+
+function isLikelyWorkspaceFileMention(rawText) {
+  const normalized = normalizeWorkspaceMentionPath(rawText);
+  if (!normalized) return false;
+  const ext = normalized.includes('.') ? normalized.slice(normalized.lastIndexOf('.') + 1).toLowerCase() : '';
+  return WORKSPACE_FILE_EXTENSIONS.has(ext);
+}
+
+function workspaceFilePathFromText(rawText) {
+  if (!isLikelyWorkspaceFileMention(rawText)) return '';
+  return normalizeWorkspaceMentionPath(rawText);
+}
+
+function workspaceFileHrefFromPath(rawPath) {
+  const normalized = normalizeWorkspaceMentionPath(rawPath);
+  if (!normalized) return '';
+  const encodedPath = normalized.split('/').map((segment) => encodeURIComponent(segment)).join('/');
+  if (!encodedPath) return '';
+  return `${BASE}/api/files/${encodedPath}`;
+}
+
+function workspaceFileHref(rawText) {
+  const normalized = workspaceFilePathFromText(rawText);
+  return normalized ? workspaceFileHrefFromPath(normalized) : '';
+}
+
+function workspacePreviewApiPath(rawPath) {
+  const normalized = normalizeWorkspaceMentionPath(rawPath);
+  if (!normalized) return '';
+  const encodedPath = normalized.split('/').map((segment) => encodeURIComponent(segment)).join('/');
+  return `/api/files-preview/${encodedPath}`;
+}
+
+function normalizeDriveBrowserPath(rawPath) {
+  const value = String(rawPath || '').trim();
+  if (!value) return '';
+  let decoded = value;
+  try {
+    decoded = decodeURIComponent(value);
+  } catch {
+    return '';
+  }
+  const normalized = decoded
+    .replace(/\0/g, '')
+    .replace(/\\/g, '/')
+    .replace(/\/+/g, '/')
+    .trim()
+    .replace(/\/+$/, '');
+  if (!normalized) return '';
+  if (!/^[A-Za-z]:(?:\/.*)?$/.test(normalized)) return '';
+  const drive = `${normalized.slice(0, 1).toUpperCase()}:`;
+  const rest = normalized.slice(2).replace(/^\/+/, '');
+  return rest ? `${drive}/${rest}` : drive;
+}
+
+function driveFileHrefFromPath(rawPath) {
+  const normalized = normalizeDriveBrowserPath(rawPath);
+  if (!normalized) return '';
+  return `${BASE}/api/drives/file?path=${encodeURIComponent(normalized)}`;
+}
+
+function drivePreviewApiPath(rawPath) {
+  const normalized = normalizeDriveBrowserPath(rawPath);
+  if (!normalized) return '';
+  return `/api/drives/files-preview?path=${encodeURIComponent(normalized)}`;
+}
+
+function normalizeReferencePathForToken(kind, rawPath, source = 'workspace') {
+  const tokenKind = String(kind || '').trim().toLowerCase();
+  if (tokenKind !== 'file' && tokenKind !== 'folder') return '';
+  const root = String(source || '').trim().toLowerCase() === 'drives' ? 'drives' : 'workspace';
+  if (root === 'drives') return normalizeDriveBrowserPath(rawPath);
+  return normalizeWorkspaceMentionPath(rawPath);
+}
+
+function buildReferenceToken(kind, rawPath, source = 'workspace') {
+  const tokenKind = String(kind || '').trim().toLowerCase();
+  if (tokenKind !== 'file' && tokenKind !== 'folder') return '';
+  const normalizedPath = normalizeReferencePathForToken(tokenKind, rawPath, source);
+  if (!normalizedPath) return '';
+  return `@${tokenKind}:${normalizedPath}`;
+}
+
+function buildWrappedReferenceToken(kind, rawPath, source = 'workspace') {
+  const token = buildReferenceToken(kind, rawPath, source);
+  if (!token) return '';
+  return `\`${token}\``;
+}
+
+async function copyTextToClipboard(value) {
+  const text = String(value || '');
+  if (!text) return false;
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+    await navigator.clipboard.writeText(text);
+    return true;
+  }
+  const input = document.createElement('textarea');
+  input.value = text;
+  input.setAttribute('readonly', 'readonly');
+  input.style.position = 'fixed';
+  input.style.left = '-9999px';
+  document.body.appendChild(input);
+  input.select();
+  try {
+    document.execCommand('copy');
+    return true;
+  } finally {
+    document.body.removeChild(input);
+  }
+}
+
+async function copyReferenceTokenToClipboard(kind, rawPath, source = 'workspace') {
+  const wrapped = buildWrappedReferenceToken(kind, rawPath, source);
+  if (!wrapped) return false;
+  try {
+    await copyTextToClipboard(wrapped);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isSafePreviewUrl(url, allowDataImage = false) {
+  const value = String(url || '').trim();
+  if (!value) return false;
+  if (value.startsWith('#') || value.startsWith('/') || value.startsWith('./') || value.startsWith('../')) return true;
+  try {
+    const parsed = new URL(value, window.location.origin);
+    const protocol = String(parsed.protocol || '').toLowerCase();
+    if (protocol === 'http:' || protocol === 'https:' || protocol === 'mailto:') return true;
+    if (allowDataImage && protocol === 'data:' && /^data:image\//i.test(value)) return true;
+  } catch {}
+  return false;
+}
+
+function sanitizePreviewHtml(html) {
+  const template = document.createElement('template');
+  template.innerHTML = String(html || '');
+  const blockedTags = new Set(['script', 'iframe', 'object', 'embed', 'link', 'style', 'meta', 'base', 'form', 'input', 'button', 'textarea', 'select', 'option']);
+  const nodes = Array.from(template.content.querySelectorAll('*'));
+  for (const el of nodes) {
+    const tagName = String(el.tagName || '').toLowerCase();
+    if (blockedTags.has(tagName)) {
+      el.replaceWith(document.createTextNode(el.textContent || ''));
+      continue;
+    }
+    const attrs = Array.from(el.attributes || []);
+    for (const attr of attrs) {
+      const name = String(attr.name || '').toLowerCase();
+      const value = String(attr.value || '');
+      if (name.startsWith('on') || name === 'style' || name === 'srcdoc') {
+        el.removeAttribute(attr.name);
+        continue;
+      }
+      if (name === 'href' && !isSafePreviewUrl(value, false)) {
+        el.removeAttribute(attr.name);
+        continue;
+      }
+      if (name === 'src' && !isSafePreviewUrl(value, true)) {
+        el.removeAttribute(attr.name);
+        continue;
+      }
+    }
+    if (tagName === 'a') {
+      el.setAttribute('target', '_blank');
+      el.setAttribute('rel', 'noopener noreferrer');
+    }
+  }
+  return template.innerHTML;
+}
+
+function renderMarkdownPreview(source, allowEmbeddedHtml) {
+  if (allowEmbeddedHtml) {
+    return sanitizePreviewHtml(marked.parse(String(source || '')));
+  }
+  const renderer = new marked.Renderer();
+  renderer.html = (html) => escHtml(html);
+  return sanitizePreviewHtml(marked.parse(String(source || ''), { renderer }));
+}
+
+function updateFilePreviewUiState() {
+  const previewBtn = document.getElementById('file-preview-mode-preview');
+  const rawBtn = document.getElementById('file-preview-mode-raw');
+  const htmlBtn = document.getElementById('file-preview-html-toggle');
+  const warning = document.getElementById('file-preview-warning');
+  const payload = filePreviewState.payload;
+  const isMarkdown = payload?.kind === 'markdown';
+  previewBtn.classList.toggle('active', filePreviewState.mode === 'preview');
+  rawBtn.classList.toggle('active', filePreviewState.mode === 'raw');
+  htmlBtn.style.display = (isMarkdown && filePreviewState.mode === 'preview') ? 'inline-block' : 'none';
+  htmlBtn.classList.toggle('active', filePreviewState.allowHtml);
+  htmlBtn.textContent = filePreviewState.allowHtml ? 'Disable embedded HTML' : 'Enable embedded HTML';
+  warning.classList.toggle('visible', isMarkdown && filePreviewState.allowHtml && filePreviewState.mode === 'preview');
+}
+
+function renderFilePreview() {
+  const titleEl = document.getElementById('file-preview-title');
+  const metaEl = document.getElementById('file-preview-meta');
+  const bodyEl = document.getElementById('file-preview-body');
+  const rawLink = document.getElementById('file-preview-open-raw');
+  const payload = filePreviewState.payload;
+  const rawHref = filePreviewState.source === 'drives'
+    ? driveFileHrefFromPath(filePreviewState.path)
+    : workspaceFileHrefFromPath(filePreviewState.path);
+  rawLink.href = rawHref || '#';
+
+  const titlePath = filePreviewState.path || '';
+  titleEl.textContent = titlePath || 'File preview';
+  const fileReferenceToken = titlePath
+    ? buildReferenceToken('file', titlePath, filePreviewState.source)
+    : '';
+  if (fileReferenceToken) {
+    titleEl.setAttribute('data-copy-reference', fileReferenceToken);
+    titleEl.setAttribute('title', `Click to copy \`${fileReferenceToken}\``);
+    titleEl.classList.add('file-preview-title-copyable');
+  } else {
+    titleEl.removeAttribute('data-copy-reference');
+    titleEl.removeAttribute('title');
+    titleEl.classList.remove('file-preview-title-copyable');
+  }
+  updateFilePreviewUiState();
+
+  if (filePreviewState.loading) {
+    metaEl.textContent = 'Loading preview...';
+    bodyEl.innerHTML = '<div class="file-preview-note">Fetching file preview…</div>';
+    return;
+  }
+  if (filePreviewState.error) {
+    metaEl.textContent = 'Preview failed';
+    bodyEl.innerHTML = `<pre class="file-preview-code"><code>${escHtml(filePreviewState.error)}</code></pre>`;
+    return;
+  }
+  if (!payload) {
+    metaEl.textContent = 'No preview data';
+    bodyEl.innerHTML = '<div class="file-preview-note">No preview available.</div>';
+    return;
+  }
+
+  const kindLabel = String(payload.kind || 'text').toUpperCase();
+  const langLabel = payload.language ? ` · ${payload.language}` : '';
+  const truncatedLabel = payload.truncated ? ` · truncated to ${formatBytes(FILE_PREVIEW_MAX_BYTES)}` : '';
+  metaEl.textContent = `${kindLabel}${langLabel} · ${formatBytes(payload.size || 0)}${truncatedLabel}`;
+
+  if (payload.kind === 'binary') {
+    bodyEl.innerHTML = '<div class="file-preview-note">Binary file preview is not shown. Use <b>Open raw tab</b> to view/download the file.</div>';
+    return;
+  }
+
+  if (payload.kind === 'image') {
+    const imageHref = String(payload.rawUrl || rawHref || '');
+    bodyEl.innerHTML = imageHref
+      ? `<div class="file-preview-image"><img loading="lazy" src="${escHtml(imageHref)}" alt="${escHtml(payload.name || filePreviewState.path || 'image')}"></div>`
+      : '<div class="file-preview-note">Image preview unavailable.</div>';
+    return;
+  }
+
+  const rawText = String(payload.content || '');
+  if (filePreviewState.mode === 'raw') {
+    bodyEl.innerHTML = `<div class="file-preview-code"><pre><code>${escHtml(rawText)}</code></pre></div>`;
+    return;
+  }
+
+  if (payload.kind === 'markdown') {
+    const html = renderMarkdownPreview(rawText, filePreviewState.allowHtml);
+    bodyEl.innerHTML = `<article class="file-preview-markdown">${html}</article>`;
+    bodyEl.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
+    return;
+  }
+
+  const languageClass = payload.language ? `language-${escHtml(payload.language)}` : '';
+  bodyEl.innerHTML = `<div class="file-preview-code"><pre><code class="${languageClass}">${escHtml(rawText)}</code></pre></div>`;
+  bodyEl.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
+}
+
+async function openWorkspaceFilePreview(rawPath) {
+  const normalized = normalizeWorkspaceMentionPath(rawPath);
+  if (!normalized) return;
+  filePreviewState = {
+    path: normalized,
+    source: 'workspace',
+    mode: 'preview',
+    allowHtml: false,
+    loading: true,
+    error: '',
+    payload: null,
+  };
+  const modal = document.getElementById('file-preview-modal');
+  modal.classList.add('visible');
+  modal.setAttribute('aria-hidden', 'false');
+  renderFilePreview();
+
+  const apiPath = workspacePreviewApiPath(normalized);
+  const payload = await apiFetch(apiPath);
+  if (!payload || payload.error) {
+    filePreviewState.loading = false;
+    filePreviewState.error = payload?.error || 'Failed to load file preview';
+    renderFilePreview();
+    return;
+  }
+  filePreviewState.loading = false;
+  filePreviewState.payload = payload;
+  filePreviewState.path = String(payload.path || normalized);
+  renderFilePreview();
+}
+
+async function openDriveFilePreview(rawPath) {
+  const normalized = normalizeDriveBrowserPath(rawPath);
+  if (!normalized) return;
+  filePreviewState = {
+    path: normalized,
+    source: 'drives',
+    mode: 'preview',
+    allowHtml: false,
+    loading: true,
+    error: '',
+    payload: null,
+  };
+  const modal = document.getElementById('file-preview-modal');
+  modal.classList.add('visible');
+  modal.setAttribute('aria-hidden', 'false');
+  renderFilePreview();
+
+  const apiPath = drivePreviewApiPath(normalized);
+  const payload = await apiFetch(apiPath);
+  if (!payload || payload.error) {
+    filePreviewState.loading = false;
+    filePreviewState.error = payload?.error || 'Failed to load drive file preview';
+    renderFilePreview();
+    return;
+  }
+  filePreviewState.loading = false;
+  filePreviewState.payload = payload;
+  filePreviewState.path = String(payload.path || normalized);
+  filePreviewState.source = 'drives';
+  renderFilePreview();
+}
+
+async function openWorkspaceFilePreviewFromRepo(rawPath) {
+  if (repoBrowserState.activeRoot === 'drives') {
+    await openDriveFilePreview(rawPath);
+    return;
+  }
+  await openWorkspaceFilePreview(rawPath);
+}
+
+function closeFilePreview() {
+  const modal = document.getElementById('file-preview-modal');
+  modal.classList.remove('visible');
+  modal.setAttribute('aria-hidden', 'true');
+}
+
+function setFilePreviewMode(mode) {
+  const nextMode = String(mode || '').toLowerCase();
+  if (nextMode !== 'preview' && nextMode !== 'raw') return;
+  filePreviewState.mode = nextMode;
+  renderFilePreview();
+}
+
+function toggleFilePreviewHtml() {
+  if (filePreviewState.payload?.kind !== 'markdown') return;
+  filePreviewState.allowHtml = !filePreviewState.allowHtml;
+  renderFilePreview();
+}
+
+function normalizeRepoPath(pathValue) {
+  if (pathValue === '' || pathValue === null || pathValue === undefined) return '';
+  if (repoBrowserState.activeRoot === 'drives') {
+    return normalizeDriveBrowserPath(pathValue);
+  }
+  return normalizeWorkspaceMentionPath(pathValue);
+}
+
+function repoNodeMapFromTree(root) {
+  const map = new Map();
+  function walk(node) {
+    if (!node || typeof node !== 'object') return;
+    const nodePath = String(node.path || '');
+    map.set(nodePath, node);
+    if (node.type === 'dir' && Array.isArray(node.children)) {
+      for (const child of node.children) walk(child);
+    }
+  }
+  walk(root);
+  return map;
+}
+
+function repoRawHref(pathValue) {
+  if (repoBrowserState.activeRoot === 'drives') {
+    return driveFileHrefFromPath(pathValue);
+  }
+  return workspaceFileHrefFromPath(pathValue);
+}
+
+function repoIcon(node) {
+  if (!node || typeof node !== 'object') return '📄';
+  if (node.type === 'dir') {
+    if (node.driveType === 'fixed') return '💽';
+    if (node.driveType === 'removable') return '💾';
+    return '📁';
+  }
+  const kind = String(node.previewKind || '').toLowerCase();
+  if (kind === 'image') return '🖼️';
+  if (kind === 'markdown') return '📝';
+  if (kind === 'code') return '💻';
+  if (kind === 'binary') return '📦';
+  return '📄';
+}
+
+function updateRepoToolbarUi() {
+  const workspaceRootBtn = document.getElementById('repo-root-workspace-btn');
+  const drivesRootBtn = document.getElementById('repo-root-drives-btn');
+  const listBtn = document.getElementById('repo-view-list-btn');
+  const gridBtn = document.getElementById('repo-view-grid-btn');
+  const hiddenBtn = document.getElementById('repo-toggle-hidden-btn');
+  const heavyBtn = document.getElementById('repo-toggle-heavy-btn');
+  const workspaceRoot = repoBrowserState.activeRoot === 'workspace';
+  workspaceRootBtn.classList.toggle('active', workspaceRoot);
+  drivesRootBtn.classList.toggle('active', !workspaceRoot);
+  listBtn.classList.toggle('active', repoBrowserState.viewMode === 'list');
+  gridBtn.classList.toggle('active', repoBrowserState.viewMode === 'grid');
+  const hiddenEnabled = workspaceRoot
+    ? repoBrowserState.workspaceIncludeHidden
+    : repoBrowserState.drivesIncludeHidden;
+  hiddenBtn.classList.toggle('active', hiddenEnabled);
+  hiddenBtn.textContent = workspaceRoot
+    ? `Hidden: ${hiddenEnabled ? 'On' : 'Off'}`
+    : `Hidden/System: ${hiddenEnabled ? 'On' : 'Off'}`;
+  heavyBtn.disabled = !workspaceRoot;
+  heavyBtn.classList.toggle('active', workspaceRoot && repoBrowserState.workspaceIncludeHeavy);
+  heavyBtn.textContent = workspaceRoot
+    ? `Heavy: ${repoBrowserState.workspaceIncludeHeavy ? 'On' : 'Off'}`
+    : 'Heavy: n/a';
+}
+
+function renderRepoTreeNode(node) {
+  if (!node || typeof node !== 'object') return '';
+  const nodePath = String(node.path || '');
+  const icon = repoIcon(node);
+  if (node.type === 'dir') {
+    const children = Array.isArray(node.children) ? node.children : [];
+    const currentPath = String(repoBrowserState.currentPath || '');
+    const isOpen = nodePath === '' || currentPath === nodePath || (currentPath && currentPath.startsWith(`${nodePath}/`));
+    const openAttr = isOpen ? ' open' : '';
+    const loading = !!node.loadingChildren;
+    const lazyUnloaded = !!node.lazy && !node.childrenLoaded;
+    const childrenHtml = loading
+      ? '<div class="repo-empty">Loading…</div>'
+      : (lazyUnloaded
+        ? '<div class="repo-empty">Expand to load entries…</div>'
+        : children.map(renderRepoTreeNode).join(''));
+    return `<details class="repo-tree-node" data-repo-dir-path="${escHtml(nodePath)}"${openAttr}>
+      <summary class="repo-tree-summary" data-repo-open-dir="${escHtml(nodePath)}">${icon} ${escHtml(node.name || '/')}</summary>
+      <div class="repo-tree-children">${childrenHtml || '<div class="repo-empty">Empty folder</div>'}</div>
+    </details>`;
+  }
+  return `<button class="repo-tree-file" data-repo-open-file="${escHtml(nodePath)}">${icon} ${escHtml(node.name || nodePath)}</button>`;
+}
+
+function updateRepoTreeSelection() {
+  const currentPath = String(repoBrowserState.currentPath || '');
+  const summaries = document.querySelectorAll('#repo-tree .repo-tree-summary[data-repo-open-dir]');
+  summaries.forEach((el) => {
+    const pathValue = String(el.getAttribute('data-repo-open-dir') || '');
+    el.classList.toggle('active', pathValue === currentPath);
+  });
+}
+
+function syncRepoTreeToCurrentPath(collapseOthers = false) {
+  const currentPath = String(repoBrowserState.currentPath || '');
+  const treeHost = document.getElementById('repo-tree');
+  if (!treeHost) return;
+
+  // Build set of paths that are ancestors of (or equal to) currentPath
+  const ancestorPaths = new Set(['']);
+  if (currentPath) {
+    const parts = currentPath.split('/').filter(Boolean);
+    let rolling = '';
+    for (const part of parts) {
+      rolling = rolling ? `${rolling}/${part}` : part;
+      ancestorPaths.add(rolling);
+    }
+  }
+
+  // Open ancestor <details> nodes. Optionally collapse all non-ancestors.
+  const details = treeHost.querySelectorAll('details.repo-tree-node[data-repo-dir-path]');
+  details.forEach((el) => {
+    const pathValue = String(el.getAttribute('data-repo-dir-path') || '');
+    if (ancestorPaths.has(pathValue)) {
+      el.open = true;
+    } else if (collapseOthers) {
+      el.open = false;
+    }
+  });
+
+  // Scroll active item into view
+  const activeEl = treeHost.querySelector('.repo-tree-summary.active, .repo-tree-file.active');
+  if (activeEl) {
+    activeEl.scrollIntoView({ block: 'nearest' });
+  } else {
+    const activeSummary = treeHost.querySelector(`.repo-tree-summary[data-repo-open-dir="${CSS.escape(currentPath)}"]`);
+    if (activeSummary) activeSummary.scrollIntoView({ block: 'nearest' });
+  }
+}
+
+function focusRepoTree() {
+  syncRepoTreeToCurrentPath(true);
+}
+
+function renderRepoBreadcrumb() {
+  const rootLabel = repoBrowserState.rootName || 'repo';
+  const pathValue = String(repoBrowserState.currentPath || '');
+  const host = document.getElementById('repo-folder-breadcrumb');
+  const rootSource = repoBrowserState.activeRoot === 'drives' ? 'drives' : 'workspace';
+  const parts = pathValue ? pathValue.split('/').filter(Boolean) : [];
+  const chips = [`<button class="repo-crumb" data-repo-nav-dir="">${escHtml(rootLabel)}</button>`];
+  let rolling = '';
+  for (const part of parts) {
+    rolling = rolling ? `${rolling}/${part}` : part;
+    chips.push(`<span>/</span><button class="repo-crumb" data-repo-nav-dir="${escHtml(rolling)}">${escHtml(part)}</button>`);
+  }
+  if (pathValue) {
+    chips.push(
+      `<button class="repo-crumb repo-copy-ref-btn" data-repo-copy-folder="${escHtml(pathValue)}" data-repo-copy-source="${escHtml(rootSource)}" title="Copy folder reference">Copy \`@folder\`</button>`,
+    );
+  }
+  host.innerHTML = chips.join('');
+}
+
+function renderRepoFolder() {
+  const folderHost = document.getElementById('repo-folder');
+  const statusHost = document.getElementById('repo-tree-status');
+  if (repoBrowserState.loading && !repoBrowserState.tree) {
+    folderHost.innerHTML = '<div class="repo-empty">Loading explorer tree…</div>';
+    statusHost.textContent = 'Loading…';
+    return;
+  }
+  if (repoBrowserState.error) {
+    folderHost.innerHTML = `<div class="repo-empty">${escHtml(repoBrowserState.error)}</div>`;
+    statusHost.textContent = 'Error';
+    return;
+  }
+  const nodeLabel = repoBrowserState.activeRoot === 'workspace' ? 'nodes' : 'entries';
+  statusHost.textContent = `${repoBrowserState.nodeCount || 0} ${nodeLabel}${repoBrowserState.truncated ? ' (truncated)' : ''}`;
+  const currentPath = String(repoBrowserState.currentPath || '');
+  let node = repoBrowserState.nodeMap.get(currentPath) || null;
+  if (!node || node.type !== 'dir') {
+    node = repoBrowserState.nodeMap.get('') || null;
+  }
+  if (!node || node.type !== 'dir') {
+    folderHost.innerHTML = '<div class="repo-empty">No explorer tree available.</div>';
+    return;
+  }
+  if (node.loadingChildren) {
+    folderHost.innerHTML = '<div class="repo-empty">Loading folder entries…</div>';
+    return;
+  }
+  if (node.lazy && !node.childrenLoaded) {
+    folderHost.innerHTML = '<div class="repo-empty">Open this folder to load entries.</div>';
+    return;
+  }
+  const children = Array.isArray(node.children) ? node.children : [];
+  if (!children.length) {
+    folderHost.innerHTML = '<div class="repo-empty">This folder is empty.</div>';
+    return;
+  }
+
+  const isGrid = repoBrowserState.viewMode === 'grid';
+  const wrapperClass = isGrid ? 'repo-folder-grid' : 'repo-folder-list';
+  const rows = children.map((child) => {
+    const childPath = String(child.path || '');
+    const rawHref = repoRawHref(childPath);
+    const icon = repoIcon(child);
+    if (isGrid) {
+      if (child.type === 'dir') {
+        return `<div class="repo-card">
+          <button class="repo-entry-action" data-repo-nav-dir="${escHtml(childPath)}">${icon} Open folder</button>
+          <div class="repo-card-name" title="${escHtml(child.name || childPath)}">${escHtml(child.name || childPath)}</div>
+          <div class="repo-entry-meta">Directory</div>
+        </div>`;
+      }
+      const ext = String(child.ext || '').replace('.', '');
+      const isImage = String(child.previewKind || '').toLowerCase() === 'image' || REPO_IMAGE_EXTENSIONS.has(ext.toLowerCase());
+      const thumb = isImage && rawHref
+        ? `<img loading="lazy" src="${escHtml(rawHref)}" alt="${escHtml(child.name || '')}">`
+        : `<span>${icon}</span>`;
+      return `<div class="repo-card">
+        <div class="repo-card-thumb">${thumb}</div>
+        <div class="repo-card-name" title="${escHtml(child.name || childPath)}">${escHtml(child.name || childPath)}</div>
+        <div class="repo-entry-actions">
+          <button class="repo-entry-action" data-repo-open-file="${escHtml(childPath)}">View</button>
+          <a class="repo-entry-action" href="${escHtml(rawHref)}" download>Download</a>
+        </div>
+      </div>`;
+    }
+
+    const mainMeta = child.type === 'dir'
+      ? (child.driveType ? `Directory · ${String(child.driveType)}` : 'Directory')
+      : `${String(child.previewKind || 'file')} · ${formatBytes(child.size || 0)}`;
+    const actions = child.type === 'dir'
+      ? `<button class="repo-entry-action" data-repo-nav-dir="${escHtml(childPath)}">Open</button>`
+      : `<button class="repo-entry-action" data-repo-open-file="${escHtml(childPath)}">View</button>
+         <a class="repo-entry-action" href="${escHtml(rawHref)}" download>Download</a>`;
+    return `<div class="repo-entry-row">
+      <div class="repo-entry-main">
+        <span>${icon}</span>
+        <div style="min-width:0">
+          <div class="repo-entry-name" title="${escHtml(child.name || childPath)}">${escHtml(child.name || childPath)}</div>
+          <div class="repo-entry-meta">${escHtml(mainMeta)}</div>
+        </div>
+      </div>
+      <div class="repo-entry-actions">${actions}</div>
+    </div>`;
+  }).join('');
+
+  folderHost.innerHTML = `<div class="${wrapperClass}">${rows}</div>`;
+}
+
+function renderRepoTree() {
+  const treeHost = document.getElementById('repo-tree');
+  if (repoBrowserState.loading && !repoBrowserState.tree) {
+    treeHost.innerHTML = '<div class="repo-empty">Loading tree…</div>';
+    return;
+  }
+  if (repoBrowserState.error) {
+    treeHost.innerHTML = `<div class="repo-empty">${escHtml(repoBrowserState.error)}</div>`;
+    return;
+  }
+  const root = repoBrowserState.tree;
+  if (!root) {
+    treeHost.innerHTML = '<div class="repo-empty">Tree unavailable.</div>';
+    return;
+  }
+  treeHost.innerHTML = renderRepoTreeNode(root);
+  updateRepoTreeSelection();
+  syncRepoTreeToCurrentPath();
+}
+
+function renderRepoBrowser() {
+  const title = document.querySelector('.repo-browser-title');
+  if (title) {
+    title.textContent = repoBrowserState.activeRoot === 'workspace' ? 'Repository Browser' : 'Drives Browser';
+  }
+  updateRepoToolbarUi();
+  renderRepoBreadcrumb();
+  renderRepoTree();
+  renderRepoFolder();
+}
+
+async function loadRepoBrowserTree() {
+  if (repoBrowserState.loading) return;
+  repoBrowserState.loading = true;
+  repoBrowserState.loadingPath = '';
+  repoBrowserState.error = '';
+  renderRepoBrowser();
+
+  const workspaceRoot = repoBrowserState.activeRoot === 'workspace';
+  const payload = workspaceRoot
+    ? await apiFetch(`/api/repo/tree?${new URLSearchParams({
+      includeHidden: repoBrowserState.workspaceIncludeHidden ? '1' : '0',
+      includeHeavy: repoBrowserState.workspaceIncludeHeavy ? '1' : '0',
+    }).toString()}`)
+    : await apiFetch('/api/drives/roots');
+  if (!payload || payload.error || !payload.root) {
+    repoBrowserState.loading = false;
+    repoBrowserState.error = payload?.error || (workspaceRoot ? 'Failed to load repository tree.' : 'Failed to load drives.');
+    renderRepoBrowser();
+    return;
+  }
+
+  repoBrowserState.loading = false;
+  repoBrowserState.rootName = String(payload.rootName || (workspaceRoot ? 'repo' : 'Drives'));
+  repoBrowserState.tree = payload.root;
+  repoBrowserState.nodeMap = repoNodeMapFromTree(payload.root);
+  repoBrowserState.truncated = !!payload.truncated;
+  repoBrowserState.nodeCount = Number(payload.nodeCount || repoBrowserState.nodeMap.size || 0);
+  repoBrowserState.maxNodes = Number(payload.maxNodes || repoBrowserState.nodeMap.size || 0);
+  if (!repoBrowserState.nodeMap.has(repoBrowserState.currentPath)) {
+    repoBrowserState.currentPath = '';
+  }
+  renderRepoBrowser();
+}
+
+async function ensureDriveChildrenLoaded(pathValue) {
+  if (repoBrowserState.activeRoot !== 'drives') return true;
+  const targetPath = normalizeDriveBrowserPath(pathValue);
+  if (!targetPath) return false;
+  const node = repoBrowserState.nodeMap.get(targetPath);
+  if (!node || node.type !== 'dir') return false;
+  if (node.childrenLoaded) return true;
+  if (node.loadingChildren) return false;
+  node.loadingChildren = true;
+  repoBrowserState.loadingPath = targetPath;
+  renderRepoBrowser();
+
+  const payload = await apiFetch(`/api/drives/list?path=${encodeURIComponent(targetPath)}&includeHidden=${repoBrowserState.drivesIncludeHidden ? '1' : '0'}`);
+  node.loadingChildren = false;
+  repoBrowserState.loadingPath = '';
+  if (!payload || payload.error || !payload.node || !Array.isArray(payload.node.children)) {
+    node.children = [];
+    node.childrenLoaded = true;
+    node.readError = true;
+    renderRepoBrowser();
+    return false;
+  }
+
+  node.children = payload.node.children;
+  node.childrenLoaded = true;
+  node.lazy = false;
+  node.readError = !!payload.node.readError;
+  repoBrowserState.nodeMap = repoNodeMapFromTree(repoBrowserState.tree);
+  repoBrowserState.nodeCount = repoBrowserState.nodeMap.size;
+  renderRepoBrowser();
+  return true;
+}
+
+function setRepoBrowserRoot(root) {
+  const nextRoot = String(root || '').trim().toLowerCase();
+  if (nextRoot !== 'workspace' && nextRoot !== 'drives') return;
+  if (repoBrowserState.activeRoot === nextRoot) return;
+  repoBrowserState.activeRoot = nextRoot;
+  repoBrowserState.tree = null;
+  repoBrowserState.nodeMap = new Map();
+  repoBrowserState.currentPath = '';
+  repoBrowserState.truncated = false;
+  repoBrowserState.nodeCount = 0;
+  repoBrowserState.maxNodes = 0;
+  repoBrowserState.loadingPath = '';
+  repoBrowserState.error = '';
+  renderRepoBrowser();
+  if (repoBrowserState.open) {
+    void loadRepoBrowserTree();
+  }
+}
+
+function openRepoBrowser() {
+  const modal = document.getElementById('repo-browser-modal');
+  modal.classList.add('visible');
+  modal.setAttribute('aria-hidden', 'false');
+  repoBrowserState.open = true;
+  if (!repoBrowserState.tree) {
+    void loadRepoBrowserTree();
+  } else {
+    renderRepoBrowser();
+  }
+}
+
+function closeRepoBrowser() {
+  const modal = document.getElementById('repo-browser-modal');
+  modal.classList.remove('visible');
+  modal.setAttribute('aria-hidden', 'true');
+  repoBrowserState.open = false;
+}
+
+function refreshRepoBrowser() {
+  const keepPath = String(repoBrowserState.currentPath || '');
+  repoBrowserState.tree = null;
+  repoBrowserState.nodeMap = new Map();
+  repoBrowserState.currentPath = '';
+  repoBrowserState.loadingPath = '';
+  repoBrowserState.error = '';
+  void (async () => {
+    await loadRepoBrowserTree();
+    if (keepPath) await setRepoCurrentPath(keepPath);
+  })();
+}
+
+function setRepoBrowserViewMode(mode) {
+  const value = String(mode || '').toLowerCase();
+  if (value !== 'list' && value !== 'grid') return;
+  repoBrowserState.viewMode = value;
+  renderRepoFolder();
+  updateRepoToolbarUi();
+}
+
+function toggleRepoBrowserHidden() {
+  if (repoBrowserState.activeRoot === 'workspace') {
+    repoBrowserState.workspaceIncludeHidden = !repoBrowserState.workspaceIncludeHidden;
+  } else {
+    repoBrowserState.drivesIncludeHidden = !repoBrowserState.drivesIncludeHidden;
+  }
+  refreshRepoBrowser();
+}
+
+function toggleRepoBrowserHeavy() {
+  if (repoBrowserState.activeRoot !== 'workspace') return;
+  repoBrowserState.workspaceIncludeHeavy = !repoBrowserState.workspaceIncludeHeavy;
+  refreshRepoBrowser();
+}
+
+async function setRepoCurrentPath(pathValue) {
+  const rawValue = String(pathValue || '').replace(/\\/g, '/').trim();
+  const normalized = normalizeRepoPath(rawValue);
+  const targetPath = repoBrowserState.nodeMap.has(rawValue)
+    ? rawValue
+    : (normalized || '');
+  const node = repoBrowserState.nodeMap.get(targetPath);
+  if (!node || node.type !== 'dir') return;
+  repoBrowserState.currentPath = targetPath;
+  if (repoBrowserState.activeRoot === 'drives' && targetPath) {
+    await ensureDriveChildrenLoaded(targetPath);
+  }
+  renderRepoBreadcrumb();
+  renderRepoFolder();
+  updateRepoTreeSelection();
+  syncRepoTreeToCurrentPath();
+}
+
+function buildLinkedTextFragment(text) {
+  const source = String(text || '');
+  const regex = workspaceMentionRegex();
+  const fragment = document.createDocumentFragment();
+  let lastIndex = 0;
+  let changed = false;
+  let match = null;
+  while ((match = regex.exec(source)) !== null) {
+    const mention = match[0];
+    const workspacePath = workspaceFilePathFromText(mention);
+    const href = workspacePath ? workspaceFileHrefFromPath(workspacePath) : '';
+    if (!workspacePath || !href) continue;
+    if (match.index > lastIndex) {
+      fragment.appendChild(document.createTextNode(source.slice(lastIndex, match.index)));
+    }
+    const anchor = document.createElement('a');
+    anchor.href = href;
+    anchor.className = 'workspace-file-link';
+    anchor.dataset.workspacePath = workspacePath;
+    anchor.target = '_blank';
+    anchor.rel = 'noopener noreferrer';
+    anchor.textContent = mention;
+    fragment.appendChild(anchor);
+    lastIndex = match.index + mention.length;
+    changed = true;
+  }
+  if (!changed) return null;
+  if (lastIndex < source.length) {
+    fragment.appendChild(document.createTextNode(source.slice(lastIndex)));
+  }
+  return fragment;
+}
+
+function linkifyWorkspaceMentionsInNode(root) {
+  if (!root) return;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!node?.nodeValue || !String(node.nodeValue).trim()) return NodeFilter.FILTER_REJECT;
+      const parent = node.parentElement;
+      if (!parent) return NodeFilter.FILTER_REJECT;
+      const tag = String(parent.tagName || '').toUpperCase();
+      if (tag === 'A' || tag === 'CODE' || tag === 'PRE' || tag === 'SCRIPT' || tag === 'STYLE') {
+        return NodeFilter.FILTER_REJECT;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+
+  const textNodes = [];
+  while (walker.nextNode()) textNodes.push(walker.currentNode);
+  for (const node of textNodes) {
+    const fragment = buildLinkedTextFragment(node.nodeValue || '');
+    if (fragment) node.parentNode.replaceChild(fragment, node);
+  }
+}
+
+function renderLinkedPlainText(text) {
+  const source = String(text || '');
+  const regex = workspaceMentionRegex();
+  let html = '';
+  let lastIndex = 0;
+  let match = null;
+  while ((match = regex.exec(source)) !== null) {
+    const mention = match[0];
+    const workspacePath = workspaceFilePathFromText(mention);
+    const href = workspacePath ? workspaceFileHrefFromPath(workspacePath) : '';
+    html += escHtml(source.slice(lastIndex, match.index));
+    if (workspacePath && href) {
+      html += `<a href="${escHtml(href)}" class="workspace-file-link" data-workspace-path="${escHtml(workspacePath)}" target="_blank" rel="noopener noreferrer">${escHtml(mention)}</a>`;
+    } else {
+      html += escHtml(mention);
+    }
+    lastIndex = match.index + mention.length;
+  }
+  html += escHtml(source.slice(lastIndex));
+  return html;
+}
+
+function eventTargetElement(event) {
+  const target = event?.target;
+  if (target instanceof Element) return target;
+  if (target && target.nodeType === Node.TEXT_NODE && target.parentElement) return target.parentElement;
+  return null;
+}
+
+function eventClosest(event, selector) {
+  const target = eventTargetElement(event);
+  if (target) {
+    const closest = target.closest(selector);
+    if (closest) return closest;
+  }
+  const path = typeof event?.composedPath === 'function' ? event.composedPath() : [];
+  for (const entry of path) {
+    if (entry instanceof Element && entry.matches(selector)) return entry;
+  }
+  return null;
+}
+
+document.addEventListener('click', (event) => {
+  const anchor = eventClosest(event, 'a.workspace-file-link[data-workspace-path]');
+  if (!anchor) return;
+  event.preventDefault();
+  void openWorkspaceFilePreview(anchor.dataset.workspacePath || '');
+});
+
+document.getElementById('file-preview-modal').addEventListener('click', (event) => {
+  if (event.target.id === 'file-preview-modal') closeFilePreview();
+});
+
+document.getElementById('file-preview-title').addEventListener('click', async (event) => {
+  const target = event.currentTarget;
+  const token = String(target?.getAttribute('data-copy-reference') || '').trim();
+  if (!token) return;
+  event.preventDefault();
+  const wrapped = `\`${token}\``;
+  try {
+    await copyTextToClipboard(wrapped);
+  } catch {}
+});
+
+document.getElementById('repo-browser-modal').addEventListener('click', (event) => {
+  if (event.target.id === 'repo-browser-modal') closeRepoBrowser();
+});
+
+document.getElementById('repo-tree').addEventListener('click', (event) => {
+  const fileButton = eventClosest(event, '[data-repo-open-file]');
+  if (fileButton) {
+    event.preventDefault();
+    void openWorkspaceFilePreviewFromRepo(fileButton.getAttribute('data-repo-open-file') || '');
+    return;
+  }
+  const dirSummary = eventClosest(event, '[data-repo-open-dir]');
+  if (dirSummary) {
+    event.preventDefault();
+    const dirPath = dirSummary.getAttribute('data-repo-open-dir') || '';
+    void setRepoCurrentPath(dirPath);
+  }
+});
+
+document.getElementById('repo-folder').addEventListener('click', (event) => {
+  const navDir = eventClosest(event, '[data-repo-nav-dir]');
+  if (navDir) {
+    event.preventDefault();
+    void setRepoCurrentPath(navDir.getAttribute('data-repo-nav-dir') || '');
+    return;
+  }
+  const openFile = eventClosest(event, '[data-repo-open-file]');
+  if (openFile) {
+    event.preventDefault();
+    void openWorkspaceFilePreviewFromRepo(openFile.getAttribute('data-repo-open-file') || '');
+  }
+});
+
+document.getElementById('repo-folder-breadcrumb').addEventListener('click', (event) => {
+  const copyFolder = eventClosest(event, '[data-repo-copy-folder]');
+  if (copyFolder) {
+    event.preventDefault();
+    const folderPath = copyFolder.getAttribute('data-repo-copy-folder') || '';
+    const source = copyFolder.getAttribute('data-repo-copy-source') || repoBrowserState.activeRoot;
+    void copyReferenceTokenToClipboard('folder', folderPath, source);
+    return;
+  }
+  const navDir = eventClosest(event, '[data-repo-nav-dir]');
+  if (!navDir) return;
+  event.preventDefault();
+  void setRepoCurrentPath(navDir.getAttribute('data-repo-nav-dir') || '');
+});
+
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape') return;
+  const modal = document.getElementById('file-preview-modal');
+  const repoModal = document.getElementById('repo-browser-modal');
+  if (modal.classList.contains('visible')) closeFilePreview();
+  else if (repoModal.classList.contains('visible')) closeRepoBrowser();
+});
+
+function scrollBottom() {
+  const el = document.getElementById('messages');
+  el.scrollTop = el.scrollHeight;
+}
+
+async function registerPwaShell() {
+  if (!('serviceWorker' in navigator)) return;
+  const scopeBase = window.location.pathname.replace(/\/+$/, '');
+  const scopeRoot = `${scopeBase}/`;
+  try {
+    await navigator.serviceWorker.register(`${scopeBase}/sw.js`, { scope: scopeRoot, updateViaCache: 'none' });
+  } catch {}
+}
+
+// ─── Boot ─────────────────────────────────────────────────────────────────────
+(async () => {
+  if (ensureTrailingSlashPath()) return;
+  registerPwaShell().catch(() => {});
+  // Bind install prompt listeners before auth/session checks so we don't miss
+  // a one-shot beforeinstallprompt event on first load.
+  initInstallButton();
+  const urlToken = getTokenFromUrl();
+  if (urlToken) stripTokenFromUrl();
+  if (await verifyExistingSession()) {
+    initApp();
+    return;
+  }
+
+  if (urlToken) {
+    const ok = await verifyToken(urlToken);
+    if (ok) {
+      initApp();
+      return;
+    }
+  }
+  // Show auth gate
+  if (urlToken) document.getElementById('token-input').value = urlToken;
+})();
+</script>
+</body>
+</html>

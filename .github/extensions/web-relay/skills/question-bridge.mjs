@@ -1,0 +1,100 @@
+export function createQuestionBridge({
+  api,
+  dbg,
+  sleep,
+  questionWaitTimeoutMs,
+  questionPollMs,
+  getActiveMessage,
+  extractQuestionPrompt,
+  extractQuestionChoices,
+  serializeRequest,
+}) {
+  function firstDefined(...values) {
+    for (const value of values) {
+      if (value !== undefined && value !== null) return value;
+    }
+    return undefined;
+  }
+
+  function extractAllowFreeform(request) {
+    const value = firstDefined(
+      request?.allow_freeform,
+      request?.allowFreeform,
+      request?.toolArgs?.allow_freeform,
+      request?.toolArgs?.allowFreeform,
+      request?.input?.allow_freeform,
+      request?.input?.allowFreeform,
+      request?.arguments?.allow_freeform,
+      request?.arguments?.allowFreeform,
+    );
+    if (value === undefined) return undefined;
+    return !!value;
+  }
+
+  async function waitForRelayQuestionAnswer(questionId) {
+    const started = Date.now();
+
+    while (true) {
+      const { question } = await api("GET", `/api/relay-question/${questionId}`);
+      if (!question) throw new Error("Relay question missing");
+      if (question.status === "answered") {
+        return String(question.answer || "");
+      }
+      if (question.status === "timed_out" || question.status === "cancelled") {
+        throw new Error(`Relay question ${question.status}`);
+      }
+      if (Date.now() - started >= questionWaitTimeoutMs) {
+        await api("POST", `/api/relay-question/${questionId}/timeout`, {}).catch(() => {});
+        throw new Error("Relay question timed out");
+      }
+      await sleep(questionPollMs);
+    }
+  }
+
+  async function forwardRelayQuestion(request) {
+    const activeMsg = getActiveMessage();
+    const choices = extractQuestionChoices(request);
+    const allowFreeform = extractAllowFreeform(request);
+    const questionPayload = {
+      queueId: activeMsg?.id,
+      messageId: activeMsg?.id,
+      conversationId: activeMsg?.conversationId,
+      mode: activeMsg?.relayMode || "agent",
+      prompt: extractQuestionPrompt(request),
+      choices,
+      allowFreeform: allowFreeform ?? !choices.length,
+      context: {
+        source: "onUserInputRequest",
+        rationale: "Agent requested clarification to continue this turn.",
+        queueMessageId: activeMsg?.id || null,
+        conversationId: activeMsg?.conversationId || null,
+        relayMode: activeMsg?.relayMode || "agent",
+      },
+      request: serializeRequest(request),
+    };
+
+    const created = await api("POST", "/api/relay-question", questionPayload);
+    const questionId = created?.question?.id;
+    if (!questionId) {
+      throw new Error("Relay question could not be created");
+    }
+
+    dbg(
+      "relay question created",
+      questionId,
+      "for msgId",
+      activeMsg.id,
+      "prompt=",
+      questionPayload.prompt,
+      "choices=",
+      String(questionPayload.choices?.length || 0),
+    );
+
+    return waitForRelayQuestionAnswer(questionId);
+  }
+
+  return {
+    forwardRelayQuestion,
+    waitForRelayQuestionAnswer,
+  };
+}
