@@ -905,7 +905,7 @@ function buildContextUsageBlock(snapshot, runtimeSession, extraEntries = []) {
     else merged.push(left.trimEnd());
   }
 
-  return ['```text', ...merged, '```'].join('\n');
+  return merged.join('\n');
 }
 
 function contextField(value) {
@@ -2703,50 +2703,6 @@ app.post('/api/message', auth, (req, res) => {
       compactedConversationId: compacted.targetConversationId,
       runtimeSessionId: compacted.runtimeSessionId,
       summarySeedPreview: compacted.summarySeed.slice(0, 240),
-    });
-  }
-
-  if (trimmedText.toLowerCase() === '/context') {
-    if (attachments.length) return res.status(400).json({ error: 'Context command does not accept attachments' });
-    const convId = (newConversation || !conversationId) ? uuidv4() : conversationId;
-    getOrCreateConversation(convId, '/context');
-    const now = new Date().toISOString();
-    const runtimeSession = ensureRuntimeSessionBinding(convId, String(model || '').trim() || null, now);
-    const parsed = readContextFromSessionEvents(runtimeSession?.id || null, runtimeSession?.runtime_key || runtimeSession?.id || null);
-    const responseText = buildContextResponseText({
-      snapshot: parsed.snapshot,
-      runtimeSession,
-      conversationId: convId,
-      eventsPath: parsed.eventsPath,
-      error: parsed.error,
-    });
-
-    const userMessageId = clientMessageId || uuidv4();
-    const responseId = uuidv4();
-    stmts.insertMsg.run(userMessageId, convId, 'user', '/context', null, normalizeRelayMode(relayMode || mode) || DEFAULT_RELAY_MODE, null, now);
-    stmts.insertMsg.run(responseId, convId, 'assistant', responseText, runtimeSession?.model || null, normalizeRelayMode(relayMode || mode) || DEFAULT_RELAY_MODE, null, now);
-    stmts.updateConvTime.run(now, convId);
-
-    emitToClientsExceptSessionId(
-      'user_message',
-      { conversationId: convId, messageId: userMessageId, senderClientId: sessionId, message: { role: 'user', text: '/context', model: runtimeSession?.model || null, mode: normalizeRelayMode(relayMode || mode) || DEFAULT_RELAY_MODE, timestamp: now, attachments: [] } },
-      sessionId,
-    );
-    io.emit('assistant_message', {
-      conversationId: convId,
-      sourceMessageId: userMessageId,
-      messageId: responseId,
-      message: { role: 'assistant', text: responseText, model: runtimeSession?.model || null, mode: normalizeRelayMode(relayMode || mode) || DEFAULT_RELAY_MODE, timestamp: now, activities: [] },
-    });
-    io.emit('message_status', { messageId: userMessageId, conversationId: convId, status: 'done' });
-
-    return res.json({
-      ok: true,
-      messageId: userMessageId,
-      responseMessageId: responseId,
-      conversationId: convId,
-      runtimeSessionId: runtimeSession?.id || null,
-      command: 'context',
     });
   }
 

@@ -390,19 +390,6 @@ relay.example.com {
 
 
 
-### `/context` command behavior
-
-- Sending `/context` in web relay is handled directly by `server.js` (it is not enqueued to normal Copilot turn processing).
-- The server reads `<session-state-root>/<runtimeSessionId>/events.jsonl` for the bound runtime session.
-- Session-state root resolution order:
-  1. `COPILOT_SESSION_STATE_DIR` (if set)
-  2. `%USERPROFILE%\.copilot\session-state` (Windows)
-  3. `$HOME/.copilot/session-state` (Linux/macOS)
-  4. `os.homedir()` fallback
-- The response is built from the newest event that contains token context fields (typically `session.shutdown`).
-- If no `events.jsonl` exists for the bound runtime session ID, relay falls back to the newest available session-state `events.jsonl` and includes a note in the response.
-- Fields not present in events are returned as `unavailable`.
-
 ## Files
 
 | File | Description |

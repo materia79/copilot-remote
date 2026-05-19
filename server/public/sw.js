@@ -1,8 +1,10 @@
-const CACHE_NAME = 'copilot-remote-shell-v2';
+const CACHE_NAME = 'copilot-remote-shell-v4';
 const STATIC_ASSETS = [
   './',
   'index.html',
   'manifest.webmanifest',
+  'app-icon-192.png',
+  'app-icon-512.png',
   'favicon.ico',
   'app-icon.svg',
 ];
@@ -13,6 +15,10 @@ function sameOrigin(url) {
 
 function isApiRequest(url) {
   return /\/api\//.test(url.pathname) || /\/socket\.io\//.test(url.pathname);
+}
+
+function isPwaMetadataRequest(url) {
+  return /\/(?:manifest\.webmanifest|app-icon(?:-\d+)?\.png|app-icon\.svg|favicon\.ico)$/.test(url.pathname);
 }
 
 async function cacheShell() {
@@ -71,6 +77,11 @@ self.addEventListener('fetch', (event) => {
 
   if (request.mode === 'navigate') {
     event.respondWith(networkFirst(request, new URL('./', self.registration.scope).href));
+    return;
+  }
+
+  if (isPwaMetadataRequest(url)) {
+    event.respondWith(networkFirst(request, request.url));
     return;
   }
 

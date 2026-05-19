@@ -12,9 +12,10 @@
 <script>
   const __APP_BASE = window.location.pathname.replace(/\/+$/, '');
   document.write(`<link rel="manifest" href="${__APP_BASE}/manifest.webmanifest">`);
+  document.write(`<link rel="icon" type="image/png" sizes="192x192" href="${__APP_BASE}/app-icon-192.png">`);
+  document.write(`<link rel="icon" type="image/png" sizes="512x512" href="${__APP_BASE}/app-icon-512.png">`);
   document.write(`<link rel="icon" type="image/svg+xml" href="${__APP_BASE}/app-icon.svg">`);
-  document.write(`<link rel="icon" href="${__APP_BASE}/favicon.ico">`);
-  document.write(`<link rel="apple-touch-icon" href="${__APP_BASE}/app-icon.svg">`);
+  document.write(`<link rel="apple-touch-icon" href="${__APP_BASE}/app-icon-192.png">`);
 </script>
 <title>Copilot Remote</title>
 <script>document.write('<scr'+'ipt src="'+window.location.pathname.replace(/\/+$/,'')+'/socket.io/socket.io.js"><\/scr'+'ipt>');</script>
@@ -37,6 +38,15 @@
     --danger:    #f85149;
     --success:   #3fb950;
     --warn:      #d29922;
+    --header-safe-top: env(safe-area-inset-top, 0px);
+    --chat-header-top-base-desktop: 14px;
+    --chat-header-top-base-mobile: 10px;
+    --sidebar-header-top-base-desktop: 16px;
+    --sidebar-header-top-base-mobile: 12px;
+    --chat-header-top-pad-desktop: calc(var(--chat-header-top-base-desktop) + var(--header-safe-top));
+    --chat-header-top-pad-mobile: calc(var(--chat-header-top-base-mobile) + var(--header-safe-top));
+    --sidebar-header-top-pad-desktop: calc(var(--sidebar-header-top-base-desktop) + var(--header-safe-top));
+    --sidebar-header-top-pad-mobile: calc(var(--sidebar-header-top-base-mobile) + var(--header-safe-top));
   }
 
   html, body {
@@ -48,6 +58,13 @@
   }
   body {
     overflow: hidden;
+  }
+  body.immersive-top {
+    --header-safe-top: 0px;
+    --chat-header-top-base-desktop: 8px;
+    --chat-header-top-base-mobile: 6px;
+    --sidebar-header-top-base-desktop: 8px;
+    --sidebar-header-top-base-mobile: 6px;
   }
   :root {
     --app-height: 100vh;
@@ -88,10 +105,40 @@
   }
 
   .sidebar-header {
-    padding: 16px; border-bottom: 1px solid var(--border);
+    padding: var(--sidebar-header-top-pad-desktop) 16px 16px; border-bottom: 1px solid var(--border);
     display: flex; align-items: center; gap: 10px;
   }
   .sidebar-header h2 { font-size: 1rem; font-weight: 600; flex: 1; }
+  #sidebar-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: auto;
+  }
+  .header-icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg3);
+    color: var(--text);
+    cursor: pointer;
+    padding: 0;
+    font-size: 0.98rem;
+    line-height: 1;
+    flex-shrink: 0;
+  }
+  .header-icon-btn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .header-icon-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
   #cli-dot {
     width: 10px; height: 10px; border-radius: 50%; background: var(--danger);
     flex-shrink: 0; transition: background 0.3s;
@@ -139,7 +186,7 @@
   }
 
   #chat-header {
-    padding: calc(14px + env(safe-area-inset-top, 0px)) 18px 14px; border-bottom: 1px solid var(--border);
+    padding: var(--chat-header-top-pad-desktop) 18px 14px; border-bottom: 1px solid var(--border);
     display: flex; align-items: center; gap: 12px; background: var(--bg2);
   }
   #sidebar-toggle {
@@ -177,16 +224,6 @@
   #cli-status-text { font-size: 0.8rem; color: var(--muted); flex-shrink: 0; }
   #fullscreen-btn {
     display: none;
-    background: none;
-    border: 1px solid var(--border);
-    color: var(--text);
-    border-radius: 8px;
-    min-width: 38px;
-    height: 32px;
-    padding: 0 8px;
-    font-size: 0.95rem;
-    cursor: pointer;
-    flex-shrink: 0;
   }
   #fullscreen-btn:active { transform: translateY(1px); }
   #compact-btn {
@@ -206,18 +243,6 @@
   }
   #install-btn {
     display: none;
-    align-items: center;
-    justify-content: center;
-    background: none;
-    border: 1px solid var(--border);
-    color: var(--text);
-    border-radius: 8px;
-    min-width: 38px;
-    height: 32px;
-    padding: 0 10px;
-    font-size: 0.82rem;
-    cursor: pointer;
-    flex-shrink: 0;
   }
   #compact-btn:disabled {
     opacity: 0.5;
@@ -650,6 +675,109 @@
     margin-top: 10px;
   }
 
+  #summary-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 11001;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.68);
+    padding: 18px;
+  }
+  #summary-modal.visible { display: flex; }
+  .summary-dialog {
+    width: min(920px, 100%);
+    max-height: min(88vh, 860px);
+    display: flex;
+    flex-direction: column;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+  }
+  .summary-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg3);
+  }
+  .summary-header-copy {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .summary-title {
+    font-size: 0.95rem;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .summary-subtitle {
+    font-size: 0.78rem;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .summary-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+  .summary-btn,
+  .summary-close {
+    border: 1px solid var(--border);
+    background: var(--bg2);
+    color: var(--text);
+    border-radius: 8px;
+    height: 32px;
+    padding: 0 10px;
+    font-size: 0.82rem;
+    cursor: pointer;
+  }
+  .summary-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .summary-close {
+    width: 32px;
+    padding: 0;
+  }
+  .summary-body {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    padding: 14px;
+  }
+  .summary-body pre {
+    margin: 0;
+    white-space: pre;
+    overflow-x: auto;
+    overflow-y: hidden;
+    word-break: normal;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.8rem;
+    line-height: 1.45;
+  }
+  .summary-loading,
+  .summary-error {
+    color: var(--muted);
+    font-size: 0.9rem;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .summary-error {
+    color: var(--warn);
+  }
+
   #repo-browser-fab {
     display: none;
     position: fixed;
@@ -1076,7 +1204,7 @@
       white-space: nowrap;
       -webkit-overflow-scrolling: touch;
     }
-    .sidebar-header { padding: 12px; gap: 8px; }
+    .sidebar-header { padding: var(--sidebar-header-top-pad-mobile) 12px 12px; gap: 8px; }
     #new-conv-btn { margin: 10px; padding: 9px 12px; border-radius: 8px; font-size: 0.88rem; }
     #conv-list { padding: 0 5px 8px; }
     .conv-item { padding: 10px 11px; border-radius: 8px; }
@@ -1095,7 +1223,7 @@
     .conv-meta { font-size: 0.76rem; margin-top: 5px; }
     .conv-delete { opacity: 1; right: 4px; font-size: 0.9rem; }
     #chat-header {
-      padding: calc(10px + env(safe-area-inset-top, 0px)) 10px 10px;
+      padding: var(--chat-header-top-pad-mobile) 10px 10px;
       gap: 6px 8px;
       flex-wrap: wrap;
       align-items: center;
@@ -1106,11 +1234,12 @@
       margin-right: auto;
       max-width: calc(100vw - 172px);
     }
-    #compact-btn { order: 3; }
-    #cli-status-text { order: 4; }
-    #pending-question-banner { order: 5; }
+    #fullscreen-btn { order: 3; }
+    #compact-btn { order: 4; }
+    #cli-status-text { order: 5; }
+    #pending-question-banner { order: 6; }
     #chat-title {
-      order: 6;
+      order: 7;
       flex: 1 0 100%;
       width: 100%;
       margin: 0 0 2px;
@@ -1120,8 +1249,7 @@
     #pending-question-banner { font-size: 0.68rem; padding: 3px 8px; }
     #session-pill { font-size: 0.68rem; padding: 2px 6px; }
     #cli-status-text { font-size: 0.76rem; }
-    #fullscreen-btn { min-width: 32px; height: 30px; padding: 0 6px; border-radius: 8px; font-size: 0.82rem; }
-    #install-btn { min-width: 32px; height: 30px; padding: 0 6px; border-radius: 8px; font-size: 0.82rem; }
+    .header-icon-btn { width: 30px; height: 30px; border-radius: 8px; font-size: 0.86rem; }
     #compact-btn { min-width: 32px; height: 30px; padding: 0 8px; border-radius: 8px; font-size: 0.74rem; }
     #input-area { padding: 4px 10px calc(10px + env(safe-area-inset-bottom, 0px)); }
     .input-row { flex-wrap: wrap; gap: 8px; align-items: stretch; }
@@ -1243,12 +1371,16 @@
 <div id="sidebar-overlay" onclick="closeSidebar()"></div>
 
 <!-- Main App -->
-<div id="app">
+  <div id="app">
   <div id="sidebar">
     <div class="sidebar-header">
       <span id="cli-dot" title="CLI status"></span>
       <h2>Copilot Remote</h2>
-      <button id="usage-btn" onclick="showUsage()" title="Check Copilot usage" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:1.1rem;padding:4px;">📊</button>
+      <div id="sidebar-actions">
+        <button id="usage-btn" class="header-icon-btn" onclick="showUsage()" title="Check Copilot usage" aria-label="Check Copilot usage">📊</button>
+        <button id="context-btn" class="header-icon-btn" onclick="showContext()" title="Check current context" aria-label="Check current context">🧠</button>
+        <button id="install-btn" class="header-icon-btn" onclick="promptInstallApp()" title="Install app to home screen" aria-label="Install app">⬇</button>
+      </div>
     </div>
     <button id="new-conv-btn" onclick="newConversation()">+ New Conversation</button>
     <div id="conv-list"></div>
@@ -1260,9 +1392,8 @@
       <span id="chat-title">Select or start a conversation</span>
       <button id="pending-question-banner" onclick="openPendingQuestionFromBanner()" title="Open pending question"></button>
       <span id="session-pill"></span>
-      <button id="install-btn" onclick="promptInstallApp()" title="Install app to home screen">Install</button>
       <button id="compact-btn" onclick="compactCurrentConversation()" title="Compact conversation into a fresh session" disabled>Compact</button>
-      <button id="fullscreen-btn" onclick="toggleFullscreen()" title="Toggle fullscreen">⛶</button>
+      <button id="fullscreen-btn" class="header-icon-btn" onclick="toggleFullscreen()" title="Toggle fullscreen" aria-label="Toggle fullscreen">⛶</button>
       <span id="cli-status-text">CLI offline</span>
     </div>
     <div id="messages">
@@ -1329,6 +1460,22 @@
         <div id="repo-folder"></div>
       </section>
     </div>
+  </div>
+</div>
+
+<div id="summary-modal" aria-hidden="true">
+  <div class="summary-dialog" role="dialog" aria-modal="true" aria-labelledby="summary-modal-title">
+    <div class="summary-header">
+      <div class="summary-header-copy">
+        <div id="summary-modal-title" class="summary-title">Details</div>
+        <div id="summary-modal-subtitle" class="summary-subtitle"></div>
+      </div>
+      <div class="summary-header-actions">
+        <button id="summary-modal-refresh" class="summary-btn" onclick="refreshSummaryModal()">Refresh</button>
+        <button class="summary-close" onclick="closeSummaryModal()" aria-label="Close details">×</button>
+      </div>
+    </div>
+    <div id="summary-modal-body" class="summary-body"></div>
   </div>
 </div>
 
@@ -1410,8 +1557,6 @@ let relayQuestionPollTimer = null;
 let viewportBaseHeight = window.innerHeight || document.documentElement.clientHeight || 0;
 let deferredInstallPrompt = null;
 const INSTALLED_DISPLAY_MODE_QUERIES = ['(display-mode: standalone)', '(display-mode: fullscreen)'];
-let installedFullscreenRetryPending = false;
-let installedFullscreenRetryBound = false;
 let relayQuestionRenderHash = '';
 let relayQuestionDrafts = new Map();
 let pullRefreshState = {
@@ -1423,6 +1568,11 @@ let pullRefreshState = {
 let compactInFlight = false;
 let contextUsageRefreshTimer = null;
 let contextUsageRefreshSeq = 0;
+let summaryModalState = {
+  kind: '',
+  refresh: null,
+  loading: false,
+};
 const PULL_REFRESH_THRESHOLD = 72;
 const PULL_REFRESH_MAX = 120;
 const RELAY_QUESTION_POLL_MS = 3000;
@@ -1551,6 +1701,97 @@ async function refreshContextUsageBar(conversationId, requestSeq = ++contextUsag
   if (requestSeq !== contextUsageRefreshSeq) return;
   if (String(currentConvId || '').trim() !== convId) return;
   applyContextUsageBar(readContextUsageRatio(payload));
+}
+
+function setSummaryModalLoading(loading) {
+  summaryModalState.loading = !!loading;
+  const refreshBtn = document.getElementById('summary-modal-refresh');
+  if (refreshBtn) {
+    refreshBtn.disabled = summaryModalState.loading || !summaryModalState.refresh;
+    refreshBtn.textContent = summaryModalState.loading ? 'Loading…' : 'Refresh';
+  }
+}
+
+function renderSummaryModalContent({ title, subtitle = '', bodyHtml = '', refresh = null, kind = '' }) {
+  summaryModalState.kind = String(kind || '').trim();
+  summaryModalState.refresh = typeof refresh === 'function' ? refresh : null;
+
+  const titleEl = document.getElementById('summary-modal-title');
+  const subtitleEl = document.getElementById('summary-modal-subtitle');
+  const bodyEl = document.getElementById('summary-modal-body');
+  if (titleEl) titleEl.textContent = String(title || 'Details').trim() || 'Details';
+  if (subtitleEl) subtitleEl.textContent = String(subtitle || '').trim();
+  if (bodyEl) bodyEl.innerHTML = bodyHtml || '';
+  setSummaryModalLoading(false);
+}
+
+function openSummaryModal({ title, subtitle = '', bodyHtml = '', refresh = null, kind = '' }) {
+  renderSummaryModalContent({ title, subtitle, bodyHtml, refresh, kind });
+  const modal = document.getElementById('summary-modal');
+  modal.classList.add('visible');
+  modal.setAttribute('aria-hidden', 'false');
+}
+
+function closeSummaryModal() {
+  summaryModalState.kind = '';
+  summaryModalState.refresh = null;
+  summaryModalState.loading = false;
+  const modal = document.getElementById('summary-modal');
+  modal.classList.remove('visible');
+  modal.setAttribute('aria-hidden', 'true');
+  const titleEl = document.getElementById('summary-modal-title');
+  const subtitleEl = document.getElementById('summary-modal-subtitle');
+  const bodyEl = document.getElementById('summary-modal-body');
+  if (titleEl) titleEl.textContent = 'Details';
+  if (subtitleEl) subtitleEl.textContent = '';
+  if (bodyEl) bodyEl.innerHTML = '';
+  setSummaryModalLoading(false);
+}
+
+async function refreshSummaryModal() {
+  if (!summaryModalState.refresh || summaryModalState.loading) return;
+  setSummaryModalLoading(true);
+  try {
+    await summaryModalState.refresh();
+  } finally {
+    setSummaryModalLoading(false);
+  }
+}
+
+async function loadUsageSummary() {
+  const r = await fetch(`${BASE}/api/usage`, { headers: { ...authHeaders() } });
+  const d = await r.json();
+  if (d.error) throw new Error(d.error);
+  const pct = d.premiumInteractions.percentRemaining != null
+    ? ` (${d.premiumInteractions.percentRemaining.toFixed(1)}% left)`
+    : '';
+  const msg = `Chat/Completions: ${d.chat.unlimited ? 'Unlimited ✅' : `${d.chat.remaining} remaining`}\n` +
+    `Premium interactions: ${d.premiumInteractions.remaining} / ${d.premiumInteractions.entitlement} remaining${pct}`;
+  renderSummaryModalContent({
+    title: 'Copilot Usage',
+    subtitle: `Resets ${d.resetDate || 'unknown'}`,
+    bodyHtml: `<pre>${escHtml(msg)}</pre>`,
+    refresh: loadUsageSummary,
+    kind: 'usage',
+  });
+}
+
+async function loadContextSummary(convId) {
+  const trimmedConvId = String(convId || '').trim();
+  const endpoint = trimmedConvId ? `/api/context/${encodeURIComponent(trimmedConvId)}` : '/api/context';
+  const payload = await apiFetch(endpoint);
+  if (!payload) throw new Error('Unable to load context');
+  const title = trimmedConvId ? 'Current Context' : 'Latest Context';
+  const subtitle = payload.runtimeSessionId
+    ? `Runtime session ${String(payload.runtimeSessionId).slice(0, 8)}`
+    : (trimmedConvId ? `Conversation ${trimmedConvId.slice(0, 8)}` : 'Latest runtime session');
+  renderSummaryModalContent({
+    title,
+    subtitle,
+    bodyHtml: `<pre>${escHtml(payload.text || 'No context data available.')}</pre>`,
+    refresh: () => loadContextSummary(trimmedConvId),
+    kind: 'context',
+  });
 }
 
 function scheduleContextUsageRefresh(conversationId = currentConvId, delayMs = 0) {
@@ -1844,6 +2085,7 @@ async function refreshCurrentView() {
 function initFullscreenButton() {
   const syncFullscreenUi = () => {
     syncInstalledAppUiState();
+    updateInstallButton();
     updateFullscreenButton();
     ensureInstalledAppFullscreen().catch(() => {});
   };
@@ -1868,9 +2110,20 @@ function matchesDisplayMode(query) {
 }
 
 function isInstalledAppMode() {
-  return matchesDisplayMode('(display-mode: standalone)')
-    || matchesDisplayMode('(display-mode: fullscreen)')
+  const standalone = matchesDisplayMode('(display-mode: standalone)');
+  const manifestFullscreen = matchesDisplayMode('(display-mode: fullscreen)');
+  const browserFullscreen = !!document.fullscreenElement;
+  return standalone
+    || (manifestFullscreen && !browserFullscreen)
     || window.navigator.standalone === true;
+}
+
+function isDisplayModeFullscreen() {
+  return matchesDisplayMode('(display-mode: fullscreen)');
+}
+
+function isBrowserFullscreenMode() {
+  return !!document.fullscreenElement;
 }
 
 function isStandaloneMode() {
@@ -1878,66 +2131,41 @@ function isStandaloneMode() {
 }
 
 function isManifestFullscreenMode() {
-  return matchesDisplayMode('(display-mode: fullscreen)');
+  return isDisplayModeFullscreen();
+}
+
+function shouldUseImmersiveTopLayout() {
+  return isInstalledAppMode() || isDisplayModeFullscreen() || isBrowserFullscreenMode();
 }
 
 function syncInstalledAppUiState() {
-  document.body.classList.toggle('installed-app', isInstalledAppMode());
-}
-
-function clearInstalledFullscreenRetryListeners() {
-  installedFullscreenRetryPending = false;
-  if (!installedFullscreenRetryBound) return;
-  const retryHandler = window.__installedFullscreenRetryHandler;
-  if (retryHandler) {
-    window.removeEventListener('pointerdown', retryHandler);
-    window.removeEventListener('touchstart', retryHandler);
-    window.removeEventListener('keydown', retryHandler);
-  }
-  window.__installedFullscreenRetryHandler = null;
-  installedFullscreenRetryBound = false;
-}
-
-function queueInstalledFullscreenRetry() {
-  installedFullscreenRetryPending = true;
-  if (installedFullscreenRetryBound) return;
-  const retryHandler = () => {
-    if (!installedFullscreenRetryPending) return;
-    ensureInstalledAppFullscreen({ userGesture: true }).catch(() => {});
-  };
-  window.__installedFullscreenRetryHandler = retryHandler;
-  window.addEventListener('pointerdown', retryHandler, { passive: true });
-  window.addEventListener('touchstart', retryHandler, { passive: true });
-  window.addEventListener('keydown', retryHandler, { passive: true });
-  installedFullscreenRetryBound = true;
+  const installed = isInstalledAppMode();
+  document.body.classList.toggle('installed-app', installed);
+  document.body.classList.toggle('immersive-top', shouldUseImmersiveTopLayout());
 }
 
 async function ensureInstalledAppFullscreen(options = {}) {
   syncInstalledAppUiState();
   if (!isInstalledAppMode()) {
-    clearInstalledFullscreenRetryListeners();
     return false;
   }
   if (isManifestFullscreenMode() || document.fullscreenElement) {
-    clearInstalledFullscreenRetryListeners();
     return true;
   }
   if (!canToggleFullscreen()) return false;
 
   const fromUserGesture = !!options.userGesture;
-  if (!fromUserGesture && navigator.userActivation && navigator.userActivation.isActive === false) {
-    queueInstalledFullscreenRetry();
+  if (!fromUserGesture) {
     return false;
   }
 
   try {
     await document.documentElement.requestFullscreen();
-    clearInstalledFullscreenRetryListeners();
     return true;
   } catch (_) {
-    queueInstalledFullscreenRetry();
     return false;
   } finally {
+    updateInstallButton();
     updateFullscreenButton();
   }
 }
@@ -1952,7 +2180,7 @@ function getInstallHelpMessage() {
     return 'To install on iPhone/iPad: open this page in Safari, tap Share, then choose "Add to Home Screen".';
   }
   if (/android/.test(ua)) {
-    return 'To install on Android: open the browser menu (⋮) and choose "Install app" or "Add to Home screen".';
+    return 'To install on Android: open the browser menu (⋮) and choose "Install app" or "Add to Home screen". If Chrome says the app is already installed, open it from your launcher or uninstall the old copy first.';
   }
   return 'To install: open your browser menu and choose "Install app" or "Add to Home screen".';
 }
@@ -1967,17 +2195,18 @@ function updateInstallButton() {
     return;
   }
 
-  const mobile = window.matchMedia('(max-width: 680px)').matches;
-  btn.textContent = mobile ? '⬇' : 'Install';
-  btn.style.display = 'inline-flex';
-  btn.title = deferredInstallPrompt
+  const title = deferredInstallPrompt
     ? 'Install app to home screen'
     : 'Show install instructions';
+  btn.textContent = '⬇';
+  btn.style.display = 'inline-flex';
+  btn.title = title;
 }
 
 async function promptInstallApp() {
-  if (isInstalledAppMode()) return;
-
+  if (!deferredInstallPrompt) {
+    await new Promise((resolve) => setTimeout(resolve, 350));
+  }
   if (deferredInstallPrompt) {
     try {
       deferredInstallPrompt.prompt();
@@ -2054,6 +2283,7 @@ async function toggleFullscreen() {
   } catch (_) {
     // Ignore browser restrictions (e.g. unsupported/platform-limited fullscreen).
   } finally {
+    updateInstallButton();
     updateFullscreenButton();
   }
 }
@@ -3139,24 +3369,66 @@ async function sendMessage() {
 
 async function showUsage() {
   const btn = document.getElementById('usage-btn');
-  btn.textContent = '⏳';
-  btn.disabled = true;
+  if (btn) {
+    btn.textContent = '⏳';
+    btn.disabled = true;
+  }
+  openSummaryModal({
+    title: 'Copilot Usage',
+    subtitle: 'Loading…',
+    bodyHtml: '<div class="summary-loading">Fetching usage snapshot…</div>',
+    refresh: loadUsageSummary,
+    kind: 'usage',
+  });
+  setSummaryModalLoading(true);
   try {
-    const r = await fetch(`${BASE}/api/usage`, { headers: { ...authHeaders() } });
-    const d = await r.json();
-    if (d.error) throw new Error(d.error);
-    const pct = d.premiumInteractions.percentRemaining != null
-      ? ` (${d.premiumInteractions.percentRemaining.toFixed(1)}% left)`
-      : '';
-    const msg = `📊 Copilot Usage — resets ${d.resetDate}\n\n` +
-      `Chat/Completions: ${d.chat.unlimited ? 'Unlimited ✅' : `${d.chat.remaining} remaining`}\n` +
-      `Premium interactions: ${d.premiumInteractions.remaining} / ${d.premiumInteractions.entitlement} remaining${pct}`;
-    alert(msg);
+    await loadUsageSummary();
   } catch (e) {
-    alert('Failed to fetch usage: ' + e.message);
+    renderSummaryModalContent({
+      title: 'Copilot Usage',
+      subtitle: 'Unable to load',
+      bodyHtml: `<div class="summary-error">Failed to fetch usage: ${escHtml(e.message || 'Unknown error')}</div>`,
+      refresh: loadUsageSummary,
+      kind: 'usage',
+    });
   } finally {
-    btn.textContent = '📊';
-    btn.disabled = false;
+    if (btn) {
+      btn.textContent = '📊';
+      btn.disabled = false;
+    }
+  }
+}
+
+async function showContext() {
+  const btn = document.getElementById('context-btn');
+  const convId = String(currentConvId || '').trim();
+  if (btn) {
+    btn.textContent = '⏳';
+    btn.disabled = true;
+  }
+  openSummaryModal({
+    title: 'Current Context',
+    subtitle: convId ? `Conversation ${convId.slice(0, 8)}` : 'Latest runtime session',
+    bodyHtml: '<div class="summary-loading">Fetching context snapshot…</div>',
+    refresh: () => loadContextSummary(convId || null),
+    kind: 'context',
+  });
+  setSummaryModalLoading(true);
+  try {
+    await loadContextSummary(convId);
+  } catch (e) {
+    renderSummaryModalContent({
+      title: 'Current Context',
+      subtitle: 'Unable to load',
+      bodyHtml: `<div class="summary-error">Failed to fetch context: ${escHtml(e.message || 'Unknown error')}</div>`,
+      refresh: () => loadContextSummary(convId || null),
+      kind: 'context',
+    });
+  } finally {
+    if (btn) {
+      btn.textContent = '🧠';
+      btn.disabled = false;
+    }
   }
 }
 
@@ -3186,10 +3458,12 @@ function updateCliStatus() {
 function openSidebar() {
   document.getElementById('sidebar').classList.add('open');
   document.getElementById('sidebar-overlay').classList.add('visible');
+  updateInstallButton();
 }
 function closeSidebar() {
   document.getElementById('sidebar').classList.remove('open');
   document.getElementById('sidebar-overlay').classList.remove('visible');
+  updateInstallButton();
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -3538,7 +3812,11 @@ function renderFilePreview() {
   }
 
   if (payload.kind === 'image') {
-    const imageHref = String(payload.rawUrl || rawHref || '');
+    // Prefer client-computed href for workspace/drives so subpath deployments
+    // (e.g. reverse-proxy prefixes) don't break when server rawUrl is root-based.
+    const imageHref = filePreviewState.source === 'upload'
+      ? String(payload.rawUrl || '')
+      : String(rawHref || payload.rawUrl || '');
     if (imageHref) {
       bodyEl.innerHTML = `<div class="file-preview-image"><img loading="lazy" src="${escHtml(imageHref)}" alt="${escHtml(payload.name || filePreviewState.path || 'image')}"></div>`;
       bodyEl.classList.add('image-zoom-mode');
@@ -4468,6 +4746,10 @@ document.getElementById('file-preview-modal').addEventListener('click', (event) 
   if (event.target.id === 'file-preview-modal') closeFilePreview();
 });
 
+document.getElementById('summary-modal').addEventListener('click', (event) => {
+  if (event.target.id === 'summary-modal') closeSummaryModal();
+});
+
 document.getElementById('file-preview-title').addEventListener('click', async (event) => {
   const target = event.currentTarget;
   const token = String(target?.getAttribute('data-copy-reference') || '').trim();
@@ -4531,8 +4813,10 @@ document.addEventListener('keydown', (event) => {
   if (event.key !== 'Escape') return;
   const modal = document.getElementById('file-preview-modal');
   const repoModal = document.getElementById('repo-browser-modal');
+  const summaryModal = document.getElementById('summary-modal');
   if (modal.classList.contains('visible')) closeFilePreview();
   else if (repoModal.classList.contains('visible')) closeRepoBrowser();
+  else if (summaryModal.classList.contains('visible')) closeSummaryModal();
 });
 
 function scrollBottom() {
