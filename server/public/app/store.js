@@ -1,0 +1,410 @@
+export const BASE = window.location.pathname.replace(/\/+$/, '');
+export let TOKEN = '';
+export let socket = null;
+export let currentConvId = null;
+export let CLIENT_ID = sessionStorage.getItem('copilot_client_id');
+if (!CLIENT_ID) {
+  CLIENT_ID = generateId();
+  sessionStorage.setItem('copilot_client_id', CLIENT_ID);
+}
+
+export const seenMessageIds = new Set();
+export const pendingUserMessageIds = new Set();
+export let cliOnline = false;
+export let conversations = {};
+export let selectedAttachments = [];
+export const RELAY_QUESTION_POLL_MS = 3000;
+export const MAX_UPLOAD_ATTACHMENTS = 6;
+export const FILE_PREVIEW_MAX_BYTES = 512 * 1024;
+export const REPO_IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico', 'bmp', 'avif']);
+export const WORKSPACE_FILE_EXTENSIONS = new Set([
+  'md', 'txt', 'json', 'js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx', 'css', 'html', 'xml', 'yml', 'yaml',
+  'toml', 'ini', 'csv', 'sql', 'ps1', 'sh', 'bat', 'go', 'py', 'java', 'rb', 'php', 'c', 'h', 'cpp',
+  'hpp', 'rs', 'lock', 'log', 'svg', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'pdf',
+]);
+export let workspaceRootName = '';
+export let workspaceRootEntrySet = new Set([
+  '.github',
+  'server',
+  'tests',
+  'readme.md',
+  'package.json',
+  'package-lock.json',
+]);
+export let relayQuestions = new Map();
+export let relayActivities = new Map();
+export let thinkingMessageId = null;
+export let relayQuestionPollTimer = null;
+export let relayQuestionRenderHash = '';
+export let relayQuestionDrafts = new Map();
+export let selectedAttachmentsState = selectedAttachments;
+export let filePreviewState = {
+  path: '',
+  source: 'workspace',
+  mode: 'preview',
+  allowHtml: false,
+  loading: false,
+  error: '',
+  payload: null,
+};
+export let repoBrowserState = {
+  open: false,
+  loading: false,
+  activeRoot: 'workspace',
+  workspaceIncludeHidden: false,
+  workspaceIncludeHeavy: false,
+  drivesIncludeHidden: false,
+  viewMode: 'list',
+  rootName: 'repo',
+  tree: null,
+  nodeMap: new Map(),
+  currentPath: '',
+  truncated: false,
+  nodeCount: 0,
+  maxNodes: 0,
+  loadingPath: '',
+  error: '',
+};
+export let contextUsageRefreshTimer = null;
+export let contextUsageRefreshSeq = 0;
+export let compactInFlight = false;
+export let deferredInstallPrompt = null;
+export let viewportBaseHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+export let pullRefreshState = {
+  active: false,
+  ready: false,
+  startY: 0,
+  refreshing: false,
+};
+
+marked.setOptions({ breaks: true });
+
+export function generateId() {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0;
+    return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+  });
+}
+
+export function setCurrentConv(id) {
+  currentConvId = id;
+  if (id) localStorage.setItem('copilot_last_conv', id);
+  else localStorage.removeItem('copilot_last_conv');
+  updateCompactButton();
+}
+
+export function authHeaders() {
+  return TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {};
+}
+
+export function setToken(value) {
+  TOKEN = String(value || '').trim();
+}
+
+export function escHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+export function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (!Number.isFinite(value) || value <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let size = value;
+  let idx = 0;
+  while (size >= 1024 && idx < units.length - 1) {
+    size /= 1024;
+    idx += 1;
+  }
+  const rounded = idx === 0 ? Math.round(size) : Math.round(size * 10) / 10;
+  return `${rounded} ${units[idx]}`;
+}
+
+export function fmtDate(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  const now = new Date();
+  if (d.toDateString() === now.toDateString()) {
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+  return `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+}
+
+export function updateWorkspaceRootHints(payload) {
+  const rootName = String(payload?.workspaceRootName || '').trim().toLowerCase();
+  const entries = Array.isArray(payload?.workspaceRootEntries) ? payload.workspaceRootEntries : [];
+  workspaceRootName = rootName;
+  if (entries.length) {
+    workspaceRootEntrySet = new Set(entries.map((entry) => String(entry || '').trim().toLowerCase()).filter(Boolean));
+  }
+}
+
+export function clampContextUsageRatio(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  if (n <= 0) return 0;
+  if (n >= 1) return 1;
+  return n;
+}
+
+export function readContextUsageRatio(payload) {
+  const snapshot = payload?.snapshot && typeof payload.snapshot === 'object' ? payload.snapshot : null;
+  if (!snapshot) return null;
+  const usedPct = Number(snapshot.used_percent);
+  if (Number.isFinite(usedPct)) {
+    return clampContextUsageRatio(usedPct / 100);
+  }
+  const usedTotal = Number(snapshot.used_total_tokens);
+  const maxTokens = Number(snapshot.max_context_tokens);
+  if (Number.isFinite(usedTotal) && Number.isFinite(maxTokens) && maxTokens > 0) {
+    return clampContextUsageRatio(usedTotal / maxTokens);
+  }
+  return null;
+}
+
+export function applyContextUsageBar(ratio) {
+  const inputArea = document.getElementById('input-area');
+  if (!inputArea) return;
+
+  const normalized = clampContextUsageRatio(ratio);
+  if (normalized === null) {
+    inputArea.style.setProperty('--context-usage-bar', 'linear-gradient(90deg, rgba(139,148,158,0.65) 0%, rgba(139,148,158,0.95) 50%, rgba(139,148,158,0.65) 100%)');
+    inputArea.style.setProperty('--context-usage-glow', 'rgba(139,148,158,0.35)');
+    inputArea.style.setProperty('--context-usage-opacity', '0.62');
+    delete inputArea.dataset.contextUsageRatio;
+    return;
+  }
+
+  const hue = Math.round((1 - normalized) * 120);
+  const lightness = 49 - Math.round(normalized * 8);
+  const baseColor = `hsl(${hue}, 88%, ${lightness}%)`;
+  const shineAlpha = (0.44 + (normalized * 0.18)).toFixed(2);
+  const glowAlpha = Math.min(0.86, 0.42 + (normalized * 0.28)).toFixed(2);
+  inputArea.style.setProperty(
+    '--context-usage-bar',
+    `linear-gradient(90deg, rgba(255,255,255,0.16) 0%, ${baseColor} 24%, rgba(255,255,255,${shineAlpha}) 50%, ${baseColor} 76%, rgba(255,255,255,0.16) 100%)`
+  );
+  inputArea.style.setProperty('--context-usage-glow', `hsla(${hue}, 88%, 52%, ${glowAlpha})`);
+  inputArea.style.setProperty('--context-usage-opacity', '0.98');
+  inputArea.dataset.contextUsageRatio = normalized.toFixed(4);
+}
+
+export function scrollBottom() {
+  const el = document.getElementById('messages');
+  if (!el) return;
+  el.scrollTop = el.scrollHeight;
+}
+
+export function scrollBottomAfterSend() {
+  scrollBottom();
+  requestAnimationFrame(() => {
+    scrollBottom();
+  });
+  setTimeout(() => {
+    scrollBottom();
+  }, 120);
+}
+
+export function isMobileComposerViewport() {
+  return window.matchMedia('(max-width: 680px)').matches;
+}
+
+export function releaseComposerFocusAfterSend(input) {
+  if (!input || !isMobileComposerViewport()) return;
+  try { input.blur(); } catch {}
+  document.body.classList.remove('keyboard-open');
+  syncViewportMetrics();
+}
+
+export function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+  syncViewportMetrics();
+}
+
+export function updateSessionPill(conversation, runtimeSession) {
+  const pill = document.getElementById('session-pill');
+  if (!pill) return;
+  const runtimeId = String(runtimeSession?.id || conversation?.runtimeSessionId || '').trim();
+  if (!runtimeId) {
+    pill.textContent = '';
+    pill.classList.remove('visible');
+    return;
+  }
+  const strategy = String(runtimeSession?.strategy || conversation?.runtimeSessionStrategy || '').trim();
+  const strategyText = strategy ? ` (${strategy})` : '';
+  pill.textContent = `Session ${runtimeId.slice(0, 8)}${strategyText}`;
+  pill.classList.add('visible');
+}
+
+export function updateCompactButton() {
+  const btn = document.getElementById('compact-btn');
+  if (!btn) return;
+  const conv = currentConvId ? conversations[currentConvId] : null;
+  const canCompact = !!(currentConvId && conv && !conv.archived && !compactInFlight);
+  btn.disabled = !canCompact;
+  btn.title = canCompact
+    ? 'Compact conversation into a fresh session'
+    : (compactInFlight ? 'Compacting conversation…' : 'Open an active conversation to compact');
+}
+
+export function updateCliStatus() {
+  const dot = document.getElementById('cli-dot');
+  const text = document.getElementById('cli-status-text');
+  const banner = document.getElementById('offline-banner');
+  if (dot) dot.className = cliOnline ? 'online' : '';
+  if (text) text.textContent = cliOnline ? 'CLI online' : 'CLI offline';
+  if (banner) {
+    if (cliOnline) banner.classList.remove('visible');
+    else banner.classList.add('visible');
+  }
+}
+
+export function setCliOnline(value) {
+  cliOnline = !!value;
+  updateCliStatus();
+}
+
+export function openSidebar() {
+  document.getElementById('sidebar')?.classList.add('open');
+  document.getElementById('sidebar-overlay')?.classList.add('visible');
+}
+
+export function closeSidebar() {
+  document.getElementById('sidebar')?.classList.remove('open');
+  document.getElementById('sidebar-overlay')?.classList.remove('visible');
+}
+
+export function setCompactInFlight(value) {
+  compactInFlight = !!value;
+  updateCompactButton();
+}
+
+export function isCompactInFlight() {
+  return compactInFlight;
+}
+
+export function setModelBanner(message) {
+  const el = document.getElementById('model-banner');
+  if (!el) return;
+  const text = String(message || '').trim();
+  if (!text) {
+    el.textContent = '';
+    el.classList.remove('visible');
+    return;
+  }
+  el.textContent = text;
+  el.classList.add('visible');
+}
+
+export function showTransientRelayNotice(message, ms = 4000) {
+  const text = String(message || '').trim();
+  if (!text) return;
+  setModelBanner(text);
+  setTimeout(() => {
+    const el = document.getElementById('model-banner');
+    if (!el) return;
+    if (String(el.textContent || '').trim() === text) {
+      setModelBanner('');
+    }
+  }, Math.max(1500, Number(ms) || 4000));
+}
+
+export function syncViewportMetrics() {
+  const layoutHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+  const vv = window.visualViewport;
+  let appHeight = layoutHeight;
+
+  if (vv) {
+    const visibleHeight = Math.max(0, vv.height || 0);
+    const offsetTop = Math.max(0, vv.offsetTop || 0);
+    const baselineCandidate = Math.max(layoutHeight, visibleHeight + offsetTop);
+    if (baselineCandidate > viewportBaseHeight) viewportBaseHeight = baselineCandidate;
+    appHeight = visibleHeight || layoutHeight;
+  } else if (layoutHeight > viewportBaseHeight) {
+    viewportBaseHeight = layoutHeight;
+  }
+
+  document.documentElement.style.setProperty('--app-height', `${Math.max(0, Math.round(appHeight))}px`);
+}
+
+export function setPullRefreshIndicator(distance, label, ready = false) {
+  const el = document.getElementById('pull-refresh-indicator');
+  if (!el) return;
+  const span = el.querySelector('span');
+  if (span) span.textContent = label;
+  el.classList.add('visible');
+  el.classList.toggle('ready', !!ready);
+  el.style.transform = `translateY(${Math.min(distance / 2, 28)}px)`;
+}
+
+export function resetPullRefreshIndicator() {
+  const el = document.getElementById('pull-refresh-indicator');
+  if (!el) return;
+  const span = el.querySelector('span');
+  if (span) span.textContent = 'Pull down to refresh';
+  el.classList.remove('visible', 'ready');
+  el.style.transform = '';
+}
+
+export let summaryModalState = {
+  kind: '',
+  refresh: null,
+  loading: false,
+};
+
+export function setSummaryModalLoading(loading) {
+  summaryModalState.loading = !!loading;
+  const refreshBtn = document.getElementById('summary-modal-refresh');
+  if (refreshBtn) {
+    refreshBtn.disabled = summaryModalState.loading || !summaryModalState.refresh;
+    refreshBtn.textContent = summaryModalState.loading ? 'Loading…' : 'Refresh';
+  }
+}
+
+export function renderSummaryModalContent({ title, subtitle = '', bodyHtml = '', refresh = null, kind = '' }) {
+  summaryModalState.kind = String(kind || '').trim();
+  summaryModalState.refresh = typeof refresh === 'function' ? refresh : null;
+
+  const titleEl = document.getElementById('summary-modal-title');
+  const subtitleEl = document.getElementById('summary-modal-subtitle');
+  const bodyEl = document.getElementById('summary-modal-body');
+  if (titleEl) titleEl.textContent = String(title || 'Details').trim() || 'Details';
+  if (subtitleEl) subtitleEl.textContent = String(subtitle || '').trim();
+  if (bodyEl) bodyEl.innerHTML = bodyHtml || '';
+  setSummaryModalLoading(false);
+}
+
+export function openSummaryModal({ title, subtitle = '', bodyHtml = '', refresh = null, kind = '' }) {
+  renderSummaryModalContent({ title, subtitle, bodyHtml, refresh, kind });
+  const modal = document.getElementById('summary-modal');
+  modal?.classList.add('visible');
+  modal?.setAttribute('aria-hidden', 'false');
+}
+
+export function closeSummaryModal() {
+  summaryModalState.kind = '';
+  summaryModalState.refresh = null;
+  summaryModalState.loading = false;
+  const modal = document.getElementById('summary-modal');
+  modal?.classList.remove('visible');
+  modal?.setAttribute('aria-hidden', 'true');
+  const titleEl = document.getElementById('summary-modal-title');
+  const subtitleEl = document.getElementById('summary-modal-subtitle');
+  const bodyEl = document.getElementById('summary-modal-body');
+  if (titleEl) titleEl.textContent = 'Details';
+  if (subtitleEl) subtitleEl.textContent = '';
+  if (bodyEl) bodyEl.innerHTML = '';
+  setSummaryModalLoading(false);
+}
+
+export async function refreshSummaryModal() {
+  if (!summaryModalState.refresh || summaryModalState.loading) return;
+  setSummaryModalLoading(true);
+  try {
+    await summaryModalState.refresh();
+  } finally {
+    setSummaryModalLoading(false);
+  }
+}
+

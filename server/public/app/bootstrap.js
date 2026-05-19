@@ -1,0 +1,870 @@
+import {
+  TOKEN,
+  CLIENT_ID,
+  currentConvId,
+  conversations,
+  seenMessageIds,
+  relayQuestions,
+  relayQuestionDrafts,
+  relayActivities,
+  repoBrowserState,
+  pendingUserMessageIds,
+  escHtml,
+  setToken,
+  setCliOnline,
+  setCurrentConv,
+  updateWorkspaceRootHints,
+  updateCliStatus,
+  openSidebar,
+  closeSidebar,
+  updateCompactButton,
+  updateSessionPill,
+  setModelBanner,
+  showTransientRelayNotice,
+  applyContextUsageBar,
+  scrollBottom,
+  setPullRefreshIndicator,
+  resetPullRefreshIndicator,
+  setSummaryModalLoading,
+  renderSummaryModalContent,
+  openSummaryModal,
+  closeSummaryModal,
+  refreshSummaryModal,
+  syncViewportMetrics,
+  isMobileComposerViewport,
+  releaseComposerFocusAfterSend,
+  autoResize,
+} from './store.js';
+import {
+  verifyExistingSession,
+  verifyToken,
+  refreshWorkspaceRootHints,
+  loadUsageSummary,
+  loadContextSummary,
+  loadModelCatalog,
+  loadConversation,
+  scheduleContextUsageRefresh,
+} from './api-client.js';
+import { loadConversations, refreshConversations, openConversation, renderConvList } from './journal-view.js';
+import { newConversation, deleteConv } from './journal-view.js';
+import { loadRelayQuestions, renderRelayQuestions, upsertRelayQuestion, updatePendingQuestionBanner } from './ask-user-view.js';
+import { openPendingQuestionFromBanner, submitRelayQuestionChoice, submitRelayQuestionAnswer, onRelayQuestionDraftInput, handleRelayQuestionKey } from './ask-user-view.js';
+import { showThinking, removeThinking, renderThinkingActivities, appendThinkingActivity, restoreInFlightThinking, renderMessages, appendMessage, compactCurrentConversation, sendMessage, handleKey } from './conversation-view.js';
+import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser } from './attachments-view.js';
+import { handleAttachmentInput, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
+
+const MODEL_STORAGE_KEY = 'copilot_selected_model';
+const MODE_STORAGE_KEY = 'copilot_selected_mode';
+const FALLBACK_MODEL = 'gpt-5.4-mini';
+const FALLBACK_MODE = 'agent';
+const MODEL_LABELS = {
+  'gpt-5.4': 'GPT-5.4',
+  'gpt-5.4-mini': 'GPT-5.4 Mini',
+  'gpt-5.3-codex': 'GPT-5.3 Codex',
+  'claude-sonnet-4.6': 'Claude Sonnet 4.6',
+  'claude-haiku-4.5': 'Claude Haiku 4.5',
+};
+const CURATED_MODELS = [
+  'gpt-5.4',
+  'gpt-5.4-mini',
+  'gpt-5.3-codex',
+  'claude-sonnet-4.6',
+  'claude-haiku-4.5',
+];
+
+let socket = null;
+let relayQuestionPollTimer = null;
+let viewportBaseHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+let deferredInstallPrompt = null;
+const INSTALLED_DISPLAY_MODE_QUERIES = ['(display-mode: standalone)', '(display-mode: fullscreen)'];
+let relayQuestionRenderHash = '';
+let modelCatalogState = {
+  models: [FALLBACK_MODEL],
+  currentModel: FALLBACK_MODEL,
+  defaultModel: FALLBACK_MODEL,
+  stale: false,
+  warning: null,
+  refreshedAt: null,
+};
+let pullRefreshState = {
+  active: false,
+  ready: false,
+  startY: 0,
+  refreshing: false,
+};
+
+function getTokenFromUrl() {
+  return new URLSearchParams(window.location.search).get('token');
+}
+
+function stripTokenFromUrl() {
+  const url = new URL(window.location.href);
+  if (!url.searchParams.has('token')) return;
+  url.searchParams.delete('token');
+  history.replaceState(null, document.title, `${url.pathname}${url.search}${url.hash}`);
+}
+
+function ensureTrailingSlashPath() {
+  const url = new URL(window.location.href);
+  const path = url.pathname || '/';
+  if (path === '/' || path.endsWith('/')) return false;
+  const lastSegment = path.split('/').filter(Boolean).pop() || '';
+  if (lastSegment.includes('.')) return false;
+  url.pathname = `${path}/`;
+  window.location.replace(url.toString());
+  return true;
+}
+
+function showAuthError(msg) {
+  document.getElementById('auth-error').textContent = msg;
+}
+
+function updateModelCatalogState(payload) {
+  const select = document.getElementById('model-select');
+  if (!select) return;
+  const models = Array.isArray(payload?.models)
+    ? payload.models.map((m) => String(m || '').trim()).filter(Boolean)
+    : [];
+  const currentModel = String(payload?.currentModel || '').trim();
+  const defaultModel = String(payload?.defaultModel || '').trim();
+  const deduped = Array.from(new Set([...CURATED_MODELS, currentModel, defaultModel, ...models].filter(Boolean)));
+  const nextModels = deduped.length ? deduped : [FALLBACK_MODEL];
+
+  modelCatalogState = {
+    models: nextModels,
+    currentModel: currentModel || nextModels[0] || FALLBACK_MODEL,
+    defaultModel: defaultModel || nextModels[0] || FALLBACK_MODEL,
+    stale: !!payload?.stale,
+    warning: payload?.warning ? String(payload.warning) : null,
+    refreshedAt: payload?.refreshedAt || null,
+  };
+
+  const selectedBefore = select.value;
+  select.innerHTML = '';
+  for (const modelId of nextModels) {
+    const opt = document.createElement('option');
+    opt.value = modelId;
+    opt.textContent = MODEL_LABELS[modelId] || modelId;
+    select.appendChild(opt);
+  }
+
+  const preferred = [selectedBefore, localStorage.getItem(MODEL_STORAGE_KEY), modelCatalogState.currentModel, modelCatalogState.defaultModel, nextModels[0]]
+    .find((value) => value && nextModels.includes(value)) || nextModels[0];
+  select.value = preferred;
+  localStorage.setItem(MODEL_STORAGE_KEY, preferred);
+
+  if (modelCatalogState.warning) {
+    setModelBanner(`⚠️ ${modelCatalogState.warning}`);
+  } else if (modelCatalogState.stale) {
+    setModelBanner('⚠️ Model list is cached from CLI; selection may be stale.');
+  } else {
+    setModelBanner('');
+  }
+}
+
+function selectedModelValue() {
+  const select = document.getElementById('model-select');
+  const value = String(select?.value || '').trim();
+  if (value) return value;
+  return modelCatalogState.currentModel || modelCatalogState.defaultModel || FALLBACK_MODEL;
+}
+
+function initModelSelector() {
+  const select = document.getElementById('model-select');
+  if (!select) return;
+  if (!select.dataset.bound) {
+    select.dataset.bound = '1';
+    select.addEventListener('change', () => {
+      localStorage.setItem(MODEL_STORAGE_KEY, select.value);
+    });
+  }
+}
+
+function initModeSelector() {
+  const select = document.getElementById('mode-select');
+  const saved = localStorage.getItem(MODE_STORAGE_KEY);
+  const available = Array.from(select.options).map(o => o.value);
+  if (saved && available.includes(saved)) {
+    select.value = saved;
+  } else if (!saved && available.includes(FALLBACK_MODE)) {
+    select.value = FALLBACK_MODE;
+  }
+  select.addEventListener('change', () => {
+    localStorage.setItem(MODE_STORAGE_KEY, select.value);
+  });
+}
+
+function refreshModelCatalog(force = false) {
+  return loadModelCatalog().then((r) => {
+    if (!r) {
+      if (force) setModelBanner('⚠️ Could not refresh live model list; using current selection.');
+      return;
+    }
+    updateModelCatalogState(r);
+  });
+}
+
+async function loadUsageSummaryAndRender() {
+  const d = await loadUsageSummary();
+  if (!d) throw new Error('Unable to load usage data');
+  const pct = d.premiumInteractions.percentRemaining != null
+    ? ` (${d.premiumInteractions.percentRemaining.toFixed(1)}% left)`
+    : '';
+  const msg = `Chat/Completions: ${d.chat.unlimited ? 'Unlimited ✅' : `${d.chat.remaining} remaining`}\n` +
+    `Premium interactions: ${d.premiumInteractions.remaining} / ${d.premiumInteractions.entitlement} remaining${pct}`;
+  renderSummaryModalContent({
+    title: 'Copilot Usage',
+    subtitle: `Resets ${d.resetDate || 'unknown'}`,
+    bodyHtml: `<pre>${escHtml(msg)}</pre>`,
+    refresh: loadUsageSummaryAndRender,
+    kind: 'usage',
+  });
+}
+
+async function loadContextSummaryAndRender(convId) {
+  const trimmedConvId = String(convId || '').trim();
+  const payload = await loadContextSummary(trimmedConvId);
+  if (!payload) throw new Error('Unable to load context');
+  const title = trimmedConvId ? 'Current Context' : 'Latest Context';
+  const subtitle = payload.runtimeSessionId
+    ? `Runtime session ${String(payload.runtimeSessionId).slice(0, 8)}`
+    : (trimmedConvId ? `Conversation ${trimmedConvId.slice(0, 8)}` : 'Latest runtime session');
+  renderSummaryModalContent({
+    title,
+    subtitle,
+    bodyHtml: `<pre>${escHtml(payload.text || 'No context data available.')}</pre>`,
+    refresh: () => loadContextSummaryAndRender(trimmedConvId),
+    kind: 'context',
+  });
+}
+
+async function showUsage() {
+  const btn = document.getElementById('usage-btn');
+  if (btn) {
+    btn.textContent = '⏳';
+    btn.disabled = true;
+  }
+  openSummaryModal({
+    title: 'Copilot Usage',
+    subtitle: 'Loading…',
+    bodyHtml: '<div class="summary-loading">Fetching usage snapshot…</div>',
+    refresh: loadUsageSummaryAndRender,
+    kind: 'usage',
+  });
+  setSummaryModalLoading(true);
+  try {
+    await loadUsageSummaryAndRender();
+  } catch (e) {
+    renderSummaryModalContent({
+      title: 'Copilot Usage',
+      subtitle: 'Unable to load',
+      bodyHtml: `<div class="summary-error">Failed to fetch usage: ${escHtml(e.message || 'Unknown error')}</div>`,
+      refresh: loadUsageSummaryAndRender,
+      kind: 'usage',
+    });
+  } finally {
+    if (btn) {
+      btn.textContent = '📊';
+      btn.disabled = false;
+    }
+  }
+}
+
+async function showContext() {
+  const btn = document.getElementById('context-btn');
+  const convId = String(currentConvId || '').trim();
+  if (btn) {
+    btn.textContent = '⏳';
+    btn.disabled = true;
+  }
+  openSummaryModal({
+    title: 'Current Context',
+    subtitle: convId ? `Conversation ${convId.slice(0, 8)}` : 'Latest runtime session',
+    bodyHtml: '<div class="summary-loading">Fetching context snapshot…</div>',
+    refresh: () => loadContextSummaryAndRender(convId || null),
+    kind: 'context',
+  });
+  setSummaryModalLoading(true);
+  try {
+    await loadContextSummaryAndRender(convId);
+  } catch (e) {
+    renderSummaryModalContent({
+      title: 'Current Context',
+      subtitle: 'Unable to load',
+      bodyHtml: `<div class="summary-error">Failed to fetch context: ${escHtml(e.message || 'Unknown error')}</div>`,
+      refresh: () => loadContextSummaryAndRender(convId || null),
+      kind: 'context',
+    });
+  } finally {
+    if (btn) {
+      btn.textContent = '🧠';
+      btn.disabled = false;
+    }
+  }
+}
+
+function matchesDisplayMode(query) {
+  try {
+    return !!window.matchMedia(query).matches;
+  } catch {
+    return false;
+  }
+}
+
+function isInstalledAppMode() {
+  const standalone = matchesDisplayMode('(display-mode: standalone)');
+  const manifestFullscreen = matchesDisplayMode('(display-mode: fullscreen)');
+  const browserFullscreen = !!document.fullscreenElement;
+  return standalone || (manifestFullscreen && !browserFullscreen) || window.navigator.standalone === true;
+}
+
+function isDisplayModeFullscreen() {
+  return matchesDisplayMode('(display-mode: fullscreen)');
+}
+
+function isBrowserFullscreenMode() {
+  return !!document.fullscreenElement;
+}
+
+function shouldUseImmersiveTopLayout() {
+  return isInstalledAppMode() || isDisplayModeFullscreen() || isBrowserFullscreenMode();
+}
+
+function syncInstalledAppUiState() {
+  const installed = isInstalledAppMode();
+  document.body.classList.toggle('installed-app', installed);
+  document.body.classList.toggle('immersive-top', shouldUseImmersiveTopLayout());
+}
+
+function canToggleFullscreen() {
+  return !!document.documentElement.requestFullscreen || !!document.fullscreenElement;
+}
+
+async function ensureInstalledAppFullscreen(options = {}) {
+  syncInstalledAppUiState();
+  if (!isInstalledAppMode()) {
+    return false;
+  }
+  if (isDisplayModeFullscreen() || document.fullscreenElement) {
+    return true;
+  }
+  if (!canToggleFullscreen()) return false;
+  if (!options.userGesture) return false;
+  try {
+    await document.documentElement.requestFullscreen();
+    return true;
+  } catch {
+    return false;
+  } finally {
+    updateInstallButton();
+    updateFullscreenButton();
+  }
+}
+
+function getInstallHelpMessage() {
+  const ua = String(navigator.userAgent || '').toLowerCase();
+  if (/iphone|ipad|ipod/.test(ua)) {
+    return 'To install on iPhone/iPad: open this page in Safari, tap Share, then choose "Add to Home Screen".';
+  }
+  if (/android/.test(ua)) {
+    return 'To install on Android: open the browser menu (⋮) and choose "Install app" or "Add to Home screen". If Chrome says the app is already installed, open it from your launcher or uninstall the old copy first.';
+  }
+  return 'To install: open your browser menu and choose "Install app" or "Add to Home screen".';
+}
+
+function updateInstallButton() {
+  const btn = document.getElementById('install-btn');
+  if (!btn) return;
+  syncInstalledAppUiState();
+
+  if (isInstalledAppMode()) {
+    btn.style.display = 'none';
+    return;
+  }
+
+  const title = deferredInstallPrompt ? 'Install app to home screen' : 'Show install instructions';
+  btn.textContent = '⬇';
+  btn.style.display = 'inline-flex';
+  btn.title = title;
+}
+
+async function promptInstallApp() {
+  if (!deferredInstallPrompt) {
+    await new Promise((resolve) => setTimeout(resolve, 350));
+  }
+  if (deferredInstallPrompt) {
+    try {
+      deferredInstallPrompt.prompt();
+      const choice = await deferredInstallPrompt.userChoice.catch(() => null);
+      if (choice?.outcome === 'accepted') {
+        showTransientRelayNotice('Install accepted. The app will appear on your home screen.');
+      }
+    } finally {
+      deferredInstallPrompt = null;
+      updateInstallButton();
+    }
+    return;
+  }
+
+  alert(getInstallHelpMessage());
+}
+
+function initInstallButton() {
+  if (window.__installButtonBound) {
+    updateInstallButton();
+    ensureInstalledAppFullscreen().catch(() => {});
+    return;
+  }
+  window.__installButtonBound = true;
+
+  window.addEventListener('beforeinstallprompt', (event) => {
+    event.preventDefault();
+    deferredInstallPrompt = event;
+    updateInstallButton();
+    updateFullscreenButton();
+  });
+
+  window.addEventListener('appinstalled', () => {
+    deferredInstallPrompt = null;
+    updateInstallButton();
+    updateFullscreenButton();
+    ensureInstalledAppFullscreen().catch(() => {});
+    showTransientRelayNotice('App installed.');
+  });
+
+  window.addEventListener('resize', () => {
+    updateInstallButton();
+    updateFullscreenButton();
+  }, { passive: true });
+
+  for (const query of INSTALLED_DISPLAY_MODE_QUERIES) {
+    const media = window.matchMedia(query);
+    if (media && typeof media.addEventListener === 'function') {
+      media.addEventListener('change', () => {
+        updateInstallButton();
+        updateFullscreenButton();
+        ensureInstalledAppFullscreen().catch(() => {});
+      });
+    }
+  }
+
+  updateInstallButton();
+  updateFullscreenButton();
+  ensureInstalledAppFullscreen().catch(() => {});
+}
+
+async function toggleFullscreen() {
+  if (isInstalledAppMode()) {
+    ensureInstalledAppFullscreen({ userGesture: true }).catch(() => {});
+    return;
+  }
+  if (!canToggleFullscreen()) return;
+  try {
+    if (document.fullscreenElement) {
+      await document.exitFullscreen();
+    } else {
+      await document.documentElement.requestFullscreen();
+    }
+  } catch {
+  } finally {
+    updateInstallButton();
+    updateFullscreenButton();
+  }
+}
+
+function updateFullscreenButton() {
+  const btn = document.getElementById('fullscreen-btn');
+  if (!btn) return;
+  syncInstalledAppUiState();
+
+  if (isInstalledAppMode()) {
+    btn.style.display = 'none';
+    return;
+  }
+
+  const mobile = window.matchMedia('(max-width: 680px)').matches;
+  if (!mobile) {
+    btn.style.display = 'none';
+    return;
+  }
+
+  const full = !!document.fullscreenElement;
+  const supported = canToggleFullscreen();
+  btn.style.display = 'inline-flex';
+  btn.disabled = !supported;
+
+  if (full) {
+    btn.textContent = '⤢';
+    btn.title = 'Exit fullscreen';
+  } else {
+    btn.textContent = '⛶';
+    btn.title = supported ? 'Enter fullscreen' : 'Fullscreen not supported on this browser';
+  }
+}
+
+function startRelayQuestionPolling() {
+  if (relayQuestionPollTimer) return;
+  relayQuestionPollTimer = setInterval(() => {
+    loadRelayQuestions(currentConvId).catch(() => {});
+  }, 3000);
+}
+
+function setupViewportTracking() {
+  syncViewportMetrics();
+  const update = () => syncViewportMetrics();
+  window.addEventListener('resize', update, { passive: true });
+  window.addEventListener('orientationchange', update, { passive: true });
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', update, { passive: true });
+    window.visualViewport.addEventListener('scroll', update, { passive: true });
+  }
+
+  const input = document.getElementById('msg-input');
+  if (input && input.dataset.viewportBound !== '1') {
+    input.dataset.viewportBound = '1';
+    input.addEventListener('focus', () => {
+      document.body.classList.add('keyboard-open');
+      syncViewportMetrics();
+    }, { passive: true });
+    input.addEventListener('blur', () => {
+      document.body.classList.remove('keyboard-open');
+      syncViewportMetrics();
+    }, { passive: true });
+  }
+}
+
+function initPullToRefresh() {
+  const el = document.getElementById('messages');
+  if (!el || el.dataset.pullRefreshBound === '1') return;
+  el.dataset.pullRefreshBound = '1';
+  el.addEventListener('touchstart', onMessagesTouchStart, { passive: true });
+  el.addEventListener('touchmove', onMessagesTouchMove, { passive: false });
+  el.addEventListener('touchend', onMessagesTouchEnd, { passive: true });
+  el.addEventListener('touchcancel', onMessagesTouchEnd, { passive: true });
+}
+
+function onMessagesTouchStart(event) {
+  const el = event.currentTarget;
+  if (!el || el.scrollTop > 0 || pullRefreshState.refreshing) return;
+  const touch = event.touches?.[0];
+  if (!touch) return;
+
+  pullRefreshState = {
+    active: true,
+    ready: false,
+    startY: touch.clientY,
+    refreshing: pullRefreshState.refreshing,
+  };
+  setPullRefreshIndicator(0, 'Pull down to refresh');
+}
+
+function onMessagesTouchMove(event) {
+  if (!pullRefreshState.active) return;
+  const el = event.currentTarget;
+  if (!el || el.scrollTop > 0) {
+    resetPullRefreshIndicator();
+    return;
+  }
+  const touch = event.touches?.[0];
+  if (!touch) return;
+  const delta = touch.clientY - pullRefreshState.startY;
+  if (delta <= 0) {
+    resetPullRefreshIndicator();
+    return;
+  }
+  const distance = Math.min(delta, 120);
+  const ready = distance >= 72;
+  pullRefreshState.ready = ready;
+  setPullRefreshIndicator(distance, ready ? 'Release to refresh' : 'Pull down to refresh', ready);
+  if (delta > 6) event.preventDefault();
+}
+
+async function onMessagesTouchEnd() {
+  if (!pullRefreshState.active) return;
+  const shouldRefresh = pullRefreshState.ready && !pullRefreshState.refreshing;
+  pullRefreshState.active = false;
+  pullRefreshState.ready = false;
+  if (!shouldRefresh) {
+    resetPullRefreshIndicator();
+    return;
+  }
+  pullRefreshState.refreshing = true;
+  setPullRefreshIndicator(72, 'Refreshing…', true);
+  try {
+    await refreshCurrentView();
+  } finally {
+    pullRefreshState.refreshing = false;
+    resetPullRefreshIndicator();
+  }
+}
+
+async function refreshCurrentView() {
+  const currentId = currentConvId;
+  const messagesEl = document.getElementById('messages');
+  const scrollTop = messagesEl?.scrollTop || 0;
+
+  await refreshConversations();
+  if (!currentId) {
+    renderMessages([]);
+    restoreInFlightThinking(null);
+    scheduleContextUsageRefresh(null);
+    return;
+  }
+
+  const r = await loadConversation(currentId);
+  if (r) {
+    renderMessages(r.messages, false);
+    restoreInFlightThinking(r.inFlight || null);
+  } else {
+    restoreInFlightThinking(null);
+  }
+  await loadRelayQuestions(currentId);
+  scheduleContextUsageRefresh(currentId, 0);
+  if (messagesEl) messagesEl.scrollTop = scrollTop;
+}
+
+function initFullscreenButton() {
+  const syncFullscreenUi = () => {
+    updateInstallButton();
+    updateFullscreenButton();
+    ensureInstalledAppFullscreen().catch(() => {});
+  };
+  document.addEventListener('fullscreenchange', syncFullscreenUi);
+  window.addEventListener('resize', syncFullscreenUi);
+  for (const query of INSTALLED_DISPLAY_MODE_QUERIES) {
+    const media = window.matchMedia(query);
+    if (media && typeof media.addEventListener === 'function') {
+      media.addEventListener('change', syncFullscreenUi);
+    }
+  }
+  updateFullscreenButton();
+  ensureInstalledAppFullscreen().catch(() => {});
+}
+
+async function connectSocket() {
+  socket = io({ path: `${window.location.pathname.replace(/\/+$/, '')}/socket.io/`, auth: TOKEN ? { token: TOKEN, clientId: CLIENT_ID } : { clientId: CLIENT_ID } });
+
+  socket.on('connect', () => {
+    console.log('Socket connected');
+    setCliOnline(true);
+    refreshModelCatalog().catch(() => {});
+  });
+  socket.on('connect_error', (e) => console.error('Socket error:', e.message));
+  socket.on('cli_status', ({ online }) => {
+    setCliOnline(online);
+    if (online) refreshModelCatalog().catch(() => {});
+  });
+  socket.on('models_updated', (payload) => {
+    updateModelCatalogState(payload || {});
+  });
+  socket.on('workspace_root_changed', (payload) => {
+    updateWorkspaceRootHints(payload || {});
+    if (repoBrowserState.activeRoot !== 'workspace') return;
+    repoBrowserState.currentPath = '';
+    if (repoBrowserState.open) {
+      void loadRepoBrowserTree();
+    }
+  });
+  socket.on('user_message', ({ conversationId, messageId, senderClientId, message }) => {
+    if (senderClientId && senderClientId === CLIENT_ID) {
+      pendingUserMessageIds.delete(messageId);
+      return;
+    }
+    if (messageId && (pendingUserMessageIds.has(messageId) || seenMessageIds?.has(messageId))) {
+      pendingUserMessageIds.delete(messageId);
+      return;
+    }
+    if (conversationId === currentConvId) appendMessage(message, true, messageId);
+  });
+  socket.on('assistant_message', ({ conversationId, message, messageId, sourceMessageId }) => {
+    removeThinking();
+    if ((!message?.activities || !message.activities.length) && sourceMessageId) {
+      const cached = relayActivities.get(sourceMessageId) || [];
+      if (cached.length) message.activities = cached.slice(0, 48);
+    }
+    if (messageId && seenMessageIds?.has(messageId)) return;
+    if (conversationId === currentConvId) {
+      appendMessage(message, true, messageId || null);
+      scheduleContextUsageRefresh(conversationId, 120);
+    }
+    if (sourceMessageId) relayActivities.delete(sourceMessageId);
+  });
+  socket.on('relay_question', ({ question }) => upsertRelayQuestion(question));
+  socket.on('relay_question_updated', ({ question }) => upsertRelayQuestion(question));
+  socket.on('relay_question_changed', () => {
+    loadRelayQuestions(currentConvId);
+  });
+  socket.on('relay_activity', ({ conversationId, messageId, text }) => {
+    if (!messageId || !text) return;
+    const items = relayActivities.get(messageId) || [];
+    const last = items[items.length - 1];
+    if (last !== text) relayActivities.set(messageId, items.concat(text).slice(-24));
+    if (conversationId === currentConvId) appendThinkingActivity(text);
+  });
+  socket.on('conversation_compacted', async ({ sourceConversationId, targetConversationId }) => {
+    if (!sourceConversationId || !targetConversationId) return;
+    await refreshConversations();
+    if (currentConvId === sourceConversationId) {
+      await openConversation(targetConversationId);
+    } else {
+      updateCompactButton();
+    }
+  });
+  socket.on('message_status', ({ messageId, conversationId, status }) => {
+    if (conversationId === currentConvId && status === 'processing') {
+      showThinking();
+      renderThinkingActivities();
+    }
+    if (conversationId === currentConvId && (status === 'done' || status === 'failed' || status === 'dropped')) {
+      removeThinking();
+      scheduleContextUsageRefresh(conversationId, 220);
+    }
+  });
+  socket.on('conversation_deleted', ({ conversationId }) => {
+    delete conversations[conversationId];
+    for (const [id, question] of relayQuestions.entries()) {
+      if (question?.conversationId === conversationId) relayQuestions.delete(id);
+    }
+    for (const id of relayQuestionDrafts.keys()) {
+      const q = relayQuestionDrafts.get(id);
+      if (!q || q.conversationId === conversationId) relayQuestionDrafts.delete(id);
+    }
+    updatePendingQuestionBanner();
+    renderConvList();
+    if (currentConvId === conversationId) {
+      setCurrentConv(null);
+      renderMessages([]);
+      document.getElementById('chat-title').textContent = 'Select or start a conversation';
+      updateSessionPill(null, null);
+      updateCompactButton();
+      scheduleContextUsageRefresh(null);
+    } else {
+      updateCompactButton();
+    }
+  });
+}
+
+function showAuthGate() {
+  document.getElementById('auth-gate').style.display = 'flex';
+  document.getElementById('app').classList.remove('visible');
+}
+
+async function initApp() {
+  setupViewportTracking();
+  document.getElementById('auth-gate').style.display = 'none';
+  document.getElementById('app').classList.add('visible');
+  initModeSelector();
+  initModelSelector();
+  await refreshWorkspaceRootHints();
+  await refreshModelCatalog(true);
+  initFullscreenButton();
+  initInstallButton();
+  initPullToRefresh();
+  connectSocket();
+  startRelayQuestionPolling();
+  await loadConversations();
+  await loadRelayQuestions(currentConvId);
+  updateCompactButton();
+  document.getElementById('msg-input').focus();
+}
+
+async function doAuth() {
+  const val = document.getElementById('token-input').value.trim() || getTokenFromUrl();
+  if (!val) return showAuthError('Please enter a token');
+  const ok = await verifyToken(val);
+  if (ok) {
+    setToken(val);
+    initApp();
+  } else {
+    showAuthError('Invalid token');
+  }
+}
+
+function registerPwaShell() {
+  if (!('serviceWorker' in navigator)) return;
+  const scopeBase = window.location.pathname.replace(/\/+$/, '');
+  const scopeRoot = `${scopeBase}/`;
+  return navigator.serviceWorker.register(`${scopeBase}/sw.js`, { scope: scopeRoot, updateViaCache: 'none' }).catch(() => {});
+}
+
+async function bootstrap() {
+  if (ensureTrailingSlashPath()) return;
+  registerPwaShell();
+  initInstallButton();
+  const urlToken = getTokenFromUrl();
+  if (urlToken) stripTokenFromUrl();
+  if (await verifyExistingSession()) {
+    await initApp();
+    return;
+  }
+  if (urlToken) {
+    const ok = await verifyToken(urlToken);
+    if (ok) {
+      setToken(urlToken);
+      await initApp();
+      return;
+    }
+  }
+  if (urlToken) document.getElementById('token-input').value = urlToken;
+  showAuthGate();
+}
+
+window.doAuth = doAuth;
+window.initApp = initApp;
+window.connectSocket = connectSocket;
+window.openSidebar = openSidebar;
+window.closeSidebar = closeSidebar;
+window.showUsage = showUsage;
+window.showContext = showContext;
+window.promptInstallApp = promptInstallApp;
+window.toggleFullscreen = toggleFullscreen;
+window.openRepoBrowser = openRepoBrowser;
+window.closeRepoBrowser = closeRepoBrowser;
+window.loadRepoBrowserTree = loadRepoBrowserTree;
+window.refreshRepoBrowser = refreshRepoBrowser;
+window.initModeSelector = initModeSelector;
+window.initModelSelector = initModelSelector;
+window.refreshModelCatalog = refreshModelCatalog;
+window.selectedModelValue = selectedModelValue;
+window.getPreferredModelSelection = () => selectedModelValue();
+window.applyModelCatalogState = updateModelCatalogState;
+window.updateCliStatus = updateCliStatus;
+window.showAuthError = showAuthError;
+window.registerPwaShell = registerPwaShell;
+window.newConversation = newConversation;
+window.deleteConv = deleteConv;
+window.openConversation = openConversation;
+window.refreshConversations = refreshConversations;
+window.renderConvList = renderConvList;
+window.handleAttachmentInput = handleAttachmentInput;
+window.removeAttachment = removeAttachment;
+window.clearAttachments = clearAttachments;
+window.openUploadedAttachmentViewer = openUploadedAttachmentViewer;
+window.setFilePreviewMode = setFilePreviewMode;
+window.toggleFilePreviewHtml = toggleFilePreviewHtml;
+window.closeFilePreview = closeFilePreview;
+window.openWorkspaceFilePreview = openWorkspaceFilePreview;
+window.openWorkspaceFilePreviewFromRepo = openWorkspaceFilePreviewFromRepo;
+window.setRepoBrowserRoot = setRepoBrowserRoot;
+window.setRepoBrowserViewMode = setRepoBrowserViewMode;
+window.toggleRepoBrowserHidden = toggleRepoBrowserHidden;
+window.toggleRepoBrowserHeavy = toggleRepoBrowserHeavy;
+window.focusRepoTree = focusRepoTree;
+window.setRepoCurrentPath = setRepoCurrentPath;
+window.submitRelayQuestionChoice = submitRelayQuestionChoice;
+window.submitRelayQuestionAnswer = submitRelayQuestionAnswer;
+window.onRelayQuestionDraftInput = onRelayQuestionDraftInput;
+window.handleRelayQuestionKey = handleRelayQuestionKey;
+window.openPendingQuestionFromBanner = openPendingQuestionFromBanner;
+window.compactCurrentConversation = compactCurrentConversation;
+window.sendMessage = sendMessage;
+window.handleKey = handleKey;
+window.autoResize = autoResize;
+window.closeSummaryModal = closeSummaryModal;
+window.refreshSummaryModal = refreshSummaryModal;
+window.renderSummaryModalContent = renderSummaryModalContent;
+window.setSummaryModalLoading = setSummaryModalLoading;
+window.openSummaryModal = openSummaryModal;
+
+bootstrap();
+

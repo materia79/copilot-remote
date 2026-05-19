@@ -30,6 +30,8 @@ import { createPollingLoop } from "./polling/polling-loop.mjs";
 import { createManagedServerLifecycle } from "./server-lifecycle/managed-server.mjs";
 import { createModelSwitchingService } from "./model-api/model-switching.mjs";
 import { createSessionIoHelpers } from "./runtime/session-io.mjs";
+import { clearSession, registerSession } from "./runtime/session-registry.mjs";
+import { syncSessionToServer } from "./runtime/session-sync-bridge.mjs";
 
 const SERVER_URL   = "http://localhost:3333";
 const POLL_MS      = 2000;
@@ -82,6 +84,7 @@ const stopManagedServer = managedServerLifecycle.stopManagedServer;
 process.on("exit", () => {
   shutdownStarted = true;
   sessionReady = false;
+  clearSession();
   pollingLoopController?.stopPolling?.();
   stopHeartbeat();
   managedServerLifecycle.killManagedProcessTree();
@@ -119,6 +122,33 @@ let warnedConversationModeFallback = false;
 let session = null;
 let heartbeatController = null;
 let pollingLoopController = null;
+
+function getCurrentConversationId() {
+  const conversationId = String(activeMsg?.conversationId || "").trim();
+  return conversationId || null;
+}
+
+function refreshSessionRegistry() {
+  const sdkSessionId = String(session?.sessionId || "").trim();
+  if (!sdkSessionId) {
+    clearSession();
+    return null;
+  }
+
+  return registerSession(sdkSessionId, getCurrentConversationId());
+}
+
+async function syncActiveSession(reason) {
+  const activeSession = refreshSessionRegistry();
+  if (!activeSession?.sdkSessionId) return false;
+
+  try {
+    return await syncSessionToServer(activeSession.sdkSessionId, activeSession.conversationId, api);
+  } catch (e) {
+    dbg("session sync failed:", reason, e?.message || String(e));
+    return false;
+  }
+}
 
 const sessionIo = createSessionIoHelpers({
   getSession: () => session,
@@ -253,6 +283,7 @@ async function gracefulShutdown(reason) {
   pollingLoopController?.stopPolling?.();
   stopHeartbeat();
   sessionReady = false;
+  clearSession();
   await Promise.race([
     requeueActiveMessage(reason),
     sleep(500).then(() => false),
@@ -408,6 +439,8 @@ session = await joinSession({
   },
 });
 
+refreshSessionRegistry();
+dbg("copilot session id:", session?.sessionId || "(none)");
 dbg("joinSession resolved");
 setTimeout(() => {
   ensureRelayActive("post-join-fallback").catch((e) => {
@@ -426,6 +459,7 @@ async function ensureRelayActive(reason) {
     dbg("ensureRelayActive", reason);
     await ensureManagedServer();
     sessionReady = true;
+    await syncActiveSession(reason);
     const status = await api("GET", "/api/status").catch(() => null);
     await renderRelayReadyBannerFromStatus(status, { force: false }).catch((e) => {
       dbg("render relay banner failed:", e?.message || String(e));

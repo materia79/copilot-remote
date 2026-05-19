@@ -17,6 +17,12 @@ import {
   parseCdCommandTarget,
   resolveCdCommandPath,
 } from './workspace-root.mjs';
+import { createSessionRepository } from './repositories/session-repository.mjs';
+import { createMessageRepository } from './repositories/message-repository.mjs';
+import { createQuestionRepository } from './repositories/question-repository.mjs';
+import { registerSessionsRoutes } from './routes/sessions-routes.mjs';
+import { registerMessagesRoutes } from './routes/messages-routes.mjs';
+import { registerAskUserRoutes } from './routes/ask-user-routes.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -436,6 +442,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS conversations (
     id         TEXT PRIMARY KEY,
     title      TEXT NOT NULL,
+    sdk_session_id TEXT,
     archived   INTEGER NOT NULL DEFAULT 0,
     compacted_into TEXT,
     compacted_from TEXT,
@@ -481,6 +488,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS runtime_sessions (
     id              TEXT PRIMARY KEY,
     conversation_id TEXT NOT NULL UNIQUE,
+    sdk_session_id  TEXT,
     strategy        TEXT NOT NULL DEFAULT 'isolated',
     runtime_key     TEXT NOT NULL,
     model           TEXT,
@@ -585,6 +593,9 @@ if (runtimeSessionColumns.length) {
   if (!runtimeSessionColumns.includes('strategy')) {
     db.exec(`ALTER TABLE runtime_sessions ADD COLUMN strategy TEXT NOT NULL DEFAULT 'isolated'`);
   }
+  if (!runtimeSessionColumns.includes('sdk_session_id')) {
+    db.exec(`ALTER TABLE runtime_sessions ADD COLUMN sdk_session_id TEXT`);
+  }
   if (!runtimeSessionColumns.includes('runtime_key')) {
     db.exec(`ALTER TABLE runtime_sessions ADD COLUMN runtime_key TEXT NOT NULL DEFAULT ''`);
     db.exec(`UPDATE runtime_sessions SET runtime_key = id WHERE runtime_key IS NULL OR runtime_key = ''`);
@@ -607,6 +618,9 @@ const conversationColumns = db.prepare(`PRAGMA table_info(conversations)`).all()
 if (!conversationColumns.includes('archived')) {
   db.exec(`ALTER TABLE conversations ADD COLUMN archived INTEGER NOT NULL DEFAULT 0`);
 }
+if (!conversationColumns.includes('sdk_session_id')) {
+  db.exec(`ALTER TABLE conversations ADD COLUMN sdk_session_id TEXT`);
+}
 if (!conversationColumns.includes('compacted_into')) {
   db.exec(`ALTER TABLE conversations ADD COLUMN compacted_into TEXT`);
 }
@@ -620,78 +634,13 @@ if (!conversationColumns.includes('seed_pending')) {
   db.exec(`ALTER TABLE conversations ADD COLUMN seed_pending INTEGER NOT NULL DEFAULT 0`);
 }
 
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_sessions_sdk_session_id ON runtime_sessions(sdk_session_id) WHERE sdk_session_id IS NOT NULL AND sdk_session_id != ''`);
+
 // ─── Prepared Statements ──────────────────────────────────────────────────────
 const stmts = {
-  // conversations
-  getConv:        db.prepare(`SELECT * FROM conversations WHERE id = ?`),
-  listConvIdsMissingRuntimeSession: db.prepare(`SELECT c.id AS id FROM conversations c LEFT JOIN runtime_sessions rs ON rs.conversation_id = c.id WHERE rs.id IS NULL`),
-  listConvs:      db.prepare(`SELECT c.id, c.title, c.archived, c.compacted_into, c.compacted_from, c.created_at, c.updated_at, rs.id AS runtime_session_id, rs.strategy AS runtime_strategy, rs.status AS runtime_status, rs.last_used_at AS runtime_last_used_at, COUNT(m.id) as message_count FROM conversations c LEFT JOIN messages m ON m.conversation_id = c.id LEFT JOIN runtime_sessions rs ON rs.conversation_id = c.id GROUP BY c.id ORDER BY c.updated_at DESC`),
-  insertConv:     db.prepare(`INSERT OR IGNORE INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)`),
-  updateConvTime: db.prepare(`UPDATE conversations SET updated_at = ? WHERE id = ?`),
-  updateConvSeed: db.prepare(`UPDATE conversations SET summary_seed = ?, seed_pending = ?, compacted_from = ?, updated_at = ? WHERE id = ?`),
-  markConvCompacted: db.prepare(`UPDATE conversations SET archived = 1, compacted_into = ?, updated_at = ? WHERE id = ?`),
-  getConvSeed:    db.prepare(`SELECT summary_seed, seed_pending FROM conversations WHERE id = ?`),
-  clearConvSeed:  db.prepare(`UPDATE conversations SET seed_pending = 0, updated_at = ? WHERE id = ?`),
-  deleteConv:     db.prepare(`DELETE FROM conversations WHERE id = ?`),
-
-  // messages
-  getMessages:    db.prepare(`SELECT * FROM messages WHERE conversation_id = ? ORDER BY timestamp ASC`),
-  getLatestConversationModel: db.prepare(`SELECT model FROM messages WHERE conversation_id = ? AND model IS NOT NULL AND model != '' ORDER BY timestamp DESC LIMIT 1`),
-  getRecentMessagesDesc: db.prepare(`SELECT role, text, timestamp FROM messages WHERE conversation_id = ? ORDER BY timestamp DESC LIMIT ?`),
-  insertMsg:      db.prepare(`INSERT INTO messages (id, conversation_id, role, text, model, mode, attachments, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`),
-
-  // queue
-  insertQ:        db.prepare(`INSERT INTO queue (id, conversation_id, runtime_session_id, is_new_conversation, model, relay_mode, text, attachments, status, timestamp, retry_count, next_attempt_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, NULL)`),
-  findPending:    db.prepare(`SELECT * FROM queue WHERE status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY retry_count ASC, CASE WHEN next_attempt_at IS NULL THEN 0 ELSE 1 END ASC, COALESCE(next_attempt_at, timestamp) ASC, timestamp ASC LIMIT 1`),
-  countStatus:    db.prepare(`SELECT status, COUNT(*) as cnt FROM queue WHERE status IN ('pending','processing') GROUP BY status`),
-  countRuntimeSessions: db.prepare(`SELECT COUNT(*) AS cnt FROM runtime_sessions WHERE status = 'active'`),
-  setProcessing:  db.prepare(`UPDATE queue SET status = 'processing', processing_at = ? WHERE id = ?`),
-  setQueueRuntimeSession: db.prepare(`UPDATE queue SET runtime_session_id = ? WHERE id = ?`),
-  setDone:        db.prepare(`UPDATE queue SET status = 'done', response = ?, processing_at = NULL, next_attempt_at = NULL WHERE id = ? AND status IN ('processing', 'pending')`),
-  setFailed:      db.prepare(`UPDATE queue SET status = 'failed', response = ?, processing_at = NULL, next_attempt_at = NULL WHERE id = ?`),
-  deleteConvQ:    db.prepare(`DELETE FROM queue WHERE conversation_id = ?`),
-  findQById:      db.prepare(`SELECT * FROM queue WHERE id = ?`),
-  pruneQueue:     db.prepare(`DELETE FROM queue WHERE status = 'done' AND id NOT IN (SELECT id FROM queue WHERE status = 'done' ORDER BY timestamp DESC LIMIT 200)`),
-  recoverStale:   db.prepare(`UPDATE queue SET status = 'pending', processing_at = NULL, next_attempt_at = ? WHERE status = 'processing' AND processing_at < ?`),
-  listRecoverableProcessing: db.prepare(`SELECT id, conversation_id FROM queue WHERE status = 'processing' AND processing_at < ?`),
-  recoverProcessingBefore: db.prepare(`UPDATE queue SET status = 'pending', processing_at = NULL, next_attempt_at = ? WHERE status = 'processing' AND processing_at < ?`),
-  listQueueForPauseDrop: db.prepare(`SELECT id, conversation_id FROM queue WHERE status IN ('pending', 'processing')`),
-  deleteQueueById: db.prepare(`DELETE FROM queue WHERE id = ?`),
-  getLatestProcessingQueueByConversation: db.prepare(`SELECT id, relay_mode, timestamp, processing_at FROM queue WHERE conversation_id = ? AND status = 'processing' ORDER BY COALESCE(processing_at, timestamp) DESC LIMIT 1`),
-
-  // runtime sessions
-  getRuntimeSessionByConversation: db.prepare(`SELECT * FROM runtime_sessions WHERE conversation_id = ?`),
-  getRuntimeSessionById: db.prepare(`SELECT * FROM runtime_sessions WHERE id = ?`),
-  listRuntimeSessions: db.prepare(`SELECT rs.*, c.title AS conversation_title, c.updated_at AS conversation_updated_at FROM runtime_sessions rs LEFT JOIN conversations c ON c.id = rs.conversation_id ORDER BY rs.last_used_at DESC`),
-  insertRuntimeSession: db.prepare(`INSERT INTO runtime_sessions (id, conversation_id, strategy, runtime_key, model, status, created_at, last_used_at) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)`),
-  touchRuntimeSession: db.prepare(`UPDATE runtime_sessions SET model = ?, last_used_at = ?, status = 'active' WHERE id = ?`),
-  deleteRuntimeSessionByConversation: db.prepare(`DELETE FROM runtime_sessions WHERE conversation_id = ?`),
-
-  // relay questions
-  insertQuestion: db.prepare(`INSERT INTO relay_questions (id, queue_id, conversation_id, message_id, relay_mode, prompt, choices, request, status, answer, created_at, answered_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, NULL, ?)`),
-  getQuestion:    db.prepare(`SELECT * FROM relay_questions WHERE id = ?`),
-  findPendingQuestionByMessage: db.prepare(`SELECT * FROM relay_questions WHERE message_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1`),
-  listQuestions:  db.prepare(`SELECT * FROM relay_questions WHERE status = ? AND (? IS NULL OR conversation_id = ?) ORDER BY created_at ASC`),
-  answerQuestion: db.prepare(`UPDATE relay_questions SET status = 'answered', answer = ?, answered_at = ? WHERE id = ? AND status = 'pending'`),
-  timeoutQuestion:db.prepare(`UPDATE relay_questions SET status = 'timed_out' WHERE id = ? AND status = 'pending'`),
-  deleteConvQuestions: db.prepare(`DELETE FROM relay_questions WHERE conversation_id = ?`),
-  expireQuestions: db.prepare(`UPDATE relay_questions SET status = 'timed_out' WHERE status = 'pending' AND expires_at < ?`),
-
-  // relay activity
-  insertActivity: db.prepare(`INSERT INTO relay_activity (queue_message_id, response_message_id, conversation_id, relay_mode, text, created_at) VALUES (?, NULL, ?, ?, ?, ?)`),
-  linkActivityToResponse: db.prepare(`UPDATE relay_activity SET response_message_id = ? WHERE queue_message_id = ? AND response_message_id IS NULL`),
-  listActivityByResponse: db.prepare(`SELECT text FROM relay_activity WHERE response_message_id = ? ORDER BY id ASC`),
-  listActivityByQueueMessage: db.prepare(`SELECT text FROM relay_activity WHERE queue_message_id = ? ORDER BY id ASC`),
-  deleteConvActivity: db.prepare(`DELETE FROM relay_activity WHERE conversation_id = ?`),
-
-  // uploads
-  getUploadFile: db.prepare(`SELECT * FROM uploaded_files WHERE sha256 = ?`),
-  insertUploadFile: db.prepare(`INSERT OR IGNORE INTO uploaded_files (sha256, original_name, mime_type, size_bytes, created_at) VALUES (?, ?, ?, ?, ?)`),
-  insertUploadRef: db.prepare(`INSERT OR IGNORE INTO upload_refs (file_sha256, conversation_id, message_id, created_at) VALUES (?, ?, ?, ?)`),
-  listUploadHashesByConversation: db.prepare(`SELECT DISTINCT file_sha256 FROM upload_refs WHERE conversation_id = ?`),
-  deleteUploadRefsByConversation: db.prepare(`DELETE FROM upload_refs WHERE conversation_id = ?`),
-  countUploadRefsBySha: db.prepare(`SELECT COUNT(*) AS cnt FROM upload_refs WHERE file_sha256 = ?`),
-  deleteUploadFile: db.prepare(`DELETE FROM uploaded_files WHERE sha256 = ?`),
+  ...createSessionRepository(db),
+  ...createMessageRepository(db),
+  ...createQuestionRepository(db),
 };
 
 function queueCounts() {
@@ -929,31 +878,6 @@ function resolveSessionStateRoot() {
   return candidates.find(Boolean) || path.join('.copilot', 'session-state');
 }
 
-function findLatestSessionEventsPath(root) {
-  if (!root || !fs.existsSync(root)) return null;
-  let latestPath = null;
-  let latestMtime = 0;
-  let entries = [];
-  try {
-    entries = fs.readdirSync(root, { withFileTypes: true });
-  } catch {
-    return null;
-  }
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const candidate = path.join(root, entry.name, 'events.jsonl');
-    if (!fs.existsSync(candidate)) continue;
-    let stat = null;
-    try { stat = fs.statSync(candidate); } catch { continue; }
-    const mtime = Number(stat?.mtimeMs || 0);
-    if (mtime > latestMtime) {
-      latestMtime = mtime;
-      latestPath = candidate;
-    }
-  }
-  return latestPath;
-}
-
 function extractSessionIdFromEventsPath(eventsPath) {
   const parent = path.basename(path.dirname(String(eventsPath || '')));
   return parent || null;
@@ -966,14 +890,10 @@ function readContextFromSessionEvents(runtimeSessionId, runtimeSessionKey = null
   const root = resolveSessionStateRoot();
   const expectedEventsPath = path.join(root, sessionKey, 'events.jsonl');
   let eventsPath = expectedEventsPath;
-  let lookupWarning = null;
   if (!fs.existsSync(eventsPath)) {
-    const latestEventsPath = findLatestSessionEventsPath(root);
-    if (!latestEventsPath) {
-      return { snapshot: null, eventsPath, error: `Session events file not found at ${expectedEventsPath}` };
-    }
-    eventsPath = latestEventsPath;
-    lookupWarning = `Session events file not found for runtime ID ${sessionKey};\n  using latest session events file instead.`;
+    // Never fall back to the newest events file here: that can belong to a
+    // different conversation and would cross-wire context for the wrong session.
+    return { snapshot: null, eventsPath, error: `Session events file not found at ${expectedEventsPath}` };
   }
 
   let content = '';
@@ -1047,7 +967,7 @@ function readContextFromSessionEvents(runtimeSessionId, runtimeSessionKey = null
       : null;
     return {
       eventsPath,
-      error: lookupWarning || partialMetricsWarning,
+      error: partialMetricsWarning,
       snapshot: {
         runtime_session_id: sessionId,
         copilot_session_id: copilotSessionId,
@@ -1072,6 +992,28 @@ function readContextFromSessionEvents(runtimeSessionId, runtimeSessionKey = null
   }
 
   return { snapshot: null, eventsPath, error: 'No context-bearing events found for this session' };
+}
+
+function resolveConversationContext(conversationId) {
+  const normalizedConversationId = String(conversationId || '').trim();
+  if (!normalizedConversationId) {
+    return { ok: false, status: 404, error: 'Missing conversationId' };
+  }
+
+  const runtimeSession = stmts.getRuntimeSessionByConversation.get(normalizedConversationId) || null;
+  if (!runtimeSession?.id) {
+    return { ok: false, status: 404, error: 'Conversation context not found' };
+  }
+
+  const parsed = readContextFromSessionEvents(runtimeSession.id, runtimeSession.runtime_key || runtimeSession.id || null);
+  if (!parsed.snapshot) {
+    const missingContextFile = String(parsed.error || '').startsWith('Session events file not found at ');
+    if (missingContextFile || parsed.error === 'Missing runtime session ID') {
+      return { ok: false, status: 404, error: 'Conversation context not found' };
+    }
+  }
+
+  return { ok: true, conversationId: normalizedConversationId, runtimeSession, parsed };
 }
 
 function buildContextResponseText({ snapshot, runtimeSession, conversationId, eventsPath, error }) {
@@ -2082,6 +2024,8 @@ function buildCompactSummary(conversation, recentMessagesDesc) {
 }
 
 function createCompactedConversation(sourceConversationId) {
+  // Compaction stays scoped to sourceConversationId; it never consults a
+  // global/latest session file that could belong to another conversation.
   const source = stmts.getConv.get(sourceConversationId);
   if (!source) return null;
 
@@ -2162,6 +2106,38 @@ function recoverProcessingOlderThan(cutoffIso, requeueAtIso) {
   return rows;
 }
 
+function fetchUsageSummary(cb) {
+  execFile('gh', ['auth', 'token'], (err, stdout) => {
+    if (err) return cb(new Error('gh auth token failed'));
+    const ghToken = stdout.trim();
+    fetch('https://api.github.com/copilot_internal/user', {
+      headers: { Authorization: `Bearer ${ghToken}`, Accept: 'application/json' },
+    })
+      .then((r) => r.json())
+      .then((data) => {
+        const snap = data.quota_snapshots || {};
+        const premium = snap.premium_interactions || {};
+        const chat = snap.chat || {};
+        cb(null, {
+          plan: data.copilot_plan,
+          resetDate: data.quota_reset_date,
+          chat: {
+            unlimited: chat.unlimited ?? true,
+            remaining: chat.remaining ?? null,
+            entitlement: chat.entitlement ?? null,
+          },
+          premiumInteractions: {
+            unlimited: premium.unlimited ?? false,
+            remaining: Math.round(premium.quota_remaining ?? premium.remaining ?? 0),
+            entitlement: premium.entitlement ?? 1500,
+            percentRemaining: premium.percent_remaining ?? null,
+          },
+        });
+      })
+      .catch((e) => cb(new Error(e.message)));
+  });
+}
+
 // ─── Express + Socket.io Setup ────────────────────────────────────────────────
 const app        = express();
 const httpServer = http.createServer(app);
@@ -2170,11 +2146,105 @@ const io         = new Server(httpServer, { cors: { origin: '*' } });
 app.use(express.json({ limit: '20mb' }));
 app.use(express.static(path.join(__dirname, 'public'), { etag: false, setHeaders: (res) => res.setHeader('Cache-Control', 'no-store') }));
 
+const runtimeState = {
+  get cliOnline() { return cliOnline; },
+  set cliOnline(value) { cliOnline = value; },
+  get relayPaused() { return relayPaused; },
+  set relayPaused(value) { relayPaused = value; },
+};
+
+const sharedRouteDeps = {
+  auth,
+  io,
+  db,
+  stmts,
+  config,
+  runtimeState,
+  uuidv4,
+  ts,
+  MAX_UPLOAD_BYTES,
+  MAX_UPLOAD_ATTACHMENTS,
+  MAX_IMAGE_DATA_URL_LENGTH,
+  MAX_REFERENCE_IMAGE_ATTACHMENT_BYTES,
+  remotePath,
+  parseBooleanQueryFlag,
+  buildRepositoryTreeSnapshot,
+  fetchBrowsableDrives,
+  fetchDriveDirectoryEntries,
+  mapDriveDirectoryEntry,
+  driveDisplayName,
+  normalizeDriveAbsolutePath,
+  driveRootFromAbsolutePath,
+  toDriveWebPath,
+  readWorkspaceFileMeta,
+  resolveWorkspaceFilePath,
+  previewLanguageForWorkspaceFile,
+  readWorkspaceFilePreviewBuffer,
+  isLikelyBinaryPreviewBuffer,
+  isLikelyTextContentType,
+  workspacePreviewKindForMeta,
+  workspaceContentType,
+  persistUploadBuffer,
+  isSha256,
+  uploadPathForSha,
+  uploadContentUrlForSha,
+  maybeApplyWorkspaceRootFromMessage,
+  getOrCreateConversation,
+  ensureRuntimeSessionBinding,
+  linkUploadReferences,
+  normalizeAttachments,
+  collectReferenceAttachmentsFromText,
+  mergeMessageAttachments,
+  attachmentSummary,
+  createCompactedConversation,
+  workspaceRootPayload,
+  queueCounts,
+  getModelCatalogState,
+  buildRelayReadyBannerData,
+  processingTimeoutMs,
+  localhostOnly,
+  listenHost,
+  ensureSessionId,
+  touchCli,
+  recoverProcessingOlderThan,
+  addMsIso,
+  computeRetryDelayMs,
+  normalizeRelayMode,
+  DEFAULT_RELAY_MODE,
+  DEFAULT_MODEL,
+  configuredConversationSessionMode,
+  parseAttachments,
+  hydrateAttachment,
+  relayActivityForResponse,
+  relayActivityForQueueMessage,
+  sanitizeActivityText,
+  inFlightStateForConversation,
+  emitToClientsExceptSessionId,
+  buildContextResponseText,
+  readContextFromSessionEvents,
+  collectOrphanedUploadsFromConversation,
+  deleteOrphanedUploads,
+  fetchUsageSummary,
+  bootstrapRuntimeSessionBindings,
+  SUPPORTED_RELAY_MODES,
+  SUPPORTED_CONVERSATION_SESSION_MODES,
+  DEFAULT_CONVERSATION_SESSION_MODE,
+  DEFAULT_QUESTION_TIMEOUT_MS,
+  questionExpiresAt,
+  sanitizeRelayQuestionPrompt,
+  sanitizeRelayQuestionRequest,
+  sanitizeRelayQuestionContext,
+  parseQuestionRequest,
+  normalizeQuestionChoices,
+  formatQuestionRow,
+};
+registerMessagesRoutes(app, sharedRouteDeps);
+registerSessionsRoutes(app, sharedRouteDeps);
+registerAskUserRoutes(app, sharedRouteDeps);
 // ─── CLI Status Tracking ──────────────────────────────────────────────────────
 let cliLastSeen = null;
 let cliOnline   = false;
 let relayPaused = false;
-
 function checkCliStatus() {
   const wasOnline = cliOnline;
   cliOnline = cliLastSeen !== null && (Date.now() - cliLastSeen) < 10_000;
@@ -2317,749 +2387,7 @@ function emitToClientsExceptSessionId(event, payload, sessionId) {
 
 // ─── Web-Client Routes ────────────────────────────────────────────────────────
 
-app.post('/api/upload', auth, express.raw({ type: () => true, limit: `${MAX_UPLOAD_BYTES}b` }), (req, res) => {
-  const payload = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
-  if (!payload.length) return res.status(400).json({ error: 'Empty upload payload' });
-  if (payload.length > MAX_UPLOAD_BYTES) return res.status(400).json({ error: 'Uploaded file too large' });
 
-  const rawNameHeader = String(req.headers['x-file-name'] || req.query.name || '').trim();
-  let decodedName = '';
-  try { decodedName = decodeURIComponent(rawNameHeader); } catch { decodedName = rawNameHeader; }
-  const fileName = decodedName || `upload-${Date.now()}`;
-  const fileType = String(req.headers['x-file-type'] || req.headers['content-type'] || req.query.type || 'application/octet-stream').trim().toLowerCase();
-
-  try {
-    const attachment = persistUploadBuffer(payload, { name: fileName, type: fileType });
-    if (!attachment) return res.status(500).json({ error: 'Upload persistence failed' });
-    res.json({ ok: true, attachment });
-  } catch (e) {
-    res.status(400).json({ error: e?.message || 'Upload failed' });
-  }
-});
-
-app.get('/api/upload/:sha256/content', auth, (req, res) => {
-  const sha256 = String(req.params.sha256 || '').trim().toLowerCase();
-  if (!isSha256(sha256)) return res.status(400).json({ error: 'Invalid file id' });
-  const file = stmts.getUploadFile.get(sha256);
-  if (!file) return res.status(404).json({ error: 'Not found' });
-  const filePath = uploadPathForSha(sha256);
-  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Missing file on disk' });
-  res.setHeader('Content-Type', file.mime_type || 'application/octet-stream');
-  res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
-  fs.createReadStream(filePath).pipe(res);
-});
-
-app.get('/api/files/*', auth, (req, res) => {
-  const requestedPath = String(req.params?.[0] || '').trim();
-  const filePath = resolveWorkspaceFilePath(requestedPath);
-  if (!filePath) return res.status(400).json({ error: 'Invalid file path' });
-
-  let meta = null;
-  try {
-    meta = readWorkspaceFileMeta(filePath);
-  } catch (error) {
-    return res.status(500).json({ error: error?.message || 'Failed to read file metadata' });
-  }
-
-  if (!meta || meta.kind === 'missing') return res.status(404).json({ error: 'File not found' });
-  if (meta.kind !== 'file') return res.status(400).json({ error: 'Path must reference a file' });
-
-  const safeName = path.basename(filePath).replace(/"/g, '');
-  res.setHeader('Content-Type', meta.contentType);
-  res.setHeader('Content-Length', String(meta.size));
-  res.setHeader('Content-Disposition', `inline; filename="${safeName}"`);
-  res.setHeader('Cache-Control', 'no-store');
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-
-  const stream = fs.createReadStream(filePath);
-  stream.on('error', (error) => {
-    workspaceFileMetaCache.delete(filePath);
-    if (res.headersSent) {
-      res.destroy(error);
-      return;
-    }
-    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') {
-      res.status(404).json({ error: 'File not found' });
-      return;
-    }
-    res.status(500).json({ error: 'Failed to read file' });
-  });
-  stream.pipe(res);
-});
-
-app.get('/api/files-preview/*', auth, (req, res) => {
-  const requestedPath = String(req.params?.[0] || '').trim();
-  const normalizedPath = normalizeWorkspaceRelativePath(requestedPath);
-  const filePath = resolveWorkspaceFilePath(requestedPath);
-  if (!filePath || !normalizedPath) return res.status(400).json({ error: 'Invalid file path' });
-
-  let meta = null;
-  try {
-    meta = readWorkspaceFileMeta(filePath);
-  } catch (error) {
-    return res.status(500).json({ error: error?.message || 'Failed to read file metadata' });
-  }
-
-  if (!meta || meta.kind === 'missing') return res.status(404).json({ error: 'File not found' });
-  if (meta.kind !== 'file') return res.status(400).json({ error: 'Path must reference a file' });
-
-  const ext = path.extname(filePath).toLowerCase();
-  const size = Number(meta.size || 0);
-  const contentType = meta.contentType || workspaceContentType(filePath);
-  const language = previewLanguageForWorkspaceFile(filePath);
-
-  let previewBuffer = Buffer.alloc(0);
-  try {
-    previewBuffer = readWorkspaceFilePreviewBuffer(filePath, size);
-  } catch (error) {
-    workspaceFileMetaCache.delete(filePath);
-    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') {
-      return res.status(404).json({ error: 'File not found' });
-    }
-    return res.status(500).json({ error: 'Failed to read file' });
-  }
-
-  const truncated = size > MAX_WORKSPACE_PREVIEW_BYTES;
-  const contentBuffer = truncated
-    ? previewBuffer.subarray(0, Math.min(previewBuffer.length, MAX_WORKSPACE_PREVIEW_BYTES))
-    : previewBuffer;
-
-  const likelyBinaryType = contentType === 'application/pdf'
-    || contentType === 'application/octet-stream';
-  const likelyBinaryBytes = isLikelyBinaryPreviewBuffer(contentBuffer);
-  const likelyTextType = isLikelyTextContentType(contentType);
-
-  let kind = workspacePreviewKindForMeta(ext, contentType);
-  if ((kind === 'markdown' || kind === 'code' || kind === 'text') && likelyBinaryType) {
-    kind = 'binary';
-  } else if ((kind === 'markdown' || kind === 'code' || kind === 'text') && (!likelyTextType && likelyBinaryBytes)) {
-    kind = 'binary';
-  }
-
-  const normalizedWebPath = normalizedPath.replace(/\\/g, '/');
-  const payload = {
-    ok: true,
-    path: normalizedWebPath,
-    name: path.basename(filePath),
-    kind,
-    language,
-    contentType,
-    size,
-    truncated,
-    previewBytes: contentBuffer.length,
-    rawUrl: `${remotePath}/api/files/${normalizedWebPath.split('/').map((part) => encodeURIComponent(part)).join('/')}`,
-  };
-
-  if (kind !== 'binary' && kind !== 'image') {
-    payload.content = contentBuffer.toString('utf8');
-  }
-
-  res.setHeader('Cache-Control', 'no-store');
-  res.json(payload);
-});
-
-app.get('/api/repo/tree', auth, (req, res) => {
-  const includeHidden = parseBooleanQueryFlag(req.query.includeHidden, false);
-  const includeHeavy = parseBooleanQueryFlag(req.query.includeHeavy, false);
-  const snapshot = buildRepositoryTreeSnapshot({ includeHidden, includeHeavy, maxNodes: MAX_REPO_TREE_NODES });
-  res.setHeader('Cache-Control', 'no-store');
-  res.json({
-    ok: true,
-    ...snapshot,
-  });
-});
-
-app.get('/api/drives/roots', auth, (req, res) => {
-  fetchBrowsableDrives((err, drives) => {
-    if (err) return res.status(500).json({ error: err.message || 'Failed to enumerate drives' });
-    const root = {
-      path: '',
-      name: 'Drives',
-      type: 'dir',
-      children: drives.map((drive) => ({
-        path: drive.webPath,
-        name: driveDisplayName(drive),
-        type: 'dir',
-        driveType: drive.driveType,
-        label: drive.label || '',
-        sizeBytes: drive.sizeBytes,
-        freeBytes: drive.freeBytes,
-        children: [],
-        lazy: true,
-        childrenLoaded: false,
-      })),
-      childrenLoaded: true,
-    };
-    res.setHeader('Cache-Control', 'no-store');
-    res.json({
-      ok: true,
-      root,
-      nodeCount: root.children.length + 1,
-      truncated: false,
-      maxNodes: root.children.length + 1,
-      includeHidden: false,
-      includeHeavy: false,
-      rootName: 'Drives',
-      driveTypes: ['fixed', 'removable'],
-    });
-  });
-});
-
-app.get('/api/drives/list', auth, (req, res) => {
-  const includeHidden = parseBooleanQueryFlag(req.query.includeHidden, false);
-  const requestedPath = String(req.query.path || '').trim();
-
-  fetchBrowsableDrives((drivesErr, drives) => {
-    if (drivesErr) return res.status(500).json({ error: drivesErr.message || 'Failed to enumerate drives' });
-    const allowedRoots = new Set(drives.map((drive) => drive.rootAbsolute.toUpperCase()));
-    const absolutePath = normalizeDriveAbsolutePath(requestedPath);
-    const rootAbsolute = driveRootFromAbsolutePath(absolutePath).toUpperCase();
-    if (!absolutePath || !rootAbsolute || !allowedRoots.has(rootAbsolute)) {
-      return res.status(400).json({ error: 'Invalid drive path' });
-    }
-
-    let stat = null;
-    try {
-      stat = fs.statSync(absolutePath);
-    } catch (error) {
-      if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return res.status(404).json({ error: 'Path not found' });
-      return res.status(500).json({ error: error?.message || 'Failed to read path metadata' });
-    }
-    if (!stat.isDirectory()) return res.status(400).json({ error: 'Path must reference a directory' });
-
-    fetchDriveDirectoryEntries(absolutePath, { includeHidden }, (listErr, entries) => {
-      if (listErr) return res.status(500).json({ error: listErr.message || 'Failed to list directory' });
-      const children = entries
-        .map(mapDriveDirectoryEntry)
-        .filter((entry) => {
-          if (!entry?.path) return false;
-          const entryRoot = driveRootFromAbsolutePath(entry.path).toUpperCase();
-          return allowedRoots.has(entryRoot);
-        });
-      const driveMeta = drives.find((drive) => drive.rootAbsolute.toUpperCase() === rootAbsolute);
-      const nodePath = toDriveWebPath(absolutePath);
-      const node = {
-        path: nodePath,
-        name: absolutePath.length <= 3 ? driveDisplayName(driveMeta) : (path.win32.basename(absolutePath) || nodePath),
-        type: 'dir',
-        driveType: driveMeta?.driveType || null,
-        label: driveMeta?.label || '',
-        children,
-        childrenLoaded: true,
-      };
-      res.setHeader('Cache-Control', 'no-store');
-      res.json({
-        ok: true,
-        node,
-        includeHidden,
-      });
-    });
-  });
-});
-
-app.get('/api/drives/file', auth, (req, res) => {
-  const requestedPath = String(req.query.path || '').trim();
-  fetchBrowsableDrives((drivesErr, drives) => {
-    if (drivesErr) return res.status(500).json({ error: drivesErr.message || 'Failed to enumerate drives' });
-    const allowedRoots = new Set(drives.map((drive) => drive.rootAbsolute.toUpperCase()));
-    const filePath = normalizeDriveAbsolutePath(requestedPath);
-    const rootAbsolute = driveRootFromAbsolutePath(filePath).toUpperCase();
-    if (!filePath || !rootAbsolute || !allowedRoots.has(rootAbsolute)) {
-      return res.status(400).json({ error: 'Invalid drive file path' });
-    }
-
-    let meta = null;
-    try {
-      meta = readWorkspaceFileMeta(filePath);
-    } catch (error) {
-      return res.status(500).json({ error: error?.message || 'Failed to read file metadata' });
-    }
-
-    if (!meta || meta.kind === 'missing') return res.status(404).json({ error: 'File not found' });
-    if (meta.kind !== 'file') return res.status(400).json({ error: 'Path must reference a file' });
-
-    const safeName = path.win32.basename(filePath).replace(/"/g, '');
-    res.setHeader('Content-Type', meta.contentType);
-    res.setHeader('Content-Length', String(meta.size));
-    res.setHeader('Content-Disposition', `inline; filename="${safeName}"`);
-    res.setHeader('Cache-Control', 'no-store');
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-
-    const stream = fs.createReadStream(filePath);
-    stream.on('error', (error) => {
-      workspaceFileMetaCache.delete(filePath);
-      if (res.headersSent) {
-        res.destroy(error);
-        return;
-      }
-      if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') {
-        res.status(404).json({ error: 'File not found' });
-        return;
-      }
-      res.status(500).json({ error: 'Failed to read file' });
-    });
-    stream.pipe(res);
-  });
-});
-
-app.get('/api/drives/files-preview', auth, (req, res) => {
-  const requestedPath = String(req.query.path || '').trim();
-  fetchBrowsableDrives((drivesErr, drives) => {
-    if (drivesErr) return res.status(500).json({ error: drivesErr.message || 'Failed to enumerate drives' });
-    const allowedRoots = new Set(drives.map((drive) => drive.rootAbsolute.toUpperCase()));
-    const filePath = normalizeDriveAbsolutePath(requestedPath);
-    const rootAbsolute = driveRootFromAbsolutePath(filePath).toUpperCase();
-    if (!filePath || !rootAbsolute || !allowedRoots.has(rootAbsolute)) {
-      return res.status(400).json({ error: 'Invalid drive file path' });
-    }
-
-    let meta = null;
-    try {
-      meta = readWorkspaceFileMeta(filePath);
-    } catch (error) {
-      return res.status(500).json({ error: error?.message || 'Failed to read file metadata' });
-    }
-
-    if (!meta || meta.kind === 'missing') return res.status(404).json({ error: 'File not found' });
-    if (meta.kind !== 'file') return res.status(400).json({ error: 'Path must reference a file' });
-
-    const ext = path.extname(filePath).toLowerCase();
-    const size = Number(meta.size || 0);
-    const contentType = meta.contentType || workspaceContentType(filePath);
-    const language = previewLanguageForWorkspaceFile(filePath);
-
-    let previewBuffer = Buffer.alloc(0);
-    try {
-      previewBuffer = readWorkspaceFilePreviewBuffer(filePath, size);
-    } catch (error) {
-      workspaceFileMetaCache.delete(filePath);
-      if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') {
-        return res.status(404).json({ error: 'File not found' });
-      }
-      return res.status(500).json({ error: 'Failed to read file' });
-    }
-
-    const truncated = size > MAX_WORKSPACE_PREVIEW_BYTES;
-    const contentBuffer = truncated
-      ? previewBuffer.subarray(0, Math.min(previewBuffer.length, MAX_WORKSPACE_PREVIEW_BYTES))
-      : previewBuffer;
-
-    const likelyBinaryType = contentType === 'application/pdf'
-      || contentType === 'application/octet-stream';
-    const likelyBinaryBytes = isLikelyBinaryPreviewBuffer(contentBuffer);
-    const likelyTextType = isLikelyTextContentType(contentType);
-
-    let kind = workspacePreviewKindForMeta(ext, contentType);
-    if ((kind === 'markdown' || kind === 'code' || kind === 'text') && likelyBinaryType) {
-      kind = 'binary';
-    } else if ((kind === 'markdown' || kind === 'code' || kind === 'text') && (!likelyTextType && likelyBinaryBytes)) {
-      kind = 'binary';
-    }
-
-    const normalizedWebPath = toDriveWebPath(filePath);
-    const payload = {
-      ok: true,
-      path: normalizedWebPath,
-      name: path.win32.basename(filePath),
-      kind,
-      language,
-      contentType,
-      size,
-      truncated,
-      previewBytes: contentBuffer.length,
-      rawUrl: `${remotePath}/api/drives/file?path=${encodeURIComponent(normalizedWebPath)}`,
-    };
-
-    if (kind !== 'binary' && kind !== 'image') {
-      payload.content = contentBuffer.toString('utf8');
-    }
-
-    res.setHeader('Cache-Control', 'no-store');
-    res.json(payload);
-  });
-});
-
-// POST /api/message — browser sends a message
-app.post('/api/message', auth, (req, res) => {
-  const { messageId: clientMessageId, clientId, conversationId, text, newConversation, model, relayMode, mode, attachments: rawAttachments } = req.body;
-  const sessionId = clientId || ensureSessionId(req, res);
-  const trimmedText = String(text || '').trim();
-  const normalizedAttachments = normalizeAttachments(rawAttachments);
-  const referenceResolution = collectReferenceAttachmentsFromText(trimmedText);
-  const attachments = mergeMessageAttachments(normalizedAttachments, referenceResolution.attachments);
-
-  if (trimmedText.toLowerCase() === '/compact') {
-    if (attachments.length) return res.status(400).json({ error: 'Compact command does not accept attachments' });
-    if (!conversationId) return res.status(400).json({ error: 'Compact command requires an existing conversation' });
-    const compacted = createCompactedConversation(conversationId);
-    if (!compacted) return res.status(404).json({ error: 'Conversation not found' });
-    io.emit('conversation_compacted', compacted);
-    return res.json({
-      ok: true,
-      command: 'compact',
-      compacted: true,
-      sourceConversationId: compacted.sourceConversationId,
-      conversationId: compacted.targetConversationId,
-      compactedConversationId: compacted.targetConversationId,
-      runtimeSessionId: compacted.runtimeSessionId,
-      summarySeedPreview: compacted.summarySeed.slice(0, 240),
-    });
-  }
-
-  if (!trimmedText && attachments.length === 0) return res.status(400).json({ error: 'Empty message' });
-  const modelResolution = resolveRequestedModel(model);
-  if (!modelResolution.ok) return res.status(400).json({ error: modelResolution.error, supportedModels: modelResolution.available || [] });
-  const requestedModel = modelResolution.model;
-  const requestedRelayMode = normalizeRelayMode(relayMode || mode);
-  if (!requestedRelayMode) return res.status(400).json({ error: 'Unsupported relay mode' });
-  const workspaceRootUpdate = attachments.length === 0
-    ? maybeApplyWorkspaceRootFromMessage(trimmedText)
-    : { attempted: false, changed: false };
-
-  const convId = (newConversation || !conversationId) ? uuidv4() : conversationId;
-  getOrCreateConversation(convId, trimmedText || attachmentSummary(attachments) || 'Image');
-  const convSeed = stmts.getConvSeed.get(convId);
-  const shouldApplySeed = Number(convSeed?.seed_pending || 0) > 0 && String(convSeed?.summary_seed || '').trim().length > 0;
-
-  const now   = new Date().toISOString();
-  const runtimeSession = ensureRuntimeSessionBinding(convId, requestedModel, now);
-  const msgId = clientMessageId || uuidv4();
-  const queueText = shouldApplySeed
-    ? [
-        '[Carry-over context from previous compacted conversation]',
-        String(convSeed.summary_seed).trim(),
-        '',
-        '[New user request]',
-        trimmedText || '(User sent image attachments only.)',
-      ].join('\n')
-    : trimmedText;
-
-  stmts.insertMsg.run(msgId, convId, 'user', trimmedText, requestedModel, requestedRelayMode, attachments.length ? JSON.stringify(attachments) : null, now);
-  linkUploadReferences(convId, msgId, attachments);
-  stmts.updateConvTime.run(now, convId);
-  stmts.insertQ.run(msgId, convId, runtimeSession?.id || null, (!conversationId || !!newConversation) ? 1 : 0, requestedModel, requestedRelayMode, queueText, attachments.length ? JSON.stringify(attachments) : null, now);
-  if (shouldApplySeed) {
-    stmts.clearConvSeed.run(now, convId);
-  }
-
-  console.log(`[${ts()}] QUEUED    ${msgId.slice(0,8)} conv=${convId.slice(0,8)} rs=${String(runtimeSession?.id || 'none').slice(0,8)} new=${!conversationId || !!newConversation} model=${requestedModel} mode=${requestedRelayMode} text="${trimmedText.slice(0,60)}"${shouldApplySeed ? ' seeded=1' : ''}${attachments.length ? ` attachments=${attachments.length}` : ''}`);
-
-  emitToClientsExceptSessionId(
-    'user_message',
-    { conversationId: convId, messageId: msgId, senderClientId: sessionId, message: { role: 'user', text: trimmedText, model: requestedModel, mode: requestedRelayMode, timestamp: now, attachments } },
-    sessionId,
-  );
-  io.emit('message_status', { messageId: msgId, conversationId: convId, status: 'pending' });
-  if (workspaceRootUpdate.changed) {
-    io.emit('workspace_root_changed', {
-      source: 'chat-cd-command',
-      commandTarget: workspaceRootUpdate.target || null,
-      ...workspaceRootPayload(),
-    });
-  }
-
-  res.json({
-    ok: true,
-    messageId: msgId,
-    conversationId: convId,
-    runtimeSessionId: runtimeSession?.id || null,
-    warning: modelResolution.warning || null,
-    workspaceRootWarning: workspaceRootUpdate.error || null,
-    workspaceRootChanged: !!workspaceRootUpdate.changed,
-    ...workspaceRootPayload(),
-    referenceAttachmentCount: referenceResolution.attachments.length,
-    skippedReferenceAttachments: referenceResolution.skipped,
-  });
-});
-
-// GET /api/conversations — list all conversations
-app.get('/api/conversations', auth, (req, res) => {
-  const rows = stmts.listConvs.all();
-  const conversations = rows.map(r => ({
-    id:           r.id,
-    title:        r.title,
-    archived:     Number(r.archived || 0) === 1,
-    compactedInto: r.compacted_into || null,
-    compactedFrom: r.compacted_from || null,
-    runtimeSessionId: r.runtime_session_id || null,
-    runtimeSessionStrategy: r.runtime_strategy || null,
-    runtimeSessionStatus: r.runtime_status || null,
-    runtimeSessionLastUsedAt: r.runtime_last_used_at || null,
-    createdAt:    r.created_at,
-    updatedAt:    r.updated_at,
-    messageCount: r.message_count,
-  }));
-  res.json({ conversations });
-});
-
-app.get('/api/sessions', auth, (req, res) => {
-  const sessions = stmts.listRuntimeSessions.all().map((row) => ({
-    id: row.id,
-    conversationId: row.conversation_id,
-    conversationTitle: row.conversation_title || row.conversation_id,
-    strategy: row.strategy || null,
-    runtimeKey: row.runtime_key || null,
-    model: row.model || null,
-    status: row.status || null,
-    createdAt: row.created_at || null,
-    lastUsedAt: row.last_used_at || null,
-    conversationUpdatedAt: row.conversation_updated_at || null,
-  }));
-  res.json({ sessions });
-});
-
-app.get('/api/context/:conversationId', auth, (req, res) => {
-  const conversationId = String(req.params.conversationId || '').trim();
-  if (!conversationId) return res.status(400).json({ error: 'Missing conversationId' });
-  const runtimeSession = stmts.getRuntimeSessionByConversation.get(conversationId) || null;
-  const parsed = readContextFromSessionEvents(runtimeSession?.id || null, runtimeSession?.runtime_key || runtimeSession?.id || null);
-
-  res.json({
-    conversationId,
-    runtimeSessionId: runtimeSession?.id || null,
-    snapshot: parsed.snapshot || null,
-    eventsPath: parsed.eventsPath || null,
-    error: parsed.error || null,
-    text: buildContextResponseText({
-      snapshot: parsed.snapshot,
-      runtimeSession,
-      conversationId,
-      eventsPath: parsed.eventsPath,
-      error: parsed.error,
-    }),
-  });
-});
-
-app.get('/api/context', auth, (req, res) => {
-  const explicitConversationId = String(req.query.conversationId || '').trim();
-  if (explicitConversationId) {
-    const runtimeSession = stmts.getRuntimeSessionByConversation.get(explicitConversationId) || null;
-    const parsed = readContextFromSessionEvents(runtimeSession?.id || null, runtimeSession?.runtime_key || runtimeSession?.id || null);
-    return res.json({
-      conversationId: explicitConversationId,
-      runtimeSessionId: runtimeSession?.id || null,
-      snapshot: parsed.snapshot || null,
-      eventsPath: parsed.eventsPath || null,
-      error: parsed.error || null,
-      text: buildContextResponseText({
-        snapshot: parsed.snapshot,
-        runtimeSession,
-        conversationId: explicitConversationId,
-        eventsPath: parsed.eventsPath,
-        error: parsed.error,
-      }),
-    });
-  }
-
-  const runtimeSessions = stmts.listRuntimeSessions.all();
-  const latest = runtimeSessions.length ? runtimeSessions[0] : null;
-  const runtimeSession = latest?.id ? (stmts.getRuntimeSessionById.get(latest.id) || latest) : null;
-  const parsed = readContextFromSessionEvents(runtimeSession?.id || null, runtimeSession?.runtime_key || runtimeSession?.id || null);
-  const conversationId = String(runtimeSession?.conversation_id || '').trim() || null;
-  return res.json({
-    conversationId,
-    runtimeSessionId: runtimeSession?.id || null,
-    snapshot: parsed.snapshot || null,
-    eventsPath: parsed.eventsPath || null,
-    error: parsed.error || null,
-    text: buildContextResponseText({
-      snapshot: parsed.snapshot,
-      runtimeSession,
-      conversationId: conversationId || 'unavailable',
-      eventsPath: parsed.eventsPath,
-      error: parsed.error,
-    }),
-  });
-});
-
-// GET /api/conversation/:id — get full conversation
-app.get('/api/conversation/:id', auth, (req, res) => {
-  const conv = stmts.getConv.get(req.params.id);
-  if (!conv) return res.status(404).json({ error: 'Conversation not found' });
-  const runtimeSession = stmts.getRuntimeSessionByConversation.get(req.params.id) || null;
-  const inFlight = inFlightStateForConversation(req.params.id);
-  const messages = stmts.getMessages.all(req.params.id).map(m => ({
-    activities: m.role === 'assistant' ? relayActivityForResponse(m.id) : [],
-    id:        m.id,
-    role:      m.role,
-    text:      m.text,
-    model:     m.model || undefined,
-    attachments: parseAttachments(m.attachments).map(hydrateAttachment).filter(Boolean),
-    mode:      m.mode || undefined,
-    timestamp: m.timestamp,
-  }));
-  res.json({
-    id: conv.id,
-    title: conv.title,
-    archived: Number(conv.archived || 0) === 1,
-    compactedInto: conv.compacted_into || null,
-    compactedFrom: conv.compacted_from || null,
-    runtimeSession: runtimeSession ? {
-      id: runtimeSession.id,
-      strategy: runtimeSession.strategy || null,
-      status: runtimeSession.status || null,
-      model: runtimeSession.model || null,
-      createdAt: runtimeSession.created_at || null,
-      lastUsedAt: runtimeSession.last_used_at || null,
-    } : null,
-    createdAt: conv.created_at,
-    updatedAt: conv.updated_at,
-    inFlight,
-    messages,
-  });
-});
-
-app.post('/api/conversation/:id/compact', auth, (req, res) => {
-  const sourceConversationId = req.params.id;
-  const compacted = createCompactedConversation(sourceConversationId);
-  if (!compacted) return res.status(404).json({ error: 'Conversation not found' });
-  io.emit('conversation_compacted', compacted);
-  res.json({
-    ok: true,
-    sourceConversationId: compacted.sourceConversationId,
-    compactedConversationId: compacted.targetConversationId,
-    conversationId: compacted.targetConversationId,
-    runtimeSessionId: compacted.runtimeSessionId,
-    summarySeedPreview: compacted.summarySeed.slice(0, 240),
-  });
-});
-
-// DELETE /api/conversation/:id — delete conversation
-app.delete('/api/conversation/:id', auth, (req, res) => {
-  const id = req.params.id;
-  if (!stmts.getConv.get(id)) return res.status(404).json({ error: 'Not found' });
-  const orphanedUploads = collectOrphanedUploadsFromConversation(id);
-  stmts.deleteConvQuestions.run(id);
-  stmts.deleteConvActivity.run(id);
-  stmts.deleteConvQ.run(id);
-  stmts.deleteConv.run(id);  // cascades to messages via FK
-  deleteOrphanedUploads(orphanedUploads);
-  io.emit('conversation_deleted', { conversationId: id });
-  res.json({ ok: true });
-});
-
-// GET /api/status — overall status
-app.get('/api/status', auth, (req, res) => {
-  ensureSessionId(req, res);
-  const { pendingCount, processingCount } = queueCounts();
-  const modelState = getModelCatalogState();
-  const activeRuntimeSessionCount = Number(stmts.countRuntimeSessions.get()?.cnt || 0);
-  const readyBanner = buildRelayReadyBannerData();
-  res.json({
-    cliOnline,
-    relayPaused,
-    pendingCount,
-    processingCount,
-    activeRuntimeSessionCount,
-    supportedModels: modelState.models,
-    defaultModel: modelState.defaultModel,
-    currentModel: modelState.currentModel,
-    modelsStale: modelState.stale,
-    modelsRefreshedAt: modelState.refreshedAt,
-    modelWarning: modelState.warning,
-    supportedRelayModes: SUPPORTED_RELAY_MODES,
-    defaultRelayMode: DEFAULT_RELAY_MODE,
-    supportedConversationSessionModes: SUPPORTED_CONVERSATION_SESSION_MODES,
-    conversationSessionMode: configuredConversationSessionMode,
-    ...workspaceRootPayload(),
-    processingTimeoutMs,
-    localhostOnly,
-    listenHost,
-    readyBanner,
-    remotePath,
-    sshTunnel: {
-      enabled: tunnelState.enabled,
-      connected: tunnelState.connected,
-      host: tunnelState.host,
-      remotePort: tunnelState.remotePort,
-      remoteBindMode: tunnelState.remoteBindMode,
-      reconnectAttempts: tunnelState.reconnectAttempts,
-      connectedSince: tunnelState.connectedSince,
-    },
-  });
-});
-
-app.get('/api/models', auth, (req, res) => {
-  ensureSessionId(req, res);
-  const modelState = getModelCatalogState();
-  res.json({
-    models: modelState.models,
-    currentModel: modelState.currentModel,
-    defaultModel: modelState.defaultModel,
-    stale: modelState.stale,
-    refreshedAt: modelState.refreshedAt,
-    source: modelState.source,
-    warning: modelState.warning,
-  });
-});
-
-app.post('/api/models/snapshot', auth, (req, res) => {
-  const { models, currentModel, defaultModel, source, error } = req.body || {};
-  const nextState = updateModelCatalog({
-    models: Array.isArray(models) ? models : [],
-    currentModel,
-    defaultModel,
-    source: source || 'relay-extension',
-    error,
-  });
-  io.emit('models_updated', {
-    models: nextState.models,
-    currentModel: nextState.currentModel,
-    defaultModel: nextState.defaultModel,
-    stale: nextState.stale,
-    refreshedAt: nextState.refreshedAt,
-    warning: nextState.warning,
-  });
-  res.json({
-    ok: true,
-    models: nextState.models,
-    currentModel: nextState.currentModel,
-    defaultModel: nextState.defaultModel,
-    stale: nextState.stale,
-    refreshedAt: nextState.refreshedAt,
-    warning: nextState.warning,
-  });
-});
-
-function fetchUsageSummary(cb) {
-  execFile('gh', ['auth', 'token'], (err, stdout) => {
-    if (err) return cb(new Error('gh auth token failed'));
-    const ghToken = stdout.trim();
-    fetch('https://api.github.com/copilot_internal/user', {
-      headers: { Authorization: `Bearer ${ghToken}`, Accept: 'application/json' },
-    })
-      .then(r => r.json())
-      .then(data => {
-        const snap = data.quota_snapshots || {};
-        const premium = snap.premium_interactions || {};
-        const chat = snap.chat || {};
-        cb(null, {
-          plan: data.copilot_plan,
-          resetDate: data.quota_reset_date,
-          chat: {
-            unlimited: chat.unlimited ?? true,
-            remaining: chat.remaining ?? null,
-            entitlement: chat.entitlement ?? null,
-          },
-          premiumInteractions: {
-            unlimited: premium.unlimited ?? false,
-            remaining: Math.round(premium.quota_remaining ?? premium.remaining ?? 0),
-            entitlement: premium.entitlement ?? 1500,
-            percentRemaining: premium.percent_remaining ?? null,
-          },
-        });
-      })
-      .catch((e) => cb(new Error(e.message)));
-  });
-}
-
-// GET /api/usage — Copilot quota fetched live from GitHub API
-app.get('/api/usage', auth, (req, res) => {
-  fetchUsageSummary((err, summary) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(summary);
-  });
-});
 
 
 // ─── CLI Routes ───────────────────────────────────────────────────────────────
@@ -3074,237 +2402,6 @@ function touchCli() {
 }
 
 // POST /api/heartbeat — CLI sends a ping every poll interval
-app.post('/api/heartbeat', auth, (req, res) => {
-  touchCli();
-  const { pendingCount } = queueCounts();
-  res.json({ ok: true, pendingCount });
-});
-
-// GET /api/pending — CLI fetches next pending message
-app.get('/api/pending', auth, (req, res) => {
-  touchCli();
-  if (relayPaused) return res.json({ message: null, paused: true });
-
-  const dequeue = db.transaction(() => {
-    const now = new Date().toISOString();
-    const msg = stmts.findPending.get(now);
-    if (!msg) return null;
-    stmts.setProcessing.run(now, msg.id);
-    return { ...msg, status: 'processing', processing_at: now };
-  });
-
-  const msg = dequeue();
-  if (msg) {
-    const attachments = parseAttachments(msg.attachments).map(hydrateAttachment).filter(Boolean);
-    let runtimeSession = msg.runtime_session_id
-      ? stmts.getRuntimeSessionById.get(msg.runtime_session_id)
-      : null;
-    if (!runtimeSession) {
-      const now = new Date().toISOString();
-      runtimeSession = ensureRuntimeSessionBinding(
-        msg.conversation_id,
-        String(msg.model || '').trim() || null,
-        now,
-      );
-      if (runtimeSession?.id && runtimeSession.id !== msg.runtime_session_id) {
-        stmts.setQueueRuntimeSession.run(runtimeSession.id, msg.id);
-      }
-    }
-    // Normalise snake_case → camelCase for the relay
-    const out = {
-      id:                msg.id,
-      conversationId:    msg.conversation_id,
-      runtimeSessionId:  runtimeSession?.id || null,
-      isNewConversation: msg.is_new_conversation === 1,
-      model:             String(msg.model || '').trim() || getModelCatalogState().currentModel || DEFAULT_MODEL,
-      relayMode:         normalizeRelayMode(msg.relay_mode) || DEFAULT_RELAY_MODE,
-      text:              msg.text,
-      attachments,
-      conversationSessionMode: configuredConversationSessionMode,
-      status:            msg.status,
-      timestamp:         msg.timestamp,
-      processingAt:      msg.processing_at,
-    };
-    console.log(`[${ts()}] DEQUEUED  ${out.id.slice(0,8)} conv=${out.conversationId.slice(0,8)} rs=${String(out.runtimeSessionId || 'none').slice(0,8)} model=${out.model} mode=${out.relayMode} text="${out.text.slice(0,60)}"${attachments.length ? ` attachments=${attachments.length}` : ''}`);
-    io.emit('message_status', { messageId: out.id, conversationId: out.conversationId, status: 'processing' });
-    res.json({ message: out });
-  } else {
-    res.json({ message: null });
-  }
-});
-
-app.post('/api/relay/pause', auth, (req, res) => {
-  relayPaused = true;
-  const rows = stmts.listQueueForPauseDrop.all();
-  const dropQueue = db.transaction(() => {
-    for (const row of rows) {
-      stmts.deleteQueueById.run(row.id);
-    }
-  });
-  dropQueue();
-
-  for (const row of rows) {
-    io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'dropped' });
-  }
-
-  io.emit('relay_pause_state', { paused: true, droppedCount: rows.length });
-  console.log(`[${ts()}] RELAY     paused dropped=${rows.length}`);
-  res.json({ ok: true, paused: true, droppedCount: rows.length });
-});
-
-app.post('/api/relay/resume', auth, (req, res) => {
-  relayPaused = false;
-  io.emit('relay_pause_state', { paused: false });
-  console.log(`[${ts()}] RELAY     resumed`);
-  res.json({ ok: true, paused: false });
-});
-
-app.post('/api/relay/recover-processing', auth, (req, res) => {
-  const rawMaxAge = Number(req.body?.maxAgeMs);
-  const maxAgeMs = Number.isFinite(rawMaxAge)
-    ? Math.max(5_000, Math.min(300_000, rawMaxAge))
-    : 15_000;
-  const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
-  const requeueAt = addMsIso(5_000);
-  const rows = recoverProcessingOlderThan(cutoff, requeueAt);
-  if (!rows.length) return res.json({ ok: true, recovered: 0, maxAgeMs });
-  console.log(`[${ts()}] RELAY     recovered processing=${rows.length} maxAgeMs=${maxAgeMs}`);
-  return res.json({ ok: true, recovered: rows.length, maxAgeMs });
-});
-
-// POST /api/response — CLI submits response
-app.post('/api/response', auth, (req, res) => {
-  touchCli();
-  const { messageId, conversationId, text, model, mode } = req.body;
-
-  if (!text?.trim()) return res.status(400).json({ error: 'Empty response' });
-  if (!messageId) return res.status(400).json({ error: 'Missing messageId' });
-
-  const q = stmts.findQById.get(messageId);
-  const targetConversationId = q?.conversation_id || conversationId;
-  if (!targetConversationId) return res.status(400).json({ error: 'Missing conversationId' });
-
-  if (q && q.status === 'done') {
-    console.log(`[${ts()}] RESPONSE  ${messageId?.slice(0,8)} ignored=already_done`);
-    return res.json({ ok: true, ignored: 'already_done' });
-  }
-  if (q && q.status === 'failed') {
-    console.log(`[${ts()}] RESPONSE  ${messageId?.slice(0,8)} ignored=already_failed`);
-    return res.json({ ok: true, ignored: 'already_failed' });
-  }
-
-  const responseId = uuidv4();
-  const now        = new Date().toISOString();
-  const relayMode = normalizeRelayMode(mode || q?.relay_mode) || DEFAULT_RELAY_MODE;
-  const finalize = db.transaction(() => {
-    const result = stmts.setDone.run(text, messageId);
-    if (result.changes === 0) return false;
-    stmts.insertMsg.run(responseId, targetConversationId, 'assistant', text, model || null, relayMode, null, now);
-    stmts.linkActivityToResponse.run(responseId, messageId);
-    stmts.updateConvTime.run(now, targetConversationId);
-    stmts.pruneQueue.run();
-    return true;
-  });
-
-  const finalized = finalize();
-  if (!finalized) {
-    console.log(`[${ts()}] RESPONSE  ${messageId?.slice(0,8)} ignored=not_pending_or_processing`);
-    return res.json({ ok: true, ignored: 'not_pending_or_processing' });
-  }
-  if (q?.runtime_session_id) {
-    const nowIso = new Date().toISOString();
-    const existing = stmts.getRuntimeSessionById.get(q.runtime_session_id);
-    if (existing?.id) {
-      stmts.touchRuntimeSession.run(
-        String(model || existing.model || '').trim() || null,
-        nowIso,
-        existing.id,
-      );
-    }
-  }
-  const activities = relayActivityForResponse(responseId);
-
-  console.log(`[${ts()}] RESPONSE  ${messageId?.slice(0,8)} conv=${targetConversationId?.slice(0,8)} mode=${relayMode} len=${text.length} preview="${text.slice(0,60)}"`);
-
-  io.emit('assistant_message', {
-    conversationId: targetConversationId,
-    sourceMessageId: messageId,
-    messageId: responseId,
-    message: { role: 'assistant', text, model: model || null, mode: relayMode, timestamp: now, activities },
-  });
-  io.emit('message_status', { messageId, conversationId: targetConversationId, status: 'done' });
-
-  res.json({ ok: true });
-});
-
-// POST /api/activity — relay sends in-flight activity updates (tool/search sections)
-app.post('/api/activity', auth, (req, res) => {
-  touchCli();
-  const { messageId, conversationId, text, mode } = req.body || {};
-  const activityText = sanitizeActivityText(text);
-  if (!messageId || !conversationId || !activityText) {
-    return res.status(400).json({ error: 'Missing activity payload' });
-  }
-
-  stmts.insertActivity.run(
-    messageId,
-    conversationId,
-    normalizeRelayMode(mode) || DEFAULT_RELAY_MODE,
-    activityText,
-    new Date().toISOString(),
-  );
-
-  io.emit('relay_activity', {
-    messageId,
-    conversationId,
-    mode: normalizeRelayMode(mode) || DEFAULT_RELAY_MODE,
-    text: activityText,
-    timestamp: new Date().toISOString(),
-  });
-  res.json({ ok: true });
-});
-
-// POST /api/requeue — relay re-queues a message it failed to process
-app.post('/api/requeue', auth, (req, res) => {
-  const { messageId } = req.body;
-  const q = stmts.findQById.get(messageId);
-  if (q && q.status === 'processing') {
-    const retryCount = Number(q.retry_count || 0) + 1;
-    if (retryCount >= MAX_REQUEUE_RETRIES) {
-      const now = new Date().toISOString();
-      const failText = `Relay timeout after ${retryCount} attempts. Message was skipped to keep the queue moving.`;
-      const failResponse = JSON.stringify({ error: 'timeout', retryCount, failedAt: now });
-      const responseId = uuidv4();
-      const tx = db.transaction(() => {
-        stmts.setFailed.run(failResponse, messageId);
-        stmts.insertMsg.run(responseId, q.conversation_id, 'assistant', failText, q.model || null, normalizeRelayMode(q.relay_mode) || DEFAULT_RELAY_MODE, null, now);
-        stmts.updateConvTime.run(now, q.conversation_id);
-      });
-      tx();
-      console.log(`[${ts()}] FAILED    ${messageId?.slice(0,8)} retry=${retryCount} reason=timeout`);
-      io.emit('assistant_message', {
-        conversationId: q.conversation_id,
-        messageId: responseId,
-        message: {
-          role: 'assistant',
-          text: failText,
-          model: q.model || null,
-          mode: normalizeRelayMode(q.relay_mode) || DEFAULT_RELAY_MODE,
-          timestamp: now,
-        },
-      });
-      io.emit('message_status', { messageId, conversationId: q?.conversation_id, status: 'failed' });
-    } else {
-      const nextAttemptAt = addMsIso(computeRetryDelayMs(retryCount));
-      const result = db.prepare(`UPDATE queue SET status = 'pending', processing_at = NULL, retry_count = ?, next_attempt_at = ? WHERE id = ? AND status = 'processing'`).run(retryCount, nextAttemptAt, messageId);
-      if (result.changes > 0) {
-        console.log(`[${ts()}] REQUEUED  ${messageId?.slice(0,8)} retry=${retryCount} next=${nextAttemptAt}`);
-        io.emit('message_status', { messageId, conversationId: q?.conversation_id, status: 'pending' });
-      }
-    }
-  }
-  res.json({ ok: true });
-});
 
 // ─── Relay Question Routes ────────────────────────────────────────────────────
 
@@ -3358,98 +2455,6 @@ function sanitizeRelayQuestionContext(rawContext) {
   return Object.keys(context).length ? context : null;
 }
 
-app.get('/api/relay-questions', auth, (req, res) => {
-  const conversationId = req.query.conversationId ? String(req.query.conversationId) : null;
-  const status = String(req.query.status || 'pending').trim() || 'pending';
-  const rows = stmts.listQuestions.all(status, conversationId, conversationId);
-  res.json({ questions: rows.map(formatQuestionRow) });
-});
-
-app.get('/api/relay-question/:id', auth, (req, res) => {
-  const row = stmts.getQuestion.get(req.params.id);
-  if (!row) return res.status(404).json({ error: 'Not found' });
-  res.json({ question: formatQuestionRow(row) });
-});
-
-app.post('/api/relay-question', auth, (req, res) => {
-  const { queueId, messageId, conversationId, mode, prompt, choices, request, context, allowFreeform } = req.body;
-  const q = stmts.findQById.get(queueId || messageId);
-  if (!q || q.status !== 'processing') {
-    return res.status(409).json({ error: 'No active relay turn' });
-  }
-
-  const effectiveMessageId = messageId || q.id;
-  const existingPending = stmts.findPendingQuestionByMessage.get(effectiveMessageId);
-  if (existingPending) {
-    const question = formatQuestionRow(existingPending);
-    return res.json({ question, reused: true });
-  }
-
-  const relayMode = normalizeRelayMode(mode || q.relay_mode) || DEFAULT_RELAY_MODE;
-  const now = new Date().toISOString();
-  const questionId = uuidv4();
-  const promptText = sanitizeRelayQuestionPrompt({ prompt });
-  const normalizedChoices = normalizeQuestionChoices(choices);
-  const requestJson = sanitizeRelayQuestionRequest({
-    request: parseQuestionRequest(request),
-    context: sanitizeRelayQuestionContext(context),
-    allowFreeform: typeof allowFreeform === 'boolean' ? allowFreeform : (!normalizedChoices.length),
-  });
-  const expiresAt = questionExpiresAt(now);
-
-  stmts.insertQuestion.run(
-    questionId,
-    q.id,
-    conversationId || q.conversation_id,
-    effectiveMessageId,
-    relayMode,
-    promptText,
-    normalizedChoices.length ? JSON.stringify(normalizedChoices) : null,
-    requestJson,
-    now,
-    expiresAt,
-  );
-
-  const question = formatQuestionRow(stmts.getQuestion.get(questionId));
-  console.log(`[${ts()}] QUESTION  ${questionId.slice(0,8)} conv=${question.conversationId.slice(0,8)} mode=${relayMode} prompt="${promptText.slice(0,60)}"`);
-  io.emit('relay_question', { question });
-  res.json({ question });
-});
-
-app.post('/api/relay-question/:id/answer', auth, (req, res) => {
-  const { answer } = req.body;
-  const text = String(answer || '').trim();
-  if (!text) return res.status(400).json({ error: 'Empty answer' });
-
-  const row = stmts.getQuestion.get(req.params.id);
-  if (!row) return res.status(404).json({ error: 'Not found' });
-  if (row.status !== 'pending') return res.status(409).json({ error: `Question already ${row.status}` });
-
-  const now = new Date().toISOString();
-  const result = stmts.answerQuestion.run(text, now, row.id);
-  if (result.changes === 0) return res.status(409).json({ error: 'Question is no longer pending' });
-
-  const question = formatQuestionRow(stmts.getQuestion.get(row.id));
-  console.log(`[${ts()}] QUESTION  ${row.id.slice(0,8)} answered len=${text.length}`);
-  io.emit('relay_question_updated', { question });
-  res.json({ ok: true, question });
-});
-
-app.post('/api/relay-question/:id/timeout', auth, (req, res) => {
-  const row = stmts.getQuestion.get(req.params.id);
-  if (!row) return res.status(404).json({ error: 'Not found' });
-  if (row.status !== 'pending') return res.json({ ok: true, question: formatQuestionRow(row) });
-
-  const result = stmts.timeoutQuestion.run(row.id);
-  if (result.changes > 0) {
-    const question = formatQuestionRow(stmts.getQuestion.get(row.id));
-    console.log(`[${ts()}] QUESTION  ${row.id.slice(0,8)} timed out`);
-    io.emit('relay_question_updated', { question });
-    return res.json({ ok: true, question });
-  }
-
-  return res.json({ ok: true, question: formatQuestionRow(stmts.getQuestion.get(row.id)) });
-});
 
 // ─── Socket.io Auth ───────────────────────────────────────────────────────────
 io.use((socket, next) => {
@@ -3500,6 +2505,8 @@ const tunnelState = {
   backoffTimer: null,
   remoteBindMode: tunnelRemoteBindMode,
 };
+
+runtimeState.tunnelState = tunnelState;
 
 function tunnelLog(msg) {
   console.log(`[${ts()}] [ssh-tunnel] ${msg}`);
