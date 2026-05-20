@@ -306,32 +306,7 @@ export function createPollingLoop({
               dbg("model switch", switchText);
             }
 
-            const requestedSessionMode = String(
-              message.conversationSessionMode || getPreferredConversationSessionMode?.() || "shared"
-            ).trim().toLowerCase() || "shared";
-            const isolatedCapable = requestedSessionMode === "isolated" && !!getSupportsIsolatedSessions?.();
-            const effectiveSessionMode = isolatedCapable ? "isolated" : "shared";
-            let prompt = await buildPromptWithRelayContext(message);
-
-            if (requestedSessionMode === "isolated" && effectiveSessionMode !== "isolated") {
-              prompt = [
-                `[Conversation scope: ${message.conversationId}]`,
-                "Treat this request as isolated to this conversation ID.",
-                "Ignore unrelated prior turns from other web conversations unless explicitly quoted below.",
-                "",
-                prompt,
-              ].join("\n");
-
-              if (!getWarnedConversationModeFallback?.()) {
-                await api("POST", "/api/activity", {
-                  messageId: message.id,
-                  conversationId: message.conversationId,
-                  mode: message.relayMode || "agent",
-                  text: "Conversation session mode requested=isolated, runtime fallback=shared (single joinSession in extension mode).",
-                }).catch(() => {});
-                setWarnedConversationModeFallback?.(true);
-              }
-            }
+            const prompt = await buildPromptWithRelayContext(message);
 
             const sdkAttachments = buildSdkAttachments(message.attachments);
             const payload = sdkAttachments.length ? { prompt, attachments: sdkAttachments } : { prompt };

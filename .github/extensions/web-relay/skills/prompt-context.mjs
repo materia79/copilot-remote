@@ -52,7 +52,5 @@ export function buildModePrompt(mode, toolInstructions = "") {
 }
 
 export function buildPromptWithMode(message, toolInstructions = "") {
-  const basePrompt = buildPrompt(message);
-  const modePrompt = buildModePrompt(message?.relayMode, toolInstructions);
-  return basePrompt ? `${basePrompt}\n\n${modePrompt}` : modePrompt;
+  return buildPrompt(message);
 }

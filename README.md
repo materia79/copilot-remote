@@ -64,6 +64,14 @@ Start Copilot with the relay extension:
 npm run copilot:relay
 ```
 
+If you installed the extension globally in `~/.copilot/extensions/web-relay/`, you can also start plain Copilot from any repository:
+
+```bash
+gh copilot
+```
+
+In that setup, the extension auto-starts and supervises `server.js` for the active CLI session; `npm run copilot:relay` is just a convenience launcher for this repository.
+
 Open:
 
 ```text
@@ -197,6 +205,8 @@ Useful environment variables:
 - `COPILOT_WEB_RELAY_NODE`
 
 Project-local extension files still take precedence when both exist.
+
+If the same extension is available both project-local (`.github/extensions/web-relay/`) and user-global (`~/.copilot/extensions/web-relay/`), Copilot may show duplicates in extension management. Keep only one active copy to avoid double-loading.
 
 ## API overview
 

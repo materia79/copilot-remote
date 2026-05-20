@@ -22,8 +22,83 @@ export function createManagedServerLifecycle({
   let stoppingManagedServer = false;
   let restartTimer = null;
   let restartAttempts = 0;
+  let attemptedSqliteRepair = false;
 
   const RESTART_BACKOFF_MS = [1000, 2000, 5000, 10000, 20000];
+  const STARTUP_LOG_TAIL_BYTES = 24 * 1024;
+
+  function readLogTail(filePath, maxBytes = STARTUP_LOG_TAIL_BYTES) {
+    try {
+      const stats = fs.statSync(filePath);
+      const size = Number(stats?.size || 0);
+      if (size <= 0) return "";
+      const readFrom = Math.max(0, size - Math.max(1024, Number(maxBytes) || STARTUP_LOG_TAIL_BYTES));
+      const readSize = Math.max(0, size - readFrom);
+      if (!readSize) return "";
+      const fd = fs.openSync(filePath, "r");
+      try {
+        const chunk = Buffer.alloc(readSize);
+        fs.readSync(fd, chunk, 0, readSize, readFrom);
+        return chunk.toString("utf8");
+      } finally {
+        try { fs.closeSync(fd); } catch {}
+      }
+    } catch {
+      return "";
+    }
+  }
+
+  function hasBetterSqliteAbiMismatch(logText) {
+    const text = String(logText || "");
+    if (!text) return false;
+    if (!/better_sqlite3\.node/i.test(text)) return false;
+    return /NODE_MODULE_VERSION|compiled against a different Node\.js version|ERR_DLOPEN_FAILED/i.test(text);
+  }
+
+  async function rebuildBetterSqlite3() {
+    const npmBin = process.platform === "win32" ? "npm.cmd" : "npm";
+    dbg("attempting native module repair", "command=npm rebuild better-sqlite3");
+
+    return await new Promise((resolve) => {
+      let out = "";
+      const rebuildProc = spawn(npmBin, ["rebuild", "better-sqlite3"], {
+        cwd: serverDir,
+        env: process.env,
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
+
+      const append = (prefix, chunk) => {
+        const text = String(chunk || "");
+        if (!text) return;
+        out += `${prefix}${text}`;
+        if (out.length > 12_000) {
+          out = out.slice(out.length - 12_000);
+        }
+      };
+
+      rebuildProc.stdout?.on("data", (chunk) => append("", chunk));
+      rebuildProc.stderr?.on("data", (chunk) => append("", chunk));
+
+      rebuildProc.once("error", (error) => {
+        resolve({
+          ok: false,
+          code: null,
+          error: error?.message || String(error),
+          output: out,
+        });
+      });
+
+      rebuildProc.once("exit", (code) => {
+        resolve({
+          ok: Number(code) === 0,
+          code: Number.isFinite(Number(code)) ? Number(code) : null,
+          error: null,
+          output: out,
+        });
+      });
+    });
+  }
 
   function closeManagedServerStreams() {
     if (managedServerStdoutFd !== null) {
@@ -100,6 +175,7 @@ export function createManagedServerLifecycle({
     managedServerProc = null;
     managedServerOwned = false;
     restartAttempts = 0;
+    attemptedSqliteRepair = false;
     stoppingManagedServer = false;
   }
 
@@ -171,6 +247,25 @@ export function createManagedServerLifecycle({
       } catch (error) {
         if (startedOwnedProcess) {
           killProcessTree(managedServerProc);
+        }
+        const startupErrorTail = readLogTail(serverErrPath);
+        const shouldRepairSqlite = startedOwnedProcess
+          && !attemptedSqliteRepair
+          && hasBetterSqliteAbiMismatch(startupErrorTail);
+        if (shouldRepairSqlite) {
+          attemptedSqliteRepair = true;
+          const repairResult = await rebuildBetterSqlite3();
+          if (repairResult.ok) {
+            restartAttempts = 0;
+            dbg("native module repair succeeded", "better-sqlite3 rebuilt for current Node runtime");
+          } else {
+            dbg(
+              "native module repair failed",
+              `code=${repairResult.code ?? "null"}`,
+              repairResult.error || "unknown error",
+              (repairResult.output || "").slice(-400),
+            );
+          }
         }
         closeManagedServerStreams();
         managedServerProc = null;

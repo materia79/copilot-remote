@@ -9,6 +9,7 @@
 import { joinSession } from "@github/copilot-sdk/extension";
 import { spawn } from "child_process";
 import fs from "fs";
+import path from "path";
 import { generateHighEntropyToken } from "./utils/token-generation.mjs";
 import { delay, killProcessTree, sleep } from "./utils/process-utils.mjs";
 import { resolveRelayPaths, loadTokenFromConfig, loadRelayInstructionsFromFile } from "./runtime/config-loader.mjs";
@@ -30,6 +31,7 @@ import { createPollingLoop } from "./polling/polling-loop.mjs";
 import { createManagedServerLifecycle } from "./server-lifecycle/managed-server.mjs";
 import { createModelSwitchingService } from "./model-api/model-switching.mjs";
 import { createSessionIoHelpers } from "./runtime/session-io.mjs";
+import { createBannerStateStore } from "./runtime/banner-state.mjs";
 import { clearSession, registerSession } from "./runtime/session-registry.mjs";
 import { syncSessionToServer } from "./runtime/session-sync-bridge.mjs";
 
@@ -58,8 +60,16 @@ const QUESTION_POLL_MS = 1500;
 const MAX_TOOL_DETAIL_LENGTH = 140;
 
 const MODEL_SNAPSHOT_MIN_INTERVAL_MS = 30_000;
+const BANNER_DEDUPE_TTL_MS = 6 * 60 * 60 * 1000;
+const BANNER_DEDUPE_COOLDOWN_MS = 15 * 1000;
 const { dbg } = createDebugLogger({ logDir: LOG_DIR });
 const api = createApiClient({ serverUrl: SERVER_URL, token: TOKEN });
+const bannerStateStore = createBannerStateStore({
+  stateFilePath: path.resolve(LOG_DIR, "relay-banner-state.json"),
+  dbg,
+  ttlMs: BANNER_DEDUPE_TTL_MS,
+  cooldownMs: BANNER_DEDUPE_COOLDOWN_MS,
+});
 const buildPromptWithRelayContext = (message) => buildPromptWithMode(message, RELAY_TOOL_INSTRUCTIONS);
 
 const managedServerLifecycle = createManagedServerLifecycle({
@@ -377,6 +387,19 @@ async function renderRelayReadyBannerFromStatus(status, { force = false } = {}) 
 
   const nextKey = relayBannerCacheKey(readyBanner);
   if (!force && nextKey && nextKey === lastRenderedRelayBannerKey) {
+    dbg("relay banner suppressed: in-memory cache key match");
+    return;
+  }
+
+  const suppress = bannerStateStore.shouldSuppress({
+    sessionId: String(session?.sessionId || "").trim() || "unknown",
+    bannerKey: nextKey || "fallback-banner",
+    token: TOKEN,
+    force,
+  });
+  if (suppress.suppress) {
+    dbg("relay banner suppressed:", suppress.reason);
+    if (nextKey) lastRenderedRelayBannerKey = nextKey;
     return;
   }
 
@@ -390,7 +413,14 @@ async function renderRelayReadyBannerFromStatus(status, { force = false } = {}) 
   await session.log(`🔐 Auth: ${info.authText}`, { ephemeral: true });
   await session.log(`📡 Pending: ${info.pollingUrl}`, { ephemeral: true });
 
-  if (nextKey) lastRenderedRelayBannerKey = nextKey;
+  if (nextKey) {
+    lastRenderedRelayBannerKey = nextKey;
+  }
+  bannerStateStore.markShown({
+    sessionId: String(session?.sessionId || "").trim() || "unknown",
+    bannerKey: nextKey || "fallback-banner",
+    token: TOKEN,
+  });
 }
 
 // Start the web server as soon as the extension loads so users get relay availability

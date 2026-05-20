@@ -24,6 +24,8 @@ import { registerSessionsRoutes } from './routes/sessions-routes.mjs';
 import { registerMessagesRoutes } from './routes/messages-routes.mjs';
 import { registerAskUserRoutes } from './routes/ask-user-routes.mjs';
 import { createDeleteArchiveService } from './services/delete-archive-service.mjs';
+import { createSessionDiscoveryService } from './services/session-discovery-service.mjs';
+import { createSessionTranscriptService } from './services/session-transcript-service.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -2160,6 +2162,19 @@ function fetchUsageSummary(cb) {
   });
 }
 
+const sessionDiscoveryService = createSessionDiscoveryService({
+  fs,
+  path,
+  resolveSessionStateRoot,
+});
+const discoverSessionStateConversations = sessionDiscoveryService.discoverSessionStateConversations;
+const sessionTranscriptService = createSessionTranscriptService({
+  fs,
+  path,
+  resolveSessionStateRoot,
+});
+const readSessionTranscriptMessages = sessionTranscriptService.readSessionTranscriptMessages;
+
 // ─── Express + Socket.io Setup ────────────────────────────────────────────────
 const app        = express();
 const httpServer = http.createServer(app);
@@ -2249,6 +2264,8 @@ const sharedRouteDeps = {
   emitToClientsExceptSessionId,
   buildContextResponseText,
   readContextFromSessionEvents,
+  discoverSessionStateConversations,
+  readSessionTranscriptMessages,
   collectOrphanedUploadsFromConversation,
   deleteOrphanedUploads,
   fetchUsageSummary,

@@ -30,6 +30,8 @@ export function registerSessionsRoutes(app, deps) {
     ensureSessionId,
     touchCli,
     fetchUsageSummary,
+    discoverSessionStateConversations,
+    readSessionTranscriptMessages,
     ensureRuntimeSessionBinding,
     bootstrapRuntimeSessionBindings,
     configuredConversationSessionMode,
@@ -62,6 +64,39 @@ export function registerSessionsRoutes(app, deps) {
       updatedAt:    r.updated_at,
       messageCount: r.message_count,
     }));
+
+    const knownById = new Set(conversations.map((c) => String(c.id || '').trim()).filter(Boolean));
+    const knownBySdkSessionId = new Set(conversations.map((c) => String(c.sdkSessionId || '').trim()).filter(Boolean));
+    const discovered = discoverSessionStateConversations(200);
+
+    for (const item of discovered) {
+      const sdkSessionId = String(item?.sdkSessionId || '').trim();
+      if (!sdkSessionId) continue;
+      if (knownBySdkSessionId.has(sdkSessionId) || knownById.has(sdkSessionId)) continue;
+
+      const runtimeSession = stmts.getRuntimeSessionBySdkSessionId.get(sdkSessionId) || null;
+      const updatedAt = String(item?.updatedAt || '').trim() || new Date().toISOString();
+      const syntheticConversation = {
+        id: sdkSessionId,
+        sdkSessionId,
+        title: `Session ${sdkSessionId.slice(0, 8)}`,
+        archived: false,
+        compactedInto: null,
+        compactedFrom: null,
+        runtimeSessionId: runtimeSession?.id || null,
+        runtimeSessionStrategy: runtimeSession?.strategy || null,
+        runtimeSessionStatus: runtimeSession?.status || null,
+        runtimeSessionLastUsedAt: runtimeSession?.last_used_at || updatedAt,
+        createdAt: updatedAt,
+        updatedAt,
+        messageCount: 0,
+      };
+      conversations.push(syntheticConversation);
+      knownById.add(sdkSessionId);
+      knownBySdkSessionId.add(sdkSessionId);
+    }
+
+    conversations.sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
     res.json({ conversations });
   });
 
@@ -169,11 +204,39 @@ export function registerSessionsRoutes(app, deps) {
 
   // GET /api/conversation/:id — get full conversation
   app.get('/api/conversation/:id', auth, (req, res) => {
-    const conv = stmts.getConv.get(req.params.id);
-    if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+    const requestedId = String(req.params.id || '').trim();
+    const conv = stmts.getConv.get(requestedId);
+    if (!conv) {
+      const discovered = discoverSessionStateConversations(400);
+      const match = discovered.find((item) => String(item?.sdkSessionId || '').trim() === requestedId) || null;
+      if (!match) return res.status(404).json({ error: 'Conversation not found' });
+      const runtimeSession = stmts.getRuntimeSessionBySdkSessionId.get(requestedId) || null;
+      const updatedAt = String(match?.updatedAt || '').trim() || new Date().toISOString();
+      const messages = readSessionTranscriptMessages(requestedId, { limit: 400 });
+      return res.json({
+        id: requestedId,
+        title: `Session ${requestedId.slice(0, 8)}`,
+        archived: false,
+        compactedInto: null,
+        compactedFrom: null,
+        runtimeSession: runtimeSession ? {
+          id: runtimeSession.id,
+          strategy: runtimeSession.strategy || null,
+          status: runtimeSession.status || null,
+          model: runtimeSession.model || null,
+          createdAt: runtimeSession.created_at || null,
+          lastUsedAt: runtimeSession.last_used_at || null,
+        } : null,
+        createdAt: updatedAt,
+        updatedAt,
+        inFlight: null,
+        messages,
+      });
+    }
     const runtimeSession = stmts.getRuntimeSessionByConversation.get(req.params.id) || null;
     const inFlight = inFlightStateForConversation(req.params.id);
-    const messages = stmts.getMessages.all(req.params.id).map(m => ({
+    const transcriptMessages = readSessionTranscriptMessages(String(conv.sdk_session_id || req.params.id || '').trim(), { limit: 400 });
+    let messages = stmts.getMessages.all(req.params.id).map(m => ({
       activities: m.role === 'assistant' ? relayActivityForResponse(m.id) : [],
       id:        m.id,
       role:      m.role,
@@ -183,6 +246,9 @@ export function registerSessionsRoutes(app, deps) {
       mode:      m.mode || undefined,
       timestamp: m.timestamp,
     }));
+    if (transcriptMessages.length > messages.length) {
+      messages = transcriptMessages;
+    }
     res.json({
       id: conv.id,
       title: conv.title,

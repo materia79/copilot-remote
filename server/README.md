@@ -12,9 +12,9 @@ This project now runs in package-wide ESM mode (`"type": "module"` in `package.j
 
 ## Starting the Server
 
-If you run `gh copilot` from this repository and the `.github/extensions/web-relay/extension.mjs`
-extension loads, the extension now auto-starts `server.js` when needed and stops the managed
-server when that Copilot session ends.
+If you run `gh copilot` and the web-relay extension is loaded (project-local or user-global),
+the extension auto-starts `server.js` when needed and stops the managed server when that
+Copilot session ends.
 
 > **Single-owner rule:** Use either extension-managed polling **or** standalone `relay.mjs`, never both at the same time.
 
@@ -27,7 +27,8 @@ npm run copilot:relay
 ```
 
 That runs `gh copilot -- --allow-all -i "launch the server"` from the repo root, so the
-extension is discovered and the relay starts immediately.
+extension is discovered and the relay starts immediately. If you installed the extension
+globally, plain `gh copilot` from any repository is enough.
 
 Or manually:
 
@@ -88,6 +89,12 @@ across repositories:
 ```text
 C:\Users\<you>\.copilot\extensions\web-relay\extension.mjs
 ```
+
+With global install, starting `gh copilot` in any workspace will load this extension and keep
+the relay tied to that workspace CWD instead of forcing a fixed repo launcher.
+
+If you also keep a project-local copy, extension management can show two `web-relay` entries.
+Keep only one active to prevent duplicate loading.
 
 For global install, copy the full `web-relay` extension folder there and set one of these
 environment variables so it can find your relay server files:
@@ -214,6 +221,7 @@ This means the following startup sequence is expected:
 |---|---|
 | UI says "CLI is offline" | Verify `/api/status` works with the auth cookie or `Authorization: Bearer <token>` and shows `cliOnline: true` |
 | UI flaps online/offline after restart | Ensure you are not mixing extension-managed mode with standalone `relay.mjs`, and confirm only one relay process owns port `3333` |
+| "Web relay connected" banner repeats too often | Ensure only one extension instance is active; banner dedupe now persists across extension restarts for the same CLI session and reprints only when relay details change |
 | No response after sending | Tail `server\ext-debug.log` and confirm `onSessionStart fired` + `startPolling called` |
 | Wrong model used | Check logs for `Model selected: requested=... active=...` |
 | Question card stuck | Answer in the card UI; logs should show `relay question created` and `relay question answered` |
