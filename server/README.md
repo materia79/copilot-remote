@@ -46,25 +46,12 @@ start only the web server manually:
 npm run start:server
 ```
 
-If you want the server to auto-restart after crashes/exits (Windows),
-use the respawn watchdog:
-
-```bash
-npm run start:server:respawn
-```
-
-On Linux/macOS, use:
-
-```bash
-npm run start:server:respawn:posix
-```
-
 Mode summary:
 
 - `npm start`: server + standalone SDK relay (manual development / local end-to-end testing)
 - `npm run start:server`: server only (use with `.github/extensions/web-relay/extension.mjs` in CLI session)
-- `npm run start:server:respawn`: server-only manual watchdog fallback (`respawn.bat`)
-- `npm run start:server:respawn:posix`: server-only manual watchdog fallback (`respawn.sh`)
+- `npm run start:server:respawn`: legacy/manual watchdog tool (`respawn.bat`, outside extension-managed flow)
+- `npm run start:server:respawn:posix`: legacy/manual watchdog tool (`respawn.sh`, outside extension-managed flow)
 
 ### Runtime safety checklist (avoid duplicate relay workers)
 
@@ -199,6 +186,7 @@ After launching the server, the CLI enters a polling loop:
 - CLI appears **online** (green dot) in the web UI while polling
 - While working, relay tool activity is streamed into the pending assistant bubble
   (for example `Search (glob)` and `Search (grep)`).
+- Assistant reply text is streamed into the pending assistant bubble while the turn is running.
 - Tool activity is now also kept with the assistant message as a collapsible
   **Tool activity** section after the response arrives.
 - Clarification prompts from `ask_user`/user-input requests are forwarded as
@@ -251,9 +239,12 @@ All authenticated routes accept an HttpOnly auth cookie or an `Authorization: Be
 | GET | `/api/conversation/:id` | Get full conversation with messages |
 | POST | `/api/conversation/:id/compact` | Compact a conversation into a new one with carry-over summary seed |
 | DELETE | `/api/conversation/:id` | Delete a conversation |
+| GET | `/api/sdk-session-delete/pending` | (CLI relay) Fetch next pending SDK session delete request |
+| POST | `/api/sdk-session-delete/result` | (CLI relay) Report SDK session delete result |
 | GET | `/api/pending` | (CLI) Fetch next pending message |
 | POST | `/api/response` | (CLI) Submit response for a message |
 | POST | `/api/activity` | (CLI) Push in-flight tool activity for current message |
+| POST | `/api/stream` | (CLI) Push in-flight assistant text stream for current pending message |
 | POST | `/api/relay/pause` | Pause dequeueing and drop currently queued messages |
 | POST | `/api/relay/resume` | Resume dequeueing after pause |
 | GET | `/api/relay-questions` | (CLI/UI) List relay questions by `status` (for example `pending` or `answered`) |
@@ -266,7 +257,7 @@ All authenticated routes accept an HttpOnly auth cookie or an `Authorization: Be
 | GET | `/api/models` | Live/cached model catalog used by the UI picker |
 | POST | `/api/models/snapshot` | (CLI/relay) Publish discovered model snapshot |
 | GET | `/api/context/:conversationId` | Parse and return context metrics from session-state events for a conversation |
-| GET | `/api/context` | Parse and return context metrics for latest (or query-selected) runtime session |
+| GET | `/api/context` | Parse context metrics only when `conversationId` query is provided; otherwise returns a missing-selection response |
 | GET | `/api/usage` | Live Copilot usage snapshot |
 
 ### Upload storage model

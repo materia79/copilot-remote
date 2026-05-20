@@ -49,7 +49,7 @@ import { loadConversations, refreshConversations, openConversation, renderConvLi
 import { newConversation, deleteConv } from './journal-view.js';
 import { loadRelayQuestions, renderRelayQuestions, upsertRelayQuestion, updatePendingQuestionBanner } from './ask-user-view.js';
 import { openPendingQuestionFromBanner, submitRelayQuestionChoice, submitRelayQuestionAnswer, onRelayQuestionDraftInput, handleRelayQuestionKey } from './ask-user-view.js';
-import { showThinking, removeThinking, renderThinkingActivities, appendThinkingActivity, restoreInFlightThinking, renderMessages, appendMessage, compactCurrentConversation, sendMessage, handleKey } from './conversation-view.js';
+import { showThinking, removeThinking, renderThinkingActivities, appendThinkingActivity, updateThinkingText, restoreInFlightThinking, renderMessages, appendMessage, compactCurrentConversation, sendMessage, handleKey } from './conversation-view.js';
 import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser } from './attachments-view.js';
 import { handleAttachmentInput, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
 
@@ -225,15 +225,17 @@ async function loadContextSummaryAndRender(convId) {
   const trimmedConvId = String(convId || '').trim();
   const payload = await loadContextSummary(trimmedConvId);
   if (!payload) throw new Error('Unable to load context');
+  const copilotSessionId = String(payload.copilotSessionId || payload.snapshot?.copilot_session_id || '').trim();
+  const refreshLookupId = copilotSessionId || trimmedConvId || null;
   const title = trimmedConvId ? 'Current Context' : 'Latest Context';
-  const subtitle = payload.runtimeSessionId
-    ? `Runtime session ${String(payload.runtimeSessionId).slice(0, 8)}`
+  const subtitle = copilotSessionId
+    ? `Copilot session ${copilotSessionId.slice(0, 8)}`
     : (trimmedConvId ? `Conversation ${trimmedConvId.slice(0, 8)}` : 'Latest runtime session');
   renderSummaryModalContent({
     title,
     subtitle,
     bodyHtml: `<pre>${escHtml(payload.text || 'No context data available.')}</pre>`,
-    refresh: () => loadContextSummaryAndRender(trimmedConvId),
+    refresh: () => loadContextSummaryAndRender(refreshLookupId),
     kind: 'context',
   });
 }
@@ -623,6 +625,53 @@ async function refreshCurrentView() {
   if (messagesEl) messagesEl.scrollTop = scrollTop;
 }
 
+async function copyTextToClipboard(text) {
+  const value = String(text || '').trim();
+  if (!value) return false;
+  if (navigator?.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return true;
+    } catch {}
+  }
+  try {
+    const el = document.createElement('textarea');
+    el.value = value;
+    el.setAttribute('readonly', 'readonly');
+    el.style.position = 'fixed';
+    el.style.opacity = '0';
+    document.body.appendChild(el);
+    el.focus();
+    el.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(el);
+    return !!ok;
+  } catch {
+    return false;
+  }
+}
+
+function initSessionPillCopy() {
+  const pill = document.getElementById('session-pill');
+  if (!pill || pill.dataset.copyBound === '1') return;
+  pill.dataset.copyBound = '1';
+
+  const copySessionId = async () => {
+    const sessionId = String(pill.dataset.copilotSessionId || '').trim();
+    if (!sessionId) return;
+    const ok = await copyTextToClipboard(sessionId);
+    if (ok) {
+      showTransientRelayNotice(`Copied Copilot session ID: ${sessionId.slice(0, 8)}…`);
+    } else {
+      showTransientRelayNotice('Could not copy session ID.');
+    }
+  };
+
+  pill.addEventListener('click', () => {
+    copySessionId().catch(() => {});
+  });
+}
+
 function initFullscreenButton() {
   const syncFullscreenUi = () => {
     updateInstallButton();
@@ -701,6 +750,11 @@ async function connectSocket() {
     if (last !== text) relayActivities.set(messageId, items.concat(text).slice(-24));
     if (conversationId === currentConvId) appendThinkingActivity(text);
   });
+  socket.on('relay_stream', ({ conversationId, messageId, text, done }) => {
+    if (!messageId) return;
+    if (conversationId !== currentConvId) return;
+    updateThinkingText(String(text || ''), messageId, !!done);
+  });
   socket.on('conversation_compacted', async ({ sourceConversationId, targetConversationId }) => {
     if (!sourceConversationId || !targetConversationId) return;
     await refreshConversations();
@@ -712,7 +766,7 @@ async function connectSocket() {
   });
   socket.on('message_status', ({ messageId, conversationId, status }) => {
     if (conversationId === currentConvId && status === 'processing') {
-      showThinking();
+      showThinking(messageId || null);
       renderThinkingActivities();
     }
     if (conversationId === currentConvId && (status === 'done' || status === 'failed' || status === 'dropped')) {
@@ -767,6 +821,7 @@ async function initApp() {
   initFullscreenButton();
   initInstallButton();
   initPullToRefresh();
+  initSessionPillCopy();
   connectSocket();
   startRelayQuestionPolling();
   await loadConversations();

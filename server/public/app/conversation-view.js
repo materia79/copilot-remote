@@ -32,6 +32,7 @@ import { renderAttachmentMarkup, clearAttachments, uploadAttachments } from './a
 import { renderRelayQuestions } from './ask-user-view.js';
 
 let thinkingMessageId = null;
+let thinkingText = '';
 
 export function decorateActivityText(text) {
   const value = String(text || '').trim();
@@ -82,24 +83,42 @@ export function renderActivityMarkup(activities) {
   return `${progressHtml}${toolsHtml}`;
 }
 
-export function showThinking() {
+export function showThinking(messageId = null) {
+  if (messageId) thinkingMessageId = messageId;
   removeThinking();
   const el = document.getElementById('messages');
   const div = document.createElement('div');
   div.className = 'msg assistant';
   div.id = 'thinking-indicator';
   div.innerHTML = `
-    <div class="msg-label">Copilot</div>
     <div class="thinking-bubble">
+      <div id="thinking-text" class="thinking-text"></div>
       <div class="dots"><span></span><span></span><span></span></div>
       <div id="thinking-activity" class="thinking-activity"></div>
-    </div>`;
+    </div>
+    <div class="msg-label">Copilot</div>`;
   el.appendChild(div);
+  renderThinkingText(thinkingText);
   scrollBottom();
 }
 
 export function removeThinking() {
+  thinkingText = '';
+  thinkingMessageId = null;
   document.getElementById('thinking-indicator')?.remove();
+}
+
+function renderThinkingText(text) {
+  const box = document.getElementById('thinking-text');
+  if (!box) return;
+  const value = String(text || '').trim();
+  if (!value) {
+    box.innerHTML = '';
+    box.classList.remove('visible');
+    return;
+  }
+  box.classList.add('visible');
+  box.innerHTML = `<p>${escHtml(value).replace(/\n/g, '<br>')}</p>`;
 }
 
 export function renderThinkingActivities() {
@@ -123,7 +142,7 @@ export function restoreInFlightThinking(inFlight) {
     : [];
   relayActivities.set(messageId, activities);
   thinkingMessageId = messageId;
-  showThinking();
+  showThinking(messageId);
   renderThinkingActivities();
 }
 
@@ -138,6 +157,24 @@ export function appendThinkingActivity(text, autoScroll = true) {
   row.textContent = decorated;
   box.appendChild(row);
   if (autoScroll) scrollBottom();
+}
+
+export function updateThinkingText(text, messageId = null, done = false) {
+  if (messageId) {
+    if (thinkingMessageId && thinkingMessageId !== messageId) return;
+    thinkingMessageId = messageId;
+  }
+  if (!document.getElementById('thinking-indicator')) {
+    if (done) return;
+    showThinking(thinkingMessageId);
+  }
+  thinkingText = String(text || '');
+  renderThinkingText(thinkingText);
+  if (done) {
+    const dots = document.querySelector('#thinking-indicator .dots');
+    if (dots) dots.style.display = 'none';
+  }
+  scrollBottom();
 }
 
 export function appendMessage(msg, scroll = true, msgId = null, force = false) {
@@ -174,8 +211,8 @@ export function appendMessage(msg, scroll = true, msgId = null, force = false) {
     : 'msg-bubble';
 
   div.innerHTML = `
-    <div class="msg-label">${label}${modelTag}${modeTag} · ${fmtDate(msg.timestamp)}</div>
-    <div class="${bubbleClass}">${content}${attachmentHtml}${activityHtml}</div>`;
+    <div class="${bubbleClass}">${content}${attachmentHtml}${activityHtml}</div>
+    <div class="msg-label">${label}${modelTag}${modeTag} · ${fmtDate(msg.timestamp)}</div>`;
 
   linkifyWorkspaceMentionsInNode(div.querySelector('.msg-bubble'));
   div.querySelectorAll('pre code').forEach((b) => hljs.highlightElement(b));
@@ -318,7 +355,7 @@ export async function sendMessage() {
       applyContextUsageBar(null);
       scheduleContextUsageRefresh(r.conversationId, 0);
     }
-    if (cliOnline) showThinking();
+    if (cliOnline) showThinking(r.messageId || null);
   }
 
   document.getElementById('send-btn').disabled = false;

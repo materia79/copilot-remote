@@ -219,8 +219,11 @@
     border-radius: 999px;
     padding: 2px 8px;
     flex-shrink: 0;
+    cursor: copy;
+    user-select: none;
   }
   #session-pill.visible { display: inline-flex; }
+  #session-pill:hover { border-color: var(--accent); color: var(--text); }
   #cli-status-text { font-size: 0.8rem; color: var(--muted); flex-shrink: 0; }
   #fullscreen-btn {
     display: none;
@@ -309,7 +312,7 @@
   .msg.user  { align-self: flex-end; align-items: flex-end; }
   .msg.assistant { align-self: flex-start; align-items: flex-start; }
 
-  .msg-label { font-size: 0.72rem; color: var(--muted); margin-bottom: 4px; padding: 0 4px; }
+  .msg-label { font-size: 0.72rem; color: var(--muted); margin-top: 4px; padding: 0 4px; }
   .msg-model {
     display: inline-block; font-size: 0.68rem; background: var(--bg3);
     border: 1px solid var(--border); border-radius: 4px; padding: 0 5px;
@@ -380,6 +383,19 @@
     max-width: 100%;
     min-width: 0;
   }
+  .thinking-text {
+    display: none;
+    margin-bottom: 8px;
+    font-size: 0.93rem;
+    line-height: 1.5;
+    color: var(--text);
+    min-width: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  .thinking-text.visible { display: block; }
+  .thinking-text p { margin: 0; }
   .thinking-activity {
     margin-top: 8px; font-size: 0.82rem; color: var(--muted);
     display: flex; flex-direction: column; gap: 4px;

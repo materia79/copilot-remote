@@ -198,7 +198,9 @@ export async function submitRelayQuestionAnswer(questionId, presetAnswer = null)
   controls.forEach((el) => { el.disabled = true; });
 
   try {
-    const r = await answerRelayQuestion(questionId, answer);
+    const question = relayQuestions.get(questionId) || null;
+    const sdkSessionId = String(question?.sdkSessionId || '').trim();
+    const r = await answerRelayQuestion(questionId, answer, sdkSessionId || null);
     if (!r?.question) throw new Error('Failed to submit relay question answer');
     relayQuestionDrafts.delete(questionId);
     relayQuestions.set(questionId, r.question);

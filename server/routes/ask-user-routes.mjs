@@ -54,6 +54,7 @@ export function registerAskUserRoutes(app, deps) {
     const relayMode = normalizeRelayMode(mode || q.relay_mode) || DEFAULT_RELAY_MODE;
     const now = new Date().toISOString();
     const questionId = uuidv4();
+    const sdkSessionId = String(req.body.sdk_session_id || '').trim() || null;
     const promptText = sanitizeRelayQuestionPrompt({ prompt });
     const normalizedChoices = normalizeQuestionChoices(choices);
     const requestJson = sanitizeRelayQuestionRequest({
@@ -72,7 +73,7 @@ export function registerAskUserRoutes(app, deps) {
       promptText,
       normalizedChoices.length ? JSON.stringify(normalizedChoices) : null,
       requestJson,
-      req.body.sdk_session_id || null,
+      sdkSessionId,
       now,
       expiresAt,
     );
@@ -87,13 +88,14 @@ export function registerAskUserRoutes(app, deps) {
     const id = String(req.params.id || '').trim();
     const { answer, sdk_session_id } = req.body;
     const text = String(answer || '').trim();
+    const sdkSessionId = String(sdk_session_id || '').trim() || null;
     if (!text) return res.status(400).json({ error: 'Empty answer' });
 
     const row = stmts.getQuestion.get(id);
     if (!row) return res.status(404).json({ error: 'Not found' });
     if (row.status !== 'pending') return res.status(409).json({ error: `Question already ${row.status}` });
 
-    const result = askUserRoutingService.routeAnswer({ question_id: id, sdk_session_id, answer: text });
+    const result = askUserRoutingService.routeAnswer({ question_id: id, sdk_session_id: sdkSessionId, answer: text });
     if (!result.ok) {
       if (result.error === 'session mismatch') return res.status(403).json({ error: result.error });
       return res.status(400).json({ error: result.error });

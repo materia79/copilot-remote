@@ -96,7 +96,8 @@ export async function newConversation() {
 export async function deleteConv(e, id) {
   e.stopPropagation();
   if (!confirm('Delete this conversation?')) return;
-  await deleteConversationApi(id);
+  const result = await deleteConversationApi(id);
+  if (!result) return;
   delete conversations[id];
   renderConvList();
   if (currentConvId === id) {

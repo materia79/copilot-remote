@@ -21,6 +21,7 @@ Copilot Remote is split into two pieces:
 - Streaming tool/activity updates while a turn runs
 - Web question cards for `ask_user` clarification flows
 - Conversation history stored in local SQLite
+- Conversation delete requests are relayed to Copilot CLI SDK `deleteSession()` so web deletes can remove resumable CLI sessions
 - Conversation **compact** workflow (`/compact`) to continue with summary carry-over
 - Workspace + drives browser with file preview and raw file access
 - `@file:` and `@folder:` reference tokens with copy-to-clipboard helpers
@@ -88,8 +89,6 @@ Sign in once with your token. The relay then uses an HttpOnly auth cookie.
 |---|---|
 | `npm run copilot:relay` | Starts Copilot CLI with an initial prompt so the extension loads and polling begins |
 | `npm run start:server` | Server only (use with an active Copilot CLI session that loads the extension) |
-| `npm run start:server:respawn` | Manual watchdog fallback (Windows; use only outside extension-managed mode) |
-| `npm run start:server:respawn:posix` | Manual watchdog fallback (Linux/macOS; use only outside extension-managed mode) |
 | `npm start` | Standalone development mode (`server.js` + `relay.mjs`) |
 
 ### Single runtime owner rule
@@ -104,6 +103,8 @@ Do not run extension polling together with standalone relay polling.
 In extension-managed mode, polling begins after the CLI session becomes active (typically after the first prompt).
 The extension now supervises managed `server.js` restarts (bounded backoff) while the CLI session is alive, and stops restart attempts on session shutdown.
 When the CLI extension connects, it also prints the relay info window (local/network/remote/auth/polling URLs) directly in the Copilot CLI client.
+
+Respawner scripts (`start:server:respawn*`) are legacy/manual troubleshooting tools only and are not part of the extension-managed startup path.
 
 ## Using the web UI
 

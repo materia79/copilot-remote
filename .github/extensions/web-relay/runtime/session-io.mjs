@@ -111,6 +111,35 @@ export function createSessionIoHelpers({ getSession, sleep, dbg = () => {} }) {
     ]);
   }
 
+  async function sendWithBestEffortStreaming(payload, timeoutMs, onEvent) {
+    const session = getSession();
+    if (!session) throw new Error("No active Copilot session");
+    if (typeof session.send !== "function") {
+      return sendAndWaitWithHardTimeout(payload, timeoutMs);
+    }
+
+    const streamOrResult = await session.send(payload);
+    if (streamOrResult && typeof streamOrResult[Symbol.asyncIterator] === "function") {
+      const deadline = Date.now() + timeoutMs + 5_000;
+      let finalEvent = null;
+      for await (const event of streamOrResult) {
+        finalEvent = event;
+        if (typeof onEvent === "function") {
+          try { await onEvent(event); } catch {}
+        }
+        if (Date.now() > deadline) {
+          throw new Error(`Hard timeout after ${timeoutMs}ms while streaming session.send`);
+        }
+      }
+      return finalEvent || {};
+    }
+
+    if (typeof onEvent === "function") {
+      try { await onEvent(streamOrResult); } catch {}
+    }
+    return streamOrResult;
+  }
+
   function extractFinalTextWithLogging(finalEvent) {
     const result = extractFinalText(finalEvent, dbg);
     // Always log envelope structure so we can diagnose extraction misses
@@ -128,5 +157,6 @@ export function createSessionIoHelpers({ getSession, sleep, dbg = () => {} }) {
   return {
     extractFinalText: extractFinalTextWithLogging,
     sendAndWaitWithHardTimeout,
+    sendWithBestEffortStreaming,
   };
 }

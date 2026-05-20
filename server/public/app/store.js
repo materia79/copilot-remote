@@ -225,15 +225,23 @@ export function autoResize(el) {
 export function updateSessionPill(conversation, runtimeSession) {
   const pill = document.getElementById('session-pill');
   if (!pill) return;
-  const runtimeId = String(runtimeSession?.id || conversation?.runtimeSessionId || '').trim();
-  if (!runtimeId) {
+  const sdkSessionId = String(
+    runtimeSession?.sdkSessionId
+    || runtimeSession?.sdk_session_id
+    || conversation?.sdkSessionId
+    || conversation?.sdk_session_id
+    || '',
+  ).trim();
+  if (!sdkSessionId) {
     pill.textContent = '';
+    pill.title = '';
+    delete pill.dataset.copilotSessionId;
     pill.classList.remove('visible');
     return;
   }
-  const strategy = String(runtimeSession?.strategy || conversation?.runtimeSessionStrategy || '').trim();
-  const strategyText = strategy ? ` (${strategy})` : '';
-  pill.textContent = `Session ${runtimeId.slice(0, 8)}${strategyText}`;
+  pill.dataset.copilotSessionId = sdkSessionId;
+  pill.textContent = `CLI ${sdkSessionId.slice(0, 8)}`;
+  pill.title = `Copilot session ${sdkSessionId} (click to copy)`;
   pill.classList.add('visible');
 }
 

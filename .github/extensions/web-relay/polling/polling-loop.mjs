@@ -1,4 +1,5 @@
 import fs from "fs";
+import { getActiveSession } from "../runtime/session-registry.mjs";
 
 function isImageAttachment(att) {
   const type = String(att?.type || "").toLowerCase();
@@ -221,6 +222,7 @@ export function createPollingLoop({
     const prompt = extractQuestionPrompt(request);
     const choices = extractQuestionChoices(request);
     if (!prompt) return null;
+    const activeSession = getActiveSession();
 
     const created = await api("POST", "/api/relay-question", {
       queueId: message.id,
@@ -230,6 +232,7 @@ export function createPollingLoop({
       prompt,
       choices,
       allowFreeform: choices.length === 0,
+      sdk_session_id: activeSession?.sdkSessionId || undefined,
       context: {
         source: "ask-user-autopilot-bridge",
         rationale: "ask_user called but onUserInputRequest was bypassed (autopilot mode); intercepted via onPreToolUse.",
@@ -258,6 +261,43 @@ export function createPollingLoop({
     });
   }
 
+  async function processPendingSdkSessionDeletes() {
+    const pending = await api("GET", "/api/sdk-session-delete/pending").catch(() => null);
+    const request = pending?.request || null;
+    const sdkSessionId = String(request?.sdkSessionId || "").trim();
+    if (!sdkSessionId) return false;
+
+    let ok = false;
+    let errorText = "";
+    try {
+      const activeSession = getActiveSession();
+      const activeSdkSessionId = String(activeSession?.sdkSessionId || "").trim();
+      if (activeSdkSessionId && activeSdkSessionId === sdkSessionId) {
+        throw new Error("Refusing to delete the currently active SDK session");
+      }
+      if (!session || typeof session.deleteSession !== "function") {
+        throw new Error("SDK deleteSession() is unavailable in this CLI runtime");
+      }
+      await session.deleteSession(sdkSessionId);
+      ok = true;
+      await session.log(`🧹 Deleted SDK session ${sdkSessionId.slice(0, 8)} from relay request`, { ephemeral: true });
+    } catch (error) {
+      ok = false;
+      errorText = String(error?.message || error || "unknown delete failure").trim() || "unknown delete failure";
+      dbg("sdk delete failed", `session=${sdkSessionId}`, errorText);
+      await session.log(`⚠️ SDK session delete failed (${sdkSessionId.slice(0, 8)}): ${errorText}`, { level: "warn" });
+    }
+
+    await api("POST", "/api/sdk-session-delete/result", {
+      sdk_session_id: sdkSessionId,
+      conversation_id: request?.conversationId || undefined,
+      ok,
+      error: ok ? undefined : errorText,
+    }).catch(() => {});
+
+    return true;
+  }
+
   async function startPolling() {
     if (getPollingLoopStarted()) return;
     setPollingLoopStarted(true);
@@ -275,6 +315,8 @@ export function createPollingLoop({
         await publishModelSnapshot("poll");
 
         if (getWaitingForAI()) continue;
+        const processedDelete = await processPendingSdkSessionDeletes();
+        if (processedDelete) continue;
 
         const { message } = await api("GET", "/api/pending");
 
@@ -323,6 +365,20 @@ export function createPollingLoop({
             }
 
             let finalEvent;
+            let lastStreamedSent = "";
+            const pushRelayStream = async (text, done = false) => {
+              const value = String(text || "");
+              if (!value && !done) return;
+              if (!done && value === lastStreamedSent) return;
+              if (!done) lastStreamedSent = value;
+              await api("POST", "/api/stream", {
+                messageId: message.id,
+                conversationId: message.conversationId,
+                mode: message.relayMode || "agent",
+                text: value,
+                done: !!done,
+              }).catch(() => {});
+            };
             try {
               finalEvent = await sendAndWaitWithHardTimeout(payload, sendTimeout);
             } catch (attachmentError) {
@@ -432,8 +488,10 @@ export function createPollingLoop({
                   ].join(" ");
               dbg("sendAndWait returned empty content; sending fallback response msgId", message.id);
               await session.log("⚠️ Empty assistant response — sending fallback reply instead of re-queuing", { level: "warn" });
+              await pushRelayStream("", true);
               await api("POST", "/api/response", { messageId: message.id, conversationId: message.conversationId, text: fallbackText, model });
             } else {
+              await pushRelayStream(text, true);
               await api("POST", "/api/response", { messageId: message.id, conversationId: message.conversationId, text, model });
               await session.log(`✅ Sent response to web (${text.length} chars)`, { ephemeral: true });
             }

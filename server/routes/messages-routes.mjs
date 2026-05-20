@@ -655,6 +655,7 @@ export function registerMessagesRoutes(app, deps) {
     const finalize = db.transaction(() => {
       const result = stmts.setDone.run(text, messageId);
       if (result.changes === 0) return false;
+      stmts.setQueueResponseMessageId?.run(responseId, messageId);
       stmts.insertMsg.run(responseId, targetConversationId, 'assistant', text, model || null, relayMode, null, now);
       stmts.linkActivityToResponse.run(responseId, messageId);
       stmts.updateConvTime.run(now, targetConversationId);
@@ -702,8 +703,11 @@ export function registerMessagesRoutes(app, deps) {
       return res.status(400).json({ error: 'Missing activity payload' });
     }
 
+    const q = stmts.findQById.get(messageId);
+    const responseMessageId = q?.response_message_id || null;
     stmts.insertActivity.run(
       messageId,
+      responseMessageId,
       conversationId,
       normalizeRelayMode(mode) || DEFAULT_RELAY_MODE,
       activityText,
@@ -715,6 +719,26 @@ export function registerMessagesRoutes(app, deps) {
       conversationId,
       mode: normalizeRelayMode(mode) || DEFAULT_RELAY_MODE,
       text: activityText,
+      timestamp: new Date().toISOString(),
+    });
+    res.json({ ok: true });
+  });
+
+  // POST /api/stream — relay sends in-flight assistant text stream updates
+  app.post('/api/stream', auth, (req, res) => {
+    touchCli();
+    const { messageId, conversationId, text, mode, done } = req.body || {};
+    const streamText = String(text || '');
+    if (!messageId || !conversationId) {
+      return res.status(400).json({ error: 'Missing stream payload' });
+    }
+
+    io.emit('relay_stream', {
+      messageId,
+      conversationId,
+      mode: normalizeRelayMode(mode) || DEFAULT_RELAY_MODE,
+      text: streamText,
+      done: !!done,
       timestamp: new Date().toISOString(),
     });
     res.json({ ok: true });

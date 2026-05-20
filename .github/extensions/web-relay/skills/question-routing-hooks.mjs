@@ -46,7 +46,7 @@ export function createQuestionRoutingHooks({
     const activityText = formatToolActivity(request, maxToolDetailLength);
     if (activityText && activeMsg?.id && activityText !== getLastActivityText()) {
       setLastActivityText(activityText);
-      api("POST", "/api/activity", {
+      await api("POST", "/api/activity", {
         messageId: activeMsg.id,
         conversationId: activeMsg.conversationId,
         mode: activeMsg.relayMode || "agent",

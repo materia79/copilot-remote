@@ -181,6 +181,18 @@ if (tokenArgIdx !== -1 && process.argv[tokenArgIdx + 1]) {
   console.log(`[server] Auth token set via --token argument (not persisted to config.json)`);
 }
 
+// --port <number> on the command line overrides config.json (in-memory only, not persisted)
+const portArgIdx = process.argv.indexOf('--port');
+if (portArgIdx !== -1 && process.argv[portArgIdx + 1]) {
+  const parsedPort = Number.parseInt(String(process.argv[portArgIdx + 1]), 10);
+  if (Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65535) {
+    config.port = parsedPort;
+    console.log(`[server] Port set via --port argument: ${parsedPort} (not persisted to config.json)`);
+  } else {
+    console.warn(`[server] Ignoring invalid --port value: ${process.argv[portArgIdx + 1]}`);
+  }
+}
+
 // --owner-pid <number> allows managed mode to auto-exit when the owning CLI process is gone.
 const ownerPidArgIdx = process.argv.indexOf('--owner-pid');
 const ownerPidRaw = ownerPidArgIdx !== -1 ? process.argv[ownerPidArgIdx + 1] : null;
@@ -482,6 +494,7 @@ db.exec(`
     status              TEXT NOT NULL DEFAULT 'pending',
     timestamp           TEXT NOT NULL,
     processing_at       TEXT,
+    response_message_id TEXT,
     response            TEXT,
     retry_count         INTEGER NOT NULL DEFAULT 0,
     next_attempt_at     TEXT
@@ -503,6 +516,26 @@ db.exec(`
   );
 
   CREATE INDEX IF NOT EXISTS idx_runtime_sessions_last_used ON runtime_sessions(last_used_at DESC);
+
+  CREATE TABLE IF NOT EXISTS deleted_sdk_sessions (
+    sdk_session_id TEXT PRIMARY KEY,
+    deleted_at     TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS sdk_delete_requests (
+    sdk_session_id TEXT PRIMARY KEY,
+    conversation_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    requested_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    processing_at TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT,
+    last_error TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_sdk_delete_requests_status
+    ON sdk_delete_requests(status, requested_at, next_attempt_at);
 
   CREATE TABLE IF NOT EXISTS relay_questions (
     id              TEXT PRIMARY KEY,
@@ -589,6 +622,9 @@ if (!queueColumns.includes('retry_count')) {
 }
 if (!queueColumns.includes('next_attempt_at')) {
   db.exec(`ALTER TABLE queue ADD COLUMN next_attempt_at TEXT`);
+}
+if (!queueColumns.includes('response_message_id')) {
+  db.exec(`ALTER TABLE queue ADD COLUMN response_message_id TEXT`);
 }
 db.exec(`UPDATE queue SET relay_mode = 'agent' WHERE relay_mode IS NULL OR relay_mode = ''`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_next_attempt ON queue(status, next_attempt_at, timestamp)`);
@@ -1056,21 +1092,23 @@ function buildContextResponseText({ snapshot, runtimeSession, conversationId, ev
     detailEntries.push({ label, value: formatCompactTokens(n), multiline: false });
   };
 
+  const canonicalCopilotSessionId = contextField(
+    snapshot?.copilot_session_id
+    || runtimeSession?.sdk_session_id,
+  );
+
   if (!snapshot) {
     const fallbackSnapshot = {
       ...snapshot,
       model: String(runtimeSession?.model || '').trim() || null,
     };
-    if (hasText(conversationId)) pushDetail('Conversation ID', conversationId);
-    if (hasText(runtimeSession?.id)) pushDetail('Runtime session ID', runtimeSession.id);
+    pushDetail('Copilot session ID', canonicalCopilotSessionId);
     if (hasText(eventsPath)) detailEntries.push({ label: 'Events source', value: contextField(eventsPath), multiline: true });
     if (hasText(error)) detailEntries.push({ label: 'Note', value: contextField(error), multiline: true });
     return buildContextUsageBlock(fallbackSnapshot, runtimeSession, detailEntries);
   }
 
-  pushDetail('Conversation ID', conversationId);
-  pushDetail('Runtime session ID', contextField(snapshot.runtime_session_id || runtimeSession?.id));
-  pushDetail('Copilot session ID', contextField(snapshot.copilot_session_id));
+  pushDetail('Copilot session ID', canonicalCopilotSessionId);
   pushDetailCount('Prompt/Input', snapshot.used_prompt_tokens);
   pushDetailCount('Completion/Output', snapshot.used_completion_tokens);
   pushDetailCount('Reasoning', snapshot.reasoning_tokens);
@@ -1103,6 +1141,7 @@ function formatQuestionRow(row) {
     id: row.id,
     queueId: row.queue_id,
     conversationId: row.conversation_id,
+    sdkSessionId: row.sdk_session_id || null,
     messageId: row.message_id,
     mode: normalizeRelayMode(row.relay_mode) || DEFAULT_RELAY_MODE,
     prompt: row.prompt,
@@ -2241,6 +2280,7 @@ const sharedRouteDeps = {
   workspaceRootPayload,
   queueCounts,
   getModelCatalogState,
+  updateModelCatalog,
   buildRelayReadyBannerData,
   processingTimeoutMs,
   localhostOnly,

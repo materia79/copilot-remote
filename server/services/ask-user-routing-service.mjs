@@ -17,10 +17,10 @@ export function createAskUserRoutingService(db) {
     const row = findQuestion.get(question_id);
     if (!row) return { ok: false, error: 'Question not found' };
 
-    if (sdk_session_id) {
-      const rowSession = String(row.sdk_session_id || '').trim();
-      const incomingSession = String(sdk_session_id || '').trim();
-      if (rowSession && incomingSession && rowSession !== incomingSession) {
+    const rowSession = String(row.sdk_session_id || '').trim();
+    const incomingSession = String(sdk_session_id || '').trim();
+    if (rowSession || incomingSession) {
+      if (!rowSession || !incomingSession || rowSession !== incomingSession) {
         return { ok: false, error: 'session mismatch' };
       }
     }

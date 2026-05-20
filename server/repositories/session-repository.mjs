@@ -29,6 +29,7 @@ export function createSessionRepository(db) {
         countRuntimeSessions: db.prepare(`SELECT COUNT(*) AS cnt FROM runtime_sessions WHERE status = 'active'`),
         setProcessing:  db.prepare(`UPDATE queue SET status = 'processing', processing_at = ? WHERE id = ?`),
         setQueueRuntimeSession: db.prepare(`UPDATE queue SET runtime_session_id = ? WHERE id = ?`),
+        setQueueResponseMessageId: db.prepare(`UPDATE queue SET response_message_id = ? WHERE id = ?`),
         setDone:        db.prepare(`UPDATE queue SET status = 'done', response = ?, processing_at = NULL, next_attempt_at = NULL WHERE id = ? AND status IN ('processing', 'pending')`),
         setFailed:      db.prepare(`UPDATE queue SET status = 'failed', response = ?, processing_at = NULL, next_attempt_at = NULL WHERE id = ?`),
         deleteConvQ:    db.prepare(`DELETE FROM queue WHERE conversation_id = ?`),
@@ -49,5 +50,66 @@ export function createSessionRepository(db) {
         insertRuntimeSession: db.prepare(`INSERT INTO runtime_sessions (id, conversation_id, strategy, runtime_key, model, status, created_at, last_used_at) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)`),
         touchRuntimeSession: db.prepare(`UPDATE runtime_sessions SET model = ?, last_used_at = ?, status = 'active' WHERE id = ?`),
         deleteRuntimeSessionByConversation: db.prepare(`DELETE FROM runtime_sessions WHERE conversation_id = ?`),
+
+        // deleted sdk sessions tombstones (hide rediscovered SDK sessions after UI delete)
+        listDeletedSdkSessions: db.prepare(`SELECT sdk_session_id FROM deleted_sdk_sessions`),
+        getDeletedSdkSession: db.prepare(`SELECT sdk_session_id FROM deleted_sdk_sessions WHERE sdk_session_id = ? LIMIT 1`),
+        markDeletedSdkSession: db.prepare(`INSERT OR REPLACE INTO deleted_sdk_sessions (sdk_session_id, deleted_at) VALUES (?, ?)`),
+        clearDeletedSdkSession: db.prepare(`DELETE FROM deleted_sdk_sessions WHERE sdk_session_id = ?`),
+
+        // SDK session delete bridge queue (server <-> extension)
+        upsertSdkDeleteRequest: db.prepare(`
+          INSERT INTO sdk_delete_requests (
+            sdk_session_id, conversation_id, status, requested_at, updated_at, processing_at, retry_count, next_attempt_at, last_error
+          ) VALUES (?, ?, 'pending', ?, ?, NULL, 0, NULL, NULL)
+          ON CONFLICT(sdk_session_id) DO UPDATE SET
+            conversation_id = COALESCE(excluded.conversation_id, sdk_delete_requests.conversation_id),
+            status = 'pending',
+            requested_at = excluded.requested_at,
+            updated_at = excluded.updated_at,
+            processing_at = NULL,
+            retry_count = 0,
+            next_attempt_at = NULL,
+            last_error = NULL
+        `),
+        dequeueSdkDeleteRequest: db.prepare(`
+          SELECT sdk_session_id, conversation_id, retry_count, requested_at
+          FROM sdk_delete_requests
+          WHERE status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+          ORDER BY requested_at ASC
+          LIMIT 1
+        `),
+        setSdkDeleteRequestProcessing: db.prepare(`
+          UPDATE sdk_delete_requests
+          SET status = 'processing', processing_at = ?, updated_at = ?, last_error = NULL
+          WHERE sdk_session_id = ? AND status = 'pending'
+        `),
+        resetStaleSdkDeleteProcessing: db.prepare(`
+          UPDATE sdk_delete_requests
+          SET status = 'pending', processing_at = NULL, updated_at = ?
+          WHERE status = 'processing' AND processing_at < ?
+        `),
+        getSdkDeleteRequestBySessionId: db.prepare(`
+          SELECT sdk_session_id, conversation_id, status, retry_count, requested_at, updated_at, next_attempt_at, last_error
+          FROM sdk_delete_requests
+          WHERE sdk_session_id = ?
+          LIMIT 1
+        `),
+        setSdkDeleteRequestPendingWithError: db.prepare(`
+          UPDATE sdk_delete_requests
+          SET status = 'pending',
+              processing_at = NULL,
+              retry_count = retry_count + 1,
+              next_attempt_at = ?,
+              updated_at = ?,
+              last_error = ?
+          WHERE sdk_session_id = ?
+        `),
+        deleteSdkDeleteRequest: db.prepare(`DELETE FROM sdk_delete_requests WHERE sdk_session_id = ?`),
+        listDeletedConversationsBySdkSessionId: db.prepare(`
+          SELECT id, sdk_session_id
+          FROM conversations
+          WHERE status = 'deleted' AND sdk_session_id = ?
+        `),
     };
 }

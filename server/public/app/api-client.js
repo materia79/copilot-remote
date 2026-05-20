@@ -112,12 +112,13 @@ export async function loadRelayQuestion(questionId) {
   return apiFetch(`/api/relay-question/${encodeURIComponent(id)}`);
 }
 
-export async function answerRelayQuestion(questionId, answer) {
+export async function answerRelayQuestion(questionId, answer, sdkSessionId = null) {
   const id = String(questionId || '').trim();
   if (!id) return null;
+  const sessionId = String(sdkSessionId || '').trim();
   return apiFetch(`/api/relay-question/${encodeURIComponent(id)}/answer`, {
     method: 'POST',
-    body: JSON.stringify({ answer }),
+    body: JSON.stringify({ answer, sdk_session_id: sessionId || undefined }),
   });
 }
 
