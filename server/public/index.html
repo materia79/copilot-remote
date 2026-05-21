@@ -120,7 +120,24 @@
     align-items: center;
     gap: 6px;
     margin-left: auto;
+    flex-wrap: wrap;
+    justify-content: flex-end;
   }
+  #sidebar-actions #compact-btn {
+    width: auto;
+    min-width: 70px;
+    padding: 0 10px;
+    background: var(--bg3);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    height: 32px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  #sidebar-actions #compact-btn:hover { border-color: var(--accent); color: var(--accent); }
   .header-icon-btn {
     display: inline-flex;
     align-items: center;
@@ -227,6 +244,7 @@
     min-width: 0;
   }
   #chat-title { font-weight: 600; font-size: 1rem; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  #chat-title[data-copilot-session-id] { cursor: copy; }
   #chat-title-edit-btn {
     width: 32px;
     height: 32px;
@@ -272,6 +290,13 @@
     font-weight: 700;
   }
   #chat-title-save-btn:hover { color: #000; }
+  #chat-header-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: auto;
+    flex-shrink: 0;
+  }
   #pending-question-banner {
     display: none;
     border: 1px solid rgba(88, 166, 255, 0.45);
@@ -289,20 +314,6 @@
     align-items: center;
     gap: 6px;
   }
-  #session-pill {
-    display: none;
-    font-size: 0.72rem;
-    color: var(--muted);
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    padding: 2px 8px;
-    flex-shrink: 0;
-    cursor: copy;
-    user-select: none;
-  }
-  #session-pill.visible { display: inline-flex; }
-  #session-pill:hover { border-color: var(--accent); color: var(--text); }
-  #cli-status-text { font-size: 0.8rem; color: var(--muted); flex-shrink: 0; }
   #fullscreen-btn {
     display: none;
   }
@@ -1358,20 +1369,40 @@
       align-items: center;
     }
     #sidebar-toggle { order: 1; }
-    #session-pill {
+    #chat-title-wrap {
       order: 2;
-      margin-right: auto;
-      max-width: calc(100vw - 172px);
+      flex: 1 1 auto;
+      width: auto;
+      min-width: 0;
+      flex-wrap: nowrap;
+      align-items: center;
+      gap: 6px;
     }
-    #fullscreen-btn { order: 3; }
-    #compact-btn { order: 4; }
-    #cli-status-text { order: 5; }
-    #pending-question-banner { order: 6; }
     #chat-title {
-      order: 7;
+      flex: 1 1 auto;
+      width: auto;
+      margin: 0;
+    }
+    #chat-header-actions {
+      order: 3;
+      margin-left: 0;
+    }
+    #pending-question-banner {
+      order: 4;
+      flex: 1 0 100%;
+    }
+    #chat-title-editor {
       flex: 1 0 100%;
       width: 100%;
-      margin: 0 0 2px;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    #chat-title-input {
+      flex: 1 0 100%;
+      width: 100%;
+    }
+    .chat-title-action-btn {
+      flex: 1 1 calc(50% - 3px);
     }
     #sidebar-toggle { font-size: 1.05rem; padding: 2px 6px; }
     #chat-title { font-size: 0.96rem; }
@@ -1385,10 +1416,8 @@
       font-size: 0.76rem;
     }
     #pending-question-banner { font-size: 0.68rem; padding: 3px 8px; }
-    #session-pill { font-size: 0.68rem; padding: 2px 6px; }
-    #cli-status-text { font-size: 0.76rem; }
     .header-icon-btn { width: 30px; height: 30px; border-radius: 8px; font-size: 0.86rem; }
-    #compact-btn { min-width: 32px; height: 30px; padding: 0 8px; border-radius: 8px; font-size: 0.74rem; }
+    #sidebar-actions #compact-btn { min-width: 64px; height: 30px; padding: 0 8px; border-radius: 8px; font-size: 0.74rem; }
     #input-area { padding: 4px 10px calc(10px + env(safe-area-inset-bottom, 0px)); }
     .input-row { flex-wrap: wrap; gap: 8px; align-items: stretch; }
     #repo-browser-input-btn,
@@ -1521,6 +1550,7 @@
       <div id="sidebar-actions">
         <button id="usage-btn" class="header-icon-btn" onclick="showUsage()" title="Check Copilot usage" aria-label="Check Copilot usage">📊</button>
         <button id="context-btn" class="header-icon-btn" onclick="showContext()" title="Check current context" aria-label="Check current context">🧠</button>
+        <button id="compact-btn" onclick="compactCurrentConversation()" title="Compact conversation into a fresh session" disabled>Compact</button>
         <button id="install-btn" class="header-icon-btn" onclick="promptInstallApp()" title="Install app to home screen" aria-label="Install app">⬇</button>
       </div>
     </div>
@@ -1533,18 +1563,17 @@
       <button id="sidebar-toggle" onclick="openSidebar()">☰</button>
       <div id="chat-title-wrap">
         <span id="chat-title">Select or start a conversation</span>
-        <button id="chat-title-edit-btn" class="header-icon-btn" type="button" title="Edit conversation title" aria-label="Edit conversation title">✍️</button>
-        <form id="chat-title-editor">
+        <form id="chat-title-editor" hidden>
           <input id="chat-title-input" type="text" maxlength="120" autocomplete="off" spellcheck="false">
           <button id="chat-title-save-btn" class="chat-title-action-btn" type="submit">Save</button>
           <button id="chat-title-cancel-btn" class="chat-title-action-btn" type="button">Cancel</button>
         </form>
       </div>
+      <div id="chat-header-actions">
+        <button id="chat-title-edit-btn" class="header-icon-btn" type="button" title="Edit conversation title" aria-label="Edit conversation title">✍️</button>
+        <button id="fullscreen-btn" class="header-icon-btn" onclick="toggleFullscreen()" title="Toggle fullscreen" aria-label="Toggle fullscreen">⛶</button>
+      </div>
       <button id="pending-question-banner" onclick="openPendingQuestionFromBanner()" title="Open pending question"></button>
-      <span id="session-pill"></span>
-      <button id="compact-btn" onclick="compactCurrentConversation()" title="Compact conversation into a fresh session" disabled>Compact</button>
-      <button id="fullscreen-btn" class="header-icon-btn" onclick="toggleFullscreen()" title="Toggle fullscreen" aria-label="Toggle fullscreen">⛶</button>
-      <span id="cli-status-text">CLI offline</span>
     </div>
     <div id="messages">
       <div id="pull-refresh-indicator" aria-hidden="true"><span>↻ Pull down to refresh</span></div>

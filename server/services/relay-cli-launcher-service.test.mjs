@@ -2,14 +2,61 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createRelayCliLauncherService } from './relay-cli-launcher-service.mjs';
 
-test('windows launcher kills copilot pids then spawns session-bound gh once', async () => {
+test('windows launcher skips restart when target session is already running', async () => {
   const execCalls = [];
   const spawnCalls = [];
+  const targetSessionId = '3dd70b44-42cf-4e6d-ab0f-40392d8426b3';
+  const snapshots = [
+    [
+      { processId: 101, name: 'gh.exe', commandLine: `gh copilot -- --allow-all --session-id ${targetSessionId}` },
+      { processId: 202, name: 'cmd.exe', commandLine: `cmd /c C:\\Users\\simon\\AppData\\Roaming\\npm\\copilot.cmd --allow-all --session-id=${targetSessionId}` },
+      { processId: 303, name: 'node.exe', commandLine: 'node C:\\git\\copilot-remote\\server\\server.js' },
+    ],
+  ];
+  const service = createRelayCliLauncherService({
+    platform: 'win32',
+    restartDelayMs: 0,
+    killWaitMs: 0,
+    maxKillAttempts: 3,
+    now: () => Date.parse('2026-05-21T00:00:00.000Z'),
+    sleepImpl: async () => {},
+    execFileSyncImpl: (_file, args) => {
+      execCalls.push(args);
+      const command = String(args?.[2] || '');
+      if (command.includes('ConvertTo-Json')) {
+        return Buffer.from(JSON.stringify(snapshots[0]));
+      }
+      return Buffer.from('');
+    },
+    spawnImpl: (command, args, options) => {
+      spawnCalls.push({ command, args, options });
+      return { pid: 9090, unref() {} };
+    },
+  });
+
+  const scheduled = service.scheduleRestart({
+    transactionId: 'tx-1',
+    targetSessionId,
+    reason: 'test',
+  });
+  assert.equal(scheduled.ok, true);
+  assert.equal(scheduled.reused, true);
+  assert.equal(scheduled.accepted, false);
+  await service.waitForIdle();
+
+  assert.equal(spawnCalls.length, 0);
+  assert.equal(execCalls.some((args) => String(args?.[2] || '').includes('Stop-Process -Id $id')), false);
+  assert.equal(service.getState(), null);
+});
+
+test('windows launcher spawns when target session is absent and leaves others alone', async () => {
+  const execCalls = [];
+  const spawnCalls = [];
+  const targetSessionId = '3dd70b44-42cf-4e6d-ab0f-40392d8426b3';
   let snapshotIndex = 0;
   const snapshots = [
     [
-      { processId: 101, name: 'gh.exe', commandLine: 'gh copilot -- --allow-all --resume bab3' },
-      { processId: 202, name: 'cmd.exe', commandLine: 'cmd /c C:\\Users\\simon\\AppData\\Roaming\\npm\\copilot.cmd --allow-all --resume bab3' },
+      { processId: 202, name: 'cmd.exe', commandLine: 'cmd /c C:\\Users\\simon\\AppData\\Roaming\\npm\\copilot.cmd --allow-all --session-id other-session' },
       { processId: 303, name: 'node.exe', commandLine: 'node C:\\git\\copilot-remote\\server\\server.js' },
     ],
     [],
@@ -39,7 +86,7 @@ test('windows launcher kills copilot pids then spawns session-bound gh once', as
 
   const scheduled = service.scheduleRestart({
     transactionId: 'tx-1',
-    targetSessionId: '3dd70b44-42cf-4e6d-ab0f-40392d8426b3',
+    targetSessionId,
     reason: 'test',
   });
   assert.equal(scheduled.ok, true);
@@ -49,13 +96,13 @@ test('windows launcher kills copilot pids then spawns session-bound gh once', as
   assert.equal(spawnCalls[0].command, 'gh');
   assert.deepEqual(
     spawnCalls[0].args,
-    ['copilot', '--', '--allow-all', '--session-id', '3dd70b44-42cf-4e6d-ab0f-40392d8426b3'],
+    ['copilot', '--', '--allow-all', '--session-id', targetSessionId],
   );
   assert.equal(spawnCalls[0].options.detached, true);
-  assert.equal(execCalls.some((args) => String(args?.[2] || '').includes('Stop-Process -Id $id')), true);
+  assert.equal(execCalls.some((args) => String(args?.[2] || '').includes('Stop-Process -Id $id')), false);
   const state = service.getState();
   assert.equal(state?.status, 'spawned');
-  assert.deepEqual(state?.killedPids, [101, 202]);
+  assert.deepEqual(state?.killedPids, []);
 });
 
 test('launcher reuses the same in-flight transaction', async () => {

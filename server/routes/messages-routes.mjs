@@ -1419,7 +1419,12 @@ export function registerMessagesRoutes(app, deps) {
 
   app.post('/api/heartbeat', auth, (req, res) => {
     touchCli();
-    relayBridgeOwnerService?.observe?.(readBridgeIdentity(req));
+    const requester = readBridgeIdentity(req);
+    const requesterSessionId = normalizeSessionWorkerId(requester?.sessionId);
+    if (requesterSessionId) {
+      sessionWorkerSupervisor?.noteSessionHeartbeat?.(requesterSessionId);
+    }
+    relayBridgeOwnerService?.observe?.(requester);
     const { pendingCount } = queueCounts();
     res.json({ ok: true, pendingCount });
   });

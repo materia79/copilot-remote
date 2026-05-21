@@ -708,24 +708,21 @@ async function copyTextToClipboard(text) {
   }
 }
 
-function initSessionPillCopy() {
-  const pill = document.getElementById('session-pill');
-  if (!pill || pill.dataset.copyBound === '1') return;
-  pill.dataset.copyBound = '1';
+function initChatTitleCopy() {
+  const title = document.getElementById('chat-title');
+  if (!title || title.dataset.copyBound === '1') return;
+  title.dataset.copyBound = '1';
 
-  const copySessionId = async () => {
-    const sessionId = String(pill.dataset.copilotSessionId || '').trim();
+  title.addEventListener('click', () => {
+    const sessionId = String(title.dataset.copilotSessionId || '').trim();
     if (!sessionId) return;
-    const ok = await copyTextToClipboard(sessionId);
-    if (ok) {
-      showTransientRelayNotice(`Copied Copilot session ID: ${sessionId.slice(0, 8)}…`);
-    } else {
-      showTransientRelayNotice('Could not copy session ID.');
-    }
-  };
-
-  pill.addEventListener('click', () => {
-    copySessionId().catch(() => {});
+    copyTextToClipboard(sessionId).then((ok) => {
+      if (ok) {
+        showTransientRelayNotice(`Copied Copilot session ID: ${sessionId.slice(0, 8)}…`);
+      } else {
+        showTransientRelayNotice('Could not copy session ID.');
+      }
+    }).catch(() => {});
   });
 }
 
@@ -915,7 +912,7 @@ async function connectSocket() {
     }
     if (messageId && seenMessageIds?.has(messageId)) return;
     if (conversationId === currentConvId) {
-      appendMessage(message, true, messageId || null);
+      appendMessage(message, true, messageId || null, false, sourceMessageId || null);
       scheduleContextUsageRefresh(conversationId, 120);
     }
     if (sourceMessageId) relayActivities.delete(sourceMessageId);
@@ -1005,13 +1002,6 @@ async function initApp() {
   setupViewportTracking();
   document.getElementById('auth-gate').style.display = 'none';
   document.getElementById('app').classList.add('visible');
-  const chatTitle = document.getElementById('chat-title');
-  if (chatTitle && chatTitle.dataset.fullscreenBound !== '1') {
-    chatTitle.dataset.fullscreenBound = '1';
-    chatTitle.addEventListener('click', () => {
-      toggleFullscreen().catch(() => {});
-    });
-  }
   const chatTitleEditBtn = document.getElementById('chat-title-edit-btn');
   if (chatTitleEditBtn && chatTitleEditBtn.dataset.bound !== '1') {
     chatTitleEditBtn.dataset.bound = '1';
@@ -1058,7 +1048,7 @@ async function initApp() {
   initFullscreenButton();
   initInstallButton();
   initPullToRefresh();
-  initSessionPillCopy();
+  initChatTitleCopy();
   initEmojiPicker();
   syncChatTitleControls();
   connectSocket();

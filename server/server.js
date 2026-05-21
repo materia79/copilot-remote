@@ -6,7 +6,7 @@ import { Server } from 'socket.io';
 import { v4 as uuidv4 } from 'uuid';
 import fs from 'fs';
 import path from 'path';
-import { execFile, spawn } from 'child_process';
+import { execFile, execFileSync, spawn } from 'child_process';
 import os from 'os';
 import crypto from 'crypto';
 import Database from 'better-sqlite3';
@@ -33,6 +33,7 @@ import { createRelayBridgeOwnerService } from './services/relay-bridge-owner-ser
 import { createRelayCliLauncherService } from './services/relay-cli-launcher-service.mjs';
 import { createSessionWorkerRegistry } from './services/session-worker-registry-service.mjs';
 import { createSessionWorkerSupervisor } from './services/session-worker-supervisor-service.mjs';
+import { createSessionWorkerProcessInspector } from './services/session-worker-process-service.mjs';
 import { FEATURES, normalizeFeatureFlags } from './features.mjs';
 import { DEFAULT_QUESTION_TIMEOUT_MS } from '../shared/question-timeout.mjs';
 
@@ -818,6 +819,10 @@ const relayRestartOrchestrator = createRelayRestartOrchestrator({
   retryBackoffMs: restartRetryBackoffMs,
 });
 const sessionWorkerRegistry = createSessionWorkerRegistry();
+const sessionWorkerProcessInspector = createSessionWorkerProcessInspector({
+  platform: process.platform,
+  execFileSyncImpl: execFileSync,
+});
 const relayCliLauncherService = createRelayCliLauncherService({
   cwd: INITIAL_WORKSPACE_ROOT,
   env: process.env,
@@ -827,6 +832,12 @@ function spawnSessionWorkerCli(targetSessionId) {
   const normalizedTargetSessionId = String(targetSessionId || '').trim();
   if (!normalizedTargetSessionId) {
     throw new Error('missing-target-session-id');
+  }
+  const liveWorker = sessionWorkerProcessInspector.findWindowsProcessForSession(normalizedTargetSessionId);
+  if (liveWorker?.processId) {
+    const workerId = `worker-${normalizedTargetSessionId.slice(0, 8)}`;
+    console.log(`[${ts()}] worker launcher: reused ${workerId} session=${normalizedTargetSessionId.slice(0, 8)} pid=${liveWorker.processId}`);
+    return { workerId, pid: liveWorker.processId };
   }
   const child = spawn('gh', ['copilot', '--', '--allow-all', '--session-id', normalizedTargetSessionId], {
     cwd: INITIAL_WORKSPACE_ROOT,

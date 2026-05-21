@@ -744,6 +744,16 @@ export function registerSessionsRoutes(app, deps) {
       resolveSessionStateRoot,
     });
     const dbMessages = stmts.getMessages.all(req.params.id);
+    const queueRows = db.prepare(`
+      SELECT id, response_message_id
+      FROM queue
+      WHERE conversation_id = ?
+    `).all(req.params.id);
+    const responseMessageToSourceId = new Map(
+      queueRows
+        .map((row) => [String(row?.response_message_id || '').trim(), String(row?.id || '').trim()])
+        .filter(([responseMessageId, sourceMessageId]) => !!responseMessageId && !!sourceMessageId),
+    );
     const relayActivitiesByMessageId = new Map(
       dbMessages
         .filter((m) => m.role === 'assistant')
@@ -758,6 +768,7 @@ export function registerSessionsRoutes(app, deps) {
       attachments: parseAttachments(m.attachments).map(hydrateAttachment).filter(Boolean),
       mode:      m.mode || undefined,
       timestamp: m.timestamp,
+      sourceMessageId: m.role === 'assistant' ? (responseMessageToSourceId.get(String(m.id || '').trim()) || undefined) : undefined,
     }));
     if (transcriptMessages.length > messages.length) {
       messages = transcriptMessages.map((message) => {
@@ -773,9 +784,18 @@ export function registerSessionsRoutes(app, deps) {
           seen.add(text);
           mergedActivities.push(text);
         }
-        return { ...message, activities: mergedActivities };
+        return {
+          ...message,
+          activities: mergedActivities,
+          sourceMessageId: responseMessageToSourceId.get(String(message.id || '').trim()) || message.sourceMessageId || undefined,
+        };
       });
     }
+    messages = messages.map((message) => {
+      if (message.role !== 'assistant') return message;
+      const sourceMessageId = responseMessageToSourceId.get(String(message.id || '').trim()) || message.sourceMessageId || undefined;
+      return sourceMessageId ? { ...message, sourceMessageId } : message;
+    });
     res.json({
       id: conv.id,
       sdkSessionId: conv.sdk_session_id || null,

@@ -281,8 +281,8 @@ export function autoResize(el) {
 }
 
 export function updateSessionPill(conversation, runtimeSession) {
-  const pill = document.getElementById('session-pill');
-  if (!pill) return;
+  const title = document.getElementById('chat-title');
+  const wrap = document.getElementById('chat-title-wrap');
   const sdkSessionId = String(
     runtimeSession?.sdkSessionId
     || runtimeSession?.sdk_session_id
@@ -291,16 +291,22 @@ export function updateSessionPill(conversation, runtimeSession) {
     || '',
   ).trim();
   if (!sdkSessionId) {
-    pill.textContent = '';
-    pill.title = '';
-    delete pill.dataset.copilotSessionId;
-    pill.classList.remove('visible');
+    if (title) {
+      delete title.dataset.copilotSessionId;
+      title.title = '';
+    }
+    if (wrap) {
+      delete wrap.dataset.copilotSessionId;
+    }
     return;
   }
-  pill.dataset.copilotSessionId = sdkSessionId;
-  pill.textContent = `CLI ${sdkSessionId.slice(0, 8)}`;
-  pill.title = `Copilot session ${sdkSessionId} (click to copy)`;
-  pill.classList.add('visible');
+  if (title) {
+    title.dataset.copilotSessionId = sdkSessionId;
+    title.title = `Copilot session ${sdkSessionId} (click to copy)`;
+  }
+  if (wrap) {
+    wrap.dataset.copilotSessionId = sdkSessionId;
+  }
 }
 
 export function updateCompactButton() {

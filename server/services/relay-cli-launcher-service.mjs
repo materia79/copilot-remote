@@ -1,10 +1,7 @@
 'use strict';
 
 import { execFileSync, spawn } from 'child_process';
-
-function normalizeText(value) {
-  return String(value || '').trim().toLowerCase();
-}
+import { createSessionWorkerProcessInspector } from './session-worker-process-service.mjs';
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -33,6 +30,10 @@ export function createRelayCliLauncherService({
   log = () => {},
 } = {}) {
   let activeJob = null;
+  const processInspector = createSessionWorkerProcessInspector({
+    platform,
+    execFileSyncImpl: typeof execFileSyncImpl === 'function' ? execFileSyncImpl : undefined,
+  });
 
   function getState() {
     if (!activeJob) return null;
@@ -49,62 +50,10 @@ export function createRelayCliLauncherService({
     };
   }
 
-  function looksLikeCopilotProcess(proc) {
-    const name = normalizeText(proc?.name);
-    const cmd = normalizeText(proc?.commandLine);
-    if (!name && !cmd) return false;
-    if (cmd.includes('\\server\\server.js')) return false;
-    if (name === 'gh.exe' && cmd.includes('gh') && cmd.includes('copilot')) return true;
-    if (name === 'copilot.exe') return true;
-    const explicitCliNodeMarker = (
-      cmd.includes('@github\\copilot') ||
-      cmd.includes('\\copilot.cmd') ||
-      cmd.includes('copilot-win32') ||
-      cmd.includes('gh copilot') ||
-      cmd.includes('--resume') ||
-      cmd.includes('--allow-all') ||
-      cmd.includes('copilot-mcp-server') ||
-      cmd.includes('@aykahshi/copilot-mcp-server')
-    );
-    if ((name === 'node.exe' || name === 'cmd.exe') && (
-      explicitCliNodeMarker
-    )) return true;
-    if (cmd.includes('gh copilot')) return true;
-    return false;
-  }
-
-  function getWindowsProcessSnapshot() {
-    const script = [
-      '$list = Get-CimInstance Win32_Process | ForEach-Object {',
-      '  [pscustomobject]@{',
-      '    processId = [int]$_.ProcessId;',
-      '    parentProcessId = [int]$_.ParentProcessId;',
-      '    name = [string]$_.Name;',
-      '    commandLine = [string]$_.CommandLine;',
-      '  }',
-      '};',
-      '$list | ConvertTo-Json -Depth 3 -Compress',
-    ].join(' ');
-    const output = execFileSyncImpl('powershell.exe', ['-NoProfile', '-Command', script], {
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    const text = String(output || '').trim();
-    if (!text) return [];
-    const parsed = JSON.parse(text);
-    return Array.isArray(parsed) ? parsed : [parsed];
-  }
-
-  function collectWindowsRetirePids() {
-    const snapshot = getWindowsProcessSnapshot();
-    return snapshot
-      .map((proc) => ({
-        processId: parsePositiveInt(proc?.processId),
-        name: String(proc?.name || ''),
-        commandLine: String(proc?.commandLine || ''),
-      }))
-      .filter((proc) => proc.processId)
-      .filter((proc) => looksLikeCopilotProcess(proc))
-      .map((proc) => proc.processId);
+  function collectWindowsRetirePids(targetSessionId) {
+    return processInspector.findWindowsProcessesForSession(targetSessionId)
+      .map((proc) => parsePositiveInt(proc?.processId))
+      .filter(Boolean);
   }
 
   function stopWindowsPids(pids) {
@@ -130,10 +79,14 @@ export function createRelayCliLauncherService({
     if (platform !== 'win32') return [];
     const killed = new Set();
     const attempts = Math.max(1, Number(maxKillAttempts || 1));
+    const liveTarget = processInspector.findWindowsProcessForSession(job.targetSessionId);
+    if (liveTarget?.processId) {
+      return Array.from(killed);
+    }
     for (let index = 0; index < attempts; index += 1) {
       let targetPids = [];
       try {
-        targetPids = collectWindowsRetirePids();
+        targetPids = collectWindowsRetirePids(job.targetSessionId);
       } catch (error) {
         job.error = error?.message || String(error);
         throw error;
@@ -163,6 +116,16 @@ export function createRelayCliLauncherService({
     if (restartDelayMs > 0) {
       await sleepImpl(restartDelayMs);
     }
+    const liveTarget = platform === 'win32' ? processInspector.findWindowsProcessForSession(job.targetSessionId) : null;
+    if (liveTarget?.processId) {
+      job.killedPids = [];
+      job.spawnedPid = liveTarget.processId;
+      job.status = 'skipped';
+      job.reason = 'target-already-running';
+      job.completedAt = isoNow(now);
+      log(`relay cli launcher: target ${job.targetSessionId} already running on pid ${liveTarget.processId}; skipping restart`);
+      return;
+    }
     log(`relay cli launcher: retiring cli processes for ${job.targetSessionId} tx=${job.transactionId || 'none'}`);
     job.killedPids = await retireCliProcesses(job);
     log(`relay cli launcher: spawning session-bound cli for ${job.targetSessionId}`);
@@ -183,6 +146,19 @@ export function createRelayCliLauncherService({
         return { ok: true, accepted: true, reused: true, state: getState() };
       }
       return { ok: false, error: 'launcher-busy', state: getState() };
+    }
+    if (platform === 'win32') {
+      const liveTarget = processInspector.findWindowsProcessForSession(target);
+      if (liveTarget?.processId) {
+        return {
+          ok: true,
+          accepted: false,
+          reused: true,
+          reason: 'target-already-running',
+          livePid: liveTarget.processId,
+          state: getState(),
+        };
+      }
     }
 
     const job = {

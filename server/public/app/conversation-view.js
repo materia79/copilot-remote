@@ -33,6 +33,7 @@ import { sendMessage as sendMessageApi, compactConversation as compactConversati
 import { linkifyWorkspaceMentionsInNode } from './router.js';
 import { renderAttachmentMarkup, clearAttachments, uploadAttachments, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { renderRelayQuestions } from './ask-user-view.js';
+import { getMessageThreadAnchor, sortConversationMessages } from './thread-order.mjs';
 
 let thinkingMessageId = null;
 let thinkingText = '';
@@ -100,6 +101,7 @@ export function showThinking(messageId = null) {
   const div = document.createElement('div');
   div.className = 'msg assistant';
   div.id = 'thinking-indicator';
+  if (messageId) div.dataset.messageId = messageId;
   div.innerHTML = `
     <div class="thinking-bubble">
       <div id="thinking-text" class="thinking-text"></div>
@@ -107,7 +109,14 @@ export function showThinking(messageId = null) {
       <div id="thinking-activity" class="thinking-activity"></div>
     </div>
     <div class="msg-label">Copilot</div>`;
-  el.appendChild(div);
+  const target = messageId ? el.querySelector(`[data-message-id="${messageId}"]`) : null;
+  if (target && target.parentNode === el) {
+    const next = target.nextSibling;
+    if (next) el.insertBefore(div, next);
+    else el.appendChild(div);
+  } else {
+    el.appendChild(div);
+  }
   renderThinkingText(thinkingText);
   scrollBottom();
 }
@@ -187,7 +196,7 @@ export function updateThinkingText(text, messageId = null, done = false) {
   scrollBottom();
 }
 
-export function appendMessage(msg, scroll = true, msgId = null, force = false) {
+export function appendMessage(msg, scroll = true, msgId = null, force = false, insertAfterId = null) {
   const el = document.getElementById('messages');
   const empty = el.querySelector('.empty-state');
   if (empty) empty.remove();
@@ -226,13 +235,27 @@ export function appendMessage(msg, scroll = true, msgId = null, force = false) {
 
   linkifyWorkspaceMentionsInNode(div.querySelector('.msg-bubble'));
   div.querySelectorAll('pre code').forEach((b) => hljs.highlightElement(b));
-  el.appendChild(div);
+  const anchorId = String(insertAfterId || msg?.sourceMessageId || msg?.parentMessageId || '').trim();
+  const anchor = anchorId ? el.querySelector(`[data-message-id="${anchorId}"]`) : null;
+  if (anchor && anchor.parentNode === el) {
+    const next = anchor.nextSibling;
+    if (next) el.insertBefore(div, next);
+    else el.appendChild(div);
+  } else {
+    el.appendChild(div);
+  }
   if (scroll) scrollBottom();
 }
 
 export function renderMessages(msgs, scroll = true) {
   const el = document.getElementById('messages');
-  if (!msgs || msgs.length === 0) {
+  const ordered = sortConversationMessages(msgs || []);
+  const messageById = new Map(
+    ordered
+      .map((item) => [String(item?.id || '').trim(), item])
+      .filter(([id]) => !!id),
+  );
+  if (!ordered.length) {
     el.innerHTML = `<div id="pull-refresh-indicator" aria-hidden="true"><span>↻ Pull down to refresh</span></div>
       <div class="empty-state">
       <div class="icon">${currentConvId ? '💬' : '🚀'}</div>
@@ -244,7 +267,7 @@ export function renderMessages(msgs, scroll = true) {
   }
   el.innerHTML = '';
   el.insertAdjacentHTML('afterbegin', '<div id="pull-refresh-indicator" aria-hidden="true"><span>↻ Pull down to refresh</span></div>');
-  for (const m of msgs) appendMessage(m, false, m.id || null, true);
+  for (const m of ordered) appendMessage(m, false, m.id || null, true, getMessageThreadAnchor(m, messageById));
   renderRelayQuestions();
   if (scroll) scrollBottom();
 }
