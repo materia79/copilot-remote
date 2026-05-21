@@ -1,4 +1,4 @@
-const CACHE_NAME = 'copilot-remote-shell-v4';
+const CACHE_NAME = 'copilot-remote-shell-v5';
 const STATIC_ASSETS = [
   './',
   'index.html',

@@ -1,72 +1,8 @@
 import fs from "fs";
+import { buildTerminalFailureText, isTerminalSendAndWaitError } from "../runtime/send-and-wait-errors.mjs";
 import { getActiveSession } from "../runtime/session-registry.mjs";
-
-const RETRYABLE_SESSION_FAILURE_REASONS = new Set([
-  "conversation-load-failed",
-  "active-session-missing",
-  "restart-required",
-  "switch-mismatch",
-  "switch-call-transient-failure",
-]);
-
-const NON_RETRYABLE_SESSION_FAILURE_REASONS = new Set([
-  "conversation-id-missing",
-  "target-session-missing",
-]);
-
-const MAX_SWITCH_RETRIES = 2;
-
-export function classifySwitchingFailure(sessionResolution) {
-  const reason = String(sessionResolution?.reason || "unknown");
-  if (typeof sessionResolution?.retryable === "boolean") {
-    return { reason, retryable: sessionResolution.retryable };
-  }
-  if (NON_RETRYABLE_SESSION_FAILURE_REASONS.has(reason)) {
-    return { reason, retryable: false };
-  }
-  if (RETRYABLE_SESSION_FAILURE_REASONS.has(reason)) {
-    return { reason, retryable: true };
-  }
-  return { reason, retryable: false };
-}
-
-export function evaluateSwitchRetry({ retryable, attempts = 0, maxRetries = MAX_SWITCH_RETRIES } = {}) {
-  const currentAttempts = Number.isFinite(Number(attempts)) ? Number(attempts) : 0;
-  const cap = Number.isFinite(Number(maxRetries)) ? Number(maxRetries) : MAX_SWITCH_RETRIES;
-  if (!retryable) {
-    return { shouldRetry: false, attempts: currentAttempts, maxRetries: cap };
-  }
-  if (currentAttempts < cap) {
-    return { shouldRetry: true, attempts: currentAttempts + 1, maxRetries: cap };
-  }
-  return { shouldRetry: false, attempts: currentAttempts, maxRetries: cap };
-}
-
-function composeSwitchFailureMessage({
-  activeSdkSessionId,
-  targetSdkSessionId,
-  detail,
-  reason,
-  attempt,
-  maxRetries,
-  retryable,
-}) {
-  const trimmedDetail = String(detail || "").trim();
-  const exhaustedText = retryable === false
-    ? "No retry was attempted because this failure type is classified as non-retryable."
-    : Number.isFinite(attempt) && Number.isFinite(maxRetries)
-      ? `Switching was retried ${attempt}/${maxRetries} time(s) before this terminal failure.`
-      : "Switching failed with a terminal outcome.";
-  return [
-    "I couldn't process this turn because the active SDK session does not match this conversation binding.",
-    activeSdkSessionId ? `Active session: ${activeSdkSessionId.slice(0, 8)}…` : "Active session: unavailable.",
-    targetSdkSessionId ? `Conversation session: ${targetSdkSessionId.slice(0, 8)}…` : "Conversation session: unavailable.",
-    `Failure type: ${reason}.`,
-    "The relay attempted in-process session switching via SDK resume/switch APIs but could not activate the target session.",
-    exhaustedText,
-    trimmedDetail || "Please retry from the matching session conversation or start a new turn in the active session.",
-  ].join(" ");
-}
+import { DEFAULT_QUESTION_TIMEOUT_MS } from "../../../../shared/question-timeout.mjs";
+import { QUESTION_TIMEOUT_CONTINUATION_TEXT } from "../../../../shared/question-timeout.mjs";
 
 function isImageAttachment(att) {
   const type = String(att?.type || "").toLowerCase();
@@ -173,46 +109,6 @@ export function createPollingLoop({
   handleControl,
 }) {
   let stopRequested = false;
-  const switchFailureAttempts = new Map();
-
-  function switchFailureKey(messageId, sessionResolution) {
-    const reason = String(sessionResolution?.reason || "unknown").trim() || "unknown";
-    const target = String(sessionResolution?.targetSessionId || "none").trim() || "none";
-    return `${String(messageId || "").trim()}::${reason}::${target}`;
-  }
-
-  function clearSwitchFailureAttempts(messageId) {
-    const prefix = `${String(messageId || "").trim()}::`;
-    for (const key of switchFailureAttempts.keys()) {
-      if (key.startsWith(prefix)) switchFailureAttempts.delete(key);
-    }
-  }
-
-  function computeSwitchFailurePolicy(messageId, sessionResolution) {
-    const classification = classifySwitchingFailure(sessionResolution);
-    const key = switchFailureKey(messageId, sessionResolution);
-    const previousAttempts = Number(switchFailureAttempts.get(key) || 0);
-    const decision = evaluateSwitchRetry({
-      retryable: classification.retryable,
-      attempts: previousAttempts,
-      maxRetries: MAX_SWITCH_RETRIES,
-    });
-    if (decision.shouldRetry) {
-      switchFailureAttempts.set(key, decision.attempts);
-    }
-    const policy = { ...classification, ...decision };
-    dbg(
-      "session switch retry policy",
-      `msgId=${String(messageId || "").trim() || "unknown"}`,
-      `reason=${policy.reason || "unknown"}`,
-      `retryable=${policy.retryable ? "yes" : "no"}`,
-      `attempt=${policy.attempts}/${policy.maxRetries}`,
-      `shouldRetry=${policy.shouldRetry ? "yes" : "no"}`,
-      `active=${String(sessionResolution?.activeSessionId || "").trim() || "none"}`,
-      `target=${String(sessionResolution?.targetSessionId || "").trim() || "none"}`,
-    );
-    return policy;
-  }
 
   function stripMarkdown(text) {
     return String(text || "")
@@ -259,18 +155,29 @@ export function createPollingLoop({
     return { shouldForce: true, parsed };
   }
 
-  async function waitForRelayQuestionAnswer(questionId, timeoutMs = 5 * 60_000, pollIntervalMs = 1500) {
+  async function waitForRelayQuestionAnswer(questionId, timeoutMs = DEFAULT_QUESTION_TIMEOUT_MS, pollIntervalMs = 1500) {
     const started = Date.now();
     while (true) {
       const { question } = await api("GET", `/api/relay-question/${questionId}`);
       if (!question) throw new Error("Relay question missing");
-      if (question.status === "answered") return String(question.answer || "").trim();
+      if (question.status === "answered") {
+        return {
+          answer: String(question.answer || "").trim(),
+          timedOut: false,
+        };
+      }
       if (question.status === "timed_out" || question.status === "cancelled") {
-        throw new Error(`Relay question ${question.status}`);
+        return {
+          answer: QUESTION_TIMEOUT_CONTINUATION_TEXT,
+          timedOut: true,
+        };
       }
       if (Date.now() - started >= timeoutMs) {
         await api("POST", `/api/relay-question/${questionId}/timeout`, {}).catch(() => {});
-        throw new Error("Relay question timed out");
+        return {
+          answer: QUESTION_TIMEOUT_CONTINUATION_TEXT,
+          timedOut: true,
+        };
       }
       await sleep(pollIntervalMs);
     }
@@ -310,8 +217,9 @@ export function createPollingLoop({
     };
   }
 
-  async function continueAfterQuestionAnswer(message, { questionPrompt, choices, answer, assistantText = "" } = {}) {
+  async function continueAfterQuestionAnswer(message, { questionPrompt, choices, answer, assistantText = "", timedOut = false } = {}) {
     const normalizedChoices = Array.isArray(choices) ? choices : [];
+    const normalizedAnswer = String(answer || "").trim();
     const lines = [
       "You are resuming a paused relay turn after asking the user a follow-up question.",
       `Original user request: ${String(message?.text || "").trim()}`,
@@ -320,7 +228,9 @@ export function createPollingLoop({
       normalizedChoices.length
         ? `Choices shown to the user: ${normalizedChoices.map((choice, idx) => `${idx + 1}. ${String(choice || "").trim()}`).join(" | ")}`
         : "Choices: (not available)",
-      `User's answer: ${String(answer || "").trim()}`,
+      timedOut
+        ? `No user answer was received before timeout. Treat this as if the user could not respond and continue according to the current relay mode.`
+        : `User's answer: ${normalizedAnswer}`,
       "Continue the original task using that answer.",
       "Do not repeat the question and do not turn the answer into a right-or-wrong grading step unless the original request explicitly asked for that.",
       "Respond with the next assistant message only.",
@@ -358,17 +268,18 @@ export function createPollingLoop({
     if (!questionId) return null;
 
     dbg("ask_user autopilot bridge: relay question created", questionId, "for msgId", message.id, "prompt=", prompt, "choices=", String(choices.length));
-    const answer = await waitForRelayQuestionAnswer(questionId);
-    return { questionId, answer, prompt, choices };
+    const result = await waitForRelayQuestionAnswer(questionId);
+    return { questionId, prompt, choices, answer: result.answer, timedOut: result.timedOut };
   }
 
-  async function continueAfterAskUserAnswer(message, request, answer) {
+  async function continueAfterAskUserAnswer(message, request, answer, timedOut = false) {
     const prompt = extractQuestionPrompt(request);
     const choices = extractQuestionChoices(request);
     return continueAfterQuestionAnswer(message, {
       questionPrompt: prompt,
       choices,
       answer,
+      timedOut,
     });
   }
 
@@ -461,50 +372,26 @@ export function createPollingLoop({
             const activeSdkSessionId = String(sessionResolution?.activeSessionId || "").trim();
             const targetSdkSessionId = String(sessionResolution?.targetSessionId || "").trim();
             const detail = String(sessionResolution?.message || "").trim();
-            const policy = computeSwitchFailurePolicy(message.id, sessionResolution);
+            const retryable = sessionResolution?.retryable === true;
             dbg(
-              "session binding check failed for msgId",
+              "session availability check failed for msgId",
               message.id,
               `reason=${sessionResolution.reason || "unknown"}`,
-              `retryable=${policy.retryable ? "yes" : "no"}`,
-              `attempt=${policy.attempts}/${policy.maxRetries}`,
               `active=${activeSdkSessionId || "none"}`,
               `target=${targetSdkSessionId || "none"}`,
             );
-
-            if (policy.shouldRetry) {
-              await session.log(
-                `⚠️ Session binding mismatch (retry ${policy.attempts}/${policy.maxRetries}); re-queuing turn`,
-                { level: "warn" },
-              );
+            await session.log(
+              detail
+                ? `⚠️ Session unavailable for this turn: ${detail}`
+                : "⚠️ Session unavailable for this turn",
+              { level: "warn" },
+            );
+            if (retryable) {
               await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
-              setActiveMsg(null);
-              continue;
             }
-
-            await session.log("⚠️ Session binding reached terminal failure for this turn", { level: "warn" });
-            const mismatchText = composeSwitchFailureMessage({
-              activeSdkSessionId,
-              targetSdkSessionId,
-              detail,
-              reason: policy.reason,
-              attempt: policy.attempts,
-              maxRetries: policy.maxRetries,
-              retryable: policy.retryable,
-            });
-            await api("POST", "/api/response", {
-              messageId: message.id,
-              conversationId: message.conversationId,
-              text: mismatchText,
-              model: await getCurrentModelId() || message.model || null,
-            }).catch(async () => {
-              await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
-            });
-            clearSwitchFailureAttempts(message.id);
             setActiveMsg(null);
             continue;
           }
-          clearSwitchFailureAttempts(message.id);
 
           const synced = await syncActiveSession?.("dequeue", true);
           if (!synced) {
@@ -602,14 +489,18 @@ export function createPollingLoop({
                 if (bridged?.questionId) {
                   let resumedText = "";
                   try {
-                    resumedText = await continueAfterAskUserAnswer(message, pendingAskUserReq, bridged.answer);
+                    resumedText = await continueAfterAskUserAnswer(message, pendingAskUserReq, bridged.answer, bridged.timedOut);
                   } catch (evaluateErr) {
                     dbg("ask_user autopilot resume failed", `msgId=${message.id}`, evaluateErr?.message || String(evaluateErr));
                   }
                   await api("POST", "/api/response", {
                     messageId: message.id,
                     conversationId: message.conversationId,
-                    text: resumedText || `Thanks — I received your answer: "${bridged.answer}". I hit a problem while resuming the turn from it.`,
+                    text: resumedText || (
+                      bridged.timedOut
+                        ? "The user did not respond before timeout. I continued with the current relay mode."
+                        : `Thanks — I received your answer: "${bridged.answer}". I hit a problem while resuming the turn from it.`
+                    ),
                     model,
                   });
                   await session.log("✅ ask_user safety-net bridge: relay question card shown, answer received, turn resumed", { ephemeral: true });
@@ -641,6 +532,7 @@ export function createPollingLoop({
                       questionPrompt: bridged.prompt,
                       choices: bridged.choices,
                       answer: bridged.answer,
+                      timedOut: bridged.timedOut,
                       assistantText: text,
                     });
                   } catch (evaluateErr) {
@@ -649,7 +541,11 @@ export function createPollingLoop({
                   await api("POST", "/api/response", {
                     messageId: message.id,
                     conversationId: message.conversationId,
-                    text: resumedText || `Thanks — I received your answer: "${bridged.answer}". I hit a problem while resuming the turn from it.`,
+                    text: resumedText || (
+                      bridged.timedOut
+                        ? "The user did not respond before timeout. I continued with the current relay mode."
+                        : `Thanks — I received your answer: "${bridged.answer}". I hit a problem while resuming the turn from it.`
+                    ),
                     model,
                   });
                   await session.log("✅ Converted plain-text question into relay bridge card and resumed the turn", { ephemeral: true });
@@ -690,8 +586,21 @@ export function createPollingLoop({
             }
           } catch (e) {
             dbg("sendAndWait ERROR for msgId", message.id, ":", e.message);
-            await session.log(`❌ Response failed: ${e.message}; re-queuing`, { level: "error" });
-            api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
+            if (isTerminalSendAndWaitError(e)) {
+              const failureText = buildTerminalFailureText(e);
+              await session.log("❌ Terminal SDK/tool-output error — marking turn failed", { level: "error" });
+              await api("POST", "/api/response", {
+                messageId: message.id,
+                conversationId: message.conversationId,
+                text: failureText,
+                model: await getCurrentModelId() || message.model || null,
+              }).catch(async () => {
+                await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
+              });
+            } else {
+              await session.log(`❌ Response failed: ${e.message}; re-queuing`, { level: "error" });
+              api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
+            }
           } finally {
             setLastActivityText("");
             setPendingAskUserRequest?.(null);

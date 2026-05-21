@@ -6,17 +6,19 @@ test("extractTargetSessionId resolves runtime session id variants", () => {
   assert.equal(extractTargetSessionId({ sdkSessionId: "sdk-a" }), "sdk-a");
   assert.equal(extractTargetSessionId({ runtimeSession: { sdkSessionId: "sdk-b" } }), "sdk-b");
   assert.equal(extractTargetSessionId({ runtimeSession: { sdk_session_id: "sdk-c" } }), "sdk-c");
+  assert.equal(extractTargetSessionId({ id: "sdk-d" }), "sdk-d");
+  assert.equal(extractTargetSessionId({}, "sdk-fallback"), "sdk-fallback");
 });
 
-test("resolveSessionBinding returns restart-required on mismatch", () => {
+test("resolveSessionBinding returns ok when the session is available", () => {
   const result = resolveSessionBinding({
     conversationId: "conv-1",
     details: { sdkSessionId: "sdk-target" },
     activeSessionId: "sdk-active",
   });
-  assert.equal(result.ok, false);
-  assert.equal(result.reason, "restart-required");
-  assert.equal(result.retryable, true);
+  assert.equal(result.ok, true);
+  assert.equal(result.switched, false);
+  assert.equal(result.via, "session-liveness");
   assert.equal(result.activeSessionId, "sdk-active");
   assert.equal(result.targetSessionId, "sdk-target");
 });
@@ -29,7 +31,7 @@ test("resolveSessionBinding returns ok when ids match", () => {
   });
   assert.equal(result.ok, true);
   assert.equal(result.switched, false);
-  assert.equal(result.via, "restart-orchestrator-binding");
+  assert.equal(result.via, "session-liveness");
 });
 
 test("resolveSessionBinding handles missing required ids deterministically", () => {
@@ -46,8 +48,8 @@ test("resolveSessionBinding handles missing required ids deterministically", () 
     details: {},
     activeSessionId: "sdk-target",
   });
-  assert.equal(noTarget.reason, "target-session-missing");
-  assert.equal(noTarget.retryable, false);
+  assert.equal(noTarget.ok, true);
+  assert.equal(noTarget.targetSessionId, "conv-1");
 
   const noActive = resolveSessionBinding({
     conversationId: "conv-1",

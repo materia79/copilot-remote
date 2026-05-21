@@ -10,7 +10,9 @@ if (!CLIENT_ID) {
 
 export const seenMessageIds = new Set();
 export const pendingUserMessageIds = new Set();
+export const pendingUserMessageEntries = new Map();
 export let cliOnline = false;
+export let relayOnline = false;
 export let conversations = {};
 export let selectedAttachments = [];
 export const RELAY_QUESTION_POLL_MS = 3000;
@@ -33,6 +35,7 @@ export let workspaceRootEntrySet = new Set([
 ]);
 export let relayQuestions = new Map();
 export let relayActivities = new Map();
+export let sessionWorkerStates = new Map();
 export let thinkingMessageId = null;
 export let relayQuestionPollTimer = null;
 export let relayQuestionRenderHash = '';
@@ -56,6 +59,8 @@ export let repoBrowserState = {
   drivesIncludeHidden: false,
   viewMode: 'list',
   rootName: 'repo',
+  sessionRootPath: '',
+  sessionRootName: 'Session',
   tree: null,
   nodeMap: new Map(),
   currentPath: '',
@@ -92,6 +97,59 @@ export function setCurrentConv(id) {
   if (id) localStorage.setItem('copilot_last_conv', id);
   else localStorage.removeItem('copilot_last_conv');
   updateCompactButton();
+}
+
+function normalizePendingMessageText(text) {
+  return String(text || '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function pendingConversationKey(conversationId) {
+  return String(conversationId || '').trim() || '__new__';
+}
+
+function cleanupStalePendingUserMessages(maxAgeMs = 15 * 60 * 1000) {
+  const cutoff = Date.now() - Math.max(60_000, Number(maxAgeMs) || 0);
+  for (const [messageId, entry] of pendingUserMessageEntries.entries()) {
+    const addedAt = Number(entry?.addedAt || 0);
+    if (!Number.isFinite(addedAt) || addedAt < cutoff) {
+      pendingUserMessageEntries.delete(messageId);
+      pendingUserMessageIds.delete(messageId);
+    }
+  }
+}
+
+export function trackPendingUserMessage(messageId, conversationId, text) {
+  const id = String(messageId || '').trim();
+  const fingerprint = normalizePendingMessageText(text);
+  if (!id || !fingerprint) return false;
+  cleanupStalePendingUserMessages();
+  pendingUserMessageEntries.set(id, {
+    conversationKey: pendingConversationKey(conversationId),
+    fingerprint,
+    addedAt: Date.now(),
+  });
+  pendingUserMessageIds.add(id);
+  return true;
+}
+
+export function clearPendingUserMessage(messageId) {
+  const id = String(messageId || '').trim();
+  if (!id) return false;
+  pendingUserMessageIds.delete(id);
+  return pendingUserMessageEntries.delete(id);
+}
+
+export function hasPendingUserMessageDuplicate(conversationId, text) {
+  const fingerprint = normalizePendingMessageText(text);
+  if (!fingerprint) return false;
+  cleanupStalePendingUserMessages();
+  const conversationKey = pendingConversationKey(conversationId);
+  for (const entry of pendingUserMessageEntries.values()) {
+    if (entry?.conversationKey === conversationKey && entry?.fingerprint === fingerprint) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function authHeaders() {
@@ -260,7 +318,26 @@ export function updateCliStatus() {
   const dot = document.getElementById('cli-dot');
   const text = document.getElementById('cli-status-text');
   const banner = document.getElementById('offline-banner');
-  if (dot) dot.className = cliOnline ? 'online' : '';
+  const workerStates = Array.from(sessionWorkerStates.values());
+  const processingCount = workerStates.filter((state) => String(state?.status || '').trim().toLowerCase() === 'processing').length;
+  const errorCount = workerStates.filter((state) => String(state?.uiState || state?.derivedUiState || '').trim().toLowerCase() === 'error').length;
+  const questionCount = workerStates.filter((state) => String(state?.uiState || state?.derivedUiState || '').trim().toLowerCase() === 'question').length;
+  if (dot) {
+    dot.className = relayOnline ? 'online' : 'offline';
+    if (!relayOnline) {
+      dot.title = 'Web relay unreachable';
+    } else if (!cliOnline) {
+      dot.title = 'Web relay reachable; CLI offline';
+    } else if (processingCount > 0) {
+      dot.title = `Web relay reachable; ${processingCount} session worker${processingCount === 1 ? '' : 's'} processing`;
+    } else if (errorCount > 0) {
+      dot.title = `Web relay reachable; ${errorCount} session worker${errorCount === 1 ? '' : 's'} degraded`;
+    } else if (questionCount > 0) {
+      dot.title = `Web relay reachable; ${questionCount} session worker${questionCount === 1 ? '' : 's'} waiting on a question`;
+    } else {
+      dot.title = 'Web relay reachable';
+    }
+  }
   if (text) text.textContent = cliOnline ? 'CLI online' : 'CLI offline';
   if (banner) {
     if (cliOnline) banner.classList.remove('visible');
@@ -271,6 +348,136 @@ export function updateCliStatus() {
 export function setCliOnline(value) {
   cliOnline = !!value;
   updateCliStatus();
+}
+
+export function setRelayOnline(value) {
+  relayOnline = !!value;
+  updateCliStatus();
+}
+
+function normalizeWorkerSessionId(value) {
+  const text = String(value || '').trim();
+  return text || '';
+}
+
+function normalizeWorkerStatus(value) {
+  const text = String(value || '').trim().toLowerCase();
+  return text || 'unknown';
+}
+
+const CANONICAL_UI_STATES = new Set(['offline', 'ready', 'question', 'error']);
+const UI_STATE_ALIAS_MAP = new Map([
+  ['offline', 'offline'],
+  ['inactive', 'offline'],
+  ['unknown', 'offline'],
+  ['new', 'offline'],
+  ['disconnected', 'offline'],
+  ['stopped', 'offline'],
+  ['idle', 'offline'],
+  ['white', 'offline'],
+  ['healthy', 'ready'],
+  ['ready', 'ready'],
+  ['online', 'ready'],
+  ['active', 'ready'],
+  ['busy', 'ready'],
+  ['processing', 'ready'],
+  ['starting', 'ready'],
+  ['green', 'ready'],
+  ['question', 'question'],
+  ['question-pending', 'question'],
+  ['question_pending', 'question'],
+  ['awaiting-input', 'question'],
+  ['awaiting_input', 'question'],
+  ['needs-input', 'question'],
+  ['needs_input', 'question'],
+  ['input-required', 'question'],
+  ['input_required', 'question'],
+  ['waiting-for-input', 'question'],
+  ['waiting_for_input', 'question'],
+  ['red', 'question'],
+  ['error', 'error'],
+  ['degraded', 'error'],
+  ['unsafe', 'error'],
+  ['failed', 'error'],
+  ['yellow', 'error'],
+]);
+
+function normalizeUiState(value) {
+  const text = String(value || '').trim().toLowerCase();
+  if (!text) return '';
+  if (CANONICAL_UI_STATES.has(text)) return text;
+  return UI_STATE_ALIAS_MAP.get(text) || '';
+}
+
+function normalizeUiStateFromStatus(value) {
+  return normalizeUiState(normalizeWorkerStatus(value));
+}
+
+export function resolveConversationUiState({ conversation = null, workerState = null, hasPendingQuestion = false } = {}) {
+  const backendUiState = normalizeUiState(
+    workerState?.uiState
+    || workerState?.ui_state
+    || conversation?.runtimeSessionUiState
+    || conversation?.runtime_session_ui_state,
+  );
+  if (backendUiState) return backendUiState;
+  if (hasPendingQuestion) return 'question';
+
+  const fallbackUiState = normalizeUiState(
+    workerState?.derivedUiState
+    || workerState?.fallbackUiState
+    || normalizeUiStateFromStatus(workerState?.status)
+    || normalizeUiStateFromStatus(conversation?.runtimeSessionStatus)
+    || normalizeUiStateFromStatus(conversation?.runtime_session_status),
+  );
+  return fallbackUiState || 'offline';
+}
+
+function normalizeWorkerStateEntry(worker) {
+  const sdkSessionId = normalizeWorkerSessionId(worker?.sdkSessionId);
+  if (!sdkSessionId) return null;
+  const explicitUiState = normalizeUiState(worker?.uiState || worker?.ui_state);
+  const derivedUiState = normalizeUiStateFromStatus(worker?.status);
+  return {
+    sdkSessionId,
+    status: normalizeWorkerStatus(worker?.status),
+    uiState: explicitUiState || null,
+    derivedUiState: derivedUiState || null,
+    workerId: String(worker?.workerId || '').trim() || null,
+    pid: Number.isInteger(Number(worker?.pid)) ? Number(worker.pid) : null,
+    updatedAt: String(worker?.updatedAt || '').trim() || null,
+  };
+}
+
+function buildSessionWorkerStateHash(map) {
+  const parts = [];
+  for (const [sid, state] of map.entries()) {
+    parts.push(`${sid}:${state.status}:${state.uiState || ''}:${state.derivedUiState || ''}:${state.workerId || ''}:${state.pid || ''}:${state.updatedAt || ''}`);
+  }
+  return parts.sort().join('|');
+}
+
+let sessionWorkerStateHash = '';
+
+export function setSessionWorkerStatesFromStatusPayload(payload) {
+  const workers = Array.isArray(payload?.workers) ? payload.workers : [];
+  const next = new Map();
+  for (const worker of workers) {
+    const normalized = normalizeWorkerStateEntry(worker);
+    if (!normalized) continue;
+    next.set(normalized.sdkSessionId, normalized);
+  }
+  const nextHash = buildSessionWorkerStateHash(next);
+  if (nextHash === sessionWorkerStateHash) return false;
+  sessionWorkerStateHash = nextHash;
+  sessionWorkerStates = next;
+  return true;
+}
+
+export function getSessionWorkerState(sdkSessionId) {
+  const sid = normalizeWorkerSessionId(sdkSessionId);
+  if (!sid) return null;
+  return sessionWorkerStates.get(sid) || null;
 }
 
 export function openSidebar() {

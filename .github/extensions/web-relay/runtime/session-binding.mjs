@@ -3,11 +3,13 @@ function normalizeId(value) {
   return text || null;
 }
 
-export function extractTargetSessionId(details) {
+export function extractTargetSessionId(details, conversationId = null) {
   return normalizeId(
     details?.sdkSessionId
     || details?.runtimeSession?.sdkSessionId
     || details?.runtimeSession?.sdk_session_id
+    || details?.id
+    || conversationId
     || "",
   );
 }
@@ -18,7 +20,7 @@ export function resolveSessionBinding({
   activeSessionId,
 } = {}) {
   const convId = normalizeId(conversationId);
-  const targetSessionId = extractTargetSessionId(details);
+  const targetSessionId = extractTargetSessionId(details, convId);
   const active = normalizeId(activeSessionId);
 
   if (!convId) {
@@ -36,7 +38,7 @@ export function resolveSessionBinding({
     return {
       ok: false,
       reason: "target-session-missing",
-      retryable: false,
+      retryable: true,
       message: "Conversation has no bound SDK session id",
       activeSessionId: active,
       targetSessionId: null,
@@ -54,21 +56,10 @@ export function resolveSessionBinding({
     };
   }
 
-  if (active !== targetSessionId) {
-    return {
-      ok: false,
-      reason: "restart-required",
-      retryable: true,
-      message: "Active SDK session does not match the conversation binding; relay restart/rebind is required.",
-      activeSessionId: active,
-      targetSessionId,
-    };
-  }
-
   return {
     ok: true,
     switched: false,
-    via: "restart-orchestrator-binding",
+    via: "session-liveness",
     activeSessionId: active,
     targetSessionId,
   };

@@ -22,6 +22,12 @@
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/powershell.min.js"></script>
+<script>
+  if (window.hljs && typeof window.hljs.registerAliases === 'function') {
+    window.hljs.registerAliases(['pwsh', 'ps1'], { languageName: 'powershell' });
+  }
+</script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -140,10 +146,22 @@
     cursor: not-allowed;
   }
   #cli-dot {
-    width: 10px; height: 10px; border-radius: 50%; background: var(--danger);
-    flex-shrink: 0; transition: background 0.3s;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    transition: background 0.2s ease, box-shadow 0.2s ease;
+    background: #6e7681;
+    box-shadow: 0 0 0 1px rgba(240, 246, 252, 0.08);
   }
-  #cli-dot.online { background: var(--success); }
+  #cli-dot.online {
+    background: #3fb950;
+    box-shadow: 0 0 0 1px rgba(63, 185, 80, 0.42), 0 0 8px rgba(63, 185, 80, 0.35);
+  }
+  #cli-dot.offline {
+    background: #6e7681;
+    box-shadow: 0 0 0 1px rgba(240, 246, 252, 0.08);
+  }
 
   #new-conv-btn {
     margin: 12px; padding: 10px 14px; background: var(--accent); color: #000;
@@ -159,7 +177,16 @@
   .conv-item:hover { background: var(--bg3); }
   .conv-item.active { background: var(--bg3); border-color: var(--border); }
   .conv-title { font-size: 0.9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-right: 24px; }
-  .conv-meta  { font-size: 0.75rem; color: var(--muted); margin-top: 2px; }
+  .conv-meta  { font-size: 0.75rem; color: var(--muted); margin-top: 2px; padding-right: 24px; }
+  .conv-item.worker-ui-offline .conv-title { color: #f0f6fc; }
+  .conv-item.worker-ui-ready .conv-title { color: #3fb950; }
+  .conv-item.worker-ui-question .conv-title { color: #f85149; }
+  .conv-item.worker-ui-error .conv-title { color: #d29922; }
+  .conv-processing-dots {
+    display: inline-block;
+    min-width: 1.8ch;
+    letter-spacing: 0.02em;
+  }
   .conv-delete {
     position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
     background: none; border: none; color: var(--muted); cursor: pointer; font-size: 1rem;
@@ -179,7 +206,6 @@
     font-weight: 600;
     vertical-align: middle;
   }
-
   /* ── Main Chat ── */
   #main {
     flex: 1; display: flex; flex-direction: column; height: 100%; overflow: hidden;
@@ -193,7 +219,59 @@
     display: none; background: none; border: none; color: var(--text);
     font-size: 1.3rem; cursor: pointer; padding: 4px 8px; margin: -4px 0;
   }
-  #chat-title { font-weight: 600; font-size: 1rem; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #chat-title-wrap {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+    min-width: 0;
+  }
+  #chat-title { font-weight: 600; font-size: 1rem; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  #chat-title-edit-btn {
+    width: 32px;
+    height: 32px;
+    flex-shrink: 0;
+  }
+  #chat-title-editor {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+    min-width: 0;
+  }
+  #chat-title-editor[hidden] { display: none; }
+  #chat-title-input {
+    flex: 1;
+    min-width: 0;
+    height: 32px;
+    padding: 0 10px;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    font-size: 0.92rem;
+    outline: none;
+  }
+  #chat-title-input:focus { border-color: var(--accent); }
+  .chat-title-action-btn {
+    border: 1px solid var(--border);
+    background: var(--bg3);
+    color: var(--text);
+    border-radius: 8px;
+    height: 32px;
+    padding: 0 10px;
+    cursor: pointer;
+    font-size: 0.8rem;
+    flex-shrink: 0;
+  }
+  .chat-title-action-btn:hover { border-color: var(--accent); color: var(--accent); }
+  #chat-title-save-btn {
+    background: var(--accent);
+    border-color: transparent;
+    color: #000;
+    font-weight: 700;
+  }
+  #chat-title-save-btn:hover { color: #000; }
   #pending-question-banner {
     display: none;
     border: 1px solid rgba(88, 166, 255, 0.45);
@@ -1297,6 +1375,15 @@
     }
     #sidebar-toggle { font-size: 1.05rem; padding: 2px 6px; }
     #chat-title { font-size: 0.96rem; }
+    #chat-title-input,
+    .chat-title-action-btn,
+    #chat-title-edit-btn {
+      height: 30px;
+    }
+    #chat-title-input,
+    .chat-title-action-btn {
+      font-size: 0.76rem;
+    }
     #pending-question-banner { font-size: 0.68rem; padding: 3px 8px; }
     #session-pill { font-size: 0.68rem; padding: 2px 6px; }
     #cli-status-text { font-size: 0.76rem; }
@@ -1444,7 +1531,15 @@
   <div id="main">
     <div id="chat-header">
       <button id="sidebar-toggle" onclick="openSidebar()">☰</button>
-      <span id="chat-title">Select or start a conversation</span>
+      <div id="chat-title-wrap">
+        <span id="chat-title">Select or start a conversation</span>
+        <button id="chat-title-edit-btn" class="header-icon-btn" type="button" title="Edit conversation title" aria-label="Edit conversation title">✍️</button>
+        <form id="chat-title-editor">
+          <input id="chat-title-input" type="text" maxlength="120" autocomplete="off" spellcheck="false">
+          <button id="chat-title-save-btn" class="chat-title-action-btn" type="submit">Save</button>
+          <button id="chat-title-cancel-btn" class="chat-title-action-btn" type="button">Cancel</button>
+        </form>
+      </div>
       <button id="pending-question-banner" onclick="openPendingQuestionFromBanner()" title="Open pending question"></button>
       <span id="session-pill"></span>
       <button id="compact-btn" onclick="compactCurrentConversation()" title="Compact conversation into a fresh session" disabled>Compact</button>
@@ -1495,8 +1590,9 @@
       <button class="repo-browser-close" onclick="closeRepoBrowser()" aria-label="Close repository browser">×</button>
     </div>
     <div class="repo-browser-toolbar">
-      <button id="repo-root-workspace-btn" class="repo-browser-btn active" onclick="setRepoBrowserRoot('workspace')">Workspace</button>
-      <button id="repo-root-drives-btn" class="repo-browser-btn" onclick="setRepoBrowserRoot('drives')">Drives</button>
+      <button id="repo-root-workspace-btn" class="repo-browser-btn active" onclick="setRepoBrowserRoot('workspace')" title="Workspace root" aria-label="Workspace root">💼</button>
+      <button id="repo-root-drives-btn" class="repo-browser-btn" onclick="setRepoBrowserRoot('drives')" title="Drives root" aria-label="Drives root">📀</button>
+      <button id="repo-root-session-btn" class="repo-browser-btn" onclick="setRepoBrowserRoot('session')" title="Session root" aria-label="Session root">🕵️</button>
       <button id="repo-view-list-btn" class="repo-browser-btn active" onclick="setRepoBrowserViewMode('list')">List</button>
       <button id="repo-view-grid-btn" class="repo-browser-btn" onclick="setRepoBrowserViewMode('grid')">Icons</button>
       <button id="repo-toggle-hidden-btn" class="repo-browser-btn" onclick="toggleRepoBrowserHidden()">Hidden: Off</button>

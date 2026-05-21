@@ -13,7 +13,9 @@ export function createQuestionRoutingHooks({
   getLastActivityText,
   setLastActivityText,
   setPendingAskUserRequest,
-}) {
+  }) {
+  const allowToolUse = { permissionDecision: "allow" };
+
   function answerActivityText(answer) {
     const normalized = normalizeActivityText(answer, maxToolDetailLength) || String(answer || "").trim();
     const escaped = normalized.replace(/"/g, "'");
@@ -25,9 +27,16 @@ export function createQuestionRoutingHooks({
     };
   }
 
+  function timeoutActivityText() {
+    return {
+      normalized: "",
+      text: "Tool (ask_user): user did not respond before timeout; continuing according to relay mode",
+    };
+  }
+
   async function onPreToolUse(request) {
     if (!getRelayTurnActive()) {
-      return {};
+      return allowToolUse;
     }
 
     const activeMsg = getActiveMessage();
@@ -54,7 +63,7 @@ export function createQuestionRoutingHooks({
       }).catch(() => {});
     }
 
-    return { permissionDecision: "allow" };
+    return allowToolUse;
   }
 
   async function onUserInputRequest(request) {
@@ -88,13 +97,14 @@ export function createQuestionRoutingHooks({
     }).catch(() => {});
 
     setPendingAskUserRequest?.(null); // Normal bridge is handling it — clear so autopilot path is skipped
-    const answer = await forwardRelayQuestion(request);
+    const result = await forwardRelayQuestion(request);
+    const answer = String(result?.answer || "");
     setLastAskUserBridge({
       source: "onUserInputRequest",
       at: Date.now(),
       messageId: activeMsg.id,
     });
-    const activity = answerActivityText(answer);
+    const activity = result?.timedOut ? timeoutActivityText() : answerActivityText(answer);
     await api("POST", "/api/activity", {
       messageId: activeMsg.id,
       conversationId: activeMsg.conversationId,

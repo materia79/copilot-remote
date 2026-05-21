@@ -145,8 +145,8 @@ export function createRelayCliLauncherService({
     return Array.from(killed);
   }
 
-  function spawnResumedCli(targetSessionId) {
-    const child = spawnImpl('gh', ['copilot', '--', '--allow-all', '--resume', targetSessionId], {
+  function spawnSessionCli(targetSessionId) {
+    const child = spawnImpl('gh', ['copilot', '--', '--allow-all', '--session-id', targetSessionId], {
       cwd,
       env,
       detached: true,
@@ -165,8 +165,8 @@ export function createRelayCliLauncherService({
     }
     log(`relay cli launcher: retiring cli processes for ${job.targetSessionId} tx=${job.transactionId || 'none'}`);
     job.killedPids = await retireCliProcesses(job);
-    log(`relay cli launcher: spawning resumed cli for ${job.targetSessionId}`);
-    job.spawnedPid = spawnResumedCli(job.targetSessionId);
+    log(`relay cli launcher: spawning session-bound cli for ${job.targetSessionId}`);
+    job.spawnedPid = spawnSessionCli(job.targetSessionId);
     job.status = 'spawned';
     job.completedAt = isoNow(now);
   }

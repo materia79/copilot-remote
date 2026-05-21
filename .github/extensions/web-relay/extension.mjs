@@ -32,12 +32,11 @@ import { createManagedServerLifecycle } from "./server-lifecycle/managed-server.
 import { createModelSwitchingService } from "./model-api/model-switching.mjs";
 import { createSessionIoHelpers } from "./runtime/session-io.mjs";
 import { resolveSessionBinding } from "./runtime/session-binding.mjs";
-import { createSessionRuntimeManager } from "./runtime/session-runtime-manager.mjs";
 import { createBannerStateStore } from "./runtime/banner-state.mjs";
 import { clearSession, registerSession } from "./runtime/session-registry.mjs";
 import { syncSessionToServer } from "./runtime/session-sync-bridge.mjs";
 import { joinSessionWithRetry } from "./runtime/session-join-retry.mjs";
-import { evaluateRestartControlGuard } from "./runtime/restart-control-guard.mjs";
+import { DEFAULT_QUESTION_TIMEOUT_MS } from "../../../shared/question-timeout.mjs";
 
 const SERVER_URL   = "http://localhost:3333";
 const POLL_MS      = 2000;
@@ -59,12 +58,10 @@ const CONFIG_TOKEN = loadTokenFromConfig(CONFIG_PATH);
 const TOKEN = CONFIG_TOKEN || TOKEN_FALLBACK;
 const TOKEN_WAS_GENERATED = !CONFIG_TOKEN;
 const RELAY_TOOL_INSTRUCTIONS = loadRelayInstructionsFromFile(RELAY_TOOLS_PATH);
-const QUESTION_WAIT_TIMEOUT_MS = 5 * 60 * 1000;
+const QUESTION_WAIT_TIMEOUT_MS = DEFAULT_QUESTION_TIMEOUT_MS;
 const QUESTION_POLL_MS = 1500;
 const MAX_TOOL_DETAIL_LENGTH = 140;
 const RESTART_CONTROL_STARTUP_GRACE_MS = 20_000;
-const RESTART_REBIND_FAST_ATTEMPTS = 12;
-const RESTART_REBIND_FAST_INTERVAL_MS = 500;
 const STARTUP_VERIFICATION_DELAY_MS = 1500;
 
 const MODEL_SNAPSHOT_MIN_INTERVAL_MS = 30_000;
@@ -152,12 +149,7 @@ let pollingLoopController = null;
 let restartControlPromise = null;
 let startupVerificationTimer = null;
 let restartControlGraceUntilMs = 0;
-let aggressiveReconnectPromise = null;
-const sessionRuntimeManager = createSessionRuntimeManager({
-  dbg,
-  getSession: () => session,
-  setSession: (nextSession) => { session = nextSession || null; },
-});
+let deferredSessionEnd = false;
 
 function getCurrentConversationId() {
   const conversationId = String(activeMsg?.conversationId || "").trim();
@@ -260,27 +252,7 @@ async function syncActiveSession(reason, forceSync = false) {
   if (!activeSession?.sdkSessionId || !activeSession?.conversationId) return false;
 
   try {
-    let syncOptions = null;
-    const status = await api("GET", "/api/status").catch(() => null);
-    const orchestrator = status?.restartOrchestrator || null;
-    const orchestratorState = String(orchestrator?.state || "").trim().toLowerCase();
-    const orchestratorTargetSessionId = String(orchestrator?.targetSessionId || "").trim();
-    const orchestratorTransactionId = String(orchestrator?.transactionId || "").trim();
-    if (orchestratorState || orchestratorTargetSessionId || orchestratorTransactionId) {
-      const shouldSignalRebind = orchestratorState === "awaiting_rebind"
-        && !!orchestratorTargetSessionId
-        && orchestratorTargetSessionId === activeSession.sdkSessionId;
-      syncOptions = {
-        orchestrator: {
-          transactionId: orchestratorTransactionId || null,
-          targetSessionId: orchestratorTargetSessionId || null,
-          rebindCompleted: shouldSignalRebind,
-          rebindState: shouldSignalRebind ? "completed" : "observed",
-          rebindSignal: shouldSignalRebind ? "extension-session-sync" : `extension-sync-${reason}`,
-        },
-      };
-    }
-    return await syncSessionToServer(activeSession.sdkSessionId, activeSession.conversationId, api, forceSync, syncOptions);
+    return await syncSessionToServer(activeSession.sdkSessionId, activeSession.conversationId, api, forceSync);
   } catch (e) {
     dbg("session sync failed:", reason, e?.message || String(e));
     return false;
@@ -319,30 +291,13 @@ async function ensureSessionForConversation(conversationId, reason = "dequeue") 
     details,
     activeSessionId: String(session?.sessionId || "").trim() || null,
   });
-  if (!binding?.ok) {
-    if (binding?.reason === "restart-required") {
-      const switchResult = await sessionRuntimeManager.activateSession(binding.targetSessionId, reason);
-      if (!switchResult?.ok) {
-        return switchResult;
-      }
-      const activeSessionId = String(session?.sessionId || "").trim() || switchResult.targetSessionId;
-      registerSession(activeSessionId, convId);
-      return {
-        ok: true,
-        switched: !!switchResult.switched,
-        via: switchResult.via || "session.resumeSession",
-        activeSessionId,
-        targetSessionId: switchResult.targetSessionId || activeSessionId,
-      };
-    }
-    return binding;
-  }
+  if (!binding?.ok) return binding;
 
   registerSession(binding.activeSessionId, convId);
   return {
     ok: true,
     switched: false,
-    via: binding?.via || "restart-orchestrator-binding",
+    via: binding?.via || "session-liveness",
     activeSessionId: binding.activeSessionId,
     targetSessionId: binding.targetSessionId,
   };
@@ -405,6 +360,14 @@ function stopHeartbeat() {
   heartbeatController?.stopHeartbeat();
 }
 
+function flushDeferredSessionEnd(reason = "deferred-onSessionEnd") {
+  if (!deferredSessionEnd || shutdownStarted || waitingForAI || relayTurnActive) return;
+  deferredSessionEnd = false;
+  queueMicrotask(() => {
+    void gracefulShutdown(reason);
+  });
+}
+
 async function startPolling() {
   if (!pollingLoopController) {
     pollingLoopController = createPollingLoop({
@@ -431,7 +394,12 @@ async function startPolling() {
       getWaitingForAI: () => waitingForAI,
       getLastAskUserBridge: () => getScopedLastAskUserBridge(),
       setActiveMsg: (value) => { activeMsg = value; },
-      setWaitingForAI: (value) => { waitingForAI = value; },
+      setWaitingForAI: (value) => {
+        waitingForAI = value;
+        if (!waitingForAI) {
+          flushDeferredSessionEnd();
+        }
+      },
       setRelayTurnActive: (value, message = null) => {
         relayTurnActive = !!value;
         if (relayTurnActive) {
@@ -442,6 +410,7 @@ async function startPolling() {
           ensureRelayScopeState(activeRelayScopeKey);
         } else {
           activeRelayScopeKey = null;
+          flushDeferredSessionEnd();
         }
       },
       setLastActivityText: (value) => { setScopedLastActivityText(value); },
@@ -453,7 +422,6 @@ async function startPolling() {
       ensureSessionForConversation,
       extractQuestionPrompt,
       extractQuestionChoices,
-      handleControl: handleRelayControl,
     });
   }
 
@@ -502,6 +470,11 @@ async function requeueActiveMessage(reason) {
 
 async function gracefulShutdown(reason) {
   if (shutdownStarted) return;
+  if (reason === "onSessionEnd" && (waitingForAI || relayTurnActive)) {
+    deferredSessionEnd = true;
+    dbg("graceful shutdown deferred until active relay turn settles", reason);
+    return;
+  }
   shutdownStarted = true;
   dbg("graceful shutdown", reason);
   if (startupVerificationTimer) {
@@ -517,102 +490,6 @@ async function gracefulShutdown(reason) {
     sleep(500).then(() => false),
   ]).catch(() => false);
   await stopManagedServer();
-}
-
-async function announceBridgeExit({ reason = "shutdown", transactionId = null, targetSessionId = null } = {}) {
-  try {
-    const response = await api("POST", "/api/restart-orchestrator/bridge-exit", {
-      reason: String(reason || "shutdown").trim() || "shutdown",
-      transactionId: String(transactionId || "").trim() || null,
-      targetSessionId: String(targetSessionId || "").trim() || null,
-    });
-    const orchestratorState = String(response?.restartOrchestrator?.state || "").trim().toLowerCase() || "unknown";
-    const launcherStatus = response?.launcher?.state?.status || "none";
-    dbg(
-      "bridge exit acknowledged",
-      `reason=${String(reason || "shutdown").trim() || "shutdown"}`,
-      `transaction=${String(transactionId || "").trim() || "none"}`,
-      `target=${String(targetSessionId || "").trim() || "none"}`,
-      `orchestrator=${orchestratorState}`,
-      `launcher=${launcherStatus}`,
-    );
-    return true;
-  } catch (error) {
-    dbg("bridge exit announcement failed", error?.message || String(error));
-    return false;
-  }
-}
-
-async function acknowledgeDeferredRestartControl({ control, pendingEnvelope = null } = {}) {
-  const targetSessionId = String(control?.targetSessionId || "").trim();
-  const transactionId = String(control?.transactionId || "").trim();
-  const activeSessionId = String(session?.sessionId || "").trim();
-  if (!targetSessionId || !transactionId || !activeSessionId) return false;
-  if (activeSessionId !== targetSessionId) return false;
-
-  const conversationId = String(
-    pendingEnvelope?.message?.conversationId
-    || activeMsg?.conversationId
-    || getCurrentConversationId()
-    || "",
-  ).trim();
-  const rebindPayload = {
-    sdk_session_id: activeSessionId,
-    orchestrator_correlation_id: transactionId,
-    orchestrator_target_session_id: targetSessionId,
-    rebind_completed: true,
-    rebind_signal: "restart-control-guard",
-    rebind_state: "ready",
-  };
-  if (conversationId) {
-    rebindPayload.conversation_id = conversationId;
-  }
-
-  try {
-    const rebind = await api("POST", "/api/restart-orchestrator/rebind", rebindPayload);
-    dbg(
-      "deferred restart control rebind ack",
-      `status=sent`,
-      `target=${targetSessionId || "none"}`,
-      `transaction=${transactionId || "none"}`,
-      `completed=${rebind?.rebind?.completed === true ? "yes" : "no"}`,
-      `state=${String(rebind?.restartOrchestrator?.state || "").trim() || "unknown"}`,
-    );
-    return true;
-  } catch (error) {
-    dbg("deferred restart control rebind ack failed", error?.message || String(error));
-  }
-
-  if (!conversationId) return false;
-
-  try {
-    const fallback = await api("POST", "/api/session-sync", rebindPayload);
-    dbg(
-      "deferred restart control session-sync fallback",
-      `status=sent`,
-      `target=${targetSessionId || "none"}`,
-      `transaction=${transactionId || "none"}`,
-      `completed=${fallback?.rebind?.completed === true ? "yes" : "no"}`,
-      `state=${String(fallback?.restartOrchestrator?.state || "").trim() || "unknown"}`,
-    );
-    return true;
-  } catch (error) {
-    dbg("deferred restart control session-sync fallback failed", error?.message || String(error));
-    return false;
-  }
-}
-
-async function handleRelayControl(control, pendingEnvelope = null) {
-  const type = String(control?.type || "").trim().toLowerCase();
-  if (type !== "restart_cli") return false;
-  const targetSessionId = String(control?.targetSessionId || "").trim();
-  const transactionId = String(control?.transactionId || "").trim();
-  dbg(
-    "restart control ignored (in-process session switching enabled)",
-    `target=${targetSessionId || "none"}`,
-    `transaction=${transactionId || "none"}`,
-  );
-  return false;
 }
 
 function scheduleStartupVerification(reason, attemptsRemaining = 4) {
@@ -652,106 +529,6 @@ async function verifyRelayStartup(reason, attemptsRemaining) {
   if (remaining > 1) {
     scheduleStartupVerification(reason, remaining - 1);
   }
-}
-
-function buildRestartRebindPayload({ activeSessionId, orchestrator, reason, attempt }) {
-  const transactionId = String(orchestrator?.transactionId || "").trim();
-  const targetSessionId = String(orchestrator?.targetSessionId || "").trim();
-  if (!activeSessionId || !transactionId || !targetSessionId) return null;
-  if (targetSessionId !== activeSessionId) return null;
-  return {
-    sdk_session_id: activeSessionId,
-    orchestrator_correlation_id: transactionId,
-    orchestrator_target_session_id: targetSessionId,
-    rebind_completed: true,
-    rebind_signal: `aggressive-reconnect:${reason}:${attempt}`,
-    rebind_state: "ready",
-  };
-}
-
-async function runAggressiveReconnectLoop(reason, initialStatus = null) {
-  const activeSessionId = String(session?.sessionId || "").trim();
-  if (!activeSessionId) return false;
-
-  let status = initialStatus;
-  for (let attempt = 1; attempt <= RESTART_REBIND_FAST_ATTEMPTS; attempt += 1) {
-    if (shutdownStarted || !sessionReady) return false;
-    if (!status) {
-      status = await api("GET", "/api/status").catch(() => null);
-    }
-    const orchestrator = status?.restartOrchestrator || null;
-    const state = String(orchestrator?.state || "").trim().toLowerCase();
-    const transactionId = String(orchestrator?.transactionId || "").trim();
-    const targetSessionId = String(orchestrator?.targetSessionId || "").trim();
-    const inProgress = state === "draining" || state === "restarting" || state === "awaiting_rebind";
-    const isTargeted = !!targetSessionId && targetSessionId === activeSessionId;
-    if (!inProgress || !isTargeted || !transactionId) {
-      if (attempt === 1) return false;
-      if (state === "ready" || state === "idle" || !transactionId) return true;
-      status = null;
-      if (attempt < RESTART_REBIND_FAST_ATTEMPTS) {
-        await sleep(RESTART_REBIND_FAST_INTERVAL_MS);
-      }
-      continue;
-    }
-
-    const payload = buildRestartRebindPayload({ activeSessionId, orchestrator, reason, attempt });
-    dbg(
-      "aggressive reconnect probe",
-      `attempt=${attempt}/${RESTART_REBIND_FAST_ATTEMPTS}`,
-      `state=${state || "unknown"}`,
-      `target=${targetSessionId || "none"}`,
-      `transaction=${transactionId || "none"}`,
-    );
-    if (payload) {
-      try {
-        const response = await api("POST", "/api/restart-orchestrator/rebind", payload);
-        const completed = response?.rebind?.completed === true;
-        const nextState = String(response?.restartOrchestrator?.state || "").trim().toLowerCase();
-        dbg(
-          "aggressive reconnect rebind",
-          `attempt=${attempt}/${RESTART_REBIND_FAST_ATTEMPTS}`,
-          `completed=${completed ? "yes" : "no"}`,
-          `nextState=${nextState || "unknown"}`,
-          `target=${targetSessionId || "none"}`,
-          `transaction=${transactionId || "none"}`,
-        );
-        await syncActiveSession(`aggressive-reconnect:${reason}:${attempt}`, true).catch(() => false);
-        await pulseHeartbeat(`aggressive-reconnect:${reason}:${attempt}`);
-        if (completed || nextState === "ready" || nextState === "idle") return true;
-      } catch (error) {
-        dbg(
-          "aggressive reconnect rebind failed",
-          `attempt=${attempt}/${RESTART_REBIND_FAST_ATTEMPTS}`,
-          `target=${targetSessionId || "none"}`,
-          `transaction=${transactionId || "none"}`,
-          error?.message || String(error),
-        );
-      }
-    }
-
-    status = null;
-    if (attempt < RESTART_REBIND_FAST_ATTEMPTS) {
-      await sleep(RESTART_REBIND_FAST_INTERVAL_MS);
-    }
-  }
-  return false;
-}
-
-function scheduleAggressiveReconnect(reason, initialStatus = null) {
-  if (aggressiveReconnectPromise) return aggressiveReconnectPromise;
-  aggressiveReconnectPromise = (async () => {
-    const ok = await runAggressiveReconnectLoop(reason, initialStatus);
-    dbg(
-      "aggressive reconnect completed",
-      `reason=${String(reason || "").trim() || "unknown"}`,
-      `result=${ok ? "ready" : "no-op-or-timeout"}`,
-    );
-    return ok;
-  })().finally(() => {
-    aggressiveReconnectPromise = null;
-  });
-  return aggressiveReconnectPromise;
 }
 
 function relayBannerCacheKey(readyBanner = null) {
@@ -974,9 +751,6 @@ async function ensureRelayActive(reason) {
     restartControlGraceUntilMs = Date.now() + RESTART_CONTROL_STARTUP_GRACE_MS;
     startPolling().catch((error) => {
       dbg("startPolling failed", reason, error?.message || String(error));
-    });
-    void scheduleAggressiveReconnect(reason, status).catch((error) => {
-      dbg("aggressive reconnect scheduling failed", reason, error?.message || String(error));
     });
     scheduleStartupVerification(reason);
     dbg("relay active", reason);

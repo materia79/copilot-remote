@@ -13,8 +13,8 @@ This project now runs in package-wide ESM mode (`"type": "module"` in `package.j
 ## Starting the Server
 
 If you run `gh copilot` and the web-relay extension is loaded (project-local or user-global),
-the extension auto-starts `server.js` when needed and reuses the existing singleton relay
-across Copilot CLI restarts.
+the extension auto-starts `server.js` when needed and keeps the relay listener singleton
+while letting session-affine CLI workers run in parallel.
 
 > **Single-owner rule:** Use either extension-managed polling **or** standalone `relay.mjs`, never both at the same time.
 
@@ -155,6 +155,28 @@ Mode is stored with each queued message so the relay can change behavior per tur
 Clarification prompts from the CLI are forwarded back into the browser as question
 cards with a reply box.
 
+## Conversation titles
+
+The active conversation header includes a `✍️` button for renaming the conversation inline.
+Title edits are saved to the database and broadcast to other open clients immediately.
+
+## Session worker rollout flags
+
+Session-worker refactor gates are OFF by default and can be enabled per flag:
+
+- `SESSION_WORKER_ROUTING_ENABLED`
+- `SESSION_WORKER_CONTINUATION_ROUTING_ENABLED`
+- `SESSION_WORKER_FALLBACK_RESTART_ENABLED` (deprecated no-op)
+
+`SESSION_WORKER_FALLBACK_RESTART_ENABLED` is now a deprecated no-op. Session-worker routing no longer asks the global restart orchestrator to respawn CLIs for worker failures.
+
+Configuration precedence is:
+
+1. `server/config.json` → `features.{FLAG_NAME}` (`true/false`, `1/0`, `yes/no`, `on/off`)
+2. Environment override: `COPILOT_REMOTE_{FLAG_NAME}`
+
+Unknown flag names and invalid values are ignored safely.
+
 Question bridge rule:
 
 - User-facing questions/clarifications must use `ask_user` so they flow through
@@ -239,7 +261,8 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | GET | `/api/drives/files-preview` | Return structured preview JSON for a drive file (`path`) |
 | GET | `/api/conversations` | List all conversations |
 | GET | `/api/sessions` | List runtime sessions bound 1:1 to conversations |
-| GET | `/api/conversation/:id` | Get full conversation with messages |
+| GET | `/api/conversation/:id` | Get full conversation with messages and session-root path metadata |
+| PATCH | `/api/conversation/:id` | Update a conversation title |
 | POST | `/api/conversation/:id/compact` | Compact a conversation into a new one with carry-over summary seed |
 | DELETE | `/api/conversation/:id` | Delete a conversation |
 | GET | `/api/sdk-session-delete/pending` | (CLI relay) Fetch next pending SDK session delete request |

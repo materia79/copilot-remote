@@ -472,6 +472,7 @@ export function renderFilePreview() {
   const rawLink = document.getElementById('file-preview-open-raw');
   const payload = filePreviewState.payload;
   const rawHref = filePreviewState.source === 'drives'
+    || filePreviewState.source === 'session'
     ? driveFileHrefFromPath(filePreviewState.path)
     : filePreviewState.source === 'upload'
       ? String(payload?.rawUrl || '')
@@ -616,7 +617,7 @@ export async function openDriveFilePreview(rawPath) {
 }
 
 export async function openWorkspaceFilePreviewFromRepo(rawPath) {
-  if (repoBrowserState.activeRoot === 'drives') {
+  if (repoBrowserState.activeRoot !== 'workspace') {
     await openDriveFilePreview(rawPath);
     return;
   }
@@ -632,7 +633,7 @@ export function closeFilePreview() {
 
 export function normalizeRepoPath(pathValue) {
   if (pathValue === '' || pathValue === null || pathValue === undefined) return '';
-  if (repoBrowserState.activeRoot === 'drives') {
+  if (repoBrowserState.activeRoot !== 'workspace') {
     return normalizeDriveBrowserPath(pathValue);
   }
   return normalizeWorkspaceMentionPath(pathValue);
@@ -653,7 +654,7 @@ export function repoNodeMapFromTree(root) {
 }
 
 export function repoRawHref(pathValue) {
-  if (repoBrowserState.activeRoot === 'drives') {
+  if (repoBrowserState.activeRoot !== 'workspace') {
     return `${BASE}/api/drives/file?path=${encodeURIComponent(String(pathValue || ''))}`;
   }
   return `${BASE}/api/files/${String(pathValue || '').split('/').map((segment) => encodeURIComponent(segment)).join('/')}`;
@@ -677,13 +678,21 @@ export function repoIcon(node) {
 function updateRepoToolbarUi() {
   const workspaceRootBtn = document.getElementById('repo-root-workspace-btn');
   const drivesRootBtn = document.getElementById('repo-root-drives-btn');
+  const sessionRootBtn = document.getElementById('repo-root-session-btn');
   const listBtn = document.getElementById('repo-view-list-btn');
   const gridBtn = document.getElementById('repo-view-grid-btn');
   const hiddenBtn = document.getElementById('repo-toggle-hidden-btn');
   const heavyBtn = document.getElementById('repo-toggle-heavy-btn');
+  if (!workspaceRootBtn || !drivesRootBtn || !sessionRootBtn || !listBtn || !gridBtn || !hiddenBtn || !heavyBtn) {
+    return;
+  }
   const workspaceRoot = repoBrowserState.activeRoot === 'workspace';
+  const sessionRoot = repoBrowserState.activeRoot === 'session';
   workspaceRootBtn.classList.toggle('active', workspaceRoot);
-  drivesRootBtn.classList.toggle('active', !workspaceRoot);
+  drivesRootBtn.classList.toggle('active', repoBrowserState.activeRoot === 'drives');
+  sessionRootBtn.classList.toggle('active', sessionRoot);
+  drivesRootBtn.disabled = false;
+  sessionRootBtn.disabled = !repoBrowserState.sessionRootPath;
   listBtn.classList.toggle('active', repoBrowserState.viewMode === 'list');
   gridBtn.classList.toggle('active', repoBrowserState.viewMode === 'grid');
   const hiddenEnabled = workspaceRoot
@@ -772,7 +781,8 @@ export function renderRepoBreadcrumb() {
   const rootLabel = repoBrowserState.rootName || 'repo';
   const pathValue = String(repoBrowserState.currentPath || '');
   const host = document.getElementById('repo-folder-breadcrumb');
-  const rootSource = repoBrowserState.activeRoot === 'drives' ? 'drives' : 'workspace';
+  if (!host) return;
+  const rootSource = repoBrowserState.activeRoot === 'workspace' ? 'workspace' : 'drives';
   const parts = pathValue ? pathValue.split('/').filter(Boolean) : [];
   const chips = [`<button class="repo-crumb" data-repo-nav-dir="">${escHtml(rootLabel)}</button>`];
   let rolling = '';
@@ -791,6 +801,7 @@ export function renderRepoBreadcrumb() {
 export function renderRepoFolder() {
   const folderHost = document.getElementById('repo-folder');
   const statusHost = document.getElementById('repo-tree-status');
+  if (!folderHost || !statusHost) return;
   if (repoBrowserState.loading && !repoBrowserState.tree) {
     folderHost.innerHTML = '<div class="repo-empty">Loading explorer tree…</div>';
     statusHost.textContent = 'Loading…';
@@ -884,6 +895,7 @@ export function renderRepoFolder() {
 
 export function renderRepoTree() {
   const treeHost = document.getElementById('repo-tree');
+  if (!treeHost) return;
   if (repoBrowserState.loading && !repoBrowserState.tree) {
     treeHost.innerHTML = '<div class="repo-empty">Loading tree…</div>';
     return;
@@ -905,7 +917,9 @@ export function renderRepoTree() {
 export function renderRepoBrowser() {
   const title = document.querySelector('.repo-browser-title');
   if (title) {
-    title.textContent = repoBrowserState.activeRoot === 'workspace' ? 'Repository Browser' : 'Drives Browser';
+    title.textContent = repoBrowserState.activeRoot === 'workspace'
+      ? 'Repository Browser'
+      : (repoBrowserState.activeRoot === 'session' ? 'Session Browser' : 'Drives Browser');
   }
   updateRepoToolbarUi();
   renderRepoBreadcrumb();
@@ -921,31 +935,41 @@ export async function loadRepoBrowserTree() {
   renderRepoBrowser();
 
   const workspaceRoot = repoBrowserState.activeRoot === 'workspace';
+  const sessionRoot = repoBrowserState.activeRoot === 'session';
   const payload = workspaceRoot
     ? await loadRepoTree(repoBrowserState.workspaceIncludeHidden, repoBrowserState.workspaceIncludeHeavy)
-    : await loadDrivesRoots();
-  if (!payload || payload.error || !payload.root) {
+    : (sessionRoot
+      ? await loadDriveChildren(normalizeDriveBrowserPath(repoBrowserState.sessionRootPath), repoBrowserState.drivesIncludeHidden)
+      : await loadDrivesRoots());
+  const rootNode = payload?.root || payload?.node || null;
+  if (!payload || payload.error || !rootNode) {
     repoBrowserState.loading = false;
-    repoBrowserState.error = payload?.error || (workspaceRoot ? 'Failed to load repository tree.' : 'Failed to load drives.');
+    repoBrowserState.error = payload?.error || (workspaceRoot ? 'Failed to load repository tree.' : (sessionRoot ? 'Failed to load session tree.' : 'Failed to load drives.'));
     renderRepoBrowser();
     return;
   }
 
   repoBrowserState.loading = false;
-  repoBrowserState.rootName = String(payload.rootName || (workspaceRoot ? 'repo' : 'Drives'));
-  repoBrowserState.tree = payload.root;
-  repoBrowserState.nodeMap = repoNodeMapFromTree(payload.root);
+  repoBrowserState.rootName = String(payload.rootName || (workspaceRoot ? 'repo' : (sessionRoot ? repoBrowserState.sessionRootName || 'Session' : 'Drives')));
+  repoBrowserState.tree = rootNode;
+  repoBrowserState.nodeMap = repoNodeMapFromTree(rootNode);
   repoBrowserState.truncated = !!payload.truncated;
   repoBrowserState.nodeCount = Number(payload.nodeCount || repoBrowserState.nodeMap.size || 0);
   repoBrowserState.maxNodes = Number(payload.maxNodes || repoBrowserState.nodeMap.size || 0);
-  if (!repoBrowserState.nodeMap.has(repoBrowserState.currentPath)) {
+  if (sessionRoot) {
+    repoBrowserState.currentPath = String(rootNode.path || repoBrowserState.sessionRootPath || '');
+    if (rootNode && typeof rootNode === 'object') {
+      rootNode.childrenLoaded = true;
+      rootNode.lazy = false;
+    }
+  } else if (!repoBrowserState.nodeMap.has(repoBrowserState.currentPath)) {
     repoBrowserState.currentPath = '';
   }
   renderRepoBrowser();
 }
 
 export async function ensureDriveChildrenLoaded(pathValue) {
-  if (repoBrowserState.activeRoot !== 'drives') return true;
+  if (repoBrowserState.activeRoot === 'workspace') return true;
   const targetPath = normalizeDriveBrowserPath(pathValue);
   if (!targetPath) return false;
   const node = repoBrowserState.nodeMap.get(targetPath);
@@ -979,7 +1003,8 @@ export async function ensureDriveChildrenLoaded(pathValue) {
 
 export function setRepoBrowserRoot(root) {
   const nextRoot = String(root || '').trim().toLowerCase();
-  if (nextRoot !== 'workspace' && nextRoot !== 'drives') return;
+  if (nextRoot !== 'workspace' && nextRoot !== 'drives' && nextRoot !== 'session') return;
+  if (nextRoot === 'session' && !repoBrowserState.sessionRootPath) return;
   if (repoBrowserState.activeRoot === nextRoot) return;
   repoBrowserState.activeRoot = nextRoot;
   setRepoBrowserState({
@@ -995,6 +1020,33 @@ export function setRepoBrowserRoot(root) {
   renderRepoBrowser();
   if (repoBrowserState.open) {
     void loadRepoBrowserTree();
+  }
+}
+
+export function setRepoBrowserSessionInfo(sessionRootPath, sessionRootName = '') {
+  const nextPath = normalizeDriveBrowserPath(sessionRootPath);
+  const nextName = String(sessionRootName || '').trim() || 'Session';
+  const pathChanged = repoBrowserState.sessionRootPath !== nextPath;
+  repoBrowserState.sessionRootPath = nextPath;
+  repoBrowserState.sessionRootName = nextName;
+  if (pathChanged) {
+    setRepoBrowserState({
+      tree: null,
+      nodeMap: new Map(),
+      currentPath: '',
+      truncated: false,
+      nodeCount: 0,
+      maxNodes: 0,
+      loadingPath: '',
+      error: '',
+    });
+  }
+  if (repoBrowserState.activeRoot === 'session') {
+    if (repoBrowserState.open) {
+      void loadRepoBrowserTree();
+      return;
+    }
+    renderRepoBrowser();
   }
 }
 
@@ -1064,7 +1116,7 @@ export async function setRepoCurrentPath(pathValue) {
   const node = repoBrowserState.nodeMap.get(targetPath);
   if (!node || node.type !== 'dir') return;
   repoBrowserState.currentPath = targetPath;
-  if (repoBrowserState.activeRoot === 'drives' && targetPath) {
+  if (repoBrowserState.activeRoot !== 'workspace' && targetPath) {
     await ensureDriveChildrenLoaded(targetPath);
   }
   renderRepoBreadcrumb();

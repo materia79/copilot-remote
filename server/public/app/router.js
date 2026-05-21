@@ -117,8 +117,8 @@ export function drivePreviewApiPath(rawPath) {
 export function normalizeReferencePathForToken(kind, rawPath, source = 'workspace') {
   const tokenKind = String(kind || '').trim().toLowerCase();
   if (tokenKind !== 'file' && tokenKind !== 'folder') return '';
-  const root = String(source || '').trim().toLowerCase() === 'drives' ? 'drives' : 'workspace';
-  if (root === 'drives') return normalizeDriveBrowserPath(rawPath);
+  const root = String(source || '').trim().toLowerCase();
+  if (root === 'drives' || root === 'session') return normalizeDriveBrowserPath(rawPath);
   return normalizeWorkspaceMentionPath(rawPath);
 }
 

@@ -52,5 +52,7 @@ export function buildModePrompt(mode, toolInstructions = "") {
 }
 
 export function buildPromptWithMode(message, toolInstructions = "") {
-  return buildPrompt(message);
+  const modePrompt = buildModePrompt(message?.relayMode, toolInstructions);
+  const body = buildPrompt(message);
+  return [modePrompt, body].filter(Boolean).join(" ");
 }

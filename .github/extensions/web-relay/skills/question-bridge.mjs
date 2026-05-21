@@ -1,4 +1,5 @@
 import { getActiveSession } from '../runtime/session-registry.mjs';
+import { QUESTION_TIMEOUT_CONTINUATION_TEXT } from "../../../../shared/question-timeout.mjs";
 
 export function createQuestionBridge({
   api,
@@ -40,14 +41,23 @@ export function createQuestionBridge({
       const { question } = await api("GET", `/api/relay-question/${questionId}`);
       if (!question) throw new Error("Relay question missing");
       if (question.status === "answered") {
-        return String(question.answer || "");
+        return {
+          answer: String(question.answer || ""),
+          timedOut: false,
+        };
       }
       if (question.status === "timed_out" || question.status === "cancelled") {
-        throw new Error(`Relay question ${question.status}`);
+        return {
+          answer: QUESTION_TIMEOUT_CONTINUATION_TEXT,
+          timedOut: true,
+        };
       }
       if (Date.now() - started >= questionWaitTimeoutMs) {
         await api("POST", `/api/relay-question/${questionId}/timeout`, {}).catch(() => {});
-        throw new Error("Relay question timed out");
+        return {
+          answer: QUESTION_TIMEOUT_CONTINUATION_TEXT,
+          timedOut: true,
+        };
       }
       await sleep(questionPollMs);
     }

@@ -12,6 +12,8 @@ import {
   escHtml,
   setToken,
   setCliOnline,
+  setRelayOnline,
+  setSessionWorkerStatesFromStatusPayload,
   setCurrentConv,
   updateWorkspaceRootHints,
   updateCliStatus,
@@ -34,6 +36,7 @@ import {
   isMobileComposerViewport,
   releaseComposerFocusAfterSend,
   autoResize,
+  clearPendingUserMessage,
 } from './store.js';
 import {
   verifyExistingSession,
@@ -43,6 +46,7 @@ import {
   loadContextSummary,
   loadModelCatalog,
   loadConversation,
+  updateConversationTitle,
   scheduleContextUsageRefresh,
 } from './api-client.js';
 import { loadConversations, refreshConversations, openConversation, renderConvList } from './journal-view.js';
@@ -50,7 +54,7 @@ import { newConversation, deleteConv } from './journal-view.js';
 import { loadRelayQuestions, renderRelayQuestions, upsertRelayQuestion, updatePendingQuestionBanner } from './ask-user-view.js';
 import { openPendingQuestionFromBanner, submitRelayQuestionChoice, submitRelayQuestionAnswer, onRelayQuestionDraftInput, handleRelayQuestionKey } from './ask-user-view.js';
 import { showThinking, removeThinking, renderThinkingActivities, appendThinkingActivity, updateThinkingText, restoreInFlightThinking, renderMessages, appendMessage, compactCurrentConversation, sendMessage, handleKey } from './conversation-view.js';
-import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser } from './attachments-view.js';
+import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { handleAttachmentInput, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
 import { initEmojiPicker, toggleEmojiPicker } from './emoji-view.js';
 
@@ -72,11 +76,14 @@ const CURATED_MODELS = [
   'claude-sonnet-4.6',
   'claude-haiku-4.5',
 ];
+const CHAT_TITLE_MAX_LENGTH = 120;
 
 let socket = null;
 let relayQuestionPollTimer = null;
+let sessionWorkerStatusPollTimer = null;
 let viewportBaseHeight = window.innerHeight || document.documentElement.clientHeight || 0;
 let deferredInstallPrompt = null;
+let chatTitleEditingConversationId = null;
 const INSTALLED_DISPLAY_MODE_QUERIES = ['(display-mode: standalone)', '(display-mode: fullscreen)'];
 let relayQuestionRenderHash = '';
 let modelCatalogState = {
@@ -306,6 +313,36 @@ async function showContext() {
   }
 }
 
+function renderSessionInstructionDocs(docs) {
+  const items = Array.isArray(docs) ? docs : [];
+  if (!items.length) {
+    return '<div class="summary-loading">No session instruction files were found.</div>';
+  }
+
+  return `<div style="display:flex;flex-direction:column;gap:12px">${
+    items.map((doc) => {
+      const title = String(doc?.title || doc?.sessionId || 'Session instructions').trim();
+      const name = String(doc?.name || '').trim();
+      const gender = String(doc?.gender || '').trim();
+      const summary = [name, gender].filter(Boolean).join(' · ');
+      const sessionId = String(doc?.sessionId || '').trim();
+      const updatedAt = String(doc?.updatedAt || '').trim();
+      const content = escHtml(String(doc?.content || '').trim());
+      return `
+        <details open style="border:1px solid var(--border);border-radius:10px;background:var(--bg3);padding:10px 12px">
+          <summary style="cursor:pointer;font-weight:600;outline:none">${escHtml(title)}</summary>
+          <div style="margin-top:6px;font-size:0.78rem;color:var(--muted)">
+            ${escHtml(summary || sessionId)}
+            ${updatedAt ? ` · ${escHtml(updatedAt)}` : ''}
+          </div>
+          <pre style="margin-top:10px;white-space:pre-wrap;word-break:break-word">${content}</pre>
+        </details>
+      `;
+    }).join('')
+  }</div>`;
+}
+
+
 function matchesDisplayMode(query) {
   try {
     return !!window.matchMedia(query).matches;
@@ -512,6 +549,22 @@ function startRelayQuestionPolling() {
   }, 3000);
 }
 
+async function refreshSessionWorkerStatus() {
+  const status = await refreshWorkspaceRootHints();
+  if (!status) return;
+  if (setSessionWorkerStatesFromStatusPayload(status.sessionWorker)) {
+    renderConvList();
+  }
+  updateCliStatus();
+}
+
+function startSessionWorkerStatusPolling() {
+  if (sessionWorkerStatusPollTimer) return;
+  sessionWorkerStatusPollTimer = setInterval(() => {
+    refreshSessionWorkerStatus().catch(() => {});
+  }, 4000);
+}
+
 function setupViewportTracking() {
   syncViewportMetrics();
   const update = () => syncViewportMetrics();
@@ -608,6 +661,7 @@ async function refreshCurrentView() {
 
   await refreshConversations();
   if (!currentId) {
+    setRepoBrowserSessionInfo('', '');
     renderMessages([]);
     restoreInFlightThinking(null);
     scheduleContextUsageRefresh(null);
@@ -616,9 +670,11 @@ async function refreshCurrentView() {
 
   const r = await loadConversation(currentId);
   if (r) {
+    setRepoBrowserSessionInfo(r.sessionRootPath || '', r.sessionRootName || r.title || '');
     renderMessages(r.messages, false);
     restoreInFlightThinking(r.inFlight || null);
   } else {
+    setRepoBrowserSessionInfo('', '');
     restoreInFlightThinking(null);
   }
   await loadRelayQuestions(currentId);
@@ -673,6 +729,120 @@ function initSessionPillCopy() {
   });
 }
 
+function getChatTitleElements() {
+  return {
+    wrap: document.getElementById('chat-title-wrap'),
+    title: document.getElementById('chat-title'),
+    editBtn: document.getElementById('chat-title-edit-btn'),
+    editor: document.getElementById('chat-title-editor'),
+    input: document.getElementById('chat-title-input'),
+    saveBtn: document.getElementById('chat-title-save-btn'),
+    cancelBtn: document.getElementById('chat-title-cancel-btn'),
+  };
+}
+
+function syncChatTitleControls() {
+  const { title, editBtn, editor, input } = getChatTitleElements();
+  const convId = String(currentConvId || '').trim();
+  if (chatTitleEditingConversationId && chatTitleEditingConversationId !== convId) {
+    chatTitleEditingConversationId = null;
+  }
+  const editing = convId && chatTitleEditingConversationId === convId;
+  if (title) title.hidden = editing;
+  if (editBtn) {
+    editBtn.hidden = !convId;
+    editBtn.disabled = !convId || editing;
+  }
+  if (editor) {
+    editor.hidden = !editing;
+  }
+  if (input) {
+    input.maxLength = CHAT_TITLE_MAX_LENGTH;
+  }
+  if (!convId && chatTitleEditingConversationId) {
+    chatTitleEditingConversationId = null;
+  }
+  if (!editing && editor && !editor.hidden) {
+    editor.hidden = true;
+  }
+}
+
+function openChatTitleEditor() {
+  const convId = String(currentConvId || '').trim();
+  if (!convId) return;
+  const { title, editBtn, editor, input } = getChatTitleElements();
+  const currentTitle = String(conversations[convId]?.title || title?.textContent || convId).trim() || convId;
+  chatTitleEditingConversationId = convId;
+  if (title) title.hidden = true;
+  if (editBtn) editBtn.hidden = true;
+  if (editor) editor.hidden = false;
+  if (input) {
+    input.maxLength = CHAT_TITLE_MAX_LENGTH;
+    input.value = currentTitle;
+    requestAnimationFrame(() => {
+      if (chatTitleEditingConversationId !== convId) return;
+      input.focus();
+      input.select();
+    });
+  }
+}
+
+function closeChatTitleEditor() {
+  chatTitleEditingConversationId = null;
+  const { title, editBtn, editor, input } = getChatTitleElements();
+  if (editor) editor.hidden = true;
+  if (title) title.hidden = !String(currentConvId || '').trim();
+  if (editBtn) editBtn.hidden = !String(currentConvId || '').trim();
+  if (input) {
+    const convId = String(currentConvId || '').trim();
+    input.value = convId ? String(conversations[convId]?.title || title?.textContent || convId) : '';
+  }
+  syncChatTitleControls();
+}
+
+function applyConversationTitleUpdate(conversationId, title, updatedAt) {
+  const id = String(conversationId || '').trim();
+  const nextTitle = String(title || '').trim();
+  if (!id || !nextTitle) return;
+  const existing = conversations[id] || { id, archived: false, messageCount: 0 };
+  conversations[id] = {
+    ...existing,
+    title: nextTitle,
+    updatedAt: String(updatedAt || existing.updatedAt || new Date().toISOString()),
+  };
+  if (currentConvId === id) {
+    const titleEl = document.getElementById('chat-title');
+    if (titleEl) titleEl.textContent = nextTitle;
+  }
+  renderConvList();
+}
+
+async function submitChatTitleEditor() {
+  const convId = String(chatTitleEditingConversationId || currentConvId || '').trim();
+  if (!convId) return;
+  const { input } = getChatTitleElements();
+  const nextTitle = String(input?.value || '').replace(/[\r\n]+/g, ' ').trim();
+  if (!nextTitle) {
+    setModelBanner('⚠️ Conversation title cannot be empty.');
+    input?.focus();
+    return;
+  }
+  if (nextTitle.length > CHAT_TITLE_MAX_LENGTH) {
+    setModelBanner(`⚠️ Conversation title must be ${CHAT_TITLE_MAX_LENGTH} characters or fewer.`);
+    input?.focus();
+    return;
+  }
+
+  const result = await updateConversationTitle(convId, nextTitle);
+  if (!result) {
+    alert('Failed to update conversation title');
+    return;
+  }
+
+  applyConversationTitleUpdate(result.conversationId || convId, result.title || nextTitle, result.updatedAt);
+  closeChatTitleEditor();
+}
+
 function initFullscreenButton() {
   const syncFullscreenUi = () => {
     updateInstallButton();
@@ -696,12 +866,23 @@ async function connectSocket() {
 
   socket.on('connect', () => {
     console.log('Socket connected');
+    setRelayOnline(true);
     setCliOnline(true);
+    renderConvList();
+    refreshSessionWorkerStatus().catch(() => {});
     refreshModelCatalog().catch(() => {});
   });
-  socket.on('connect_error', (e) => console.error('Socket error:', e.message));
+  socket.on('connect_error', (e) => {
+    setRelayOnline(false);
+    console.error('Socket error:', e.message);
+  });
+  socket.on('disconnect', () => {
+    setRelayOnline(false);
+  });
   socket.on('cli_status', ({ online }) => {
     setCliOnline(online);
+    renderConvList();
+    refreshSessionWorkerStatus().catch(() => {});
     if (online) refreshModelCatalog().catch(() => {});
   });
   socket.on('models_updated', (payload) => {
@@ -765,15 +946,30 @@ async function connectSocket() {
       updateCompactButton();
     }
   });
+  socket.on('conversation_title_updated', ({ conversationId, title, updatedAt }) => {
+    applyConversationTitleUpdate(conversationId, title, updatedAt);
+    syncChatTitleControls();
+  });
   socket.on('message_status', ({ messageId, conversationId, status }) => {
+    if (conversationId && conversations[conversationId]) {
+      if (status === 'processing') {
+        conversations[conversationId].runtimeSessionStatus = 'processing';
+      } else if (status === 'done' || status === 'failed' || status === 'dropped') {
+        delete conversations[conversationId].runtimeSessionStatus;
+      }
+    }
     if (conversationId === currentConvId && status === 'processing') {
       showThinking(messageId || null);
       renderThinkingActivities();
+    }
+    if (status === 'done' || status === 'failed' || status === 'dropped') {
+      clearPendingUserMessage(messageId);
     }
     if (conversationId === currentConvId && (status === 'done' || status === 'failed' || status === 'dropped')) {
       removeThinking();
       scheduleContextUsageRefresh(conversationId, 220);
     }
+    renderConvList();
   });
   socket.on('conversation_deleted', ({ conversationId }) => {
     delete conversations[conversationId];
@@ -790,6 +986,7 @@ async function connectSocket() {
       setCurrentConv(null);
       renderMessages([]);
       document.getElementById('chat-title').textContent = 'Select or start a conversation';
+      syncChatTitleControls();
       updateSessionPill(null, null);
       updateCompactButton();
       scheduleContextUsageRefresh(null);
@@ -815,17 +1012,58 @@ async function initApp() {
       toggleFullscreen().catch(() => {});
     });
   }
+  const chatTitleEditBtn = document.getElementById('chat-title-edit-btn');
+  if (chatTitleEditBtn && chatTitleEditBtn.dataset.bound !== '1') {
+    chatTitleEditBtn.dataset.bound = '1';
+    chatTitleEditBtn.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      openChatTitleEditor();
+    });
+  }
+  const chatTitleEditor = document.getElementById('chat-title-editor');
+  if (chatTitleEditor && chatTitleEditor.dataset.bound !== '1') {
+    chatTitleEditor.dataset.bound = '1';
+    chatTitleEditor.addEventListener('submit', (event) => {
+      event.preventDefault();
+      submitChatTitleEditor().catch((error) => {
+        alert(error?.message || 'Failed to update conversation title');
+      });
+    });
+  }
+  const chatTitleInput = document.getElementById('chat-title-input');
+  if (chatTitleInput && chatTitleInput.dataset.bound !== '1') {
+    chatTitleInput.dataset.bound = '1';
+    chatTitleInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeChatTitleEditor();
+      }
+    });
+  }
+  const chatTitleCancelBtn = document.getElementById('chat-title-cancel-btn');
+  if (chatTitleCancelBtn && chatTitleCancelBtn.dataset.bound !== '1') {
+    chatTitleCancelBtn.dataset.bound = '1';
+    chatTitleCancelBtn.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      closeChatTitleEditor();
+    });
+  }
   initModeSelector();
   initModelSelector();
-  await refreshWorkspaceRootHints();
+  const status = await refreshWorkspaceRootHints();
+  setSessionWorkerStatesFromStatusPayload(status?.sessionWorker || null);
   await refreshModelCatalog(true);
   initFullscreenButton();
   initInstallButton();
   initPullToRefresh();
   initSessionPillCopy();
   initEmojiPicker();
+  syncChatTitleControls();
   connectSocket();
   startRelayQuestionPolling();
+  startSessionWorkerStatusPolling();
   await loadConversations();
   await loadRelayQuestions(currentConvId);
   updateCompactButton();
@@ -931,6 +1169,7 @@ window.refreshSummaryModal = refreshSummaryModal;
 window.renderSummaryModalContent = renderSummaryModalContent;
 window.setSummaryModalLoading = setSummaryModalLoading;
 window.openSummaryModal = openSummaryModal;
+window.syncChatTitleControls = syncChatTitleControls;
 
 bootstrap();
 

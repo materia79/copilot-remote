@@ -92,6 +92,15 @@ export async function deleteConversation(id) {
   return apiFetch(`/api/conversation/${convId}`, { method: 'DELETE' });
 }
 
+export async function updateConversationTitle(id, title) {
+  const convId = String(id || '').trim();
+  if (!convId) return null;
+  return apiFetch(`/api/conversation/${convId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ title }),
+  });
+}
+
 export async function compactConversation(id) {
   const convId = String(id || '').trim();
   if (!convId) return null;

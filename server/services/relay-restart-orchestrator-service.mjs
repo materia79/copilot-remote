@@ -340,7 +340,7 @@ export function createRelayRestartOrchestrator({
   }
 
   function buildRestartCommand(targetSessionId) {
-    return `gh copilot -- --allow-all --resume ${targetSessionId}`;
+    return `gh copilot -- --allow-all --session-id ${targetSessionId}`;
   }
 
   function buildControlPayload(state, force = false) {

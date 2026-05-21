@@ -7,7 +7,10 @@ import {
   escHtml,
   fmtDate,
   generateId,
+  hasPendingUserMessageDuplicate,
+  clearPendingUserMessage,
   pendingUserMessageIds,
+  trackPendingUserMessage,
   seenMessageIds,
   relayActivities,
   selectedAttachments,
@@ -28,11 +31,18 @@ import {
 } from './store.js';
 import { sendMessage as sendMessageApi, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation } from './api-client.js';
 import { linkifyWorkspaceMentionsInNode } from './router.js';
-import { renderAttachmentMarkup, clearAttachments, uploadAttachments } from './attachments-view.js';
+import { renderAttachmentMarkup, clearAttachments, uploadAttachments, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { renderRelayQuestions } from './ask-user-view.js';
 
 let thinkingMessageId = null;
 let thinkingText = '';
+let sendInFlight = false;
+
+function setSendInFlight(value) {
+  sendInFlight = !!value;
+  const btn = document.getElementById('send-btn');
+  if (btn) btn.disabled = sendInFlight;
+}
 
 export function decorateActivityText(text) {
   const value = String(text || '').trim();
@@ -270,6 +280,10 @@ export async function sendMessage() {
   const text = input.value.trim();
   if (!text && selectedAttachments.length === 0) return;
   const mobileSend = isMobileComposerViewport();
+  if (sendInFlight) {
+    showTransientRelayNotice('Please wait for the current message to finish sending.');
+    return;
+  }
 
   if (text.toLowerCase() === '/compact' && selectedAttachments.length === 0) {
     input.value = '';
@@ -284,96 +298,120 @@ export async function sendMessage() {
     return;
   }
   const targetConversationId = String(currentConvId || '').trim() || null;
+  if (hasPendingUserMessageDuplicate(targetConversationId, text)) {
+    showTransientRelayNotice('That message is already pending.');
+    return;
+  }
 
+  setSendInFlight(true);
   let attachments = [];
+  let clientMessageId = null;
   try {
     attachments = await uploadAttachments(selectedAttachments.slice());
-  } catch (e) {
-    alert(e.message || 'File upload failed');
-    return;
-  }
 
-  const isNew = !targetConversationId;
-  const msgTimestamp = new Date().toISOString();
-  const selectedModel = document.getElementById('model-select').value || '';
-  const selectedMode = document.getElementById('mode-select').value || 'agent';
-  const titleSeed = text || (attachments[0]?.name || 'Attachment');
-  const clientMessageId = generateId();
-  input.value = '';
-  autoResize(input);
-  releaseComposerFocusAfterSend(input);
-  document.getElementById('send-btn').disabled = true;
-  pendingUserMessageIds.add(clientMessageId);
-  appendMessage({ role: 'user', text, model: selectedModel, mode: selectedMode, timestamp: msgTimestamp, attachments }, true, clientMessageId, true);
-  scrollBottomAfterSend();
+    const isNew = !targetConversationId;
+    const msgTimestamp = new Date().toISOString();
+    const selectedModel = document.getElementById('model-select').value || '';
+    const selectedMode = document.getElementById('mode-select').value || 'agent';
+    const titleSeed = text || (attachments[0]?.name || 'Attachment');
+    clientMessageId = generateId();
+    trackPendingUserMessage(clientMessageId, targetConversationId, text);
+    input.value = '';
+    autoResize(input);
+    releaseComposerFocusAfterSend(input);
+    pendingUserMessageIds.add(clientMessageId);
+    appendMessage({ role: 'user', text, model: selectedModel, mode: selectedMode, timestamp: msgTimestamp, attachments }, true, clientMessageId, true);
+    scrollBottomAfterSend();
 
-  const body = {
-    messageId: clientMessageId,
-    clientId: CLIENT_ID,
-    text,
-    model: selectedModel,
-    relayMode: selectedMode,
-    conversationId: targetConversationId || undefined,
-    newConversation: isNew || undefined,
-    attachments,
-  };
+    const body = {
+      messageId: clientMessageId,
+      clientId: CLIENT_ID,
+      text,
+      model: selectedModel,
+      relayMode: selectedMode,
+      conversationId: targetConversationId || undefined,
+      newConversation: isNew || undefined,
+      attachments,
+    };
 
-  const r = await sendMessageApi(body);
-  if (!r) {
-    const pendingNode = document.querySelector(`[data-message-id="${clientMessageId}"]`);
-    pendingNode?.remove();
-    pendingUserMessageIds.delete(clientMessageId);
-    seenMessageIds.delete(clientMessageId);
-    document.getElementById('send-btn').disabled = false;
-    if (!mobileSend) input.focus();
-    setModelBanner('⚠️ Message could not be sent. Please try again.');
-    return;
-  }
-
-  if (r.workspaceRootName || r.workspaceRootEntries || r.workspaceRootPath) {
-    updateWorkspaceRootHints(r);
-    if (repoBrowserState.open && repoBrowserState.activeRoot === 'workspace') {
-      repoBrowserState.currentPath = '';
-      await window.loadRepoBrowserTree?.();
+    const r = await sendMessageApi(body);
+    if (!r) {
+      clearPendingUserMessage(clientMessageId);
+      const pendingNode = document.querySelector(`[data-message-id="${clientMessageId}"]`);
+      pendingNode?.remove();
+      pendingUserMessageIds.delete(clientMessageId);
+      seenMessageIds.delete(clientMessageId);
+      if (!mobileSend) input.focus();
+      setModelBanner('⚠️ Message could not be sent. Please try again.');
+      return;
     }
-  }
-  if (r.compactedConversationId) {
-    await window.refreshConversations?.();
-    await window.openConversation?.(r.compactedConversationId);
-    document.getElementById('send-btn').disabled = false;
+
+    if (r.duplicate) {
+      clearPendingUserMessage(clientMessageId);
+      const pendingNode = document.querySelector(`[data-message-id="${clientMessageId}"]`);
+      pendingNode?.remove();
+      pendingUserMessageIds.delete(clientMessageId);
+      seenMessageIds.delete(clientMessageId);
+      if (!mobileSend) input.focus();
+      showTransientRelayNotice('That message was already sent recently.');
+      return;
+    }
+
+    if (r.workspaceRootName || r.workspaceRootEntries || r.workspaceRootPath) {
+      updateWorkspaceRootHints(r);
+      if (repoBrowserState.open && repoBrowserState.activeRoot === 'workspace') {
+        repoBrowserState.currentPath = '';
+        await window.loadRepoBrowserTree?.();
+      }
+    }
+    if (r.compactedConversationId) {
+      await window.refreshConversations?.();
+      await window.openConversation?.(r.compactedConversationId);
+      clearAttachments();
+      if (!mobileSend) input.focus();
+      scrollBottomAfterSend();
+      return;
+    }
+    if (r.warning) setModelBanner(`⚠️ ${r.warning}`);
+    if (r.workspaceRootWarning) setModelBanner(`⚠️ ${r.workspaceRootWarning}`);
+    const skippedRefs = Array.isArray(r.skippedReferenceAttachments) ? r.skippedReferenceAttachments : [];
+    if (skippedRefs.length) {
+      const firstReason = String(skippedRefs[0]?.reason || 'reference skipped');
+      setModelBanner(`⚠️ Some referenced images were not attached (${firstReason}).`);
+    }
+    if (isNew || !targetConversationId) {
+      setCurrentConv(r.conversationId);
+      conversations[r.conversationId] = {
+        id: r.conversationId,
+        title: titleSeed.slice(0, 60),
+        updatedAt: new Date().toISOString(),
+        messageCount: 1,
+        runtimeSessionId: r.runtimeSessionId || null,
+      };
+      document.getElementById('chat-title').textContent = titleSeed.slice(0, 60);
+      window.syncChatTitleControls?.();
+      updateCompactButton();
+      window.renderConvList?.();
+      applyContextUsageBar(null);
+      scheduleContextUsageRefresh(r.conversationId, 0);
+    }
+    if (cliOnline) showThinking(r.messageId || null);
+
     clearAttachments();
     if (!mobileSend) input.focus();
     scrollBottomAfterSend();
-    return;
+  } catch (e) {
+    if (clientMessageId) {
+      clearPendingUserMessage(clientMessageId);
+      const pendingNode = document.querySelector(`[data-message-id="${clientMessageId}"]`);
+      pendingNode?.remove();
+      pendingUserMessageIds.delete(clientMessageId);
+      seenMessageIds.delete(clientMessageId);
+    }
+    alert(e.message || 'Failed to send message');
+  } finally {
+    setSendInFlight(false);
   }
-  if (r.warning) setModelBanner(`⚠️ ${r.warning}`);
-  if (r.workspaceRootWarning) setModelBanner(`⚠️ ${r.workspaceRootWarning}`);
-  const skippedRefs = Array.isArray(r.skippedReferenceAttachments) ? r.skippedReferenceAttachments : [];
-  if (skippedRefs.length) {
-    const firstReason = String(skippedRefs[0]?.reason || 'reference skipped');
-    setModelBanner(`⚠️ Some referenced images were not attached (${firstReason}).`);
-  }
-  if (isNew || !targetConversationId) {
-    setCurrentConv(r.conversationId);
-    conversations[r.conversationId] = {
-      id: r.conversationId,
-      title: titleSeed.slice(0, 60),
-      updatedAt: new Date().toISOString(),
-      messageCount: 1,
-      runtimeSessionId: r.runtimeSessionId || null,
-    };
-    document.getElementById('chat-title').textContent = titleSeed.slice(0, 60);
-    updateCompactButton();
-    window.renderConvList?.();
-    applyContextUsageBar(null);
-    scheduleContextUsageRefresh(r.conversationId, 0);
-  }
-  if (cliOnline) showThinking(r.messageId || null);
-
-  document.getElementById('send-btn').disabled = false;
-  clearAttachments();
-  if (!mobileSend) input.focus();
-  scrollBottomAfterSend();
 }
 
 export function handleKey(e) {
@@ -407,6 +445,7 @@ async function validateSelectedConversationBeforeSend() {
     sdkSessionId: conversationSessionId,
     runtimeSessionId: current.runtimeSession?.id || null,
   };
+  setRepoBrowserSessionInfo(current.sessionRootPath || '', current.sessionRootName || current.title || '');
   updateSessionPill(conversations[convId], current.runtimeSession || null);
   return true;
 }

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createRelayCliLauncherService } from './relay-cli-launcher-service.mjs';
 
-test('windows launcher kills copilot pids then spawns resumed gh once', async () => {
+test('windows launcher kills copilot pids then spawns session-bound gh once', async () => {
   const execCalls = [];
   const spawnCalls = [];
   let snapshotIndex = 0;
@@ -49,7 +49,7 @@ test('windows launcher kills copilot pids then spawns resumed gh once', async ()
   assert.equal(spawnCalls[0].command, 'gh');
   assert.deepEqual(
     spawnCalls[0].args,
-    ['copilot', '--', '--allow-all', '--resume', '3dd70b44-42cf-4e6d-ab0f-40392d8426b3'],
+    ['copilot', '--', '--allow-all', '--session-id', '3dd70b44-42cf-4e6d-ab0f-40392d8426b3'],
   );
   assert.equal(spawnCalls[0].options.detached, true);
   assert.equal(execCalls.some((args) => String(args?.[2] || '').includes('Stop-Process -Id $id')), true);

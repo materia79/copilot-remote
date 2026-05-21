@@ -23,5 +23,21 @@ When changing anything related to the web relay (`server/` or `.github/extension
 8. Per-message execution mode now lives in the browser composer (`plan` / `ask` / `agent` / `autopilot`) and is stored with each queued turn.
 9. When a turn needs user input, always use `ask_user` rather than asking inline text.
 10. In `autopilot`, still use `ask_user` for clarification; the relay bridge will capture it and show a web question card even if the direct SDK question hook is bypassed.
+11. When tracing a stuck or missing message, follow this exact sequence to locate where it stopped:
+   - Collect identifiers first: `conversation_id`, approximate timestamp, and message text (or `message_id` if available).
+   - Trace server flow in `server/logs/server.log` for that conversation:
+     - `QUEUED` (accepted by relay)
+     - `DEQUEUED` (picked for execution)
+     - `RESPONSE` (completed)
+   - Trace extension flow in `server/logs/ext-debug.log` for same window:
+     - `session.send: queuing for msgId ...`
+     - `session.sendAndWait: completed ...` (or failure/retry signals)
+   - Check DB queue truth in `server/data/copilot.db` (`queue` table) for the specific row status (`pending`/`processing`/`done`) and ownership (`owner_sdk_session_id`, `runtime_session_id`).
+   - Check live runtime snapshot via authenticated `GET /api/status`:
+     - `sessionWorker.workers[]` entry for the target `sdkSessionId`
+     - `activeBridgeOwner`
+     - queue counters (`pendingCount`, `processingCount`)
+   - Validate worker PID reality: if status says `ready/processing` but the worker PID is not running, treat as stale worker registration.
+   - Conclude with a one-line stop point: **accepted but not dequeued**, **dequeued but no response**, or **response emitted but UI missed update**.
 
 Do not consider relay-related work complete until restart + status + log checks pass.

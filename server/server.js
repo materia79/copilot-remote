@@ -31,6 +31,10 @@ import { createRelaySingletonGuard } from './services/relay-singleton-guard.mjs'
 import { createRelayRestartOrchestrator } from './services/relay-restart-orchestrator-service.mjs';
 import { createRelayBridgeOwnerService } from './services/relay-bridge-owner-service.mjs';
 import { createRelayCliLauncherService } from './services/relay-cli-launcher-service.mjs';
+import { createSessionWorkerRegistry } from './services/session-worker-registry-service.mjs';
+import { createSessionWorkerSupervisor } from './services/session-worker-supervisor-service.mjs';
+import { FEATURES, normalizeFeatureFlags } from './features.mjs';
+import { DEFAULT_QUESTION_TIMEOUT_MS } from '../shared/question-timeout.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -60,7 +64,6 @@ const SUPPORTED_RELAY_MODES = ['plan', 'ask', 'agent', 'autopilot'];
 const DEFAULT_RELAY_MODE = 'agent';
 const SUPPORTED_CONVERSATION_SESSION_MODES = ['isolated', 'shared'];
 const DEFAULT_CONVERSATION_SESSION_MODE = 'isolated';
-const DEFAULT_QUESTION_TIMEOUT_MS = 5 * 60 * 1000;
 const MAX_UPLOAD_ATTACHMENTS = 6;
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 const MAX_IMAGE_DATA_URL_LENGTH = 12 * 1024 * 1024;
@@ -508,6 +511,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS conversations (
     id         TEXT PRIMARY KEY,
     title      TEXT NOT NULL,
+    title_source TEXT NOT NULL DEFAULT 'auto',
     sdk_session_id TEXT,
     archived   INTEGER NOT NULL DEFAULT 0,
     status     TEXT NOT NULL DEFAULT 'active',
@@ -549,6 +553,10 @@ db.exec(`
     response            TEXT,
     retry_count         INTEGER NOT NULL DEFAULT 0,
     next_attempt_at     TEXT,
+    owner_sdk_session_id TEXT,
+    owner_assigned_at   TEXT,
+    owner_lease_expires_at TEXT,
+    owner_last_claimed_at TEXT,
     parked_at           TEXT,
     parked_target_session_id TEXT,
     parked_transaction_id TEXT,
@@ -604,6 +612,9 @@ db.exec(`
     status          TEXT NOT NULL DEFAULT 'pending',
     answer          TEXT,
     sdk_session_id  TEXT,
+    owner_worker_id TEXT,
+    continuation_id TEXT,
+    continuation_question_id TEXT,
     created_at      TEXT NOT NULL,
     answered_at     TEXT,
     expires_at      TEXT NOT NULL,
@@ -678,6 +689,18 @@ if (!queueColumns.includes('retry_count')) {
 if (!queueColumns.includes('next_attempt_at')) {
   db.exec(`ALTER TABLE queue ADD COLUMN next_attempt_at TEXT`);
 }
+if (!queueColumns.includes('owner_sdk_session_id')) {
+  db.exec(`ALTER TABLE queue ADD COLUMN owner_sdk_session_id TEXT`);
+}
+if (!queueColumns.includes('owner_assigned_at')) {
+  db.exec(`ALTER TABLE queue ADD COLUMN owner_assigned_at TEXT`);
+}
+if (!queueColumns.includes('owner_lease_expires_at')) {
+  db.exec(`ALTER TABLE queue ADD COLUMN owner_lease_expires_at TEXT`);
+}
+if (!queueColumns.includes('owner_last_claimed_at')) {
+  db.exec(`ALTER TABLE queue ADD COLUMN owner_last_claimed_at TEXT`);
+}
 if (!queueColumns.includes('response_message_id')) {
   db.exec(`ALTER TABLE queue ADD COLUMN response_message_id TEXT`);
 }
@@ -695,6 +718,7 @@ if (!queueColumns.includes('parked_reason')) {
 }
 db.exec(`UPDATE queue SET relay_mode = 'agent' WHERE relay_mode IS NULL OR relay_mode = ''`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_next_attempt ON queue(status, next_attempt_at, timestamp)`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_owner_pending ON queue(status, owner_sdk_session_id, next_attempt_at, timestamp)`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_parked_release ON queue(status, parked_transaction_id, parked_target_session_id, parked_at, timestamp)`);
 
 const runtimeSessionColumns = db.prepare(`PRAGMA table_info(runtime_sessions)`).all().map((c) => c.name);
@@ -745,6 +769,9 @@ if (!conversationColumns.includes('seed_pending')) {
 if (!conversationColumns.includes('status')) {
   db.exec(`ALTER TABLE conversations ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`);
 }
+if (!conversationColumns.includes('title_source')) {
+  db.exec(`ALTER TABLE conversations ADD COLUMN title_source TEXT NOT NULL DEFAULT 'auto'`);
+}
 
 db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_sessions_sdk_session_id ON runtime_sessions(sdk_session_id) WHERE sdk_session_id IS NOT NULL AND sdk_session_id != ''`);
 
@@ -752,6 +779,16 @@ const relayQuestionColumns = db.prepare(`PRAGMA table_info(relay_questions)`).al
 if (relayQuestionColumns.length && !relayQuestionColumns.includes('sdk_session_id')) {
   db.exec(`ALTER TABLE relay_questions ADD COLUMN sdk_session_id TEXT`);
 }
+if (relayQuestionColumns.length && !relayQuestionColumns.includes('owner_worker_id')) {
+  db.exec(`ALTER TABLE relay_questions ADD COLUMN owner_worker_id TEXT`);
+}
+if (relayQuestionColumns.length && !relayQuestionColumns.includes('continuation_id')) {
+  db.exec(`ALTER TABLE relay_questions ADD COLUMN continuation_id TEXT`);
+}
+if (relayQuestionColumns.length && !relayQuestionColumns.includes('continuation_question_id')) {
+  db.exec(`ALTER TABLE relay_questions ADD COLUMN continuation_question_id TEXT`);
+}
+db.exec(`CREATE INDEX IF NOT EXISTS idx_relay_questions_continuation ON relay_questions(continuation_id, continuation_question_id, status, created_at)`);
 
 // ─── Prepared Statements ──────────────────────────────────────────────────────
 const stmts = {
@@ -780,11 +817,36 @@ const relayRestartOrchestrator = createRelayRestartOrchestrator({
   maxAttempts: restartMaxAttempts,
   retryBackoffMs: restartRetryBackoffMs,
 });
+const sessionWorkerRegistry = createSessionWorkerRegistry();
 const relayCliLauncherService = createRelayCliLauncherService({
   cwd: INITIAL_WORKSPACE_ROOT,
   env: process.env,
   log: (message) => console.log(`[${ts()}] ${message}`),
 });
+function spawnSessionWorkerCli(targetSessionId) {
+  const normalizedTargetSessionId = String(targetSessionId || '').trim();
+  if (!normalizedTargetSessionId) {
+    throw new Error('missing-target-session-id');
+  }
+  const child = spawn('gh', ['copilot', '--', '--allow-all', '--session-id', normalizedTargetSessionId], {
+    cwd: INITIAL_WORKSPACE_ROOT,
+    env: process.env,
+    detached: true,
+    stdio: 'ignore',
+    shell: process.platform === 'win32',
+    windowsHide: true,
+  });
+  child.unref?.();
+  const workerPid = Number.isInteger(Number(child?.pid)) ? Number(child.pid) : null;
+  const workerId = `worker-${normalizedTargetSessionId.slice(0, 8)}`;
+  console.log(`[${ts()}] worker launcher: spawned ${workerId} session=${normalizedTargetSessionId.slice(0, 8)} pid=${workerPid || 'none'}`);
+  return { workerId, pid: workerPid };
+}
+const sessionWorkerSupervisor = createSessionWorkerSupervisor({
+  registry: sessionWorkerRegistry,
+  spawnWorker: async (sdkSessionId) => spawnSessionWorkerCli(sdkSessionId),
+});
+const featureFlags = normalizeFeatureFlags(FEATURES);
 
 function queueCounts() {
   const rows = stmts.countStatus.all();
@@ -1225,6 +1287,9 @@ function formatQuestionRow(row) {
     queueId: row.queue_id,
     conversationId: row.conversation_id,
     sdkSessionId: row.sdk_session_id || null,
+    ownerWorkerId: row.owner_worker_id || null,
+    continuationId: row.continuation_id || null,
+    continuationQuestionId: row.continuation_question_id || null,
     messageId: row.message_id,
     mode: normalizeRelayMode(row.relay_mode) || DEFAULT_RELAY_MODE,
     prompt: row.prompt,
@@ -2317,6 +2382,8 @@ const runtimeState = {
   get relayPaused() { return relayPaused; },
   set relayPaused(value) { relayPaused = value; },
   get activeBridgeOwner() { return relayBridgeOwnerService.getOwner(); },
+  get featureFlags() { return featureFlags; },
+  get sessionWorkerSupervisor() { return sessionWorkerSupervisor; },
 };
 
 const sharedRouteDeps = {
@@ -2395,6 +2462,9 @@ const sharedRouteDeps = {
   emitToClientsExceptSessionId,
   relayBridgeOwnerService,
   relayCliLauncherService,
+  featureFlags,
+  sessionWorkerSupervisor,
+  sessionWorkerRegistry,
   buildContextResponseText,
   readContextFromSessionEvents,
   discoverSessionStateConversations,
@@ -2418,6 +2488,7 @@ const sharedRouteDeps = {
   normalizeQuestionChoices,
   formatQuestionRow,
   relayRestartOrchestrator,
+  resolveSessionStateRoot,
 };
 registerMessagesRoutes(app, sharedRouteDeps);
 registerSessionsRoutes(app, sharedRouteDeps);
@@ -2521,10 +2592,14 @@ function getOrCreateConversation(id, firstLine) {
 }
 
 function ensureRuntimeSessionBinding(conversationId, model, nowIso = new Date().toISOString()) {
+  const normalizedConversationId = String(conversationId || '').trim();
+  if (!normalizedConversationId) return null;
   const normalizedModel = String(model || '').trim() || null;
-  const existing = stmts.getRuntimeSessionByConversation.get(conversationId);
+  stmts.setConvSdkSessionIdIfMissing.run(normalizedConversationId, nowIso, normalizedConversationId);
+  const existing = stmts.getRuntimeSessionByConversation.get(normalizedConversationId);
   if (existing?.id) {
     stmts.touchRuntimeSession.run(normalizedModel, nowIso, existing.id);
+    stmts.setRuntimeSessionSdkSessionIdIfMissing.run(normalizedConversationId, nowIso, existing.id);
     return stmts.getRuntimeSessionById.get(existing.id);
   }
 
@@ -2533,12 +2608,13 @@ function ensureRuntimeSessionBinding(conversationId, model, nowIso = new Date().
   const runtimeKey = runtimeSessionId;
   stmts.insertRuntimeSession.run(
     runtimeSessionId,
-    conversationId,
+    normalizedConversationId,
     strategy,
     runtimeKey,
     normalizedModel,
     nowIso,
     nowIso,
+    normalizedConversationId,
   );
   return stmts.getRuntimeSessionById.get(runtimeSessionId);
 }
@@ -2558,8 +2634,9 @@ function bootstrapRuntimeSessionBindings() {
       if (!conversationId || tombstonedSessions.has(conversationId)) continue;
 
       const existingConversation = stmts.getConvAnyStatus.get(conversationId) || null;
+      const discoveredTitle = String(item?.title || '').trim() || `Session ${conversationId.slice(0, 8)}`;
       if (!existingConversation) {
-        stmts.insertConv.run(conversationId, `Session ${conversationId.slice(0, 8)}`, discoveredUpdatedAt, discoveredUpdatedAt);
+        stmts.insertConv.run(conversationId, discoveredTitle, discoveredUpdatedAt, discoveredUpdatedAt);
       }
       db.prepare(`
         UPDATE conversations

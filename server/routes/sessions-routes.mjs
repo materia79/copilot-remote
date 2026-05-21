@@ -1,6 +1,208 @@
 'use strict';
 
+import fs from 'fs';
+import path from 'path';
 import { createSdkSessionSyncService } from '../services/sdk-session-sync-service.mjs';
+
+const SESSION_WORKER_STATUS_QUEUE_STATES = Object.freeze(['pending', 'processing', 'parked']);
+
+function normalizeWorkerStatusText(value, fallback = null) {
+  const text = String(value || '').trim();
+  return text || fallback;
+}
+
+function toSafeNonNegativeInt(value, fallback = 0) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.max(0, Math.trunc(numeric));
+}
+
+const MAX_CONVERSATION_TITLE_LENGTH = 120;
+
+export function normalizeConversationTitle(value) {
+  const title = String(value || '').replace(/[\r\n]+/g, ' ').trim();
+  if (!title) return '';
+  return title.slice(0, MAX_CONVERSATION_TITLE_LENGTH);
+}
+
+export function resolveConversationTitle({ title = '', titleSource = '', discoveredTitle = '' } = {}) {
+  const storedTitle = String(title || '').trim();
+  const source = String(titleSource || '').trim().toLowerCase();
+  const discovered = String(discoveredTitle || '').trim();
+  if (source === 'manual') return storedTitle || discovered;
+  return discovered || storedTitle;
+}
+
+export function persistConversationTitle({
+  db,
+  stmts,
+  io = null,
+  conversationId = '',
+  title = '',
+} = {}) {
+  const id = String(conversationId || '').trim();
+  const nextTitle = normalizeConversationTitle(title);
+  if (!id) {
+    return { ok: false, statusCode: 400, error: 'Missing conversation id' };
+  }
+  if (!nextTitle) {
+    return { ok: false, statusCode: 400, error: 'Missing title' };
+  }
+
+  const existing = stmts?.getConvAnyStatus?.get?.(id) || null;
+  if (existing && String(existing.status || '').trim() === 'deleted') {
+    return { ok: false, statusCode: 404, error: 'Conversation not found' };
+  }
+
+  const updatedAt = new Date().toISOString();
+
+  if (!existing) {
+    if (typeof stmts?.insertConv?.run === 'function') {
+      stmts.insertConv.run(id, nextTitle, updatedAt, updatedAt);
+    } else if (db && typeof db.prepare === 'function') {
+      db.prepare(`INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)`).run(id, nextTitle, updatedAt, updatedAt);
+    }
+    if (typeof stmts?.setConvSdkSessionIdIfMissing?.run === 'function') {
+      stmts.setConvSdkSessionIdIfMissing.run(id, updatedAt, id);
+    }
+  }
+
+  if (typeof stmts?.updateConvTitle?.run === 'function') {
+    stmts.updateConvTitle.run(nextTitle, updatedAt, id);
+  } else if (db && typeof db.prepare === 'function') {
+    db.prepare(`UPDATE conversations SET title = ?, title_source = 'manual', updated_at = ? WHERE id = ?`).run(nextTitle, updatedAt, id);
+  }
+
+  const payload = {
+    conversationId: id,
+    title: nextTitle,
+    updatedAt,
+  };
+  io?.emit?.('conversation_title_updated', payload);
+  return { ok: true, ...payload, created: !existing };
+}
+
+export function buildSessionWorkerStatusPayload({
+  featureFlags = null,
+  supervisorSnapshot = null,
+  queueRows = [],
+} = {}) {
+  const snapshot = supervisorSnapshot && typeof supervisorSnapshot === 'object'
+    ? supervisorSnapshot
+    : {};
+  const workers = Array.isArray(snapshot.workers) ? snapshot.workers : [];
+  const normalizedRows = Array.isArray(queueRows) ? queueRows : [];
+  const workerBySession = new Map();
+  for (const worker of workers) {
+    const sid = normalizeWorkerStatusText(worker?.sdkSessionId);
+    if (!sid) continue;
+    workerBySession.set(sid, worker);
+  }
+
+  const integrity = {
+    scannedQueueRowCount: normalizedRows.length,
+    workerRegistryCount: workers.length,
+    queueOwnerOrphanCount: 0,
+    queueConversationMismatchCount: 0,
+    queueRuntimeMismatchCount: 0,
+    queueProcessingStateMismatchCount: 0,
+    queueOwnerOrphanSamples: [],
+    queueConversationMismatchSamples: [],
+    queueRuntimeMismatchSamples: [],
+    queueProcessingStateMismatchSamples: [],
+  };
+
+  for (const row of normalizedRows) {
+    const messageId = normalizeWorkerStatusText(row?.id);
+    const ownerSessionId = normalizeWorkerStatusText(row?.owner_sdk_session_id);
+    const conversationId = normalizeWorkerStatusText(row?.conversation_id);
+    const runtimeSessionId = normalizeWorkerStatusText(row?.runtime_session_id);
+    const queueStatus = normalizeWorkerStatusText(row?.status, 'pending');
+    if (!ownerSessionId) continue;
+
+    const worker = workerBySession.get(ownerSessionId);
+    if (!worker) {
+      integrity.queueOwnerOrphanCount += 1;
+      integrity.queueOwnerOrphanSamples.push({
+        messageId,
+        ownerSessionId,
+        queueStatus,
+      });
+      continue;
+    }
+
+    if (conversationId && worker.conversationId && conversationId !== worker.conversationId) {
+      integrity.queueConversationMismatchCount += 1;
+      integrity.queueConversationMismatchSamples.push({
+        messageId,
+        ownerSessionId,
+        queueConversationId: conversationId,
+        workerConversationId: worker.conversationId,
+      });
+    }
+
+    if (runtimeSessionId && worker.runtimeSessionId && runtimeSessionId !== worker.runtimeSessionId) {
+      integrity.queueRuntimeMismatchCount += 1;
+      integrity.queueRuntimeMismatchSamples.push({
+        messageId,
+        ownerSessionId,
+        queueRuntimeSessionId: runtimeSessionId,
+        workerRuntimeSessionId: worker.runtimeSessionId,
+      });
+    }
+
+    if (queueStatus === 'processing' && normalizeWorkerStatusText(worker.status) !== 'processing') {
+      integrity.queueProcessingStateMismatchCount += 1;
+      integrity.queueProcessingStateMismatchSamples.push({
+        messageId,
+        ownerSessionId,
+        queueStatus,
+        workerStatus: normalizeWorkerStatusText(worker.status, 'unknown'),
+      });
+    }
+  }
+
+  return {
+    enabled: featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true,
+    continuationRoutingEnabled: featureFlags?.SESSION_WORKER_CONTINUATION_ROUTING_ENABLED === true,
+    fallbackRestartEnabled: false,
+    uiState: normalizeWorkerStatusText(snapshot?.health?.uiState, 'white'),
+    degradedReason: normalizeWorkerStatusText(snapshot?.health?.degradedReason, null),
+    health: snapshot?.health && typeof snapshot.health === 'object' ? snapshot.health : null,
+    workerCount: toSafeNonNegativeInt(snapshot.workerCount, workers.length),
+    counts: snapshot.counts && typeof snapshot.counts === 'object' ? snapshot.counts : {},
+    workers,
+    pendingStarts: toSafeNonNegativeInt(snapshot.pendingStarts, 0),
+    lifecycle: Array.isArray(snapshot.lifecycle) ? snapshot.lifecycle : [],
+    integrity,
+  };
+}
+
+export function buildConversationSessionRootPayload({
+  conversationId = '',
+  sdkSessionId = '',
+  title = '',
+  resolveSessionStateRoot = null,
+} = {}) {
+  const sid = String(sdkSessionId || '').trim() || String(conversationId || '').trim();
+  if (!sid || typeof resolveSessionStateRoot !== 'function') return null;
+  const root = String(resolveSessionStateRoot() || '').trim();
+  if (!root) return null;
+  const rootPath = path.join(root, sid);
+  if (!fs.existsSync(rootPath)) return null;
+  let stat = null;
+  try {
+    stat = fs.statSync(rootPath);
+  } catch {
+    return null;
+  }
+  if (!stat.isDirectory()) return null;
+  return {
+    sdkSessionId: sid,
+    sessionRootPath: rootPath,
+    sessionRootName: String(title || '').trim() || `Session ${sid.slice(0, 8)}`,
+  };
+}
 
 export function registerSessionsRoutes(app, deps) {
   const {
@@ -45,13 +247,29 @@ export function registerSessionsRoutes(app, deps) {
     computeRetryDelayMs,
     relayRestartOrchestrator,
     relayBridgeOwnerService,
-    relayCliLauncherService,
+    featureFlags,
+    sessionWorkerSupervisor,
+    sessionWorkerRegistry,
+    resolveSessionStateRoot,
   } = deps;
   const sdkSessionSyncService = createSdkSessionSyncService(db);
   const SDK_DELETE_WAIT_TIMEOUT_MS = 12_000;
   const SDK_DELETE_POLL_MS = 200;
   const SDK_DELETE_STALE_PROCESSING_MS = 60_000;
   const markConversationDeleted = db.prepare(`UPDATE conversations SET status = 'deleted', updated_at = datetime('now') WHERE id = ?`);
+  const listSessionWorkerQueueRows = db.prepare(`
+    SELECT id, conversation_id, runtime_session_id, owner_sdk_session_id, status
+    FROM queue
+    WHERE status IN (${SESSION_WORKER_STATUS_QUEUE_STATES.map(() => '?').join(', ')})
+    ORDER BY timestamp ASC
+  `);
+  const listPendingQuestionSessionRows = db.prepare(`
+    SELECT DISTINCT TRIM(sdk_session_id) AS sdk_session_id
+    FROM relay_questions
+    WHERE status = 'pending'
+      AND sdk_session_id IS NOT NULL
+      AND TRIM(sdk_session_id) <> ''
+  `);
   const hardDeleteConversationRows = db.transaction((conversationId) => {
     db.prepare(`DELETE FROM relay_questions WHERE conversation_id = ?`).run(conversationId);
     db.prepare(`DELETE FROM queue WHERE conversation_id = ?`).run(conversationId);
@@ -77,6 +295,19 @@ export function registerSessionsRoutes(app, deps) {
     const text = String(value || '').trim();
     if (!text) return 'none';
     return `${text.slice(0, 8)}…`;
+  }
+
+  function markWorkerSessionSeen({ sdkSessionId, conversationId, runtimeSessionId } = {}) {
+    const sid = String(sdkSessionId || '').trim();
+    if (!sid) return null;
+    const existing = sessionWorkerRegistry?.getWorker?.(sid) || null;
+    return sessionWorkerRegistry?.upsertWorker?.({
+      ...(existing || {}),
+      sdkSessionId: sid,
+      conversationId: String(conversationId || '').trim() || existing?.conversationId || null,
+      runtimeSessionId: String(runtimeSessionId || '').trim() || existing?.runtimeSessionId || null,
+      status: existing?.status || 'new',
+    }) || null;
   }
 
   function enqueueSdkDeleteRequest(sdkSessionId, conversationId = null) {
@@ -130,21 +361,37 @@ export function registerSessionsRoutes(app, deps) {
 
     const includeArchived = String(req.query.archived || '').trim().toLowerCase() === 'true';
     const rows = stmts.listConvs.all(includeArchived ? 1 : 0);
-    const conversations = rows.map(r => ({
-      id:           r.id,
-      sdkSessionId: r.sdk_session_id || null,
-      title:        r.title,
-      archived:     Number(r.archived || 0) === 1,
-      compactedInto: r.compacted_into || null,
-      compactedFrom: r.compacted_from || null,
-      runtimeSessionId: r.runtime_session_id || null,
-      runtimeSessionStrategy: r.runtime_strategy || null,
-      runtimeSessionStatus: r.runtime_status || null,
-      runtimeSessionLastUsedAt: r.runtime_last_used_at || null,
-      createdAt:    r.created_at,
-      updatedAt:    r.updated_at,
-      messageCount: resolveMessageCount(r.sdk_session_id, r.message_count),
-    }));
+    const discovered = discoverSessionStateConversations(200);
+    const discoveredBySdkSessionId = new Map(
+      discovered
+        .map((item) => [String(item?.sdkSessionId || '').trim(), item])
+        .filter(([sid]) => !!sid),
+    );
+    const conversations = rows.map((r) => {
+      const sid = String(r.sdk_session_id || '').trim();
+      const discoveredItem = sid ? discoveredBySdkSessionId.get(sid) : null;
+      const discoveredUpdatedAt = String(discoveredItem?.updatedAt || '').trim();
+      const discoveredTitle = String(discoveredItem?.title || '').trim();
+      return {
+        id:           r.id,
+        sdkSessionId: sid || null,
+        title:        resolveConversationTitle({
+          title: r.title,
+          titleSource: r.title_source,
+          discoveredTitle,
+        }),
+        archived:     Number(r.archived || 0) === 1,
+        compactedInto: r.compacted_into || null,
+        compactedFrom: r.compacted_from || null,
+        runtimeSessionId: r.runtime_session_id || null,
+        runtimeSessionStrategy: r.runtime_strategy || null,
+        runtimeSessionStatus: r.runtime_status || null,
+        runtimeSessionLastUsedAt: r.runtime_last_used_at || null,
+        createdAt:    r.created_at,
+        updatedAt:    discoveredUpdatedAt || r.updated_at,
+        messageCount: resolveMessageCount(r.sdk_session_id, r.message_count),
+      };
+    });
 
     const knownById = new Set(conversations.map((c) => String(c.id || '').trim()).filter(Boolean));
     const knownBySdkSessionId = new Set(conversations.map((c) => String(c.sdkSessionId || '').trim()).filter(Boolean));
@@ -154,8 +401,6 @@ export function registerSessionsRoutes(app, deps) {
         .map((row) => String(row?.sdk_session_id || '').trim())
         .filter(Boolean),
     );
-    const discovered = discoverSessionStateConversations(200);
-
     for (const item of discovered) {
       const sdkSessionId = String(item?.sdkSessionId || '').trim();
       if (!sdkSessionId) continue;
@@ -167,7 +412,7 @@ export function registerSessionsRoutes(app, deps) {
       const syntheticConversation = {
         id: sdkSessionId,
         sdkSessionId,
-        title: `Session ${sdkSessionId.slice(0, 8)}`,
+        title: String(item?.title || '').trim() || `Session ${sdkSessionId.slice(0, 8)}`,
         archived: false,
         compactedInto: null,
         compactedFrom: null,
@@ -237,6 +482,7 @@ export function registerSessionsRoutes(app, deps) {
     if (ok) {
       stmts.deleteSdkDeleteRequest.run(sdkSessionId);
       const finalizedConversationIds = finalizeDeletedConversationsForSdkSession(sdkSessionId);
+      sessionWorkerRegistry?.removeWorker?.(sdkSessionId);
       if (!finalizedConversationIds.length) {
         io.emit('conversation_deleted', { conversationId: sdkSessionId });
       }
@@ -323,6 +569,11 @@ export function registerSessionsRoutes(app, deps) {
         });
       }
       stmts.clearDeletedSdkSession.run(sdkSessionId);
+      markWorkerSessionSeen({
+        sdkSessionId: sync?.sdkSessionId || sdkSessionId,
+        conversationId: sync?.conversationId || conversationId,
+        runtimeSessionId: sync?.runtimeSessionId || null,
+      });
       return res.json({
         ok: true,
         session: {
@@ -438,11 +689,20 @@ export function registerSessionsRoutes(app, deps) {
       if (!match) return res.status(404).json({ error: 'Conversation not found' });
       const runtimeSession = stmts.getRuntimeSessionBySdkSessionId.get(requestedId) || null;
       const updatedAt = String(match?.updatedAt || '').trim() || new Date().toISOString();
+      const discoveredTitle = String(match?.title || '').trim() || `Session ${requestedId.slice(0, 8)}`;
       const messages = readSessionTranscriptMessages(requestedId, { limit: 400 });
+      const sessionRoot = buildConversationSessionRootPayload({
+        conversationId: requestedId,
+        sdkSessionId: requestedId,
+        title: discoveredTitle,
+        resolveSessionStateRoot,
+      });
       return res.json({
         id: requestedId,
         sdkSessionId: requestedId,
-        title: `Session ${requestedId.slice(0, 8)}`,
+        title: discoveredTitle,
+        sessionRootPath: sessionRoot?.sessionRootPath || null,
+        sessionRootName: sessionRoot?.sessionRootName || discoveredTitle,
         archived: false,
         compactedInto: null,
         compactedFrom: null,
@@ -462,8 +722,27 @@ export function registerSessionsRoutes(app, deps) {
       });
     }
     const runtimeSession = stmts.getRuntimeSessionByConversation.get(req.params.id) || null;
+    const discoveredTitle = (() => {
+      const sdkSessionId = String(conv.sdk_session_id || '').trim();
+      if (!sdkSessionId) return null;
+      const discovered = discoverSessionStateConversations(400);
+      const match = discovered.find((item) => String(item?.sdkSessionId || '').trim() === sdkSessionId) || null;
+      const title = String(match?.title || '').trim();
+      return title || null;
+    })();
+    const resolvedTitle = resolveConversationTitle({
+      title: conv.title,
+      titleSource: conv.title_source,
+      discoveredTitle,
+    });
     const inFlight = inFlightStateForConversation(req.params.id);
     const transcriptMessages = readSessionTranscriptMessages(String(conv.sdk_session_id || req.params.id || '').trim(), { limit: 400 });
+    const sessionRoot = buildConversationSessionRootPayload({
+      conversationId: req.params.id,
+      sdkSessionId: conv.sdk_session_id || req.params.id,
+      title: resolvedTitle,
+      resolveSessionStateRoot,
+    });
     const dbMessages = stmts.getMessages.all(req.params.id);
     const relayActivitiesByMessageId = new Map(
       dbMessages
@@ -500,7 +779,9 @@ export function registerSessionsRoutes(app, deps) {
     res.json({
       id: conv.id,
       sdkSessionId: conv.sdk_session_id || null,
-      title: conv.title,
+      title: resolvedTitle,
+      sessionRootPath: sessionRoot?.sessionRootPath || null,
+      sessionRootName: sessionRoot?.sessionRootName || resolvedTitle || 'Session',
       archived: Number(conv.archived || 0) === 1,
       compactedInto: conv.compacted_into || null,
       compactedFrom: conv.compacted_from || null,
@@ -517,6 +798,27 @@ export function registerSessionsRoutes(app, deps) {
       updatedAt: conv.updated_at,
       inFlight,
       messages,
+    });
+  });
+
+  app.patch('/api/conversation/:id', auth, (req, res) => {
+    const conversationId = String(req.params.id || '').trim();
+    const result = persistConversationTitle({
+      db,
+      stmts,
+      io,
+      conversationId,
+      title: req.body?.title,
+    });
+    if (!result.ok) {
+      return res.status(result.statusCode || 500).json({ error: result.error || 'Failed to update conversation title' });
+    }
+    return res.json({
+      ok: true,
+      conversationId: result.conversationId,
+      title: result.title,
+      updatedAt: result.updatedAt,
+      created: result.created === true,
     });
   });
 
@@ -602,6 +904,9 @@ export function registerSessionsRoutes(app, deps) {
     const modelState = getModelCatalogState();
     const activeRuntimeSessionCount = Number(stmts.countRuntimeSessions.get()?.cnt || 0);
     const readyBanner = buildRelayReadyBannerData();
+    const pendingQuestionSessionIds = listPendingQuestionSessionRows.all()
+      .map((row) => normalizeWorkerStatusText(row?.sdk_session_id))
+      .filter(Boolean);
     res.json({
       cliOnline: runtimeState.cliOnline,
       relayPaused: runtimeState.relayPaused,
@@ -636,6 +941,12 @@ export function registerSessionsRoutes(app, deps) {
       },
       activeBridgeOwner: runtimeState.activeBridgeOwner || null,
       restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
+      features: featureFlags || {},
+      sessionWorker: buildSessionWorkerStatusPayload({
+        featureFlags,
+        supervisorSnapshot: sessionWorkerSupervisor?.snapshot?.({ pendingQuestionSessionIds }) || null,
+        queueRows: listSessionWorkerQueueRows.all(...SESSION_WORKER_STATUS_QUEUE_STATES),
+      }),
     });
   });
 
@@ -743,31 +1054,15 @@ export function registerSessionsRoutes(app, deps) {
       });
     }
 
-    const requestedTransactionId = String(req.body?.transactionId || '').trim() || null;
-    const requestedTargetSessionId = String(req.body?.targetSessionId || '').trim() || null;
-    markCliOffline('bridge-exit');
     const orchestratorState = relayRestartOrchestrator?.getState?.() || null;
-    let launcher = null;
-    if (
-      orchestratorState?.state === 'awaiting_rebind' &&
-      orchestratorState?.targetSessionId &&
-      (!requestedTransactionId || requestedTransactionId === orchestratorState.transactionId) &&
-      (!requestedTargetSessionId || requestedTargetSessionId === orchestratorState.targetSessionId)
-    ) {
-      launcher = relayCliLauncherService?.scheduleRestart?.({
-        transactionId: orchestratorState.transactionId,
-        targetSessionId: orchestratorState.targetSessionId,
-        reason: String(req.body?.reason || 'bridge-exit').trim() || 'bridge-exit',
-      }) || null;
-    }
     console.log(
-      `[bridge-exit] outcome tx=${shortId(orchestratorState?.transactionId)} target=${shortId(orchestratorState?.targetSessionId)} state=${String(orchestratorState?.state || 'unknown')} launcher=${String(launcher?.state?.status || 'none')}`,
+      `[bridge-exit] outcome tx=${shortId(orchestratorState?.transactionId)} target=${shortId(orchestratorState?.targetSessionId)} state=${String(orchestratorState?.state || 'unknown')} launcher=skipped`,
     );
     return res.json({
       ok: true,
       activeBridgeOwner: relayBridgeOwnerService?.getOwner?.() || null,
       restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
-      launcher,
+      launcher: null,
     });
   });
 

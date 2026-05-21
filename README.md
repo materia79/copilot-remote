@@ -147,6 +147,7 @@ Selection is persisted in browser storage and attached per message.
 | `localhostOnly` | `true` | Bind only to loopback (`127.0.0.1`) and disable LAN/WAN access |
 | `pollIntervalMs` | `3000` | CLI heartbeat/poll cadence |
 | `processingTimeoutMs` | `600000` | Max turn processing wait |
+| `ask_user` timeout | `900000` | `ask_user` question wait; edit `shared/question-timeout.mjs` to change it |
 | `conversationSessionMode` | `isolated` | Configured strategy (`isolated` / `shared`) exposed in status |
 | `restartGracefulTimeoutMs` | `8000` | Graceful restart wait before force fallback |
 | `restartShutdownTimeoutMs` | `45000` | Drain timeout while waiting for active queue job completion |

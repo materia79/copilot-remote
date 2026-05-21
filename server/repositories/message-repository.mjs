@@ -9,21 +9,53 @@ export function createMessageRepository(db) {
         insertMsg:      db.prepare(`INSERT INTO messages (id, conversation_id, role, text, model, mode, attachments, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`),
 
         // queue
-        insertQ:        db.prepare(`INSERT INTO queue (id, conversation_id, runtime_session_id, is_new_conversation, model, relay_mode, text, attachments, status, timestamp, retry_count, next_attempt_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, NULL)`),
+        insertQ:        db.prepare(`INSERT INTO queue (id, conversation_id, runtime_session_id, is_new_conversation, model, relay_mode, text, attachments, status, timestamp, retry_count, next_attempt_at, owner_sdk_session_id, owner_assigned_at, owner_lease_expires_at, owner_last_claimed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, NULL, ?, ?, ?, ?)`),
         findPending:    db.prepare(`SELECT * FROM queue WHERE status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY retry_count ASC, CASE WHEN next_attempt_at IS NULL THEN 0 ELSE 1 END ASC, COALESCE(next_attempt_at, timestamp) ASC, timestamp ASC LIMIT 1`),
+        findPendingForWorker: db.prepare(`
+          SELECT *
+          FROM queue
+          WHERE status = 'pending'
+            AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+            AND (
+              owner_sdk_session_id IS NULL
+              OR owner_sdk_session_id = ''
+              OR owner_sdk_session_id = ?
+            )
+          ORDER BY
+            CASE
+              WHEN owner_sdk_session_id = ? THEN 0
+              ELSE 1
+            END ASC,
+            retry_count ASC,
+            CASE WHEN next_attempt_at IS NULL THEN 0 ELSE 1 END ASC,
+            COALESCE(next_attempt_at, timestamp) ASC,
+            timestamp ASC
+          LIMIT 1
+        `),
         countStatus:    db.prepare(`SELECT status, COUNT(*) as cnt FROM queue WHERE status IN ('pending','processing','parked') GROUP BY status`),
         countRuntimeSessions: db.prepare(`SELECT COUNT(*) AS cnt FROM runtime_sessions WHERE status = 'active'`),
         setProcessing:  db.prepare(`UPDATE queue SET status = 'processing', processing_at = ? WHERE id = ?`),
+        setProcessingWithWorkerLease: db.prepare(`
+          UPDATE queue
+          SET
+            status = 'processing',
+            processing_at = ?,
+            owner_sdk_session_id = COALESCE(NULLIF(owner_sdk_session_id, ''), ?),
+            owner_assigned_at = COALESCE(owner_assigned_at, ?),
+            owner_lease_expires_at = ?,
+            owner_last_claimed_at = ?
+          WHERE id = ?
+        `),
         setQueueRuntimeSession: db.prepare(`UPDATE queue SET runtime_session_id = ? WHERE id = ?`),
         setQueueResponseMessageId: db.prepare(`UPDATE queue SET response_message_id = ? WHERE id = ?`),
-        setDone:        db.prepare(`UPDATE queue SET status = 'done', response = ?, processing_at = NULL, next_attempt_at = NULL WHERE id = ? AND status IN ('processing', 'pending')`),
-        setFailed:      db.prepare(`UPDATE queue SET status = 'failed', response = ?, processing_at = NULL, next_attempt_at = NULL WHERE id = ?`),
+        setDone:        db.prepare(`UPDATE queue SET status = 'done', response = ?, processing_at = NULL, next_attempt_at = NULL, owner_lease_expires_at = NULL WHERE id = ? AND status IN ('processing', 'pending')`),
+        setFailed:      db.prepare(`UPDATE queue SET status = 'failed', response = ?, processing_at = NULL, next_attempt_at = NULL, owner_lease_expires_at = NULL WHERE id = ?`),
         deleteConvQ:    db.prepare(`DELETE FROM queue WHERE conversation_id = ?`),
         findQById:      db.prepare(`SELECT * FROM queue WHERE id = ?`),
         pruneQueue:     db.prepare(`DELETE FROM queue WHERE status = 'done' AND id NOT IN (SELECT id FROM queue WHERE status = 'done' ORDER BY timestamp DESC LIMIT 200)`),
-        recoverStale:   db.prepare(`UPDATE queue SET status = 'pending', processing_at = NULL, next_attempt_at = ? WHERE status = 'processing' AND processing_at < ?`),
+        recoverStale:   db.prepare(`UPDATE queue SET status = 'pending', processing_at = NULL, next_attempt_at = ?, owner_lease_expires_at = NULL WHERE status = 'processing' AND processing_at < ?`),
         listRecoverableProcessing: db.prepare(`SELECT id, conversation_id FROM queue WHERE status = 'processing' AND processing_at < ?`),
-        recoverProcessingBefore: db.prepare(`UPDATE queue SET status = 'pending', processing_at = NULL, next_attempt_at = ? WHERE status = 'processing' AND processing_at < ?`),
+        recoverProcessingBefore: db.prepare(`UPDATE queue SET status = 'pending', processing_at = NULL, next_attempt_at = ?, owner_lease_expires_at = NULL WHERE status = 'processing' AND processing_at < ?`),
         listQueueForPauseDrop: db.prepare(`SELECT id, conversation_id FROM queue WHERE status IN ('pending', 'processing', 'parked')`),
         deleteQueueById: db.prepare(`DELETE FROM queue WHERE id = ?`),
         getLatestProcessingQueueByConversation: db.prepare(`SELECT id, relay_mode, timestamp, processing_at FROM queue WHERE conversation_id = ? AND status = 'processing' ORDER BY COALESCE(processing_at, timestamp) DESC LIMIT 1`),
