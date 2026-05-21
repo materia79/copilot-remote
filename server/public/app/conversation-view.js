@@ -26,7 +26,7 @@ import {
   showTransientRelayNotice,
   repoBrowserState,
 } from './store.js';
-import { sendMessage as sendMessageApi, compactConversation as compactConversationApi, scheduleContextUsageRefresh } from './api-client.js';
+import { sendMessage as sendMessageApi, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation } from './api-client.js';
 import { linkifyWorkspaceMentionsInNode } from './router.js';
 import { renderAttachmentMarkup, clearAttachments, uploadAttachments } from './attachments-view.js';
 import { renderRelayQuestions } from './ask-user-view.js';
@@ -280,26 +280,29 @@ export async function sendMessage() {
     return;
   }
 
-  input.value = '';
-  autoResize(input);
-  releaseComposerFocusAfterSend(input);
-  document.getElementById('send-btn').disabled = true;
+  if (!(await validateSelectedConversationBeforeSend())) {
+    return;
+  }
+  const targetConversationId = String(currentConvId || '').trim() || null;
 
   let attachments = [];
   try {
     attachments = await uploadAttachments(selectedAttachments.slice());
   } catch (e) {
-    document.getElementById('send-btn').disabled = false;
     alert(e.message || 'File upload failed');
     return;
   }
 
-  const isNew = !currentConvId;
+  const isNew = !targetConversationId;
   const msgTimestamp = new Date().toISOString();
   const selectedModel = document.getElementById('model-select').value || '';
   const selectedMode = document.getElementById('mode-select').value || 'agent';
   const titleSeed = text || (attachments[0]?.name || 'Attachment');
   const clientMessageId = generateId();
+  input.value = '';
+  autoResize(input);
+  releaseComposerFocusAfterSend(input);
+  document.getElementById('send-btn').disabled = true;
   pendingUserMessageIds.add(clientMessageId);
   appendMessage({ role: 'user', text, model: selectedModel, mode: selectedMode, timestamp: msgTimestamp, attachments }, true, clientMessageId, true);
   scrollBottomAfterSend();
@@ -310,53 +313,62 @@ export async function sendMessage() {
     text,
     model: selectedModel,
     relayMode: selectedMode,
-    conversationId: currentConvId || undefined,
+    conversationId: targetConversationId || undefined,
     newConversation: isNew || undefined,
     attachments,
   };
 
   const r = await sendMessageApi(body);
-  if (r) {
-    if (r.workspaceRootName || r.workspaceRootEntries || r.workspaceRootPath) {
-      updateWorkspaceRootHints(r);
-      if (repoBrowserState.open && repoBrowserState.activeRoot === 'workspace') {
-        repoBrowserState.currentPath = '';
-        await window.loadRepoBrowserTree?.();
-      }
-    }
-    if (r.compactedConversationId) {
-      await window.refreshConversations?.();
-      await window.openConversation?.(r.compactedConversationId);
-      document.getElementById('send-btn').disabled = false;
-      clearAttachments();
-      if (!mobileSend) input.focus();
-      scrollBottomAfterSend();
-      return;
-    }
-    if (r.warning) setModelBanner(`⚠️ ${r.warning}`);
-    if (r.workspaceRootWarning) setModelBanner(`⚠️ ${r.workspaceRootWarning}`);
-    const skippedRefs = Array.isArray(r.skippedReferenceAttachments) ? r.skippedReferenceAttachments : [];
-    if (skippedRefs.length) {
-      const firstReason = String(skippedRefs[0]?.reason || 'reference skipped');
-      setModelBanner(`⚠️ Some referenced images were not attached (${firstReason}).`);
-    }
-    if (isNew || !currentConvId) {
-      setCurrentConv(r.conversationId);
-      conversations[r.conversationId] = {
-        id: r.conversationId,
-        title: titleSeed.slice(0, 60),
-        updatedAt: new Date().toISOString(),
-        messageCount: 1,
-        runtimeSessionId: r.runtimeSessionId || null,
-      };
-      document.getElementById('chat-title').textContent = titleSeed.slice(0, 60);
-      updateCompactButton();
-      window.renderConvList?.();
-      applyContextUsageBar(null);
-      scheduleContextUsageRefresh(r.conversationId, 0);
-    }
-    if (cliOnline) showThinking(r.messageId || null);
+  if (!r) {
+    const pendingNode = document.querySelector(`[data-message-id="${clientMessageId}"]`);
+    pendingNode?.remove();
+    pendingUserMessageIds.delete(clientMessageId);
+    seenMessageIds.delete(clientMessageId);
+    document.getElementById('send-btn').disabled = false;
+    if (!mobileSend) input.focus();
+    setModelBanner('⚠️ Message could not be sent. Please try again.');
+    return;
   }
+
+  if (r.workspaceRootName || r.workspaceRootEntries || r.workspaceRootPath) {
+    updateWorkspaceRootHints(r);
+    if (repoBrowserState.open && repoBrowserState.activeRoot === 'workspace') {
+      repoBrowserState.currentPath = '';
+      await window.loadRepoBrowserTree?.();
+    }
+  }
+  if (r.compactedConversationId) {
+    await window.refreshConversations?.();
+    await window.openConversation?.(r.compactedConversationId);
+    document.getElementById('send-btn').disabled = false;
+    clearAttachments();
+    if (!mobileSend) input.focus();
+    scrollBottomAfterSend();
+    return;
+  }
+  if (r.warning) setModelBanner(`⚠️ ${r.warning}`);
+  if (r.workspaceRootWarning) setModelBanner(`⚠️ ${r.workspaceRootWarning}`);
+  const skippedRefs = Array.isArray(r.skippedReferenceAttachments) ? r.skippedReferenceAttachments : [];
+  if (skippedRefs.length) {
+    const firstReason = String(skippedRefs[0]?.reason || 'reference skipped');
+    setModelBanner(`⚠️ Some referenced images were not attached (${firstReason}).`);
+  }
+  if (isNew || !targetConversationId) {
+    setCurrentConv(r.conversationId);
+    conversations[r.conversationId] = {
+      id: r.conversationId,
+      title: titleSeed.slice(0, 60),
+      updatedAt: new Date().toISOString(),
+      messageCount: 1,
+      runtimeSessionId: r.runtimeSessionId || null,
+    };
+    document.getElementById('chat-title').textContent = titleSeed.slice(0, 60);
+    updateCompactButton();
+    window.renderConvList?.();
+    applyContextUsageBar(null);
+    scheduleContextUsageRefresh(r.conversationId, 0);
+  }
+  if (cliOnline) showThinking(r.messageId || null);
 
   document.getElementById('send-btn').disabled = false;
   clearAttachments();
@@ -369,5 +381,33 @@ export function handleKey(e) {
     e.preventDefault();
     sendMessage();
   }
+}
+
+async function validateSelectedConversationBeforeSend() {
+  const convId = String(currentConvId || '').trim();
+  if (!convId) return true;
+
+  const current = await loadConversation(convId);
+  if (!current) {
+    setModelBanner('⚠️ Selected conversation is unavailable. Please choose another conversation.');
+    await window.refreshConversations?.();
+    return false;
+  }
+
+  const conversationSessionId = String(current.sdkSessionId || current.sdk_session_id || '').trim();
+  const runtimeSessionSessionId = String(current.runtimeSession?.sdkSessionId || current.runtimeSession?.sdk_session_id || '').trim();
+  if (!conversationSessionId || !runtimeSessionSessionId || conversationSessionId !== runtimeSessionSessionId) {
+    setModelBanner('⚠️ This conversation is not session-bound yet. Please wait for the relay to sync or open another conversation.');
+    return false;
+  }
+
+  conversations[convId] = {
+    ...(conversations[convId] || {}),
+    ...current,
+    sdkSessionId: conversationSessionId,
+    runtimeSessionId: current.runtimeSession?.id || null,
+  };
+  updateSessionPill(conversations[convId], current.runtimeSession || null);
+  return true;
 }
 

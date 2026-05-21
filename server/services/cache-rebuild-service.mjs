@@ -1,0 +1,232 @@
+'use strict';
+
+function normalizeId(value) {
+  return String(value || '').trim();
+}
+
+function buildLegacyConversationList(db) {
+  return db.prepare(`
+    SELECT id, sdk_session_id, archived, status, updated_at
+    FROM conversations
+    WHERE status != 'deleted'
+      AND (sdk_session_id IS NULL OR sdk_session_id = '')
+    ORDER BY updated_at DESC, id ASC
+  `);
+}
+
+function buildBoundConversationList(db) {
+  return db.prepare(`
+    SELECT id, sdk_session_id
+    FROM conversations
+    WHERE status != 'deleted'
+      AND sdk_session_id IS NOT NULL
+      AND sdk_session_id != ''
+    ORDER BY updated_at DESC, id ASC
+  `);
+}
+
+function buildConversationActivityStatements(db) {
+  return {
+    queueCount: db.prepare(`
+      SELECT COUNT(*) AS cnt
+        FROM queue
+        WHERE conversation_id = ?
+        AND status IN ('pending', 'processing', 'parked')
+    `),
+    runtimeSessionCount: db.prepare(`
+      SELECT COUNT(*) AS cnt
+      FROM runtime_sessions
+      WHERE conversation_id = ?
+    `),
+    pendingQuestionCount: db.prepare(`
+      SELECT COUNT(*) AS cnt
+      FROM relay_questions
+      WHERE conversation_id = ?
+        AND status = 'pending'
+    `),
+    conversationRows: db.prepare(`
+      SELECT id
+      FROM conversations
+      WHERE status != 'deleted'
+    `),
+  };
+}
+
+export function createCacheRebuildService({
+  db,
+  stmts,
+  io,
+  fs,
+  path,
+  uploadsDir,
+  discoverSessionStateConversations,
+  bootstrapRuntimeSessionBindings,
+  collectOrphanedUploadsFromConversation,
+  deleteOrphanedUploads,
+}) {
+  const legacyConversationList = buildLegacyConversationList(db);
+  const boundConversationList = buildBoundConversationList(db);
+  const activity = buildConversationActivityStatements(db);
+
+  function isLegacyConversationActive(conversationId) {
+    const sid = normalizeId(conversationId);
+    if (!sid) return false;
+    const queueCount = Number(activity.queueCount.get(sid)?.cnt || 0);
+    const runtimeSessionCount = Number(activity.runtimeSessionCount.get(sid)?.cnt || 0);
+    const pendingQuestionCount = Number(activity.pendingQuestionCount.get(sid)?.cnt || 0);
+    return queueCount > 0 || runtimeSessionCount > 0 || pendingQuestionCount > 0;
+  }
+
+  function purgeConversation(conversationId) {
+    const sid = normalizeId(conversationId);
+    if (!sid) return [];
+    const orphanedUploads = collectOrphanedUploadsFromConversation(sid);
+    db.transaction(() => {
+      db.prepare(`DELETE FROM relay_questions WHERE conversation_id = ?`).run(sid);
+      db.prepare(`DELETE FROM relay_activity WHERE conversation_id = ?`).run(sid);
+      db.prepare(`DELETE FROM queue WHERE conversation_id = ?`).run(sid);
+      db.prepare(`DELETE FROM messages WHERE conversation_id = ?`).run(sid);
+      db.prepare(`DELETE FROM runtime_sessions WHERE conversation_id = ?`).run(sid);
+      db.prepare(`DELETE FROM conversations WHERE id = ?`).run(sid);
+    })();
+    deleteOrphanedUploads(orphanedUploads);
+    return orphanedUploads;
+  }
+
+  function archiveConversation(conversationId) {
+    const sid = normalizeId(conversationId);
+    if (!sid) return false;
+    const result = db.prepare(`UPDATE conversations SET archived = 1, updated_at = datetime('now') WHERE id = ? AND status != 'deleted'`).run(sid);
+    return Number(result?.changes || 0) > 0;
+  }
+
+  function fullWipeCache() {
+    const now = new Date().toISOString();
+    const conversationIds = activity.conversationRows.all().map((row) => normalizeId(row?.id)).filter(Boolean);
+    const uploadHashes = [];
+    for (const conversationId of conversationIds) {
+      for (const hash of collectOrphanedUploadsFromConversation(conversationId)) {
+        if (!uploadHashes.includes(hash)) uploadHashes.push(hash);
+      }
+    }
+
+    db.transaction(() => {
+      db.prepare(`DELETE FROM relay_questions`).run();
+      db.prepare(`DELETE FROM relay_activity`).run();
+      db.prepare(`DELETE FROM queue`).run();
+      db.prepare(`DELETE FROM messages`).run();
+      db.prepare(`DELETE FROM runtime_sessions`).run();
+      db.prepare(`DELETE FROM conversations`).run();
+      db.prepare(`DELETE FROM deleted_sdk_sessions`).run();
+      db.prepare(`DELETE FROM sdk_delete_requests`).run();
+      db.prepare(`DELETE FROM upload_refs`).run();
+      db.prepare(`DELETE FROM uploaded_files`).run();
+    })();
+
+    deleteOrphanedUploads(uploadHashes);
+
+    if (uploadsDir && fs?.existsSync?.(uploadsDir)) {
+      try {
+        for (const entry of fs.readdirSync(uploadsDir, { withFileTypes: true })) {
+          const entryPath = path.join(uploadsDir, entry.name);
+          fs.rmSync(entryPath, { recursive: true, force: true });
+        }
+      } catch {}
+      try {
+        fs.mkdirSync(uploadsDir, { recursive: true });
+      } catch {}
+    }
+
+    return {
+      wipedAt: now,
+      conversationsRemoved: conversationIds.length,
+      uploadsRemoved: uploadHashes.length,
+    };
+  }
+
+  function reconcileCache() {
+    const discoveredSessionIds = new Set(
+      discoverSessionStateConversations(400)
+        .map((row) => normalizeId(row?.sdkSessionId))
+        .filter(Boolean),
+    );
+    const tombstonedSessionIds = new Set(
+      stmts.listDeletedSdkSessions.all().map((row) => normalizeId(row?.sdk_session_id)).filter(Boolean),
+    );
+    const legacyRows = legacyConversationList.all();
+    const summary = {
+      discoveredSessionCount: discoveredSessionIds.size,
+      backfilledConversationIds: [],
+      purgedConversationIds: [],
+      archivedConversationIds: [],
+      retainedConversationIds: [],
+      runtimeSessionsBootstrapped: 0,
+      uploadsRemoved: 0,
+    };
+
+    for (const row of legacyRows) {
+      const conversationId = normalizeId(row?.id);
+      if (!conversationId) continue;
+
+      if (discoveredSessionIds.has(conversationId) && !tombstonedSessionIds.has(conversationId)) {
+        const updateResult = db.prepare(`
+          UPDATE conversations
+          SET sdk_session_id = ?, updated_at = datetime('now')
+          WHERE id = ? AND (sdk_session_id IS NULL OR sdk_session_id = '')
+        `).run(conversationId, conversationId);
+        if (Number(updateResult?.changes || 0) > 0) {
+          summary.backfilledConversationIds.push(conversationId);
+          stmts.clearDeletedSdkSession.run(conversationId);
+        }
+        continue;
+      }
+
+      if (isLegacyConversationActive(conversationId)) {
+        if (archiveConversation(conversationId)) {
+          summary.archivedConversationIds.push(conversationId);
+        } else {
+          summary.retainedConversationIds.push(conversationId);
+        }
+        continue;
+      }
+
+      purgeConversation(conversationId);
+      summary.purgedConversationIds.push(conversationId);
+    }
+
+    summary.runtimeSessionsBootstrapped = bootstrapRuntimeSessionBindings();
+    return summary;
+  }
+
+  function rebuildCache({ mode = 'reconcile' } = {}) {
+    const normalizedMode = String(mode || 'reconcile').trim().toLowerCase();
+    if (normalizedMode === 'full' || normalizedMode === 'wipe' || normalizedMode === 'rebuild') {
+      return {
+        mode: 'full',
+        summary: fullWipeCache(),
+      };
+    }
+
+    if (normalizedMode !== 'reconcile') {
+      const error = new Error(`Unsupported cache rebuild mode: ${normalizedMode || 'empty'}`);
+      error.statusCode = 400;
+      throw error;
+    }
+
+    return {
+      mode: 'reconcile',
+      summary: reconcileCache(),
+    };
+  }
+
+  return {
+    rebuildCache,
+    reconcileCache,
+    fullWipeCache,
+    purgeConversation,
+    archiveConversation,
+    isLegacyConversationActive,
+    listLegacyConversations: () => legacyConversationList.all(),
+    listBoundConversations: () => boundConversationList.all(),
+  };
+}

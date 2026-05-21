@@ -11,7 +11,7 @@ export function createMessageRepository(db) {
         // queue
         insertQ:        db.prepare(`INSERT INTO queue (id, conversation_id, runtime_session_id, is_new_conversation, model, relay_mode, text, attachments, status, timestamp, retry_count, next_attempt_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, NULL)`),
         findPending:    db.prepare(`SELECT * FROM queue WHERE status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY retry_count ASC, CASE WHEN next_attempt_at IS NULL THEN 0 ELSE 1 END ASC, COALESCE(next_attempt_at, timestamp) ASC, timestamp ASC LIMIT 1`),
-        countStatus:    db.prepare(`SELECT status, COUNT(*) as cnt FROM queue WHERE status IN ('pending','processing') GROUP BY status`),
+        countStatus:    db.prepare(`SELECT status, COUNT(*) as cnt FROM queue WHERE status IN ('pending','processing','parked') GROUP BY status`),
         countRuntimeSessions: db.prepare(`SELECT COUNT(*) AS cnt FROM runtime_sessions WHERE status = 'active'`),
         setProcessing:  db.prepare(`UPDATE queue SET status = 'processing', processing_at = ? WHERE id = ?`),
         setQueueRuntimeSession: db.prepare(`UPDATE queue SET runtime_session_id = ? WHERE id = ?`),
@@ -24,9 +24,47 @@ export function createMessageRepository(db) {
         recoverStale:   db.prepare(`UPDATE queue SET status = 'pending', processing_at = NULL, next_attempt_at = ? WHERE status = 'processing' AND processing_at < ?`),
         listRecoverableProcessing: db.prepare(`SELECT id, conversation_id FROM queue WHERE status = 'processing' AND processing_at < ?`),
         recoverProcessingBefore: db.prepare(`UPDATE queue SET status = 'pending', processing_at = NULL, next_attempt_at = ? WHERE status = 'processing' AND processing_at < ?`),
-        listQueueForPauseDrop: db.prepare(`SELECT id, conversation_id FROM queue WHERE status IN ('pending', 'processing')`),
+        listQueueForPauseDrop: db.prepare(`SELECT id, conversation_id FROM queue WHERE status IN ('pending', 'processing', 'parked')`),
         deleteQueueById: db.prepare(`DELETE FROM queue WHERE id = ?`),
         getLatestProcessingQueueByConversation: db.prepare(`SELECT id, relay_mode, timestamp, processing_at FROM queue WHERE conversation_id = ? AND status = 'processing' ORDER BY COALESCE(processing_at, timestamp) DESC LIMIT 1`),
+        parkPendingQueueForRestart: db.prepare(`
+          UPDATE queue
+          SET
+            status = 'parked',
+            next_attempt_at = NULL,
+            parked_at = COALESCE(parked_at, @parkedAt),
+            parked_target_session_id = @targetSessionId,
+            parked_transaction_id = @transactionId,
+            parked_reason = @reason
+          WHERE status = 'pending'
+        `),
+        listParkedQueueForRelease: db.prepare(`
+          SELECT id, conversation_id
+          FROM queue
+          WHERE status = 'parked'
+            AND (
+              parked_transaction_id IS NULL
+              OR parked_transaction_id = ?
+              OR parked_target_session_id = ?
+            )
+          ORDER BY COALESCE(parked_at, timestamp) ASC, timestamp ASC
+        `),
+        listAllParkedQueueForRelease: db.prepare(`
+          SELECT id, conversation_id
+          FROM queue
+          WHERE status = 'parked'
+          ORDER BY COALESCE(parked_at, timestamp) ASC, timestamp ASC
+        `),
+        releaseParkedQueueByIds: db.prepare(`
+          UPDATE queue
+          SET
+            status = 'pending',
+            parked_at = NULL,
+            parked_target_session_id = NULL,
+            parked_transaction_id = NULL,
+            parked_reason = NULL
+          WHERE id = ? AND status = 'parked'
+        `),
 
 
         // uploads

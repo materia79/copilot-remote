@@ -2,6 +2,11 @@
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
+import {
+  shouldParkForRestart,
+  parkPendingQueueForRestart,
+  releaseParkedQueueForReadyState,
+} from '../services/relay-queue-gate-service.mjs';
 
 export function registerMessagesRoutes(app, deps) {
   const {
@@ -73,7 +78,48 @@ export function registerMessagesRoutes(app, deps) {
     sanitizeActivityText,
     inFlightStateForConversation,
     emitToClientsExceptSessionId,
+    relayBridgeOwnerService,
+    relayRestartOrchestrator,
   } = deps;
+
+  function readBridgeIdentity(req) {
+    return relayBridgeOwnerService?.normalizeIdentity?.({
+      pid: req.headers['x-relay-process-pid'],
+      parentPid: req.headers['x-relay-parent-pid'],
+      sessionId: req.headers['x-relay-session-id'],
+      conversationId: req.headers['x-relay-conversation-id'],
+    }) || null;
+  }
+
+  function normalizeBindingValue(value) {
+    const text = String(value || '').trim();
+    return text || null;
+  }
+
+  function getConversationSessionState(conversationId) {
+    const normalizedConversationId = String(conversationId || '').trim();
+    if (!normalizedConversationId) {
+      return { ok: false, status: 400, error: 'Missing conversationId' };
+    }
+    const conversation = stmts.getConvAnyStatus.get(normalizedConversationId) || null;
+    if (!conversation || String(conversation.status || '').trim() === 'deleted') {
+      return { ok: false, status: 404, error: 'Conversation not found' };
+    }
+    const runtimeSession = stmts.getRuntimeSessionByConversation.get(normalizedConversationId) || null;
+    const conversationSdkSessionId = normalizeBindingValue(conversation.sdk_session_id);
+    const runtimeSessionSdkSessionId = normalizeBindingValue(runtimeSession?.sdk_session_id);
+    return {
+      ok: true,
+      conversation,
+      runtimeSession,
+      conversationSdkSessionId,
+      runtimeSessionSdkSessionId,
+    };
+  }
+
+  function rejectSessionBinding(res, status, error, extra = {}) {
+    return res.status(status).json({ error, ...extra });
+  }
 
   app.post('/api/upload', auth, express.raw({ type: () => true, limit: `${MAX_UPLOAD_BYTES}b` }), (req, res) => {
     const payload = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
@@ -473,9 +519,25 @@ export function registerMessagesRoutes(app, deps) {
     const workspaceRootUpdate = attachments.length === 0
       ? maybeApplyWorkspaceRootFromMessage(trimmedText)
       : { attempted: false, changed: false };
+    const shouldCreateConversation = !!newConversation || !conversationId;
 
-    const convId = (newConversation || !conversationId) ? uuidv4() : conversationId;
-    getOrCreateConversation(convId, trimmedText || attachmentSummary(attachments) || 'Image');
+    if (!shouldCreateConversation) {
+      const sessionState = getConversationSessionState(conversationId);
+      if (!sessionState.ok) {
+        return rejectSessionBinding(res, sessionState.status, sessionState.error);
+      }
+      if (!sessionState.conversationSdkSessionId || !sessionState.runtimeSessionSdkSessionId) {
+        return rejectSessionBinding(res, 409, 'Conversation is not session-bound yet');
+      }
+      if (sessionState.conversationSdkSessionId !== sessionState.runtimeSessionSdkSessionId) {
+        return rejectSessionBinding(res, 409, 'Conversation session binding mismatch');
+      }
+    }
+
+    const convId = shouldCreateConversation ? uuidv4() : conversationId;
+    if (shouldCreateConversation) {
+      getOrCreateConversation(convId, trimmedText || attachmentSummary(attachments) || 'Image');
+    }
     const convSeed = stmts.getConvSeed.get(convId);
     const shouldApplySeed = Number(convSeed?.seed_pending || 0) > 0 && String(convSeed?.summary_seed || '').trim().length > 0;
 
@@ -532,6 +594,7 @@ export function registerMessagesRoutes(app, deps) {
 
   app.post('/api/heartbeat', auth, (req, res) => {
     touchCli();
+    relayBridgeOwnerService?.observe?.(readBridgeIdentity(req));
     const { pendingCount } = queueCounts();
     res.json({ ok: true, pendingCount });
   });
@@ -539,7 +602,36 @@ export function registerMessagesRoutes(app, deps) {
   // GET /api/pending — CLI fetches next pending message
   app.get('/api/pending', auth, (req, res) => {
     touchCli();
+    const requester = readBridgeIdentity(req);
+    const ownerObservation = relayBridgeOwnerService?.observe?.(requester) || null;
+    if (requester && ownerObservation?.accepted === false) {
+      return res.json({
+        message: null,
+        ownerMismatch: true,
+        activeBridgeOwner: relayBridgeOwnerService?.getOwner?.() || null,
+        restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
+      });
+    }
     if (runtimeState.relayPaused) return res.json({ message: null, paused: true });
+    const counts = queueCounts();
+    const restartProbe = relayRestartOrchestrator?.onDequeueProbe({
+      processingCount: counts.processingCount,
+      cliOnline: runtimeState.cliOnline,
+    }) || null;
+    const parkedCount = parkPendingQueueForRestart({ stmts, state: restartProbe?.state });
+    const releasedRows = releaseParkedQueueForReadyState({ db, stmts, state: restartProbe?.state });
+    for (const row of releasedRows) {
+      io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'pending' });
+    }
+    if (restartProbe?.blockDequeue) {
+      return res.json({
+        message: null,
+        restartOrchestrator: restartProbe.state || relayRestartOrchestrator?.getState?.() || null,
+        control: restartProbe.control || null,
+        parkedCount,
+        releasedCount: releasedRows.length,
+      });
+    }
 
     const dequeue = db.transaction(() => {
       const now = new Date().toISOString();
@@ -583,9 +675,19 @@ export function registerMessagesRoutes(app, deps) {
       };
       console.log(`[${ts()}] DEQUEUED  ${out.id.slice(0,8)} conv=${out.conversationId.slice(0,8)} rs=${String(out.runtimeSessionId || 'none').slice(0,8)} model=${out.model} mode=${out.relayMode} text="${out.text.slice(0,60)}"${attachments.length ? ` attachments=${attachments.length}` : ''}`);
       io.emit('message_status', { messageId: out.id, conversationId: out.conversationId, status: 'processing' });
-      res.json({ message: out });
+      res.json({
+        message: out,
+        restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
+        parkedCount,
+        releasedCount: releasedRows.length,
+      });
     } else {
-      res.json({ message: null });
+      res.json({
+        message: null,
+        restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
+        parkedCount,
+        releasedCount: releasedRows.length,
+      });
     }
   });
 
@@ -775,11 +877,34 @@ export function registerMessagesRoutes(app, deps) {
         });
         io.emit('message_status', { messageId, conversationId: q?.conversation_id, status: 'failed' });
       } else {
-        const nextAttemptAt = addMsIso(computeRetryDelayMs(retryCount));
-        const result = db.prepare(`UPDATE queue SET status = 'pending', processing_at = NULL, retry_count = ?, next_attempt_at = ? WHERE id = ? AND status = 'processing'`).run(retryCount, nextAttemptAt, messageId);
+        const restartState = relayRestartOrchestrator?.getState?.() || null;
+        const parkForRestart = shouldParkForRestart(restartState);
+        const nextAttemptAt = parkForRestart ? null : addMsIso(computeRetryDelayMs(retryCount));
+        const result = db.prepare(`
+          UPDATE queue
+          SET
+            status = ?,
+            processing_at = NULL,
+            retry_count = ?,
+            next_attempt_at = ?,
+            parked_at = ?,
+            parked_target_session_id = ?,
+            parked_transaction_id = ?,
+            parked_reason = ?
+          WHERE id = ? AND status = 'processing'
+        `).run(
+          parkForRestart ? 'parked' : 'pending',
+          retryCount,
+          nextAttemptAt,
+          parkForRestart ? new Date().toISOString() : null,
+          parkForRestart ? (restartState?.targetSessionId || null) : null,
+          parkForRestart ? (restartState?.transactionId || null) : null,
+          parkForRestart ? (restartState?.lastError || 'session-rebind-pending') : null,
+          messageId,
+        );
         if (result.changes > 0) {
-          console.log(`[${ts()}] REQUEUED  ${messageId?.slice(0,8)} retry=${retryCount} next=${nextAttemptAt}`);
-          io.emit('message_status', { messageId, conversationId: q?.conversation_id, status: 'pending' });
+          console.log(`[${ts()}] REQUEUED  ${messageId?.slice(0,8)} retry=${retryCount} status=${parkForRestart ? 'parked' : 'pending'}${nextAttemptAt ? ` next=${nextAttemptAt}` : ''}`);
+          io.emit('message_status', { messageId, conversationId: q?.conversation_id, status: parkForRestart ? 'parked' : 'pending' });
         }
       }
     }

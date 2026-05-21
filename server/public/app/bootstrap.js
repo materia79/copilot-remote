@@ -52,6 +52,7 @@ import { openPendingQuestionFromBanner, submitRelayQuestionChoice, submitRelayQu
 import { showThinking, removeThinking, renderThinkingActivities, appendThinkingActivity, updateThinkingText, restoreInFlightThinking, renderMessages, appendMessage, compactCurrentConversation, sendMessage, handleKey } from './conversation-view.js';
 import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser } from './attachments-view.js';
 import { handleAttachmentInput, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
+import { initEmojiPicker, toggleEmojiPicker } from './emoji-view.js';
 
 const MODEL_STORAGE_KEY = 'copilot_selected_model';
 const MODE_STORAGE_KEY = 'copilot_selected_mode';
@@ -822,6 +823,7 @@ async function initApp() {
   initInstallButton();
   initPullToRefresh();
   initSessionPillCopy();
+  initEmojiPicker();
   connectSocket();
   startRelayQuestionPolling();
   await loadConversations();
@@ -913,6 +915,7 @@ window.toggleRepoBrowserHidden = toggleRepoBrowserHidden;
 window.toggleRepoBrowserHeavy = toggleRepoBrowserHeavy;
 window.focusRepoTree = focusRepoTree;
 window.setRepoCurrentPath = setRepoCurrentPath;
+window.toggleEmojiPicker = toggleEmojiPicker;
 window.submitRelayQuestionChoice = submitRelayQuestionChoice;
 window.submitRelayQuestionAnswer = submitRelayQuestionAnswer;
 window.onRelayQuestionDraftInput = onRelayQuestionDraftInput;

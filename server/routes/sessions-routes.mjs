@@ -29,6 +29,7 @@ export function registerSessionsRoutes(app, deps) {
     listenHost,
     ensureSessionId,
     touchCli,
+    markCliOffline,
     fetchUsageSummary,
     discoverSessionStateConversations,
     readSessionTranscriptMessages,
@@ -42,6 +43,9 @@ export function registerSessionsRoutes(app, deps) {
     DEFAULT_MODEL,
     remotePath,
     computeRetryDelayMs,
+    relayRestartOrchestrator,
+    relayBridgeOwnerService,
+    relayCliLauncherService,
   } = deps;
   const sdkSessionSyncService = createSdkSessionSyncService(db);
   const SDK_DELETE_WAIT_TIMEOUT_MS = 12_000;
@@ -58,6 +62,21 @@ export function registerSessionsRoutes(app, deps) {
 
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function readBridgeIdentity(req) {
+    return relayBridgeOwnerService?.normalizeIdentity?.({
+      pid: req.headers['x-relay-process-pid'],
+      parentPid: req.headers['x-relay-parent-pid'],
+      sessionId: req.headers['x-relay-session-id'],
+      conversationId: req.headers['x-relay-conversation-id'],
+    }) || null;
+  }
+
+  function shortId(value) {
+    const text = String(value || '').trim();
+    if (!text) return 'none';
+    return `${text.slice(0, 8)}…`;
   }
 
   function enqueueSdkDeleteRequest(sdkSessionId, conversationId = null) {
@@ -100,6 +119,15 @@ export function registerSessionsRoutes(app, deps) {
 
   // GET /api/conversations — list all conversations
   app.get('/api/conversations', auth, (req, res) => {
+    const resolveMessageCount = (sdkSessionId, currentCount) => {
+      const numeric = Number(currentCount || 0);
+      if (numeric > 0) return numeric;
+      const sid = String(sdkSessionId || '').trim();
+      if (!sid) return 0;
+      const transcript = readSessionTranscriptMessages(sid, { limit: 2000 });
+      return Array.isArray(transcript) ? transcript.length : 0;
+    };
+
     const includeArchived = String(req.query.archived || '').trim().toLowerCase() === 'true';
     const rows = stmts.listConvs.all(includeArchived ? 1 : 0);
     const conversations = rows.map(r => ({
@@ -115,7 +143,7 @@ export function registerSessionsRoutes(app, deps) {
       runtimeSessionLastUsedAt: r.runtime_last_used_at || null,
       createdAt:    r.created_at,
       updatedAt:    r.updated_at,
-      messageCount: r.message_count,
+      messageCount: resolveMessageCount(r.sdk_session_id, r.message_count),
     }));
 
     const knownById = new Set(conversations.map((c) => String(c.id || '').trim()).filter(Boolean));
@@ -149,7 +177,7 @@ export function registerSessionsRoutes(app, deps) {
         runtimeSessionLastUsedAt: runtimeSession?.last_used_at || updatedAt,
         createdAt: updatedAt,
         updatedAt,
-        messageCount: 0,
+        messageCount: resolveMessageCount(sdkSessionId, 0),
       };
       conversations.push(syntheticConversation);
       knownById.add(sdkSessionId);
@@ -233,20 +261,99 @@ export function registerSessionsRoutes(app, deps) {
 
   app.post('/api/session-sync', auth, (req, res) => {
     const body = req.body || {};
+    relayBridgeOwnerService?.observe?.(readBridgeIdentity(req));
     const sdkSessionId = String(body.sdk_session_id || '').trim();
     const conversationId = String(body.conversation_id || '').trim();
+    const orchestratorCorrelationId = String(
+      body.orchestrator_correlation_id
+      || body.orchestrator_transaction_id
+      || body.restart_transaction_id
+      || body.transaction_id
+      || body.correlation_id
+      || '',
+    ).trim();
+    const orchestratorTargetSessionId = String(
+      body.orchestrator_target_session_id
+      || body.restart_target_session_id
+      || body.target_session_id
+      || body.targetSessionId
+      || '',
+    ).trim();
+    const rebindCompleted = body.rebind_completed === true
+      || body.rebind_complete === true
+      || body.rebindConfirmed === true
+      || String(body.rebind_state || body.rebind_signal || '').trim().toLowerCase() === 'completed';
+    if (rebindCompleted) {
+      console.log(
+        `[session-sync] rebind signal sid=${shortId(sdkSessionId)} conv=${shortId(conversationId)} tx=${shortId(orchestratorCorrelationId)} target=${shortId(orchestratorTargetSessionId)}`,
+      );
+    }
 
     if (!sdkSessionId || !conversationId) {
       return res.status(400).json({ error: 'Missing sdk_session_id or conversation_id' });
     }
 
-    sdkSessionSyncService.syncSession({
-      sdk_session_id: sdkSessionId,
-      conversation_id: conversationId,
-    });
-    stmts.clearDeletedSdkSession.run(sdkSessionId);
-
-    return res.json({ ok: true });
+    try {
+      const sync = sdkSessionSyncService.syncSession({
+        sdk_session_id: sdkSessionId,
+        conversation_id: conversationId,
+      });
+      const rebind = relayRestartOrchestrator?.applySessionSync?.({
+        sdkSessionId,
+        conversationId,
+        correlationId: orchestratorCorrelationId || null,
+        targetSessionId: orchestratorTargetSessionId || null,
+        rebindCompleted,
+        signalSource: 'api-session-sync',
+      }) || null;
+      if (rebindCompleted) {
+        console.log(
+          `[session-sync] rebind outcome sid=${shortId(sdkSessionId)} tx=${shortId(orchestratorCorrelationId)} code=${String(rebind?.code || 'none')} completed=${rebind?.completed === true ? 'yes' : 'no'} state=${String(rebind?.state?.state || 'unknown')}`,
+        );
+      }
+      if (rebindCompleted && rebind?.ok === false && rebind?.conflict) {
+        const statusCode = rebind.retryable ? 409 : 409;
+        return res.status(statusCode).json({
+          error: rebind.message || 'Rebind confirmation conflict',
+          code: rebind.code || 'rebind-conflict',
+          retryable: rebind.retryable === true,
+          terminal: rebind.terminal === true,
+          rebind,
+          restartOrchestrator: rebind.state || relayRestartOrchestrator?.getState?.() || null,
+        });
+      }
+      stmts.clearDeletedSdkSession.run(sdkSessionId);
+      return res.json({
+        ok: true,
+        session: {
+          conversationId: sync?.conversationId || conversationId,
+          sdkSessionId: sync?.sdkSessionId || sdkSessionId,
+          runtimeSessionId: sync?.runtimeSessionId || null,
+          createdRuntimeSession: sync?.createdRuntimeSession === true,
+        },
+        rebind: rebind ? {
+          considered: rebind.considered === true,
+          completed: rebind.completed === true,
+          awaitingRebind: rebind.awaitingRebind === true,
+          code: rebind.code || null,
+          retryable: rebind.retryable === true,
+          terminal: rebind.terminal === true,
+          expected: rebind.expected || null,
+        } : null,
+        restartOrchestrator: rebind?.state || relayRestartOrchestrator?.getState?.() || null,
+        activeBridgeOwner: relayBridgeOwnerService?.getOwner?.() || null,
+      });
+    } catch (error) {
+      const statusCode = Number(error?.statusCode || 500);
+      const retryable = statusCode >= 500;
+      const payload = {
+        error: error?.message || 'Failed to sync session',
+        code: statusCode === 409 ? 'binding-conflict' : 'session-sync-failed',
+        retryable,
+        terminal: !retryable,
+      };
+      return res.status(Number.isInteger(statusCode) ? statusCode : 500).json(payload);
+    }
   });
 
   app.get('/api/context/:conversationId', auth, (req, res) => {
@@ -491,7 +598,7 @@ export function registerSessionsRoutes(app, deps) {
   // GET /api/status — overall status
   app.get('/api/status', auth, (req, res) => {
     ensureSessionId(req, res);
-    const { pendingCount, processingCount } = queueCounts();
+    const { pendingCount, processingCount, parkedCount } = queueCounts();
     const modelState = getModelCatalogState();
     const activeRuntimeSessionCount = Number(stmts.countRuntimeSessions.get()?.cnt || 0);
     const readyBanner = buildRelayReadyBannerData();
@@ -500,6 +607,7 @@ export function registerSessionsRoutes(app, deps) {
       relayPaused: runtimeState.relayPaused,
       pendingCount,
       processingCount,
+      parkedCount,
       activeRuntimeSessionCount,
       supportedModels: modelState.models,
       defaultModel: modelState.defaultModel,
@@ -526,6 +634,140 @@ export function registerSessionsRoutes(app, deps) {
         reconnectAttempts: runtimeState.tunnelState?.reconnectAttempts ?? 0,
         connectedSince: runtimeState.tunnelState?.connectedSince ?? null,
       },
+      activeBridgeOwner: runtimeState.activeBridgeOwner || null,
+      restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
+    });
+  });
+
+  app.get('/api/restart-orchestrator', auth, (req, res) => {
+    ensureSessionId(req, res);
+    return res.json({ orchestrator: relayRestartOrchestrator?.getState?.() || null });
+  });
+
+  app.post('/api/restart-orchestrator/request', auth, (req, res) => {
+    const targetSessionId = String(req.body?.targetSessionId || req.body?.target_session_id || '').trim();
+    if (!targetSessionId) return res.status(400).json({ error: 'Missing targetSessionId' });
+    const result = relayRestartOrchestrator?.requestRestart({
+      targetSessionId,
+      reason: String(req.body?.reason || 'manual-request').trim() || 'manual-request',
+    });
+    if (!result?.ok) return res.status(400).json({ error: result?.error || 'request rejected', orchestrator: result?.state || null });
+    return res.json({ ok: true, ...result });
+  });
+
+  app.post('/api/restart-orchestrator/rebind', auth, (req, res) => {
+    touchCli();
+    relayBridgeOwnerService?.observe?.(readBridgeIdentity(req));
+    const body = req.body || {};
+    const sdkSessionId = String(body.sdk_session_id || body.sdkSessionId || '').trim();
+    const conversationId = String(body.conversation_id || body.conversationId || '').trim() || null;
+    const orchestratorCorrelationId = String(
+      body.orchestrator_correlation_id
+      || body.orchestrator_transaction_id
+      || body.restart_transaction_id
+      || body.transaction_id
+      || body.correlation_id
+      || '',
+    ).trim();
+    const orchestratorTargetSessionId = String(
+      body.orchestrator_target_session_id
+      || body.restart_target_session_id
+      || body.target_session_id
+      || body.targetSessionId
+      || '',
+    ).trim();
+    if (!sdkSessionId) {
+      return res.status(400).json({ error: 'Missing sdk_session_id' });
+    }
+    console.log(
+      `[relay-rebind] request sid=${shortId(sdkSessionId)} conv=${shortId(conversationId)} tx=${shortId(orchestratorCorrelationId)} target=${shortId(orchestratorTargetSessionId)}`,
+    );
+    const rebind = relayRestartOrchestrator?.applySessionSync?.({
+      sdkSessionId,
+      conversationId,
+      correlationId: orchestratorCorrelationId || null,
+      targetSessionId: orchestratorTargetSessionId || null,
+      rebindCompleted: true,
+      signalSource: 'api-restart-orchestrator-rebind',
+    }) || null;
+    if (!rebind) {
+      return res.status(503).json({
+        error: 'Restart orchestrator unavailable',
+        code: 'restart-orchestrator-unavailable',
+      });
+    }
+    if (rebind.ok === false && rebind.conflict) {
+      console.warn(
+        `[relay-rebind] conflict sid=${shortId(sdkSessionId)} tx=${shortId(orchestratorCorrelationId)} code=${String(rebind.code || 'none')} retryable=${rebind.retryable === true ? 'yes' : 'no'} terminal=${rebind.terminal === true ? 'yes' : 'no'} state=${String(rebind?.state?.state || 'unknown')}`,
+      );
+      return res.status(409).json({
+        error: rebind.message || 'Rebind confirmation conflict',
+        code: rebind.code || 'rebind-conflict',
+        retryable: rebind.retryable === true,
+        terminal: rebind.terminal === true,
+        rebind,
+        restartOrchestrator: rebind.state || relayRestartOrchestrator?.getState?.() || null,
+      });
+    }
+    console.log(
+      `[relay-rebind] outcome sid=${shortId(sdkSessionId)} tx=${shortId(orchestratorCorrelationId)} completed=${rebind.completed === true ? 'yes' : 'no'} state=${String(rebind?.state?.state || 'unknown')}`,
+    );
+    return res.json({
+      ok: rebind.ok === true,
+      rebind: {
+        considered: rebind.considered === true,
+        completed: rebind.completed === true,
+        awaitingRebind: rebind.awaitingRebind === true,
+        code: rebind.code || null,
+        retryable: rebind.retryable === true,
+        terminal: rebind.terminal === true,
+        expected: rebind.expected || null,
+      },
+      restartOrchestrator: rebind.state || relayRestartOrchestrator?.getState?.() || null,
+      activeBridgeOwner: relayBridgeOwnerService?.getOwner?.() || null,
+    });
+  });
+
+  app.post('/api/restart-orchestrator/bridge-exit', auth, (req, res) => {
+    const requester = readBridgeIdentity(req);
+    const activeOwner = relayBridgeOwnerService?.getOwner?.() || null;
+    console.log(
+      `[bridge-exit] request ownerSid=${shortId(requester?.sessionId)} ownerPid=${String(requester?.pid || 'none')} tx=${shortId(req.body?.transactionId)} target=${shortId(req.body?.targetSessionId)}`,
+    );
+    if (activeOwner && requester && !relayBridgeOwnerService?.isOwner?.(requester)) {
+      return res.status(409).json({
+        error: 'Bridge exit rejected for non-owner requester',
+        code: 'bridge-owner-mismatch',
+        activeBridgeOwner: activeOwner,
+        restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
+      });
+    }
+
+    const requestedTransactionId = String(req.body?.transactionId || '').trim() || null;
+    const requestedTargetSessionId = String(req.body?.targetSessionId || '').trim() || null;
+    markCliOffline('bridge-exit');
+    const orchestratorState = relayRestartOrchestrator?.getState?.() || null;
+    let launcher = null;
+    if (
+      orchestratorState?.state === 'awaiting_rebind' &&
+      orchestratorState?.targetSessionId &&
+      (!requestedTransactionId || requestedTransactionId === orchestratorState.transactionId) &&
+      (!requestedTargetSessionId || requestedTargetSessionId === orchestratorState.targetSessionId)
+    ) {
+      launcher = relayCliLauncherService?.scheduleRestart?.({
+        transactionId: orchestratorState.transactionId,
+        targetSessionId: orchestratorState.targetSessionId,
+        reason: String(req.body?.reason || 'bridge-exit').trim() || 'bridge-exit',
+      }) || null;
+    }
+    console.log(
+      `[bridge-exit] outcome tx=${shortId(orchestratorState?.transactionId)} target=${shortId(orchestratorState?.targetSessionId)} state=${String(orchestratorState?.state || 'unknown')} launcher=${String(launcher?.state?.status || 'none')}`,
+    );
+    return res.json({
+      ok: true,
+      activeBridgeOwner: relayBridgeOwnerService?.getOwner?.() || null,
+      restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
+      launcher,
     });
   });
 

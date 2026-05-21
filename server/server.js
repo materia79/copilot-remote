@@ -23,9 +23,14 @@ import { createQuestionRepository } from './repositories/question-repository.mjs
 import { registerSessionsRoutes } from './routes/sessions-routes.mjs';
 import { registerMessagesRoutes } from './routes/messages-routes.mjs';
 import { registerAskUserRoutes } from './routes/ask-user-routes.mjs';
+import { registerCacheRoutes } from './routes/cache-routes.mjs';
 import { createDeleteArchiveService } from './services/delete-archive-service.mjs';
 import { createSessionDiscoveryService } from './services/session-discovery-service.mjs';
 import { createSessionTranscriptService } from './services/session-transcript-service.mjs';
+import { createRelaySingletonGuard } from './services/relay-singleton-guard.mjs';
+import { createRelayRestartOrchestrator } from './services/relay-restart-orchestrator-service.mjs';
+import { createRelayBridgeOwnerService } from './services/relay-bridge-owner-service.mjs';
+import { createRelayCliLauncherService } from './services/relay-cli-launcher-service.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -33,6 +38,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH    = path.join(__dirname, 'config.json');
 const DATA_DIR       = path.join(__dirname, 'data');
 const DB_PATH        = path.join(DATA_DIR, 'copilot.db');
+const RELAY_LOCK_PATH = path.join(DATA_DIR, 'relay-server.lock');
 const UPLOAD_DIR     = path.join(__dirname, 'uploads');
 const INITIAL_WORKSPACE_ROOT = resolveStartupWorkspaceRoot(__dirname);
 const WORKSPACE_ROOT_LOCKED = true;
@@ -208,6 +214,30 @@ if (!config.authToken || config.authToken === DEFAULT_CONFIG.authToken) {
   console.log(`[server] Generated random auth token (in-memory only): ${config.authToken}`);
 }
 
+function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const relaySingletonGuard = createRelaySingletonGuard({
+  lockPath: RELAY_LOCK_PATH,
+  pid: process.pid,
+  token: config.authToken,
+  isProcessAlive,
+  logger: console,
+});
+try {
+  relaySingletonGuard.acquire();
+} catch (error) {
+  console.error(`[server] ${error?.message || String(error)}`);
+  process.exit(1);
+}
+
 const MAX_REQUEUE_RETRIES = Number.isFinite(Number(config.maxRequeueRetries))
   ? Math.max(1, Number(config.maxRequeueRetries))
   : 5;
@@ -215,6 +245,27 @@ const MAX_REQUEUE_RETRIES = Number.isFinite(Number(config.maxRequeueRetries))
 const processingTimeoutMs = Number(config.processingTimeoutMs) > 0
   ? Number(config.processingTimeoutMs)
   : DEFAULT_PROCESSING_TIMEOUT_MS;
+const restartGracefulTimeoutMs = Number(config.restartGracefulTimeoutMs) > 0
+  ? Number(config.restartGracefulTimeoutMs)
+  : 8_000;
+const restartReadyCooldownMs = Number(config.restartReadyCooldownMs) > 0
+  ? Number(config.restartReadyCooldownMs)
+  : 1_000;
+const restartShutdownTimeoutMs = Number(config.restartShutdownTimeoutMs) > 0
+  ? Number(config.restartShutdownTimeoutMs)
+  : 45_000;
+const restartSpawnTimeoutMs = Number(config.restartSpawnTimeoutMs) > 0
+  ? Number(config.restartSpawnTimeoutMs)
+  : 18_000;
+const restartRebindTimeoutMs = Number(config.restartRebindTimeoutMs) > 0
+  ? Number(config.restartRebindTimeoutMs)
+  : 20_000;
+const restartMaxAttempts = Number.isFinite(Number(config.restartMaxAttempts))
+  ? Math.max(1, Number(config.restartMaxAttempts))
+  : 3;
+const restartRetryBackoffMs = Array.isArray(config.restartRetryBackoffMs)
+  ? config.restartRetryBackoffMs
+  : [1_000, 3_000, 7_000];
 const localhostOnly = config.localhostOnly === true || String(config.localhostOnly || '').trim().toLowerCase() === 'true';
 const listenHost = localhostOnly ? '127.0.0.1' : '0.0.0.0';
 const OFFLINE_STALE_RECOVER_MS = 45_000;
@@ -497,7 +548,11 @@ db.exec(`
     response_message_id TEXT,
     response            TEXT,
     retry_count         INTEGER NOT NULL DEFAULT 0,
-    next_attempt_at     TEXT
+    next_attempt_at     TEXT,
+    parked_at           TEXT,
+    parked_target_session_id TEXT,
+    parked_transaction_id TEXT,
+    parked_reason       TEXT
   );
 
   CREATE INDEX IF NOT EXISTS idx_queue_status ON queue(status, timestamp);
@@ -626,8 +681,21 @@ if (!queueColumns.includes('next_attempt_at')) {
 if (!queueColumns.includes('response_message_id')) {
   db.exec(`ALTER TABLE queue ADD COLUMN response_message_id TEXT`);
 }
+if (!queueColumns.includes('parked_at')) {
+  db.exec(`ALTER TABLE queue ADD COLUMN parked_at TEXT`);
+}
+if (!queueColumns.includes('parked_target_session_id')) {
+  db.exec(`ALTER TABLE queue ADD COLUMN parked_target_session_id TEXT`);
+}
+if (!queueColumns.includes('parked_transaction_id')) {
+  db.exec(`ALTER TABLE queue ADD COLUMN parked_transaction_id TEXT`);
+}
+if (!queueColumns.includes('parked_reason')) {
+  db.exec(`ALTER TABLE queue ADD COLUMN parked_reason TEXT`);
+}
 db.exec(`UPDATE queue SET relay_mode = 'agent' WHERE relay_mode IS NULL OR relay_mode = ''`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_next_attempt ON queue(status, next_attempt_at, timestamp)`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_parked_release ON queue(status, parked_transaction_id, parked_target_session_id, parked_at, timestamp)`);
 
 const runtimeSessionColumns = db.prepare(`PRAGMA table_info(runtime_sessions)`).all().map((c) => c.name);
 if (runtimeSessionColumns.length) {
@@ -702,11 +770,26 @@ void deleteArchiveService.retryPendingDeletesOnStartup()
   .catch((error) => {
     console.warn(`Startup delete retry failed: ${error?.message || error}`);
   });
+const relayRestartOrchestrator = createRelayRestartOrchestrator({
+  db,
+  gracefulTimeoutMs: restartGracefulTimeoutMs,
+  readyCooldownMs: restartReadyCooldownMs,
+  shutdownTimeoutMs: restartShutdownTimeoutMs,
+  spawnTimeoutMs: restartSpawnTimeoutMs,
+  rebindTimeoutMs: restartRebindTimeoutMs,
+  maxAttempts: restartMaxAttempts,
+  retryBackoffMs: restartRetryBackoffMs,
+});
+const relayCliLauncherService = createRelayCliLauncherService({
+  cwd: INITIAL_WORKSPACE_ROOT,
+  env: process.env,
+  log: (message) => console.log(`[${ts()}] ${message}`),
+});
 
 function queueCounts() {
   const rows = stmts.countStatus.all();
   const map = Object.fromEntries(rows.map(r => [r.status, r.cnt]));
-  return { pendingCount: map.pending || 0, processingCount: map.processing || 0 };
+  return { pendingCount: map.pending || 0, processingCount: map.processing || 0, parkedCount: map.parked || 0 };
 }
 
 function toNullableInt(value) {
@@ -2222,11 +2305,18 @@ const io         = new Server(httpServer, { cors: { origin: '*' } });
 app.use(express.json({ limit: '20mb' }));
 app.use(express.static(path.join(__dirname, 'public'), { etag: false, setHeaders: (res) => res.setHeader('Cache-Control', 'no-store') }));
 
+// ─── CLI Status Tracking ──────────────────────────────────────────────────────
+let cliLastSeen = null;
+let cliOnline   = false;
+let relayPaused = false;
+const relayBridgeOwnerService = createRelayBridgeOwnerService();
+
 const runtimeState = {
   get cliOnline() { return cliOnline; },
   set cliOnline(value) { cliOnline = value; },
   get relayPaused() { return relayPaused; },
   set relayPaused(value) { relayPaused = value; },
+  get activeBridgeOwner() { return relayBridgeOwnerService.getOwner(); },
 };
 
 const sharedRouteDeps = {
@@ -2287,6 +2377,7 @@ const sharedRouteDeps = {
   listenHost,
   ensureSessionId,
   touchCli,
+  markCliOffline,
   recoverProcessingOlderThan,
   addMsIso,
   computeRetryDelayMs,
@@ -2302,12 +2393,17 @@ const sharedRouteDeps = {
   sanitizeActivityText,
   inFlightStateForConversation,
   emitToClientsExceptSessionId,
+  relayBridgeOwnerService,
+  relayCliLauncherService,
   buildContextResponseText,
   readContextFromSessionEvents,
   discoverSessionStateConversations,
   readSessionTranscriptMessages,
   collectOrphanedUploadsFromConversation,
   deleteOrphanedUploads,
+  fs,
+  path,
+  uploadsDir: UPLOAD_DIR,
   fetchUsageSummary,
   bootstrapRuntimeSessionBindings,
   SUPPORTED_RELAY_MODES,
@@ -2321,37 +2417,43 @@ const sharedRouteDeps = {
   parseQuestionRequest,
   normalizeQuestionChoices,
   formatQuestionRow,
+  relayRestartOrchestrator,
 };
 registerMessagesRoutes(app, sharedRouteDeps);
 registerSessionsRoutes(app, sharedRouteDeps);
 registerAskUserRoutes(app, sharedRouteDeps);
-// ─── CLI Status Tracking ──────────────────────────────────────────────────────
-let cliLastSeen = null;
-let cliOnline   = false;
-let relayPaused = false;
+registerCacheRoutes(app, sharedRouteDeps);
+function markCliOffline(reason = 'offline', { clearOwner = true } = {}) {
+  cliLastSeen = null;
+  const wasOnline = cliOnline;
+  cliOnline = false;
+  if (clearOwner) {
+    relayBridgeOwnerService.clearOwner();
+  }
+  relayRestartOrchestrator.noteCliOffline();
+  if (wasOnline) {
+    console.log(`[${ts()}] CLI OFFLINE${reason ? ` (${reason})` : ''}`);
+    io.emit('cli_status', { online: false });
+  }
+}
+
 function checkCliStatus() {
   const wasOnline = cliOnline;
   cliOnline = cliLastSeen !== null && (Date.now() - cliLastSeen) < 10_000;
   if (wasOnline !== cliOnline) {
-    console.log(`[${ts()}] CLI ${cliOnline ? 'ONLINE' : 'OFFLINE'}`);
-    io.emit('cli_status', { online: cliOnline });
+    if (!cliOnline) {
+      markCliOffline('heartbeat-timeout');
+      return;
+    }
+    console.log(`[${ts()}] CLI ONLINE`);
+    io.emit('cli_status', { online: true });
   }
 }
 runtimeTimers.cliStatus = setInterval(checkCliStatus, 2000);
 
-function ownerProcessAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 if (managedOwnerPid) {
   runtimeTimers.ownerWatchdog = setInterval(() => {
-    if (ownerProcessAlive(managedOwnerPid)) return;
+    if (isProcessAlive(managedOwnerPid)) return;
     console.log(`[${ts()}] Owner process ${managedOwnerPid} is gone; shutting down managed relay.`);
     void shutdownRuntime(`owner-pid-missing:${managedOwnerPid}`);
   }, 3000);
@@ -2442,19 +2544,65 @@ function ensureRuntimeSessionBinding(conversationId, model, nowIso = new Date().
 }
 
 function bootstrapRuntimeSessionBindings() {
+  const discoveredSessions = discoverSessionStateConversations(400);
+  const tombstonedSessions = new Set(
+    stmts.listDeletedSdkSessions.all().map((row) => String(row?.sdk_session_id || '').trim()).filter(Boolean),
+  );
   const missing = stmts.listConvIdsMissingRuntimeSession.all();
-  if (!missing.length) return 0;
   const now = new Date().toISOString();
+  let bootstrapped = 0;
   const tx = db.transaction(() => {
+    for (const item of discoveredSessions) {
+      const conversationId = String(item?.sdkSessionId || '').trim();
+      const discoveredUpdatedAt = String(item?.updatedAt || '').trim() || now;
+      if (!conversationId || tombstonedSessions.has(conversationId)) continue;
+
+      const existingConversation = stmts.getConvAnyStatus.get(conversationId) || null;
+      if (!existingConversation) {
+        stmts.insertConv.run(conversationId, `Session ${conversationId.slice(0, 8)}`, discoveredUpdatedAt, discoveredUpdatedAt);
+      }
+      db.prepare(`
+        UPDATE conversations
+        SET sdk_session_id = ?,
+            updated_at = CASE
+              WHEN updated_at IS NULL OR updated_at = '' OR updated_at < ? THEN ?
+              ELSE updated_at
+            END
+        WHERE id = ?
+      `).run(conversationId, discoveredUpdatedAt, discoveredUpdatedAt, conversationId);
+
+      const existingRuntimeSession = stmts.getRuntimeSessionByConversation.get(conversationId) || null;
+      if (!existingRuntimeSession) {
+        const latestModel = stmts.getLatestConversationModel.get(conversationId)?.model || null;
+        const runtimeSession = ensureRuntimeSessionBinding(conversationId, latestModel, discoveredUpdatedAt);
+        if (runtimeSession?.id) {
+          db.prepare(`
+            UPDATE runtime_sessions
+            SET sdk_session_id = ?, last_used_at = ?, status = 'active'
+            WHERE id = ?
+          `).run(conversationId, discoveredUpdatedAt, runtimeSession.id);
+          bootstrapped += 1;
+        }
+      } else if (String(existingRuntimeSession.sdk_session_id || '').trim() !== conversationId) {
+        db.prepare(`
+          UPDATE runtime_sessions
+          SET sdk_session_id = ?, last_used_at = ?, status = 'active'
+          WHERE id = ?
+        `).run(conversationId, discoveredUpdatedAt, existingRuntimeSession.id);
+        bootstrapped += 1;
+      }
+    }
+
     for (const row of missing) {
       const conversationId = row?.id;
       if (!conversationId) continue;
       const latestModel = stmts.getLatestConversationModel.get(conversationId)?.model || null;
       ensureRuntimeSessionBinding(conversationId, latestModel, now);
+      bootstrapped += 1;
     }
   });
   tx();
-  return missing.length;
+  return bootstrapped;
 }
 
 function emitToClientsExceptSessionId(event, payload, sessionId) {
@@ -2478,6 +2626,7 @@ function emitToClientsExceptSessionId(event, payload, sessionId) {
 
 function touchCli() {
   cliLastSeen = Date.now();
+  relayRestartOrchestrator.noteCliOnline();
   if (!cliOnline) {
     cliOnline = true;
     console.log(`[${ts()}] CLI ONLINE (heartbeat)`);
@@ -2698,6 +2847,9 @@ function shutdownRuntime(reason = 'unknown') {
   clearRuntimeTimers();
   stopWorkspaceFileWatcher();
   stopSshTunnel();
+  try { relaySingletonGuard.release(); } catch (error) {
+    console.warn(`[${ts()}] Failed to release singleton lock: ${error?.message || error}`);
+  }
 
   runtimeShutdownPromise = new Promise((resolve) => {
     let settled = false;
@@ -2786,8 +2938,16 @@ function buildRelayReadyBannerData() {
 // Graceful shutdown: stop timers/tunnel and release listener deterministically.
 process.on('SIGTERM', () => { void shutdownRuntime('SIGTERM'); });
 process.on('SIGINT',  () => { void shutdownRuntime('SIGINT'); });
+process.on('exit', () => {
+  try { relaySingletonGuard.release(); } catch {}
+});
 
 // ─── Start ────────────────────────────────────────────────────────────────────
+httpServer.on('error', (error) => {
+  console.error(`[server] HTTP server failed: ${error?.message || error}`);
+  try { relaySingletonGuard.release(); } catch {}
+  process.exit(1);
+});
 httpServer.listen(config.port, listenHost, () => {
   const readyBanner = buildRelayReadyBannerData();
   console.log('');

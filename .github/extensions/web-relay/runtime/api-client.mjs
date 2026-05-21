@@ -1,11 +1,13 @@
-export function createApiClient({ serverUrl, token }) {
+export function createApiClient({ serverUrl, token, getHeaders }) {
   return async function api(method, routePath, body) {
     const url = `${serverUrl}${routePath}`;
+    const extraHeaders = typeof getHeaders === "function" ? (getHeaders() || {}) : {};
     const opts = {
       method,
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${token}`,
+        ...extraHeaders,
       },
       ...(method !== "GET" ? { body: JSON.stringify(body || {}) } : {}),
     };

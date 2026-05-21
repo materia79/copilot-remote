@@ -1,6 +1,73 @@
 import fs from "fs";
 import { getActiveSession } from "../runtime/session-registry.mjs";
 
+const RETRYABLE_SESSION_FAILURE_REASONS = new Set([
+  "conversation-load-failed",
+  "active-session-missing",
+  "restart-required",
+  "switch-mismatch",
+  "switch-call-transient-failure",
+]);
+
+const NON_RETRYABLE_SESSION_FAILURE_REASONS = new Set([
+  "conversation-id-missing",
+  "target-session-missing",
+]);
+
+const MAX_SWITCH_RETRIES = 2;
+
+export function classifySwitchingFailure(sessionResolution) {
+  const reason = String(sessionResolution?.reason || "unknown");
+  if (typeof sessionResolution?.retryable === "boolean") {
+    return { reason, retryable: sessionResolution.retryable };
+  }
+  if (NON_RETRYABLE_SESSION_FAILURE_REASONS.has(reason)) {
+    return { reason, retryable: false };
+  }
+  if (RETRYABLE_SESSION_FAILURE_REASONS.has(reason)) {
+    return { reason, retryable: true };
+  }
+  return { reason, retryable: false };
+}
+
+export function evaluateSwitchRetry({ retryable, attempts = 0, maxRetries = MAX_SWITCH_RETRIES } = {}) {
+  const currentAttempts = Number.isFinite(Number(attempts)) ? Number(attempts) : 0;
+  const cap = Number.isFinite(Number(maxRetries)) ? Number(maxRetries) : MAX_SWITCH_RETRIES;
+  if (!retryable) {
+    return { shouldRetry: false, attempts: currentAttempts, maxRetries: cap };
+  }
+  if (currentAttempts < cap) {
+    return { shouldRetry: true, attempts: currentAttempts + 1, maxRetries: cap };
+  }
+  return { shouldRetry: false, attempts: currentAttempts, maxRetries: cap };
+}
+
+function composeSwitchFailureMessage({
+  activeSdkSessionId,
+  targetSdkSessionId,
+  detail,
+  reason,
+  attempt,
+  maxRetries,
+  retryable,
+}) {
+  const trimmedDetail = String(detail || "").trim();
+  const exhaustedText = retryable === false
+    ? "No retry was attempted because this failure type is classified as non-retryable."
+    : Number.isFinite(attempt) && Number.isFinite(maxRetries)
+      ? `Switching was retried ${attempt}/${maxRetries} time(s) before this terminal failure.`
+      : "Switching failed with a terminal outcome.";
+  return [
+    "I couldn't process this turn because the active SDK session does not match this conversation binding.",
+    activeSdkSessionId ? `Active session: ${activeSdkSessionId.slice(0, 8)}…` : "Active session: unavailable.",
+    targetSdkSessionId ? `Conversation session: ${targetSdkSessionId.slice(0, 8)}…` : "Conversation session: unavailable.",
+    `Failure type: ${reason}.`,
+    "The relay attempted in-process session switching via SDK resume/switch APIs but could not activate the target session.",
+    exhaustedText,
+    trimmedDetail || "Please retry from the matching session conversation or start a new turn in the active session.",
+  ].join(" ");
+}
+
 function isImageAttachment(att) {
   const type = String(att?.type || "").toLowerCase();
   return type.startsWith("image/");
@@ -91,6 +158,8 @@ export function createPollingLoop({
   getSessionReady,
   getWaitingForAI,
   getLastAskUserBridge,
+  syncActiveSession,
+  ensureSessionForConversation,
   setActiveMsg,
   setWaitingForAI,
   setRelayTurnActive,
@@ -98,10 +167,52 @@ export function createPollingLoop({
   setLastAskUserBridge,
   getPendingAskUserRequest,
   setPendingAskUserRequest,
+  clearRelayScopeState,
   extractQuestionPrompt,
   extractQuestionChoices,
+  handleControl,
 }) {
   let stopRequested = false;
+  const switchFailureAttempts = new Map();
+
+  function switchFailureKey(messageId, sessionResolution) {
+    const reason = String(sessionResolution?.reason || "unknown").trim() || "unknown";
+    const target = String(sessionResolution?.targetSessionId || "none").trim() || "none";
+    return `${String(messageId || "").trim()}::${reason}::${target}`;
+  }
+
+  function clearSwitchFailureAttempts(messageId) {
+    const prefix = `${String(messageId || "").trim()}::`;
+    for (const key of switchFailureAttempts.keys()) {
+      if (key.startsWith(prefix)) switchFailureAttempts.delete(key);
+    }
+  }
+
+  function computeSwitchFailurePolicy(messageId, sessionResolution) {
+    const classification = classifySwitchingFailure(sessionResolution);
+    const key = switchFailureKey(messageId, sessionResolution);
+    const previousAttempts = Number(switchFailureAttempts.get(key) || 0);
+    const decision = evaluateSwitchRetry({
+      retryable: classification.retryable,
+      attempts: previousAttempts,
+      maxRetries: MAX_SWITCH_RETRIES,
+    });
+    if (decision.shouldRetry) {
+      switchFailureAttempts.set(key, decision.attempts);
+    }
+    const policy = { ...classification, ...decision };
+    dbg(
+      "session switch retry policy",
+      `msgId=${String(messageId || "").trim() || "unknown"}`,
+      `reason=${policy.reason || "unknown"}`,
+      `retryable=${policy.retryable ? "yes" : "no"}`,
+      `attempt=${policy.attempts}/${policy.maxRetries}`,
+      `shouldRetry=${policy.shouldRetry ? "yes" : "no"}`,
+      `active=${String(sessionResolution?.activeSessionId || "").trim() || "none"}`,
+      `target=${String(sessionResolution?.targetSessionId || "").trim() || "none"}`,
+    );
+    return policy;
+  }
 
   function stripMarkdown(text) {
     return String(text || "")
@@ -262,6 +373,8 @@ export function createPollingLoop({
   }
 
   async function processPendingSdkSessionDeletes() {
+    const status = await api("GET", "/api/status").catch(() => null);
+    if (status?.relayPaused) return false;
     const pending = await api("GET", "/api/sdk-session-delete/pending").catch(() => null);
     const request = pending?.request || null;
     const sdkSessionId = String(request?.sdkSessionId || "").trim();
@@ -318,14 +431,94 @@ export function createPollingLoop({
         const processedDelete = await processPendingSdkSessionDeletes();
         if (processedDelete) continue;
 
-        const { message } = await api("GET", "/api/pending");
+        const pending = await api("GET", "/api/pending");
+        const control = pending?.control || null;
+        if (control && typeof handleControl === "function") {
+          const handled = await handleControl(control, pending);
+          if (handled) continue;
+        }
+        const { message } = pending || {};
 
         if (message) {
           setActiveMsg(message);
+          if (typeof ensureSessionForConversation !== "function") {
+            dbg("session routing unavailable for msgId", message.id, "ensureSessionForConversation is not configured");
+            await session.log("⚠️ Session routing is unavailable for this turn", { level: "warn" });
+            await api("POST", "/api/response", {
+              messageId: message.id,
+              conversationId: message.conversationId,
+              text: "I couldn't process this turn because session routing is unavailable in the relay runtime. Please retry after the relay extension is fully initialized.",
+              model: await getCurrentModelId() || message.model || null,
+            }).catch(async () => {
+              await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
+            });
+            setActiveMsg(null);
+            continue;
+          }
+
+          const sessionResolution = await ensureSessionForConversation(message.conversationId, "dequeue");
+          if (sessionResolution && !sessionResolution.ok) {
+            const activeSdkSessionId = String(sessionResolution?.activeSessionId || "").trim();
+            const targetSdkSessionId = String(sessionResolution?.targetSessionId || "").trim();
+            const detail = String(sessionResolution?.message || "").trim();
+            const policy = computeSwitchFailurePolicy(message.id, sessionResolution);
+            dbg(
+              "session binding check failed for msgId",
+              message.id,
+              `reason=${sessionResolution.reason || "unknown"}`,
+              `retryable=${policy.retryable ? "yes" : "no"}`,
+              `attempt=${policy.attempts}/${policy.maxRetries}`,
+              `active=${activeSdkSessionId || "none"}`,
+              `target=${targetSdkSessionId || "none"}`,
+            );
+
+            if (policy.shouldRetry) {
+              await session.log(
+                `⚠️ Session binding mismatch (retry ${policy.attempts}/${policy.maxRetries}); re-queuing turn`,
+                { level: "warn" },
+              );
+              await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
+              setActiveMsg(null);
+              continue;
+            }
+
+            await session.log("⚠️ Session binding reached terminal failure for this turn", { level: "warn" });
+            const mismatchText = composeSwitchFailureMessage({
+              activeSdkSessionId,
+              targetSdkSessionId,
+              detail,
+              reason: policy.reason,
+              attempt: policy.attempts,
+              maxRetries: policy.maxRetries,
+              retryable: policy.retryable,
+            });
+            await api("POST", "/api/response", {
+              messageId: message.id,
+              conversationId: message.conversationId,
+              text: mismatchText,
+              model: await getCurrentModelId() || message.model || null,
+            }).catch(async () => {
+              await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
+            });
+            clearSwitchFailureAttempts(message.id);
+            setActiveMsg(null);
+            continue;
+          }
+          clearSwitchFailureAttempts(message.id);
+
+          const synced = await syncActiveSession?.("dequeue", true);
+          if (!synced) {
+            dbg("session sync failed before processing msgId", message.id, "- requeueing");
+            await session.log("⚠️ Session sync failed before processing; re-queuing turn", { level: "warn" });
+            await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
+            setActiveMsg(null);
+            continue;
+          }
           setWaitingForAI(true);
-          setRelayTurnActive(true);
+          setRelayTurnActive(true, message);
           setLastActivityText("");
           setLastAskUserBridge(null);
+          setPendingAskUserRequest?.(null);
 
           const label = message.isNewConversation ? "new conv" : "existing conv";
           await session.log(`📨 [${label}] Web message (${message.model || "default"} / ${message.relayMode || "agent"}): "${String(message.text || "").slice(0, 80)}"`);
@@ -500,11 +693,12 @@ export function createPollingLoop({
             await session.log(`❌ Response failed: ${e.message}; re-queuing`, { level: "error" });
             api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
           } finally {
-            setActiveMsg(null);
-            setWaitingForAI(false);
-            setRelayTurnActive(false);
             setLastActivityText("");
             setPendingAskUserRequest?.(null);
+            clearRelayScopeState?.();
+            setRelayTurnActive(false, message);
+            setActiveMsg(null);
+            setWaitingForAI(false);
           }
         }
       } catch {

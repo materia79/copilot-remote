@@ -13,8 +13,8 @@ This project now runs in package-wide ESM mode (`"type": "module"` in `package.j
 ## Starting the Server
 
 If you run `gh copilot` and the web-relay extension is loaded (project-local or user-global),
-the extension auto-starts `server.js` when needed and stops the managed server when that
-Copilot session ends.
+the extension auto-starts `server.js` when needed and reuses the existing singleton relay
+across Copilot CLI restarts.
 
 > **Single-owner rule:** Use either extension-managed polling **or** standalone `relay.mjs`, never both at the same time.
 
@@ -57,8 +57,9 @@ Mode summary:
 
 1. Stop stale detached watchdog/relay processes before restart.
 2. Keep exactly one listener on port `3333`.
-3. In extension-managed mode, do not run `npm start` or `node relay.mjs`.
-4. Verify `/api/status` shows `cliOnline: true` and queue counts are moving or zero.
+3. The relay singleton lock is stored at `server/data/relay-server.lock` (stale locks are auto-recovered).
+4. In extension-managed mode, do not run `npm start` or `node relay.mjs`.
+5. Verify `/api/status` shows `cliOnline: true` and queue counts are moving or zero.
 
 Script necessity note:
 
@@ -221,6 +222,8 @@ This means the following startup sequence is expected:
 All authenticated routes accept an HttpOnly auth cookie or an `Authorization: Bearer <token>` header.
 
 `GET /api/status` now also includes `readyBanner`, a preformatted relay-info payload used by the CLI extension to print the access window directly in the Copilot CLI client when relay connectivity is established.
+It also includes `restartOrchestrator` with the current relay-side restart transaction state.
+Queue metrics include `parkedCount` for turns deferred behind restart/rebind gates.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -241,8 +244,11 @@ All authenticated routes accept an HttpOnly auth cookie or an `Authorization: Be
 | DELETE | `/api/conversation/:id` | Delete a conversation |
 | GET | `/api/sdk-session-delete/pending` | (CLI relay) Fetch next pending SDK session delete request |
 | POST | `/api/sdk-session-delete/result` | (CLI relay) Report SDK session delete result |
+| POST | `/api/session-sync` | (CLI relay) Sync conversation↔SDK binding and optionally confirm orchestrator rebind completion |
 | GET | `/api/pending` | (CLI) Fetch next pending message |
 | POST | `/api/response` | (CLI) Submit response for a message |
+| GET | `/api/restart-orchestrator` | Read relay restart orchestrator state |
+| POST | `/api/restart-orchestrator/request` | Queue a restart transaction for a target SDK session |
 | POST | `/api/activity` | (CLI) Push in-flight tool activity for current message |
 | POST | `/api/stream` | (CLI) Push in-flight assistant text stream for current pending message |
 | POST | `/api/relay/pause` | Pause dequeueing and drop currently queued messages |
@@ -338,6 +344,12 @@ call `/api/usage` directly.
 | `pollIntervalMs` | `3000` | CLI poll interval (ms) |
 | `processingTimeoutMs` | `600000` | Max response wait time (ms) |
 | `conversationSessionMode` | `isolated` | SDK session strategy (`isolated` or `shared`) |
+| `restartGracefulTimeoutMs` | `8000` | Graceful shutdown wait before force fallback |
+| `restartShutdownTimeoutMs` | `45000` | Drain timeout while waiting for active queue jobs |
+| `restartSpawnTimeoutMs` | `18000` | Max wait for resume process to leave online state |
+| `restartRebindTimeoutMs` | `20000` | Max wait for session-sync rebind confirmation |
+| `restartMaxAttempts` | `3` | Max restart attempts before terminal exhaustion |
+| `restartRetryBackoffMs` | `[1000,3000,7000]` | Deterministic retry backoff schedule |
 | `sshTunnel.enabled` | `false` | Start reverse tunnel on server boot |
 | `sshTunnel.remoteBind` | `loopback` | Remote bind mode for SSH `-R` (`loopback` or `public`) |
 | `sshTunnel.user` | — | SSH user on VPS |
@@ -386,6 +398,19 @@ relay.example.com {
   "connectedSince": "2026-05-18T01:00:00.000Z"
 }
 ```
+
+`restartOrchestrator` in `/api/status` and `/api/restart-orchestrator` now exposes
+attempt/retry/timeout fields (`attempts`, `maxAttempts`, `retryAt`, `retryBackoffMs`,
+`spawnDeadlineAt`, `rebindDeadlineAt`) plus terminal outcomes
+(`terminalOutcomeCode`, `terminalOutcomeMessage`, `terminalOutcomeAttempts`).
+Failure classes are deterministic: transient timeouts (`spawn-timeout`, `rebind-timeout`)
+retry with bounded backoff; session mismatch conflicts (`transaction-mismatch`, `target-mismatch`)
+are terminal and stop retrying.  
+`POST /api/session-sync` accepts optional orchestrator correlation/target/rebind fields:
+`orchestrator_correlation_id`, `orchestrator_target_session_id`, and `rebind_completed`
+(or `rebind_state=completed`). Rebind mismatches return `409` with `retryable`/`terminal`.
+The extension dequeue/send path treats this restart-orchestrator flow as authoritative and
+does not attempt in-process runtime session switch calls.
 
 
 

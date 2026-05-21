@@ -148,6 +148,12 @@ Selection is persisted in browser storage and attached per message.
 | `pollIntervalMs` | `3000` | CLI heartbeat/poll cadence |
 | `processingTimeoutMs` | `600000` | Max turn processing wait |
 | `conversationSessionMode` | `isolated` | Configured strategy (`isolated` / `shared`) exposed in status |
+| `restartGracefulTimeoutMs` | `8000` | Graceful restart wait before force fallback |
+| `restartShutdownTimeoutMs` | `45000` | Drain timeout while waiting for active queue job completion |
+| `restartSpawnTimeoutMs` | `18000` | Max wait for resume/restart phase per attempt |
+| `restartRebindTimeoutMs` | `20000` | Max wait for rebind/session-sync completion per attempt |
+| `restartMaxAttempts` | `3` | Bounded restart attempts before terminal exhaustion |
+| `restartRetryBackoffMs` | `[1000,3000,7000]` | Deterministic retry backoff schedule in milliseconds |
 | `maxRequeueRetries` | `5` | Queue retry limit for failed processing |
 | `remotePath` | `""` | URL base path when reverse-proxied under a subpath |
 | `sshTunnel.enabled` | `false` | Enable reverse SSH tunnel |
@@ -157,7 +163,7 @@ Selection is persisted in browser storage and attached per message.
 | `sshTunnel.remotePort` | — | Remote forwarded port |
 | `sshTunnel.identityFile` | optional | SSH key path (falls back to default agent/key) |
 
-> In extension-managed mode, turns currently run through one SDK session, so isolation is enforced with conversation-scoped prompt guardrails rather than separate runtime processes.
+> Session mismatch recovery is restart-driven: the relay restart orchestrator parks queue work, restarts/rebinds the CLI runtime, and resumes dequeueing after rebind confirmation. The extension no longer attempts in-process session switch APIs from the dequeue/send path.
 
 ## Optional remote internet access (SSH tunnel)
 

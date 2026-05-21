@@ -20,6 +20,7 @@ export function registerAskUserRoutes(app, deps) {
     formatQuestionRow,
     normalizeRelayMode,
     DEFAULT_RELAY_MODE,
+    relayRestartOrchestrator,
   } = deps;
 
   const askUserRoutingService = createAskUserRoutingService(db);
@@ -97,7 +98,16 @@ export function registerAskUserRoutes(app, deps) {
 
     const result = askUserRoutingService.routeAnswer({ question_id: id, sdk_session_id: sdkSessionId, answer: text });
     if (!result.ok) {
-      if (result.error === 'session mismatch') return res.status(403).json({ error: result.error });
+      if (result.error === 'session mismatch') {
+        const targetSessionId = String(row.sdk_session_id || '').trim() || null;
+        const restart = targetSessionId
+          ? relayRestartOrchestrator?.requestRestart({
+            targetSessionId,
+            reason: 'ask-user-session-mismatch',
+          }) || null
+          : null;
+        return res.status(403).json({ error: result.error, restart });
+      }
       return res.status(400).json({ error: result.error });
     }
 
