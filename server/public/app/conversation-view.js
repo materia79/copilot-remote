@@ -656,8 +656,12 @@ async function validateSelectedConversationBeforeSend() {
 
   const conversationSessionId = String(current.sdkSessionId || current.sdk_session_id || '').trim();
   const runtimeSessionSessionId = String(current.runtimeSession?.sdkSessionId || current.runtimeSession?.sdk_session_id || '').trim();
-  if (!conversationSessionId || !runtimeSessionSessionId || conversationSessionId !== runtimeSessionSessionId) {
-    setModelBanner('⚠️ This conversation is not session-bound yet. Please wait for the relay to sync or open another conversation.');
+  if (!conversationSessionId) {
+    setModelBanner('⚠️ This conversation is waiting to be claimed by the relay. Please wait, or open another conversation.');
+    return false;
+  }
+  if (!runtimeSessionSessionId || conversationSessionId !== runtimeSessionSessionId) {
+    setModelBanner('⚠️ This conversation is bound to a different relay session. Wait for the matching session to claim it, or open another conversation.');
     return false;
   }
 

@@ -40,7 +40,9 @@ import { DEFAULT_QUESTION_TIMEOUT_MS } from '../shared/question-timeout.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ─── Config ────────────────────────────────────────────────────────────────────
-const CONFIG_PATH    = path.join(__dirname, 'config.json');
+const CONFIG_PATH    = process.env.COPILOT_WEB_RELAY_CONFIG
+  ? path.resolve(String(process.env.COPILOT_WEB_RELAY_CONFIG))
+  : path.join(__dirname, 'config.json');
 const DATA_DIR       = path.join(__dirname, 'data');
 const DB_PATH        = path.join(DATA_DIR, 'copilot.db');
 const RELAY_LOCK_PATH = path.join(DATA_DIR, 'relay-server.lock');
@@ -2605,15 +2607,20 @@ function getOrCreateConversation(id, firstLine) {
   return stmts.getConv.get(id);
 }
 
-function ensureRuntimeSessionBinding(conversationId, model, nowIso = new Date().toISOString()) {
+function ensureRuntimeSessionBinding(conversationId, model, nowIso = new Date().toISOString(), sdkSessionId = null) {
   const normalizedConversationId = String(conversationId || '').trim();
   if (!normalizedConversationId) return null;
   const normalizedModel = String(model || '').trim() || null;
-  stmts.setConvSdkSessionIdIfMissing.run(normalizedConversationId, nowIso, normalizedConversationId);
+  const normalizedSdkSessionId = String(sdkSessionId || '').trim() || null;
+  if (normalizedSdkSessionId) {
+    stmts.setConvSdkSessionIdIfMissing.run(normalizedConversationId, nowIso, normalizedSdkSessionId);
+  }
   const existing = stmts.getRuntimeSessionByConversation.get(normalizedConversationId);
   if (existing?.id) {
     stmts.touchRuntimeSession.run(normalizedModel, nowIso, existing.id);
-    stmts.setRuntimeSessionSdkSessionIdIfMissing.run(normalizedConversationId, nowIso, existing.id);
+    if (normalizedSdkSessionId) {
+      stmts.setRuntimeSessionSdkSessionIdIfMissing.run(normalizedSdkSessionId, nowIso, existing.id);
+    }
     return stmts.getRuntimeSessionById.get(existing.id);
   }
 
@@ -2628,7 +2635,7 @@ function ensureRuntimeSessionBinding(conversationId, model, nowIso = new Date().
     normalizedModel,
     nowIso,
     nowIso,
-    normalizedConversationId,
+    normalizedSdkSessionId,
   );
   return stmts.getRuntimeSessionById.get(runtimeSessionId);
 }
@@ -2665,7 +2672,7 @@ function bootstrapRuntimeSessionBindings() {
       const existingRuntimeSession = stmts.getRuntimeSessionByConversation.get(conversationId) || null;
       if (!existingRuntimeSession) {
         const latestModel = stmts.getLatestConversationModel.get(conversationId)?.model || null;
-        const runtimeSession = ensureRuntimeSessionBinding(conversationId, latestModel, discoveredUpdatedAt);
+        const runtimeSession = ensureRuntimeSessionBinding(conversationId, latestModel, discoveredUpdatedAt, item?.sdkSessionId || null);
         if (runtimeSession?.id) {
           db.prepare(`
             UPDATE runtime_sessions

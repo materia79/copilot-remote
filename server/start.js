@@ -16,6 +16,8 @@ const relayScript = path.join(projectDir, 'relay.mjs');
 
 const tokenArgIdx = rawArgs.indexOf('--token');
 const tokenFromArg = tokenArgIdx !== -1 ? rawArgs[tokenArgIdx + 1] : null;
+const portArgIdx = rawArgs.indexOf('--port');
+const portFromArg = portArgIdx !== -1 ? rawArgs[portArgIdx + 1] : null;
 
 let shuttingDown = false;
 let serverProc = null;
@@ -26,7 +28,9 @@ function delay(ms) {
 }
 
 function readConfig() {
-  const configPath = path.join(projectDir, 'config.json');
+  const configPath = process.env.COPILOT_WEB_RELAY_CONFIG
+    ? path.resolve(String(process.env.COPILOT_WEB_RELAY_CONFIG))
+    : path.join(projectDir, 'config.json');
   try {
     return JSON.parse(fs.readFileSync(configPath, 'utf8'));
   } catch {
@@ -121,6 +125,7 @@ async function main() {
 
   console.log('[start] Launching relay...');
   const relayArgs = [relayScript, '--token', sharedToken];
+  if (portFromArg) relayArgs.push('--port', portFromArg);
   if (rawArgs.includes('--foreground')) relayArgs.push('--foreground');
   if (rawArgs.includes('--quiet')) relayArgs.push('--quiet');
   if (rawArgs.includes('--verbose')) relayArgs.push('--verbose');

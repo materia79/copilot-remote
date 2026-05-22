@@ -39,6 +39,21 @@ npm start
 This starts both the web server and relay automatically.
 Stopping the main process (Ctrl+C / closing the terminal) also stops the relay.
 
+If you install this repo locally with `npm link` or `npm install -g .`, the `copilot-remote`
+command starts the web relay server if needed and then launches `gh copilot` in the same shell
+from whatever folder you run it in. If a relay is already live, it reuses it instead of starting
+a second owner.
+
+Relay server output is redirected to a logfile under `%LOCALAPPDATA%\copilot-remote\logs` by
+default (or `COPILOT_WEB_RELAY_LOG_DIR` if set), so the terminal stays reserved for the CLI.
+
+The global launcher no longer injects a bootstrap prompt; it just starts `gh copilot` directly
+after the relay is ready.
+
+If you need a specific `server/config.json` for token or tunnel settings, set
+`COPILOT_WEB_RELAY_CONFIG` to that file before launching. The global npm install does not include
+the repo-local gitignored config file by default.
+
 If you want CLI-extension mode (your active Copilot CLI session does the work),
 start only the web server manually:
 
@@ -229,6 +244,8 @@ This means the following startup sequence is expected:
 1. Open `http://localhost:3333` and briefly see "CLI is offline"
 2. Send one message in the CLI
 3. Extension starts polling and queued web messages begin processing
+
+If a conversation is still unbound when the CLI first sees it, the extension now claims it through `/api/session-sync` before processing so the browser can send back to the same SDK session.
 
 | Symptom | Check |
 |---|---|

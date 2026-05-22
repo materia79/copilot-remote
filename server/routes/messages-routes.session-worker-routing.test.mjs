@@ -8,6 +8,7 @@ import {
   extractRestartTerminalOutcome,
   maybeTriggerWorkerFallbackRestart,
   parseTerminalFailureText,
+  resolveInitialQueueOwnerSessionId,
   resolveBlockedWorkerTerminalFailure,
   resolvePrimedWorkerTerminalFailure,
   resolveTerminalFailurePayload,
@@ -177,6 +178,42 @@ test('dequeuePendingMessage routes deterministically to requester ownership when
   });
   assert.equal(blocked, null);
   db.close();
+});
+
+test('resolveInitialQueueOwnerSessionId prefers conversation id for new conversation routing', () => {
+  const ownerSessionId = resolveInitialQueueOwnerSessionId({
+    routingEnabled: true,
+    requesterSessionId: 'sdk-existing',
+    runtimeSession: { sdk_session_id: null },
+    conversationSdkSessionId: null,
+    conversationId: 'conv-new',
+    isNewConversation: true,
+  });
+  assert.equal(ownerSessionId, 'conv-new');
+});
+
+test('resolveInitialQueueOwnerSessionId prefers conversation id for existing unbound conversation', () => {
+  const ownerSessionId = resolveInitialQueueOwnerSessionId({
+    routingEnabled: true,
+    requesterSessionId: 'sdk-existing',
+    runtimeSession: { sdk_session_id: null },
+    conversationSdkSessionId: null,
+    conversationId: 'conv-unbound',
+    isNewConversation: false,
+  });
+  assert.equal(ownerSessionId, 'conv-unbound');
+});
+
+test('resolveInitialQueueOwnerSessionId keeps bound runtime session id when already present', () => {
+  const ownerSessionId = resolveInitialQueueOwnerSessionId({
+    routingEnabled: true,
+    requesterSessionId: 'sdk-requester',
+    runtimeSession: { sdk_session_id: 'sdk-bound' },
+    conversationSdkSessionId: null,
+    conversationId: 'conv-bound',
+    isNewConversation: false,
+  });
+  assert.equal(ownerSessionId, 'sdk-bound');
 });
 
 test('dequeuePendingMessageForWorkerLoop returns blocked reason when worker cannot restart yet', async () => {

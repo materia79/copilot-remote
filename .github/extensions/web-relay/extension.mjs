@@ -291,16 +291,41 @@ async function ensureSessionForConversation(conversationId, reason = "dequeue") 
     details,
     activeSessionId: String(session?.sessionId || "").trim() || null,
   });
-  if (!binding?.ok) return binding;
+  if (binding?.ok) {
+    registerSession(binding.activeSessionId, convId);
+    return {
+      ok: true,
+      switched: false,
+      via: binding?.via || "session-liveness",
+      activeSessionId: binding.activeSessionId,
+      targetSessionId: binding.targetSessionId,
+    };
+  }
 
-  registerSession(binding.activeSessionId, convId);
-  return {
-    ok: true,
-    switched: false,
-    via: binding?.via || "session-liveness",
-    activeSessionId: binding.activeSessionId,
-    targetSessionId: binding.targetSessionId,
-  };
+  if (binding?.canClaim === true && binding?.activeSessionId) {
+    try {
+      await syncSessionToServer(binding.activeSessionId, convId, api, true);
+      registerSession(binding.activeSessionId, convId);
+      return {
+        ok: true,
+        switched: false,
+        via: "session-claim",
+        activeSessionId: binding.activeSessionId,
+        targetSessionId: binding.activeSessionId,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        reason: "session-claim-failed",
+        retryable: true,
+        message: `Failed to claim conversation binding: ${error?.message || String(error)}`,
+        activeSessionId: binding.activeSessionId || String(session?.sessionId || "").trim() || null,
+        targetSessionId: null,
+      };
+    }
+  }
+
+  return binding;
 }
 
 const sessionIo = createSessionIoHelpers({

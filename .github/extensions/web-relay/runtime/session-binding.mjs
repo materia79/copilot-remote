@@ -8,8 +8,6 @@ export function extractTargetSessionId(details, conversationId = null) {
     details?.sdkSessionId
     || details?.runtimeSession?.sdkSessionId
     || details?.runtimeSession?.sdk_session_id
-    || details?.id
-    || conversationId
     || "",
   );
 }
@@ -39,9 +37,10 @@ export function resolveSessionBinding({
       ok: false,
       reason: "target-session-missing",
       retryable: true,
-      message: "Conversation has no bound SDK session id",
+      message: "Conversation has no bound SDK session id yet",
       activeSessionId: active,
       targetSessionId: null,
+      canClaim: true,
     };
   }
 
@@ -53,6 +52,18 @@ export function resolveSessionBinding({
       message: "No active SDK runtime session available",
       activeSessionId: null,
       targetSessionId,
+    };
+  }
+
+  if (targetSessionId !== active) {
+    return {
+      ok: false,
+      reason: "session-binding-mismatch",
+      retryable: true,
+      message: `Conversation is bound to SDK session ${targetSessionId}`,
+      activeSessionId: active,
+      targetSessionId,
+      canClaim: false,
     };
   }
 

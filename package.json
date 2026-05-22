@@ -4,6 +4,9 @@
   "type": "module",
   "description": "Web proxy for GitHub Copilot CLI — relay messages between browser and CLI",
   "main": "server/server.js",
+  "bin": {
+    "copilot-remote": "./bin/copilot-remote.js"
+  },
   "scripts": {
     "start": "node server/start.js",
     "start:server": "node server/server.js",

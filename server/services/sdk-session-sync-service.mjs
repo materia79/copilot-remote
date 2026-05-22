@@ -77,7 +77,10 @@ export function createSdkSessionSyncService(db) {
     }
 
     const existingConversationSdkSessionId = normalizeId(conversation.sdk_session_id);
-    if (existingConversationSdkSessionId && existingConversationSdkSessionId !== sdkSessionId) {
+    const placeholderConversationBinding = existingConversationSdkSessionId
+      && existingConversationSdkSessionId === conversationId
+      && existingConversationSdkSessionId !== sdkSessionId;
+    if (existingConversationSdkSessionId && existingConversationSdkSessionId !== sdkSessionId && !placeholderConversationBinding) {
       throw makeError(
         `Conversation ${conversationId} is already bound to SDK session ${existingConversationSdkSessionId}`,
         409,
@@ -99,7 +102,9 @@ export function createSdkSessionSyncService(db) {
       const sameRuntimeSession = String(runtimeSessionByConversation.id || '') === String(runtimeSessionBySdkSessionId.id || '');
       const sameConversation = String(runtimeSessionBySdkSessionId.conversation_id || '') === conversationId;
       const sameSdkSession = normalizeId(runtimeSessionByConversation.sdk_session_id) === sdkSessionId;
-      if (!sameRuntimeSession && !sameConversation) {
+      const placeholderRuntimeBinding = normalizeId(runtimeSessionByConversation.sdk_session_id) === conversationId
+        && normalizeId(runtimeSessionByConversation.sdk_session_id) !== sdkSessionId;
+      if (!sameRuntimeSession && !sameConversation && !placeholderRuntimeBinding) {
         throw makeError(
           `SDK session ${sdkSessionId} is already bound to another runtime session`,
           409,
@@ -125,7 +130,7 @@ export function createSdkSessionSyncService(db) {
 
     if (runtimeSessionByConversation) {
       const currentSdkSessionId = normalizeId(runtimeSessionByConversation.sdk_session_id);
-      if (currentSdkSessionId && currentSdkSessionId !== sdkSessionId) {
+      if (currentSdkSessionId && currentSdkSessionId !== sdkSessionId && currentSdkSessionId !== conversationId) {
         throw makeError(
           `Runtime session ${runtimeSessionByConversation.id} is already bound to SDK session ${currentSdkSessionId}`,
           409,

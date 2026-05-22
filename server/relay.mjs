@@ -37,12 +37,30 @@ const FOREGROUND = !FORCE_HIDDEN && (args.includes('--foreground') || process.pl
 const VERBOSE = args.includes('--quiet') ? false : true;
 const tokenArgIdx = args.indexOf('--token');
 const TOKEN_OVERRIDE = tokenArgIdx !== -1 ? args[tokenArgIdx + 1] : null;
+const portArgIdx = args.indexOf('--port');
+const PORT_OVERRIDE = portArgIdx !== -1 ? args[portArgIdx + 1] : null;
 
 // ─── Config ────────────────────────────────────────────────────────────────────
-const configPath = path.join(__dirname, 'config.json');
-const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-const SERVER_URL = `http://localhost:${config.port}`;
-const TOKEN = TOKEN_OVERRIDE || config.authToken;
+const configPath = process.env.COPILOT_WEB_RELAY_CONFIG
+  ? path.resolve(String(process.env.COPILOT_WEB_RELAY_CONFIG))
+  : path.join(__dirname, 'config.json');
+function readConfig(filePath) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function parsePort(value, fallback = 3333) {
+  const parsed = Number.parseInt(String(value || '').trim(), 10);
+  return Number.isInteger(parsed) && parsed > 0 && parsed <= 65535 ? parsed : fallback;
+}
+
+const config = readConfig(configPath);
+const SERVER_PORT = parsePort(PORT_OVERRIDE, parsePort(config.port, 3333));
+const SERVER_URL = `http://localhost:${SERVER_PORT}`;
+const TOKEN = TOKEN_OVERRIDE || config.authToken || '';
 const RUNTIME_SESSION_POLICY = 'conversation-bound';
 const launchWorkspaceRoot = resolveStartupWorkspaceRoot(__dirname);
 
@@ -452,6 +470,27 @@ function waitForPort(port, timeoutMs) {
   });
 }
 
+export function buildCopilotClientOptions({
+  foreground = false,
+  tcpInfo = null,
+  cliPath = CLI_PATH,
+  launchRoot = launchWorkspaceRoot,
+} = {}) {
+  if (foreground && tcpInfo) {
+    return {
+      cliUrl: `localhost:${tcpInfo.port}`,
+      tcpConnectionToken: tcpInfo.tcpConnectionToken,
+    };
+  }
+
+  return {
+    cliPath,
+    useLoggedInUser: true,
+    logLevel: 'debug',
+    cwd: launchRoot,
+  };
+}
+
 // ─── Client Init ──────────────────────────────────────────────────────────────
 async function initClient(CopilotClient) {
   log('Initialising Copilot SDK client...');
@@ -467,23 +506,14 @@ async function initClient(CopilotClient) {
     }
 
     if (tcpInfo) {
-      clientOptions = {
-        cliUrl: `localhost:${tcpInfo.port}`,
-        tcpConnectionToken: tcpInfo.tcpConnectionToken,
-        useLoggedInUser: true,
-      };
+      clientOptions = buildCopilotClientOptions({ foreground: true, tcpInfo });
       log(`Connecting to foreground CLI at localhost:${tcpInfo.port}`);
     }
   }
 
   // Default: hidden subprocess via stdio
   if (!clientOptions) {
-    clientOptions = {
-      cliPath: CLI_PATH,
-      useLoggedInUser: true,
-      logLevel: 'debug',
-      cwd: launchWorkspaceRoot,
-    };
+    clientOptions = buildCopilotClientOptions();
     if (FOREGROUND) log('Using hidden CLI (foreground spawn failed)');
   }
 
@@ -863,12 +893,17 @@ async function main() {
   log('Relay running. Polling for messages every 2s.');
 }
 
-main().catch(e => { err('Fatal:', e); process.exit(1); });
+const executedPath = process.argv[1] ? path.resolve(process.argv[1]) : null;
+if (executedPath && executedPath === path.resolve(fileURLToPath(import.meta.url))) {
+  main().catch((e) => { err('Fatal:', e); process.exit(1); });
 
-// Keep the process alive through unhandled rejections (e.g. from SDK internals)
-process.on('unhandledRejection', (reason) => {
-  err('Unhandled rejection (relay will keep running):', reason);
-});
-process.on('uncaughtException', (e) => {
-  err('Uncaught exception (relay will keep running):', e.message, e.stack);
-});
+  // Keep the process alive through unhandled rejections (e.g. from SDK internals)
+  process.on('unhandledRejection', (reason) => {
+    err('Unhandled rejection (relay will keep running):', reason);
+  });
+  process.on('uncaughtException', (e) => {
+    err('Uncaught exception (relay will keep running):', e.message, e.stack);
+  });
+}
+
+export { readConfig, parsePort };

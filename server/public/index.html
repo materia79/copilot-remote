@@ -11,11 +11,13 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <script>
   const __APP_BASE = window.location.pathname.replace(/\/+$/, '');
-  document.write(`<link rel="manifest" href="${__APP_BASE}/manifest.webmanifest">`);
-  document.write(`<link rel="icon" type="image/png" sizes="192x192" href="${__APP_BASE}/app-icon-192.png">`);
-  document.write(`<link rel="icon" type="image/png" sizes="512x512" href="${__APP_BASE}/app-icon-512.png">`);
-  document.write(`<link rel="icon" type="image/svg+xml" href="${__APP_BASE}/app-icon.svg">`);
-  document.write(`<link rel="apple-touch-icon" href="${__APP_BASE}/app-icon-192.png">`);
+  const __PWA_VERSION = '10';
+  const __PWA_BUST = `v=${__PWA_VERSION}`;
+  document.write(`<link rel="manifest" href="${__APP_BASE}/manifest.webmanifest?${__PWA_BUST}">`);
+  document.write(`<link rel="icon" type="image/png" sizes="192x192" href="${__APP_BASE}/app-icon-192.png?${__PWA_BUST}">`);
+  document.write(`<link rel="icon" type="image/png" sizes="512x512" href="${__APP_BASE}/app-icon-512.png?${__PWA_BUST}">`);
+  document.write(`<link rel="icon" type="image/svg+xml" href="${__APP_BASE}/app-icon.svg?${__PWA_BUST}">`);
+  document.write(`<link rel="apple-touch-icon" href="${__APP_BASE}/app-icon-192.png?${__PWA_BUST}">`);
 </script>
 <title>Copilot Remote</title>
 <script>document.write('<scr'+'ipt src="'+window.location.pathname.replace(/\/+$/,'')+'/socket.io/socket.io.js"><\/scr'+'ipt>');</script>
@@ -54,6 +56,7 @@
     --sidebar-header-top-pad-desktop: calc(var(--sidebar-header-top-base-desktop) + var(--header-safe-top));
     --sidebar-header-top-pad-mobile: calc(var(--sidebar-header-top-base-mobile) + var(--header-safe-top));
     --immersive-top-shift: 0px;
+    --sidebar-width: 280px;
   }
 
   html, body {
@@ -107,9 +110,47 @@
 
   /* ── Sidebar ── */
   #sidebar {
-    width: 280px; min-width: 280px; background: var(--bg2); border-right: 1px solid var(--border);
+    width: var(--sidebar-width); min-width: var(--sidebar-width); flex: 0 0 var(--sidebar-width);
+    background: var(--bg2); border-right: 1px solid var(--border);
     display: flex; flex-direction: column; height: 100%; overflow: hidden;
-    transition: transform 0.25s ease;
+    transition: transform 0.25s ease, width 0.25s ease, min-width 0.25s ease, flex-basis 0.25s ease, border-color 0.25s ease;
+  }
+  body.sidebar-collapsed #sidebar {
+    width: 0;
+    min-width: 0;
+    flex-basis: 0;
+    border-right-color: transparent;
+    transform: translateX(-100%);
+    pointer-events: none;
+  }
+  #sidebar-resizer {
+    width: 8px;
+    flex: 0 0 8px;
+    cursor: col-resize;
+    position: relative;
+    background: transparent;
+    touch-action: none;
+  }
+  #sidebar-resizer::before {
+    content: '';
+    position: absolute;
+    left: 3px;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    border-radius: 999px;
+    background: rgba(139, 148, 158, 0.3);
+    transition: background 0.2s ease;
+  }
+  #sidebar-resizer:hover::before,
+  body.sidebar-resizing #sidebar-resizer::before {
+    background: rgba(88, 166, 255, 0.8);
+  }
+  body.sidebar-collapsed #sidebar-resizer {
+    width: 0;
+    flex-basis: 0;
+    opacity: 0;
+    pointer-events: none;
   }
 
   .sidebar-header {
@@ -117,7 +158,6 @@
     display: flex; align-items: center; gap: 10px;
     margin-top: var(--immersive-top-shift);
   }
-  .sidebar-header h2 { font-size: 1rem; font-weight: 600; flex: 1; }
   #sidebar-actions {
     display: inline-flex;
     align-items: center;
@@ -126,21 +166,6 @@
     flex-wrap: wrap;
     justify-content: flex-end;
   }
-  #sidebar-actions #compact-btn {
-    width: auto;
-    min-width: 70px;
-    padding: 0 10px;
-    background: var(--bg3);
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    height: 32px;
-    font-size: 0.8rem;
-    font-weight: 600;
-    cursor: pointer;
-    flex-shrink: 0;
-  }
-  #sidebar-actions #compact-btn:hover { border-color: var(--accent); color: var(--accent); }
   .header-icon-btn {
     display: inline-flex;
     align-items: center;
@@ -237,8 +262,12 @@
     margin-top: var(--immersive-top-shift);
   }
   #sidebar-toggle {
-    display: none; background: none; border: none; color: var(--text);
-    font-size: 1.3rem; cursor: pointer; padding: 4px 8px; margin: -4px 0;
+    display: inline-flex;
+    width: 32px;
+    height: 32px;
+    flex-shrink: 0;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
   }
   #chat-title-wrap {
     display: flex;
@@ -247,12 +276,25 @@
     flex: 1;
     min-width: 0;
   }
-  #chat-title { font-weight: 600; font-size: 1rem; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  #chat-title-slot {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  #chat-title { font-weight: 600; font-size: 1rem; display: inline; }
   #chat-title[data-copilot-session-id] { cursor: copy; }
-  #chat-title-edit-btn {
+  #chat-title[data-copilot-session-id]:hover {
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  #chat-actions-menu-btn {
     width: 32px;
     height: 32px;
     flex-shrink: 0;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
   }
   #chat-title-editor {
     display: flex;
@@ -301,6 +343,59 @@
     margin-left: auto;
     flex-shrink: 0;
   }
+  #chat-actions-menu-wrap {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    z-index: 55;
+  }
+  #chat-actions-menu {
+    position: absolute;
+    top: calc(100% + 8px);
+    right: 0;
+    min-width: 220px;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: 0 10px 24px rgba(0, 0, 0, 0.35);
+    padding: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    z-index: 60;
+  }
+  #chat-actions-menu[hidden] {
+    display: none;
+  }
+  .chat-actions-menu-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    min-height: 32px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--text);
+    border-radius: 8px;
+    padding: 0 10px;
+    font-size: 0.82rem;
+    text-align: left;
+    cursor: pointer;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .chat-actions-menu-item:hover {
+    background: var(--bg3);
+    border-color: var(--border);
+  }
+  .chat-actions-menu-item:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .chat-actions-menu-item:disabled:hover {
+    background: transparent;
+    border-color: transparent;
+  }
   #pending-question-banner {
     display: none;
     border: 1px solid rgba(88, 166, 255, 0.45);
@@ -322,27 +417,8 @@
     display: none;
   }
   #fullscreen-btn:active { transform: translateY(1px); }
-  #compact-btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    background: none;
-    border: 1px solid var(--border);
-    color: var(--text);
-    border-radius: 8px;
-    min-width: 38px;
-    height: 32px;
-    padding: 0 10px;
-    font-size: 0.82rem;
-    cursor: pointer;
-    flex-shrink: 0;
-  }
   #install-btn {
     display: none;
-  }
-  #compact-btn:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
   }
   body.installed-app #install-btn,
   body.installed-app #fullscreen-btn {
@@ -1353,15 +1429,36 @@
   #sidebar-overlay {
     display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 10;
   }
+  #chat-actions-menu-backdrop {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: transparent;
+    z-index: 54;
+  }
+  #chat-actions-menu-backdrop.visible {
+    display: block;
+  }
 
   @media (max-width: 680px) {
     html, body { font-size: clamp(12px, 3.4vw, 14px); }
     #sidebar {
       position: fixed; top: 0; left: 0; height: 100%; z-index: 20;
       transform: translateX(-100%);
+      width: 92vw;
+      min-width: 92vw;
+      flex-basis: 92vw;
     }
     #sidebar.open { transform: translateX(0); }
-    #sidebar-toggle { display: block; }
+    body.sidebar-collapsed #sidebar {
+      width: 92vw;
+      min-width: 92vw;
+      flex-basis: 92vw;
+      border-right-color: var(--border);
+      transform: translateX(-100%);
+      pointer-events: auto;
+    }
+    #sidebar-resizer { display: none; }
     #fullscreen-btn { display: inline-flex; align-items: center; justify-content: center; }
     #sidebar-overlay { display: block; opacity: 0; pointer-events: none; transition: opacity 0.25s; }
     #sidebar-overlay.visible { opacity: 1; pointer-events: all; }
@@ -1401,10 +1498,10 @@
       gap: 6px 8px;
       flex-wrap: nowrap;
       align-items: center;
+      position: relative;
+      z-index: 30;
     }
-    #sidebar-toggle { order: 1; }
     #chat-title-wrap {
-      order: 2;
       flex: 1 1 auto;
       width: auto;
       min-width: 0;
@@ -1412,13 +1509,12 @@
       align-items: center;
       gap: 6px;
     }
-    #chat-title {
+    #chat-title-slot {
       flex: 1 1 auto;
       width: auto;
       margin: 0;
     }
     #chat-header-actions {
-      order: 3;
       margin-left: auto;
     }
     #pending-question-banner {
@@ -1431,6 +1527,28 @@
       flex-wrap: wrap;
       gap: 6px;
     }
+    body.chat-title-editing #chat-header-actions {
+      align-self: flex-start;
+    }
+    body.chat-title-editing #chat-title-wrap {
+      z-index: 40;
+    }
+    body.chat-title-editing #chat-title-editor {
+      position: fixed;
+      left: 10px;
+      right: 10px;
+      top: calc(env(safe-area-inset-top, 0px) + 60px);
+      width: auto;
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 8px;
+      box-shadow: 0 14px 30px rgba(0, 0, 0, 0.42);
+      max-height: calc(var(--app-height, 100vh) - 88px - env(safe-area-inset-bottom, 0px));
+      overflow: auto;
+      z-index: 60;
+    }
+    body.chat-title-editing #chat-title-editor[hidden] { display: none; }
     #chat-title-input {
       flex: 1 0 100%;
       width: 100%;
@@ -1438,11 +1556,17 @@
     .chat-title-action-btn {
       flex: 1 1 calc(50% - 3px);
     }
-    #sidebar-toggle { font-size: 1.05rem; padding: 2px 6px; }
+    #sidebar-toggle {
+      order: 1;
+      font-size: 1.05rem;
+      padding: 2px 6px;
+    }
+    #chat-title-wrap { order: 2; }
+    #chat-header-actions { order: 3; }
     #chat-title { font-size: 0.96rem; }
     #chat-title-input,
     .chat-title-action-btn,
-    #chat-title-edit-btn {
+    #chat-actions-menu-btn {
       height: 30px;
     }
     #chat-title-input,
@@ -1451,7 +1575,7 @@
     }
     #pending-question-banner { font-size: 0.68rem; padding: 3px 8px; }
     .header-icon-btn { width: 30px; height: 30px; border-radius: 8px; font-size: 0.86rem; }
-    #sidebar-actions #compact-btn { min-width: 64px; height: 30px; padding: 0 8px; border-radius: 8px; font-size: 0.74rem; }
+    #chat-actions-menu { min-width: 200px; }
     #input-area { padding: 4px 10px calc(10px + env(safe-area-inset-bottom, 0px)); }
     .input-row { flex-wrap: wrap; gap: 8px; align-items: stretch; }
     #repo-browser-input-btn,
@@ -1575,29 +1699,29 @@
 
 <!-- Sidebar overlay (mobile) -->
 <div id="sidebar-overlay" onclick="closeSidebar()"></div>
+<div id="chat-actions-menu-backdrop" onclick="window.closeChatActionsMenu && window.closeChatActionsMenu()"></div>
 
 <!-- Main App -->
   <div id="app">
   <div id="sidebar">
     <div class="sidebar-header">
       <span id="cli-dot" title="CLI status"></span>
-      <h2>Copilot Remote</h2>
       <div id="sidebar-actions">
         <button id="usage-btn" class="header-icon-btn" onclick="showUsage()" title="Check Copilot usage" aria-label="Check Copilot usage">📊</button>
         <button id="context-btn" class="header-icon-btn" onclick="showContext()" title="Check current context" aria-label="Check current context">🧠</button>
-        <button id="compact-btn" onclick="compactCurrentConversation()" title="Compact conversation into a fresh session" disabled>Compact</button>
         <button id="install-btn" class="header-icon-btn" onclick="promptInstallApp()" title="Install app to home screen" aria-label="Install app">⬇</button>
       </div>
     </div>
     <button id="new-conv-btn" onclick="newConversation()">+ New Conversation</button>
     <div id="conv-list"></div>
   </div>
+  <div id="sidebar-resizer" role="separator" aria-orientation="vertical" aria-label="Resize conversations sidebar"></div>
 
   <div id="main">
     <div id="chat-header">
-      <button id="sidebar-toggle" onclick="openSidebar()">☰</button>
+      <button id="sidebar-toggle" class="header-icon-btn" type="button" title="Toggle conversations sidebar" aria-label="Toggle conversations sidebar">☰</button>
       <div id="chat-title-wrap">
-        <span id="chat-title">Select or start a conversation</span>
+        <span id="chat-title-slot"><span id="chat-title">Select or start a conversation</span></span>
         <form id="chat-title-editor" hidden>
           <input id="chat-title-input" type="text" maxlength="120" autocomplete="off" spellcheck="false">
           <button id="chat-title-save-btn" class="chat-title-action-btn" type="submit">Save</button>
@@ -1605,7 +1729,13 @@
         </form>
       </div>
       <div id="chat-header-actions">
-        <button id="chat-title-edit-btn" class="header-icon-btn" type="button" title="Edit conversation title" aria-label="Edit conversation title">✍️</button>
+        <div id="chat-actions-menu-wrap">
+          <button id="chat-actions-menu-btn" class="header-icon-btn" type="button" title="Conversation actions" aria-label="Conversation actions" aria-haspopup="menu" aria-expanded="false">⋯</button>
+          <div id="chat-actions-menu" role="menu" hidden>
+            <button id="chat-menu-edit-title" class="chat-actions-menu-item" type="button" role="menuitem">✍️ Edit conversation title</button>
+            <button id="chat-menu-compact" class="chat-actions-menu-item" type="button" role="menuitem">🗜️ Compact</button>
+          </div>
+        </div>
         <button id="fullscreen-btn" class="header-icon-btn" onclick="toggleFullscreen()" title="Toggle fullscreen" aria-label="Toggle fullscreen">⛶</button>
       </div>
       <button id="pending-question-banner" onclick="openPendingQuestionFromBanner()" title="Open pending question"></button>

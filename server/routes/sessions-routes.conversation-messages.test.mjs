@@ -144,6 +144,90 @@ test('buildConversationMessages avoids duplicate transcript rows when ids differ
   assert.deepEqual(messages.find((message) => message.id === 'db-a1')?.activities, []);
 });
 
+test('buildConversationMessages de-dupes transcript rows even when timestamps drift from DB rows', () => {
+  const messages = buildConversationMessages({
+    dbMessages: [
+      {
+        id: 'db-u1',
+        role: 'user',
+        text: 'hello there',
+        timestamp: '2026-05-22T00:00:01.000Z',
+      },
+      {
+        id: 'db-a1',
+        role: 'assistant',
+        text: 'general kenobi',
+        timestamp: '2026-05-22T00:00:02.000Z',
+      },
+    ],
+    transcriptMessages: [
+      {
+        id: 'tx-u1',
+        role: 'user',
+        text: 'hello there',
+        timestamp: '2026-05-22T00:00:03.500Z',
+      },
+      {
+        id: 'tx-a1',
+        role: 'assistant',
+        text: 'general kenobi',
+        timestamp: '2026-05-22T00:00:04.250Z',
+        activities: ['Thought: from transcript'],
+      },
+    ],
+  });
+
+  assert.deepEqual(messages.map((message) => message.id), ['db-u1', 'db-a1']);
+  assert.deepEqual(messages.find((message) => message.id === 'db-a1')?.activities, []);
+});
+
+test('buildConversationMessages keeps same-text rows when timestamps are far apart', () => {
+  const messages = buildConversationMessages({
+    dbMessages: [
+      {
+        id: 'db-u1',
+        role: 'user',
+        text: 'ping',
+        timestamp: '2026-05-22T00:00:01.000Z',
+      },
+    ],
+    transcriptMessages: [
+      {
+        id: 'tx-u2',
+        role: 'user',
+        text: 'ping',
+        timestamp: '2026-05-22T00:15:00.000Z',
+      },
+    ],
+  });
+
+  assert.deepEqual(messages.map((message) => message.id), ['db-u1', 'tx-u2']);
+});
+
+test('buildConversationMessages de-dupes transcript user rows with inline attachment marker suffix', () => {
+  const messages = buildConversationMessages({
+    dbMessages: [
+      {
+        id: 'db-u1',
+        role: 'user',
+        text: 'please investigate carefully',
+        timestamp: '2026-05-22T00:00:01.000Z',
+        attachments: [{ name: 'Screenshot.png', type: 'image/png' }],
+      },
+    ],
+    transcriptMessages: [
+      {
+        id: 'tx-u1',
+        role: 'user',
+        text: 'please investigate carefully [Attached file: Screenshot.png (image/png, inline image attachment)]',
+        timestamp: '2026-05-22T00:00:01.500Z',
+      },
+    ],
+  });
+
+  assert.deepEqual(messages.map((message) => message.id), ['db-u1']);
+});
+
 test('buildConversationMessages falls back to transcript rows when no DB messages exist', () => {
   const messages = buildConversationMessages({
     dbMessages: [],

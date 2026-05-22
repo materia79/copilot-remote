@@ -89,6 +89,7 @@ Sign in once with your token. The relay then uses an HttpOnly auth cookie.
 
 | Command | Purpose |
 |---|---|
+| `copilot-remote` | Global npm command (after `npm link` or `npm install -g .`) that starts the web relay if needed, then runs `gh copilot` in the same shell |
 | `npm run copilot:relay` | Starts Copilot CLI with an initial prompt so the extension loads and polling begins |
 | `npm run start:server` | Server only (use with an active Copilot CLI session that loads the extension) |
 | `npm start` | Standalone development mode (`server.js` + `relay.mjs`) |
@@ -107,6 +108,28 @@ The extension now supervises managed `server.js` restarts (bounded backoff) whil
 When the CLI extension connects, it also prints the relay info window (local/network/remote/auth/polling URLs) directly in the Copilot CLI client.
 
 Respawner scripts (`start:server:respawn*`) are legacy/manual troubleshooting tools only and are not part of the extension-managed startup path.
+
+### Global npm command (Windows first)
+
+You can install the repo locally and get a global `copilot-remote` command without publishing:
+
+```powershell
+npm link
+# or
+npm install -g .
+```
+
+Run it from any folder to start the web relay server for that folder's workspace root, then immediately hand the shell to `gh copilot` without a bootstrap prompt. If a relay is already active, the command reuses it and still opens Copilot in the same shell.
+
+Relay server output is written to a logfile under `%LOCALAPPDATA%\copilot-remote\logs` by default (or `COPILOT_WEB_RELAY_LOG_DIR` if you set it), so it stays out of the CLI terminal.
+
+If you want custom token/tunnel settings from a specific `server/config.json`, point `COPILOT_WEB_RELAY_CONFIG` at that file before launching. A plain `npm install -g .` does not bundle the repo-local gitignored config file.
+
+Roadmap for later launcher modes:
+
+1. **Option 2**: launch/attach a Copilot CLI session directly.
+2. **Option 3**: support `copilot-remote -- [gh copilot args]` pass-through.
+3. **Session resume**: add `--session-id=<...>` handoff once the session orchestration contract is defined.
 
 ## Using the web UI
 

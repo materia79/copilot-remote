@@ -423,16 +423,25 @@ export function maybeTriggerWorkerFallbackRestart({
   return fallback;
 }
 
-function resolveInitialQueueOwnerSessionId({
+export function resolveInitialQueueOwnerSessionId({
   routingEnabled = false,
   requesterSessionId = null,
   runtimeSession = null,
   conversationSdkSessionId = null,
+  conversationId = null,
+  isNewConversation = false,
 } = {}) {
   if (!routingEnabled) return null;
+  const runtimeSdkSessionId = normalizeSessionWorkerId(runtimeSession?.sdk_session_id);
+  const boundConversationSessionId = normalizeSessionWorkerId(conversationSdkSessionId);
+  const normalizedConversationId = normalizeSessionWorkerId(conversationId);
+  const unboundConversation = !runtimeSdkSessionId && !boundConversationSessionId;
+  if (normalizedConversationId && (isNewConversation || unboundConversation)) {
+    return normalizedConversationId;
+  }
   return normalizeSessionWorkerId(
-    runtimeSession?.sdk_session_id
-    || conversationSdkSessionId
+    runtimeSdkSessionId
+    || boundConversationSessionId
     || requesterSessionId,
   );
 }
@@ -1297,6 +1306,8 @@ export function registerMessagesRoutes(app, deps) {
       requesterSessionId,
       runtimeSession,
       conversationSdkSessionId,
+      conversationId: convId,
+      isNewConversation: shouldCreateConversation,
     });
     const msgId = clientMessageId || uuidv4();
     const queueText = shouldApplySeed

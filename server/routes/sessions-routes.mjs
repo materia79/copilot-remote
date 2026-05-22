@@ -158,9 +158,6 @@ export function persistConversationTitle({
     } else if (db && typeof db.prepare === 'function') {
       db.prepare(`INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)`).run(id, nextTitle, updatedAt, updatedAt);
     }
-    if (typeof stmts?.setConvSdkSessionIdIfMissing?.run === 'function') {
-      stmts.setConvSdkSessionIdIfMissing.run(id, updatedAt, id);
-    }
   }
 
   if (typeof stmts?.updateConvTitle?.run === 'function') {
@@ -322,7 +319,9 @@ function mergeUniqueActivityTexts(primary = [], secondary = []) {
 }
 
 function normalizeConversationMessageIdentityText(value) {
-  return String(value || '').replace(/\s+/g, ' ').trim();
+  const raw = String(value || '');
+  const withoutAttachmentMarkers = raw.replace(/\s*\[(?:Attached file|Attached files):[^\]]+\]\s*/gi, ' ');
+  return withoutAttachmentMarkers.replace(/\s+/g, ' ').trim();
 }
 
 function conversationMessageIdentityKey(message) {
@@ -330,6 +329,27 @@ function conversationMessageIdentityKey(message) {
   const timestamp = String(message?.timestamp || '').trim();
   const text = normalizeConversationMessageIdentityText(message?.text);
   return `${role}::${timestamp}::${text}`;
+}
+
+function conversationMessageRoleTextKey(message) {
+  const role = String(message?.role || '').trim().toLowerCase();
+  const text = normalizeConversationMessageIdentityText(message?.text);
+  return `${role}::${text}`;
+}
+
+function isLikelyCanonicalDuplicateMessage(a, b, timestampWindowMs = 30_000) {
+  const aRoleText = conversationMessageRoleTextKey(a);
+  const bRoleText = conversationMessageRoleTextKey(b);
+  if (!aRoleText || !bRoleText || aRoleText !== bRoleText) return false;
+
+  const aSource = String(a?.sourceMessageId || '').trim();
+  const bSource = String(b?.sourceMessageId || '').trim();
+  if (aSource && bSource) return aSource === bSource;
+
+  const aTs = normalizeConversationTimestampMs(a?.timestamp);
+  const bTs = normalizeConversationTimestampMs(b?.timestamp);
+  if (!aTs || !bTs) return false;
+  return Math.abs(aTs - bTs) <= Math.max(1_000, Number(timestampWindowMs) || 30_000);
 }
 
 function normalizeConversationTimestampMs(value) {
@@ -473,6 +493,14 @@ export function buildConversationMessages({
   const dbIdentityKeys = new Set(
     normalizedDbMessages.map((message) => conversationMessageIdentityKey(message)),
   );
+  const dbMessagesByRoleText = new Map();
+  for (const message of normalizedDbMessages) {
+    const key = conversationMessageRoleTextKey(message);
+    if (!key || key.endsWith('::')) continue;
+    const bucket = dbMessagesByRoleText.get(key) || [];
+    bucket.push(message);
+    dbMessagesByRoleText.set(key, bucket);
+  }
 
   for (const message of transcriptById.values()) {
     const id = String(message?.id || '').trim();
@@ -497,6 +525,9 @@ export function buildConversationMessages({
     if (id && messagesById.has(id)) continue;
     const identityKey = conversationMessageIdentityKey(message);
     if (dbIdentityKeys.has(identityKey)) continue;
+    const roleTextKey = conversationMessageRoleTextKey(message);
+    const maybeCanonicalRows = roleTextKey ? (dbMessagesByRoleText.get(roleTextKey) || []) : [];
+    if (maybeCanonicalRows.some((row) => isLikelyCanonicalDuplicateMessage(row, message))) continue;
     dbIdentityKeys.add(identityKey);
     if (!id) continue;
     messagesById.set(id, message);
@@ -875,6 +906,11 @@ export function registerSessionsRoutes(app, deps) {
         conversationId: sync?.conversationId || conversationId,
         runtimeSessionId: sync?.runtimeSessionId || null,
       });
+      io.emit('conversation_session_bound', {
+        conversationId: sync?.conversationId || conversationId,
+        sdkSessionId: sync?.sdkSessionId || sdkSessionId,
+        runtimeSessionId: sync?.runtimeSessionId || null,
+      });
       return res.json({
         ok: true,
         session: {
@@ -892,6 +928,7 @@ export function registerSessionsRoutes(app, deps) {
           terminal: rebind.terminal === true,
           expected: rebind.expected || null,
         } : null,
+        bindingState: 'bound',
         restartOrchestrator: rebind?.state || relayRestartOrchestrator?.getState?.() || null,
         activeBridgeOwner: relayBridgeOwnerService?.getOwner?.() || null,
       });

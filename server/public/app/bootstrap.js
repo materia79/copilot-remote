@@ -37,6 +37,8 @@ import {
   releaseComposerFocusAfterSend,
   autoResize,
   clearPendingUserMessage,
+  initSidebarLayout,
+  toggleSidebar,
 } from './store.js';
 import {
   verifyExistingSession,
@@ -734,12 +736,94 @@ function getChatTitleElements() {
   return {
     wrap: document.getElementById('chat-title-wrap'),
     title: document.getElementById('chat-title'),
-    editBtn: document.getElementById('chat-title-edit-btn'),
+    editBtn: document.getElementById('chat-actions-menu-btn'),
     editor: document.getElementById('chat-title-editor'),
     input: document.getElementById('chat-title-input'),
     saveBtn: document.getElementById('chat-title-save-btn'),
     cancelBtn: document.getElementById('chat-title-cancel-btn'),
   };
+}
+
+function closeChatActionsMenu() {
+  const menu = document.getElementById('chat-actions-menu');
+  const trigger = document.getElementById('chat-actions-menu-btn');
+  const backdrop = document.getElementById('chat-actions-menu-backdrop');
+  if (menu) menu.hidden = true;
+  if (trigger) trigger.setAttribute('aria-expanded', 'false');
+  if (backdrop && !window.__chatActionsMenuShieldTimer) backdrop.classList.remove('visible');
+}
+
+function toggleChatActionsMenu() {
+  const menu = document.getElementById('chat-actions-menu');
+  const trigger = document.getElementById('chat-actions-menu-btn');
+  if (!menu || !trigger || trigger.hidden || trigger.disabled) return;
+  const willOpen = !!menu.hidden;
+  menu.hidden = !willOpen;
+  trigger.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+}
+
+function lockChatActionsMenuShield(ms = 300) {
+  const backdrop = document.getElementById('chat-actions-menu-backdrop');
+  if (!backdrop) return;
+  if (window.__chatActionsMenuShieldTimer) {
+    window.clearTimeout(window.__chatActionsMenuShieldTimer);
+  }
+  backdrop.classList.add('visible');
+  window.__chatActionsMenuShieldTimer = window.setTimeout(() => {
+    window.__chatActionsMenuShieldTimer = null;
+    const menu = document.getElementById('chat-actions-menu');
+    if (menu?.hidden) backdrop.classList.remove('visible');
+  }, Math.max(150, Number(ms) || 300));
+}
+
+function bindTapAction(element, handler) {
+  if (!element || element.dataset.tapBound === '1') return;
+  element.dataset.tapBound = '1';
+  let suppressClickUntil = 0;
+  const markSuppressed = (ms = 450) => {
+    suppressClickUntil = Date.now() + Math.max(200, Number(ms) || 450);
+  };
+  element.addEventListener('pointerup', (event) => {
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    markSuppressed();
+    handler(event);
+  });
+  element.addEventListener('click', (event) => {
+    if (Date.now() < suppressClickUntil) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    handler(event);
+  });
+}
+
+function bindMenuAction(element, handler) {
+  if (!element || element.dataset.menuTapBound === '1') return;
+  element.dataset.menuTapBound = '1';
+  let suppressClickUntil = 0;
+  const markSuppressed = (ms = 450) => {
+    suppressClickUntil = Date.now() + Math.max(200, Number(ms) || 450);
+  };
+  element.addEventListener('pointerdown', (event) => {
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    markSuppressed();
+    handler(event);
+  }, true);
+  element.addEventListener('click', (event) => {
+    if (Date.now() < suppressClickUntil) {
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      return;
+    }
+    handler(event);
+  }, true);
 }
 
 function syncChatTitleControls() {
@@ -749,6 +833,7 @@ function syncChatTitleControls() {
     chatTitleEditingConversationId = null;
   }
   const editing = convId && chatTitleEditingConversationId === convId;
+  document.body.classList.toggle('chat-title-editing', !!editing);
   if (title) title.hidden = editing;
   if (editBtn) {
     editBtn.hidden = !convId;
@@ -772,28 +857,35 @@ function openChatTitleEditor() {
   const convId = String(currentConvId || '').trim();
   if (!convId) return;
   const { title, editBtn, editor, input } = getChatTitleElements();
+  closeChatActionsMenu();
   const currentTitle = String(conversations[convId]?.title || title?.textContent || convId).trim() || convId;
   chatTitleEditingConversationId = convId;
+  document.body.classList.add('chat-title-editing');
   if (title) title.hidden = true;
-  if (editBtn) editBtn.hidden = true;
+  if (editBtn) editBtn.disabled = true;
   if (editor) editor.hidden = false;
   if (input) {
     input.maxLength = CHAT_TITLE_MAX_LENGTH;
     input.value = currentTitle;
     requestAnimationFrame(() => {
       if (chatTitleEditingConversationId !== convId) return;
-      input.focus();
-      input.select();
+      window.setTimeout(() => {
+        if (chatTitleEditingConversationId !== convId) return;
+        input.focus({ preventScroll: true });
+        input.select();
+      }, 50);
     });
   }
 }
 
 function closeChatTitleEditor() {
   chatTitleEditingConversationId = null;
+  document.body.classList.remove('chat-title-editing');
   const { title, editBtn, editor, input } = getChatTitleElements();
+  closeChatActionsMenu();
   if (editor) editor.hidden = true;
   if (title) title.hidden = !String(currentConvId || '').trim();
-  if (editBtn) editBtn.hidden = !String(currentConvId || '').trim();
+  if (editBtn) editBtn.disabled = !String(currentConvId || '').trim();
   if (input) {
     const convId = String(currentConvId || '').trim();
     input.value = convId ? String(conversations[convId]?.title || title?.textContent || convId) : '';
@@ -952,6 +1044,21 @@ async function connectSocket() {
     applyConversationTitleUpdate(conversationId, title, updatedAt);
     syncChatTitleControls();
   });
+  socket.on('conversation_session_bound', async ({ conversationId, sdkSessionId, runtimeSessionId }) => {
+    const id = String(conversationId || '').trim();
+    if (!id) return;
+    if (conversations[id]) {
+      conversations[id] = {
+        ...conversations[id],
+        sdkSessionId: String(sdkSessionId || conversations[id].sdkSessionId || '').trim() || null,
+        runtimeSessionId: String(runtimeSessionId || conversations[id].runtimeSessionId || '').trim() || null,
+      };
+    }
+    await refreshConversations();
+    if (currentConvId === id) {
+      await openConversation(id);
+    }
+  });
   socket.on('message_status', ({ messageId, conversationId, status }) => {
     if (conversationId && conversations[conversationId]) {
       if (status === 'processing') {
@@ -1008,13 +1115,48 @@ async function initApp() {
   setupViewportTracking();
   document.getElementById('auth-gate').style.display = 'none';
   document.getElementById('app').classList.add('visible');
-  const chatTitleEditBtn = document.getElementById('chat-title-edit-btn');
-  if (chatTitleEditBtn && chatTitleEditBtn.dataset.bound !== '1') {
-    chatTitleEditBtn.dataset.bound = '1';
-    chatTitleEditBtn.addEventListener('click', (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      openChatTitleEditor();
+  initSidebarLayout();
+  const chatActionsMenuBtn = document.getElementById('chat-actions-menu-btn');
+  bindTapAction(chatActionsMenuBtn, (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    toggleChatActionsMenu();
+  });
+  const chatMenuEditBtn = document.getElementById('chat-menu-edit-title');
+  bindMenuAction(chatMenuEditBtn, (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    lockChatActionsMenuShield(350);
+    closeChatActionsMenu();
+    openChatTitleEditor();
+  });
+  const chatMenuCompactBtn = document.getElementById('chat-menu-compact');
+  bindMenuAction(chatMenuCompactBtn, (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    lockChatActionsMenuShield(350);
+    closeChatActionsMenu();
+    compactCurrentConversation().catch((error) => {
+      alert(error?.message || 'Failed to compact conversation');
+    });
+  });
+  const sidebarToggleBtn = document.getElementById('sidebar-toggle');
+  bindTapAction(sidebarToggleBtn, (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    toggleSidebar();
+  });
+  if (!window.__chatActionsMenuBound) {
+    window.__chatActionsMenuBound = true;
+    document.addEventListener('click', (event) => {
+      const menuWrap = document.getElementById('chat-actions-menu-wrap');
+      if (!menuWrap) return;
+      if (menuWrap.contains(event.target)) return;
+      closeChatActionsMenu();
+    });
+    document.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape') return;
+      closeChatActionsMenu();
     });
   }
   const chatTitleEditor = document.getElementById('chat-title-editor');
@@ -1082,7 +1224,7 @@ function registerPwaShell() {
   if (!('serviceWorker' in navigator)) return;
   const scopeBase = window.location.pathname.replace(/\/+$/, '');
   const scopeRoot = `${scopeBase}/`;
-  return navigator.serviceWorker.register(`${scopeBase}/sw.js`, { scope: scopeRoot, updateViaCache: 'none' }).catch(() => {});
+  return navigator.serviceWorker.register(`${scopeBase}/sw.js?v=10`, { scope: scopeRoot, updateViaCache: 'none' }).catch(() => {});
 }
 
 async function bootstrap() {
@@ -1112,6 +1254,7 @@ window.initApp = initApp;
 window.connectSocket = connectSocket;
 window.openSidebar = openSidebar;
 window.closeSidebar = closeSidebar;
+window.toggleSidebar = toggleSidebar;
 window.showUsage = showUsage;
 window.showContext = showContext;
 window.promptInstallApp = promptInstallApp;
@@ -1167,6 +1310,7 @@ window.renderSummaryModalContent = renderSummaryModalContent;
 window.setSummaryModalLoading = setSummaryModalLoading;
 window.openSummaryModal = openSummaryModal;
 window.syncChatTitleControls = syncChatTitleControls;
+window.closeChatActionsMenu = closeChatActionsMenu;
 
 bootstrap();
 

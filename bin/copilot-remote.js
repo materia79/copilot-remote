@@ -1,0 +1,351 @@
+#!/usr/bin/env node
+
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+import { randomUUID } from 'crypto';
+import { EventEmitter } from 'events';
+import { fileURLToPath } from 'url';
+import { spawn } from 'child_process';
+
+function resolvePackageRoot(metaUrl = import.meta.url) {
+  return path.resolve(path.dirname(fileURLToPath(metaUrl)), '..');
+}
+
+function parsePort(argv = []) {
+  const args = Array.isArray(argv) ? argv : [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = String(args[index] || '');
+    if (arg === '--port' && args[index + 1]) {
+      const parsed = Number.parseInt(String(args[index + 1]), 10);
+      if (Number.isInteger(parsed) && parsed > 0 && parsed <= 65535) return parsed;
+    }
+    if (arg.startsWith('--port=')) {
+      const parsed = Number.parseInt(arg.slice('--port='.length), 10);
+      if (Number.isInteger(parsed) && parsed > 0 && parsed <= 65535) return parsed;
+    }
+  }
+  return 3333;
+}
+
+function readRelayLock(lockPath) {
+  try {
+    const raw = fs.readFileSync(lockPath, 'utf8');
+    const parsed = JSON.parse(raw);
+    return {
+      pid: Number.parseInt(String(parsed?.pid ?? ''), 10),
+      startedAt: typeof parsed?.startedAt === 'string' ? parsed.startedAt : null,
+      token: typeof parsed?.token === 'string' ? parsed.token : '',
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readJsonFile(filePath) {
+  if (!filePath) return null;
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function writeJsonFile(filePath, value) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+}
+
+function openAppendFileDescriptor(filePath) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  return fs.openSync(filePath, 'a');
+}
+
+function getUserConfigDir() {
+  if (process.platform === 'win32') {
+    return path.join(
+      process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'),
+      'copilot-remote',
+    );
+  }
+  return path.join(
+    process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'),
+    'copilot-remote',
+  );
+}
+
+function getLauncherLogDir(env = process.env) {
+  const envLogDir = String(env.COPILOT_WEB_RELAY_LOG_DIR || '').trim();
+  if (envLogDir) return envLogDir;
+  return path.join(getUserConfigDir(), 'logs');
+}
+
+function createDefaultConfig({ port = 3333, token = '' } = {}) {
+  const parsedPort = Number.parseInt(String(port || ''), 10);
+  return {
+    authToken: String(token || '').trim() || randomUUID(),
+    port: Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65535 ? parsedPort : 3333,
+    localhostOnly: true,
+    pollIntervalMs: 3000,
+    conversationSessionMode: 'isolated',
+  };
+}
+
+function resolveLauncherConfig({ packageRoot, env = process.env, relayToken = '', relayPort = 3333 } = {}) {
+  const envConfigPath = String(env.COPILOT_WEB_RELAY_CONFIG || '').trim();
+  const repoConfigPath = path.join(packageRoot, 'server', 'config.json');
+  const seedPath = (
+    (envConfigPath && fs.existsSync(envConfigPath) && envConfigPath)
+    || (fs.existsSync(repoConfigPath) && repoConfigPath)
+    || null
+  );
+  const managedPath = path.join(getUserConfigDir(), 'config.json');
+  const configPath = seedPath || managedPath;
+  const seedConfig = readJsonFile(seedPath) || {};
+  const runtimeConfig = {
+    ...createDefaultConfig({ port: relayPort }),
+    ...seedConfig,
+  };
+  if (relayToken) runtimeConfig.authToken = relayToken;
+  if (!String(runtimeConfig.authToken || '').trim()) runtimeConfig.authToken = randomUUID();
+  const parsedPort = Number.parseInt(String(runtimeConfig.port || relayPort || 3333), 10);
+  runtimeConfig.port = Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65535
+    ? parsedPort
+    : 3333;
+  return {
+    configPath,
+    managed: !seedPath,
+    config: runtimeConfig,
+  };
+}
+
+export async function detectRunningRelay({
+  lockPath,
+  statusUrl,
+  fetchImpl = globalThis.fetch,
+  isProcessAliveImpl = isProcessAlive,
+} = {}) {
+  const lock = readRelayLock(lockPath);
+  if (Number.isInteger(lock?.pid) && isProcessAliveImpl(lock.pid)) {
+    return { running: true, source: 'lock', lock };
+  }
+
+  if (typeof fetchImpl === 'function' && statusUrl) {
+    try {
+      const response = await fetchImpl(statusUrl, { method: 'GET' });
+      if (response) {
+        return { running: true, source: 'status', lock };
+      }
+    } catch {
+      // Not running or unreachable.
+    }
+  }
+
+  return { running: false, source: null, lock };
+}
+
+export async function launchRelay({
+  argv = process.argv.slice(2),
+  cwd = process.cwd(),
+  packageRoot = resolvePackageRoot(),
+  nodeBin = process.execPath,
+  spawnImpl = spawn,
+  fetchImpl = globalThis.fetch,
+  env = process.env,
+  logger = console,
+} = {}) {
+  const args = Array.isArray(argv) ? [...argv] : [];
+  const separatorIdx = args.indexOf('--');
+  const launcherArgs = separatorIdx === -1 ? args : args.slice(0, separatorIdx);
+  const forwardedArgs = separatorIdx === -1 ? [] : args.slice(separatorIdx + 1);
+  if (args.includes('--help') || args.includes('-h')) {
+    logger.log([
+      'Usage: copilot-remote [--port <port>] [--token <token>] [-- [gh copilot args...]]',
+      '',
+      'Starts the web relay server if needed, then launches gh copilot in the current shell.',
+      'Install locally with: npm link  or  npm install -g .',
+    ].join('\n'));
+    return { code: 0, reason: 'help' };
+  }
+
+  const port = parsePort(launcherArgs);
+  const serverDir = path.join(packageRoot, 'server');
+  const lockPath = path.join(serverDir, 'data', 'relay-server.lock');
+  const statusUrl = `http://localhost:${port}/api/status`;
+  const running = await detectRunningRelay({
+    lockPath,
+    statusUrl,
+    fetchImpl,
+  });
+
+  const runtimeConfig = resolveLauncherConfig({
+    packageRoot,
+    env,
+    relayToken: running?.lock?.token || '',
+    relayPort: port,
+  });
+  if (runtimeConfig.managed || !fs.existsSync(runtimeConfig.configPath)) {
+    writeJsonFile(runtimeConfig.configPath, runtimeConfig.config);
+  }
+
+  const baseEnv = {
+    ...env,
+    COPILOT_WORKSPACE_ROOT: cwd,
+    COPILOT_WEB_RELAY_ROOT: packageRoot,
+    COPILOT_WEB_RELAY_SERVER_DIR: serverDir,
+    COPILOT_WEB_RELAY_CONFIG: runtimeConfig.configPath,
+    COPILOT_WEB_RELAY_LOG_DIR: getLauncherLogDir(env),
+  };
+
+  let serverProc = null;
+  let relayStartedByThisCommand = false;
+  if (running.running) {
+    const pid = Number.isInteger(running?.lock?.pid) ? running.lock.pid : null;
+    logger.log(
+      pid
+        ? `Copilot relay is already running (pid=${pid}) at ${statusUrl}.`
+        : `Copilot relay is already running at ${statusUrl}.`,
+    );
+  } else {
+    logger.log(`Starting Copilot relay from ${cwd}...`);
+    const serverArgs = [path.join(serverDir, 'server.js'), '--token', runtimeConfig.config.authToken, '--port', String(runtimeConfig.config.port)];
+    const logDir = getLauncherLogDir(baseEnv);
+    const serverLogPath = path.join(logDir, 'server.log');
+    const serverErrPath = path.join(logDir, 'server-err.log');
+    const serverOutFd = openAppendFileDescriptor(serverLogPath);
+    const serverErrFd = openAppendFileDescriptor(serverErrPath);
+    try {
+      serverProc = spawnImpl(nodeBin, serverArgs, {
+        cwd: packageRoot,
+        env: baseEnv,
+        stdio: ['ignore', serverOutFd, serverErrFd],
+        windowsHide: false,
+      });
+      relayStartedByThisCommand = true;
+    } catch (error) {
+      try { fs.closeSync(serverOutFd); } catch {}
+      try { fs.closeSync(serverErrFd); } catch {}
+      logger.error?.(`[copilot-remote] Failed to launch relay: ${error?.message || error}`);
+      return { code: 1, reason: 'spawn-failed', error };
+    }
+
+    if (!(serverProc instanceof EventEmitter) && typeof serverProc?.on !== 'function') {
+      return { code: 1, reason: 'spawn-invalid-child' };
+    }
+
+    const readyDeadlineMs = 20_000;
+    const ready = await new Promise((resolve) => {
+      const deadline = Date.now() + readyDeadlineMs;
+      const probe = async () => {
+        if (serverProc && serverProc.exitCode !== null) {
+          resolve(false);
+          return;
+        }
+        try {
+          const res = await fetchImpl(statusUrl, {
+            headers: { Authorization: `Bearer ${runtimeConfig.config.authToken}` },
+          });
+          if (res && res.ok) {
+            resolve(true);
+            return;
+          }
+        } catch {
+          // retry
+        }
+        if (Date.now() >= deadline) {
+          resolve(false);
+          return;
+        }
+        setTimeout(probe, 300);
+      };
+      probe();
+    });
+
+    if (!ready) {
+      logger.error?.(`[copilot-remote] Relay did not become ready at ${statusUrl}`);
+      try {
+        if (serverProc && typeof serverProc.kill === 'function') serverProc.kill();
+      } catch {}
+      try { fs.closeSync(serverOutFd); } catch {}
+      try { fs.closeSync(serverErrFd); } catch {}
+      return { code: 1, reason: 'server-not-ready' };
+    }
+
+    serverProc.once('exit', () => {
+      try { fs.closeSync(serverOutFd); } catch {}
+      try { fs.closeSync(serverErrFd); } catch {}
+    });
+  }
+
+  const ghArgs = forwardedArgs.length
+    ? ['copilot', '--', ...forwardedArgs]
+    : ['copilot'];
+  logger.log(`Launching Copilot CLI from ${cwd}...`);
+
+  let child;
+  try {
+    child = spawnImpl('gh', ghArgs, {
+      cwd,
+      env: baseEnv,
+      stdio: 'inherit',
+      windowsHide: false,
+    });
+  } catch (error) {
+    logger.error?.(`[copilot-remote] Failed to launch Copilot CLI: ${error?.message || error}`);
+    try {
+      if (relayStartedByThisCommand && serverProc && typeof serverProc.kill === 'function') serverProc.kill();
+    } catch {}
+    return { code: 1, reason: 'spawn-failed', error };
+  }
+
+  if (!(child instanceof EventEmitter) && typeof child?.on !== 'function') {
+    try {
+      if (relayStartedByThisCommand && serverProc && typeof serverProc.kill === 'function') serverProc.kill();
+    } catch {}
+    return { code: 1, reason: 'spawn-invalid-child' };
+  }
+
+  const exitCode = await new Promise((resolve) => {
+    child.on('exit', (code, signal) => {
+      resolve(code ?? (signal ? 1 : 0));
+    });
+    child.on('error', (error) => {
+      logger.error?.(`[copilot-remote] Copilot CLI process error: ${error?.message || error}`);
+      resolve(1);
+    });
+  });
+
+  if (relayStartedByThisCommand && serverProc && serverProc.exitCode === null) {
+    try {
+      serverProc.kill();
+    } catch {}
+  }
+
+  return { code: exitCode, reason: 'exited' };
+}
+
+function main() {
+  return launchRelay();
+}
+
+const executedName = process.argv[1] ? path.basename(String(process.argv[1])) : '';
+if (executedName === 'copilot-remote.js') {
+  main().then(({ code }) => {
+    process.exit(code ?? 0);
+  }).catch((error) => {
+    console.error(`[copilot-remote] Unhandled error: ${error?.message || error}`);
+    process.exit(1);
+  });
+}
+
+export { main, parsePort, readRelayLock, resolvePackageRoot };
