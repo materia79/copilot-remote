@@ -6,6 +6,7 @@ When changing anything related to the web relay (`server/` or `.github/extension
    - **Extension-managed (default):** let `.github/extensions/web-relay/extension.mjs` own server supervision and polling/heartbeat.
    - **Standalone dev mode:** `npm start` (starts `server.js` + `relay.mjs`) only when you intentionally are not relying on extension polling.
    - Never run `npm start`, `node server/relay.mjs`, and extension polling together.
+   - Never kill or restart the node process bound to port `3333` unless the user explicitly asks to kill or restart the web relay.
 2. Before any restart, stop stale relay/watchdog processes from earlier runs (especially detached shells) so only one web relay remains bound to `:3333`.
 3. For extension-managed mode, restart by restarting the CLI extension/session first. Use watchdog scripts only as manual fallback outside extension-managed mode:
    - `cd <repo-root>`

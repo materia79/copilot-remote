@@ -1468,6 +1468,7 @@ export function registerMessagesRoutes(app, deps) {
           queueDepth: Math.max(0, Number(counts.pendingCount || 0)),
         });
       }
+      sessionWorkerSupervisor?.noteSessionHeartbeat?.(requesterSessionId);
     }
     const restartProbe = relayRestartOrchestrator?.onDequeueProbe({
       processingCount: counts.processingCount,

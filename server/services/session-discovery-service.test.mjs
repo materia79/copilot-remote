@@ -52,7 +52,7 @@ test('discoverSessionStateConversations uses workspace summary/name for title', 
   assert.equal(byId.get(summarySessionId)?.updatedAt, '2026-05-21T17:30:00.000Z');
   assert.equal(byId.get(nameSessionId)?.title, 'Verify Session Delete Flow');
   assert.equal(byId.get(nameSessionId)?.updatedAt, '2026-05-21T17:31:00.000Z');
-  assert.equal(byId.get(fallbackSessionId)?.title, `Session ${fallbackSessionId.slice(0, 8)}`);
+  assert.equal(byId.get(fallbackSessionId)?.title, 'Session');
 });
 
 test('discoverSessionStateConversations uses freshest timestamp between workspace and events', () => {

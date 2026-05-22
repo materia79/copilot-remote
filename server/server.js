@@ -828,6 +828,7 @@ const relayCliLauncherService = createRelayCliLauncherService({
   env: process.env,
   log: (message) => console.log(`[${ts()}] ${message}`),
 });
+const workerStartupMonitoringPlanPath = path.join(INITIAL_WORKSPACE_ROOT, '.cursor', 'plans', 'worker-startup-monitoring-plan.md');
 function spawnSessionWorkerCli(targetSessionId) {
   const normalizedTargetSessionId = String(targetSessionId || '').trim();
   if (!normalizedTargetSessionId) {
@@ -856,6 +857,8 @@ function spawnSessionWorkerCli(targetSessionId) {
 const sessionWorkerSupervisor = createSessionWorkerSupervisor({
   registry: sessionWorkerRegistry,
   spawnWorker: async (sdkSessionId) => spawnSessionWorkerCli(sdkSessionId),
+  diagnosticPlanReference: workerStartupMonitoringPlanPath,
+  log: (message) => console.warn(`[${ts()}] ${message}`),
 });
 const featureFlags = normalizeFeatureFlags(FEATURES);
 
@@ -2645,7 +2648,7 @@ function bootstrapRuntimeSessionBindings() {
       if (!conversationId || tombstonedSessions.has(conversationId)) continue;
 
       const existingConversation = stmts.getConvAnyStatus.get(conversationId) || null;
-      const discoveredTitle = String(item?.title || '').trim() || `Session ${conversationId.slice(0, 8)}`;
+      const discoveredTitle = String(item?.title || '').trim() || 'Session';
       if (!existingConversation) {
         stmts.insertConv.run(conversationId, discoveredTitle, discoveredUpdatedAt, discoveredUpdatedAt);
       }

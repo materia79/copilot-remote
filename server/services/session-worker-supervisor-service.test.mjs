@@ -12,13 +12,28 @@ test('ensureWorker creates ready worker for session and reuses it', async () => 
   assert.equal(first.reused, false);
   assert.equal(first.worker.sdkSessionId, 'sdk-a');
   assert.equal(first.worker.status, 'ready');
+  assert.equal(first.lifecycle?.uiState, 'white');
+  assert.equal(first.lifecycle?.awaitingHeartbeat, true);
 
   const second = await supervisor.ensureWorker('sdk-a');
   assert.equal(second.ok, true);
   assert.equal(second.reused, true);
   assert.equal(second.worker.sdkSessionId, 'sdk-a');
   assert.equal(second.lifecycle?.retryCount ?? 0, 0);
-  assert.equal(second.lifecycle?.uiState, 'green');
+  assert.equal(second.lifecycle?.uiState, 'white');
+  assert.equal(second.lifecycle?.awaitingHeartbeat, true);
+
+  supervisor.noteSessionHeartbeat('sdk-a');
+  const snapshot = supervisor.snapshot();
+  const worker = snapshot.workers.find((row) => row.sdkSessionId === 'sdk-a');
+  assert.equal(worker.uiState, 'green');
+  assert.equal(worker.awaitingHeartbeat, false);
+
+  const third = await supervisor.ensureWorker('sdk-a');
+  assert.equal(third.ok, true);
+  assert.equal(third.reused, true);
+  assert.equal(third.lifecycle?.uiState, 'green');
+  assert.equal(third.lifecycle?.awaitingHeartbeat, false);
 });
 
 test('ensureWorker applies retry backoff and enforces bounded restart attempts', async () => {
@@ -197,6 +212,8 @@ test('ensureWorker reuses a live worker even when its heartbeat is stale', async
   assert.equal(result.ok, true);
   assert.equal(result.reused, true);
   assert.equal(result.worker.pid, 7777);
+  assert.equal(result.lifecycle?.uiState, 'white');
+  assert.equal(result.lifecycle?.awaitingHeartbeat, true);
   assert.equal(spawnCalls, 0);
 });
 
@@ -260,6 +277,7 @@ test('processing workers remain green when the pid is still alive', async () => 
   });
 
   await supervisor.ensureWorker('sdk-busy');
+  supervisor.noteSessionHeartbeat('sdk-busy');
   supervisor.markProcessing('sdk-busy', 1);
   currentTime += 5_000;
 
@@ -287,6 +305,7 @@ test('status precedence favors yellow over red/green and never reports green whe
   await supervisor.ensureWorker('sdk-precedence-yellow');
   await supervisor.ensureWorker('sdk-precedence-red');
   await supervisor.ensureWorker('sdk-precedence-green');
+  supervisor.noteSessionHeartbeat('sdk-precedence-green');
   let snapshot = supervisor.snapshot({ pendingQuestionSessionIds: ['sdk-precedence-yellow', 'sdk-precedence-red'] });
   const yellowWorker = snapshot.workers.find((row) => row.sdkSessionId === 'sdk-precedence-yellow');
   const redWorker = snapshot.workers.find((row) => row.sdkSessionId === 'sdk-precedence-red');
@@ -389,7 +408,7 @@ test('heartbeat clears restart exhaustion once a live worker comes back', async 
   assert.equal(worker.stalePidDetected, false);
 });
 
-test('stale heartbeat alone does not turn a live worker yellow', async () => {
+test('live worker remains green between heartbeats once observed', async () => {
   const registry = createSessionWorkerRegistry();
   let currentTime = Date.parse('2026-01-01T00:00:00.000Z');
   const supervisor = createSessionWorkerSupervisor({
@@ -400,9 +419,15 @@ test('stale heartbeat alone does not turn a live worker yellow', async () => {
     isPidAlive: () => true,
   });
   await supervisor.ensureWorker('sdk-heartbeat');
-  currentTime += 2_000;
   let snapshot = supervisor.snapshot();
   let worker = snapshot.workers.find((row) => row.sdkSessionId === 'sdk-heartbeat');
+  assert.equal(worker.uiState, 'white');
+  assert.equal(worker.awaitingHeartbeat, true);
+
+  supervisor.noteSessionHeartbeat('sdk-heartbeat');
+  currentTime += 2_000;
+  snapshot = supervisor.snapshot();
+  worker = snapshot.workers.find((row) => row.sdkSessionId === 'sdk-heartbeat');
   assert.equal(worker.uiState, 'green');
   assert.equal(worker.degradedReason, null);
 
@@ -417,5 +442,39 @@ test('stale heartbeat alone does not turn a live worker yellow', async () => {
   snapshot = supervisor.snapshot();
   worker = snapshot.workers.find((row) => row.sdkSessionId === 'sdk-heartbeat');
   assert.equal(worker.uiState, 'green');
+});
+
+test('startup timeout exposes monitoring diagnostics and plan reference', async () => {
+  const registry = createSessionWorkerRegistry();
+  let currentTime = Date.parse('2026-01-01T00:00:00.000Z');
+  const planPath = 'C:\\git\\copilot-remote\\.cursor\\plans\\worker-startup-monitoring-plan.md';
+  const monitorLogs = [];
+  const supervisor = createSessionWorkerSupervisor({
+    registry,
+    now: () => currentTime,
+    heartbeatTimeoutMs: 1_000,
+    degradedRecoveryGraceMs: 2_000,
+    isPidAlive: () => true,
+    diagnosticPlanReference: planPath,
+    log: (message) => monitorLogs.push(message),
+    spawnWorker: async () => ({ workerId: 'worker-timeout', pid: 4321 }),
+  });
+
+  const result = await supervisor.ensureWorker('sdk-timeout');
+  assert.equal(result.ok, true);
+  assert.equal(result.lifecycle?.uiState, 'white');
+  assert.equal(result.lifecycle?.awaitingHeartbeat, true);
+
+  currentTime += 1_500;
+  const snapshot = supervisor.snapshot();
+  const worker = snapshot.workers.find((row) => row.sdkSessionId === 'sdk-timeout');
+  assert.equal(worker.uiState, 'yellow');
+  assert.equal(worker.degradedReason, 'startup-heartbeat-timeout');
+  assert.equal(worker.launchMode, 'spawned');
+  assert.equal(worker.awaitingHeartbeat, true);
+  assert.equal(worker.diagnosticPlanReference, planPath);
+  assert.ok(worker.readyWithoutHeartbeatMs >= 1_500);
+  assert.equal(monitorLogs.length, 1);
+  assert.match(monitorLogs[0], /startup-heartbeat-timeout/);
 });
 

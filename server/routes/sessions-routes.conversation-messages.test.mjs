@@ -42,7 +42,7 @@ test('selectConversationHistoryPage clamps limit and advances cursors', () => {
   assert.deepEqual(timestampPage.messages.map((message) => message.id), ['m2', 'm3']);
 });
 
-test('buildConversationMessages keeps DB rows canonical when persisted history exists', () => {
+test('buildConversationMessages keeps DB rows canonical and includes transcript-only history', () => {
   const responseMessageToSourceId = new Map([
     ['a1', 'u1'],
     ['a2', 'u2'],
@@ -94,15 +94,54 @@ test('buildConversationMessages keeps DB rows canonical when persisted history e
     responseMessageToSourceId,
   });
 
-  assert.deepEqual(messages.map((message) => message.id), ['u2', 'a2']);
+  assert.deepEqual(messages.map((message) => message.id), ['u1', 'a1', 'u2', 'a2']);
+  assert.equal(messages.find((message) => message.id === 'u1')?.text, 'transcript user 1');
+  assert.equal(messages.find((message) => message.id === 'a1')?.text, 'transcript assistant 1');
   assert.equal(messages.find((message) => message.id === 'u2')?.text, 'db user 2');
   assert.equal(messages.find((message) => message.id === 'a2')?.text, 'db assistant 2');
   assert.equal(messages.find((message) => message.id === 'a2')?.sourceMessageId, 'u2');
   assert.deepEqual(messages.find((message) => message.id === 'a2')?.activities, ['Tool (view): transcript file']);
 
   const history = selectConversationHistoryPage(messages, { limit: 4 });
-  assert.deepEqual(history.messages.map((message) => message.id), ['u2', 'a2']);
+  assert.deepEqual(history.messages.map((message) => message.id), ['u1', 'a1', 'u2', 'a2']);
   assert.equal(history.pageInfo.hasMore, false);
+});
+
+test('buildConversationMessages avoids duplicate transcript rows when ids differ but content matches DB', () => {
+  const messages = buildConversationMessages({
+    dbMessages: [
+      {
+        id: 'db-u1',
+        role: 'user',
+        text: 'hello there',
+        timestamp: '2026-05-22T00:00:01.000Z',
+      },
+      {
+        id: 'db-a1',
+        role: 'assistant',
+        text: 'general kenobi',
+        timestamp: '2026-05-22T00:00:02.000Z',
+      },
+    ],
+    transcriptMessages: [
+      {
+        id: 'tx-u1',
+        role: 'user',
+        text: 'hello there',
+        timestamp: '2026-05-22T00:00:01.000Z',
+      },
+      {
+        id: 'tx-a1',
+        role: 'assistant',
+        text: 'general kenobi',
+        timestamp: '2026-05-22T00:00:02.000Z',
+        activities: ['Thought: from transcript'],
+      },
+    ],
+  });
+
+  assert.deepEqual(messages.map((message) => message.id), ['db-u1', 'db-a1']);
+  assert.deepEqual(messages.find((message) => message.id === 'db-a1')?.activities, []);
 });
 
 test('buildConversationMessages falls back to transcript rows when no DB messages exist', () => {

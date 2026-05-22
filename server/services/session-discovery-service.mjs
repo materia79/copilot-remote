@@ -102,7 +102,7 @@ export function createSessionDiscoveryService({ fs, path, resolveSessionStateRoo
       sessions.push({
         sdkSessionId: sessionId,
         updatedAt: pickLatestIso(workspaceMeta.updatedAt, updatedAtIso) || new Date().toISOString(),
-        title: workspaceMeta.title || `Session ${sessionId.slice(0, 8)}`,
+        title: workspaceMeta.title || 'Session',
       });
     }
 

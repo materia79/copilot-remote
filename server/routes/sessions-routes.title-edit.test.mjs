@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
   normalizeConversationTitle,
   persistConversationTitle,
@@ -96,5 +99,43 @@ test('persistConversationTitle inserts missing conversations so title edits stay
   assert.equal(row.title, 'Manual session title');
   assert.equal(row.title_source, 'manual');
   assert.equal(row.sdk_session_id, 'sdk-123');
+  db.close();
+});
+
+test('persistConversationTitle updates the SDK workspace yaml title', () => {
+  const { db, stmts, io } = createHarness();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'copilot-title-sync-'));
+  const sessionId = 'sdk-xyz';
+  const sessionDir = path.join(root, sessionId);
+  const workspacePath = path.join(sessionDir, 'workspace.yaml');
+  fs.mkdirSync(sessionDir, { recursive: true });
+  fs.writeFileSync(workspacePath, [
+    `id: ${sessionId}`,
+    'summary: Old title',
+    'name: Old title',
+    'updated_at: 2026-01-01T00:00:00.000Z',
+    'modified: 2026-01-01T00:00:00.000Z',
+  ].join('\n'), 'utf8');
+  db.prepare(`
+    INSERT INTO conversations (id, title, title_source, sdk_session_id, status, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run('conv-sync', 'Old title', 'auto', sessionId, 'active', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+
+  const result = persistConversationTitle({
+    db,
+    stmts,
+    io,
+    conversationId: 'conv-sync',
+    title: 'Renamed session title',
+    resolveSessionStateRoot: () => root,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.workspaceYamlPath, workspacePath);
+  const updated = fs.readFileSync(workspacePath, 'utf8');
+  assert.match(updated, /^summary:\s*Renamed session title$/m);
+  assert.match(updated, /^name:\s*Renamed session title$/m);
+  assert.match(updated, /^updated_at:\s*/m);
+  assert.match(updated, /^modified:\s*/m);
   db.close();
 });

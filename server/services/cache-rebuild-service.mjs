@@ -103,6 +103,13 @@ export function createCacheRebuildService({
   function fullWipeCache() {
     const now = new Date().toISOString();
     const conversationIds = activity.conversationRows.all().map((row) => normalizeId(row?.id)).filter(Boolean);
+    const manualTitleConversations = db.prepare(`
+      SELECT id
+      FROM conversations
+      WHERE status != 'deleted'
+        AND title_source = 'manual'
+    `).all().map((row) => normalizeId(row?.id)).filter(Boolean);
+    const manualTitleConversationSet = new Set(manualTitleConversations);
     const uploadHashes = [];
     for (const conversationId of conversationIds) {
       for (const hash of collectOrphanedUploadsFromConversation(conversationId)) {
@@ -116,7 +123,20 @@ export function createCacheRebuildService({
       db.prepare(`DELETE FROM queue`).run();
       db.prepare(`DELETE FROM messages`).run();
       db.prepare(`DELETE FROM runtime_sessions`).run();
-      db.prepare(`DELETE FROM conversations`).run();
+      db.prepare(`DELETE FROM conversations WHERE status = 'deleted' OR title_source != 'manual'`).run();
+      for (const conversationId of manualTitleConversations) {
+        db.prepare(`
+          UPDATE conversations
+          SET archived = 0,
+              status = 'active',
+              compacted_into = NULL,
+              compacted_from = NULL,
+              summary_seed = NULL,
+              seed_pending = 0,
+              updated_at = ?
+          WHERE id = ?
+        `).run(now, conversationId);
+      }
       db.prepare(`DELETE FROM deleted_sdk_sessions`).run();
       db.prepare(`DELETE FROM sdk_delete_requests`).run();
       db.prepare(`DELETE FROM upload_refs`).run();
@@ -139,7 +159,8 @@ export function createCacheRebuildService({
 
     return {
       wipedAt: now,
-      conversationsRemoved: conversationIds.length,
+      conversationsRemoved: conversationIds.length - manualTitleConversations.length,
+      manualTitleConversationsRetained: manualTitleConversationSet.size,
       uploadsRemoved: uploadHashes.length,
     };
   }

@@ -26,6 +26,100 @@ export function normalizeConversationTitle(value) {
   return title.slice(0, MAX_CONVERSATION_TITLE_LENGTH);
 }
 
+function replaceYamlScalarLine(content, key, value) {
+  const nextKey = String(key || '').trim();
+  if (!nextKey) return String(content || '');
+  const replacement = `${nextKey}: ${value}`;
+  const pattern = new RegExp(`^\\s*${nextKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*:\\s*.*$`, 'im');
+  const text = String(content || '');
+  if (pattern.test(text)) {
+    return text.replace(pattern, replacement);
+  }
+  const trimmed = text.trimEnd();
+  if (!trimmed) return `${replacement}\n`;
+  return `${trimmed}\n${replacement}\n`;
+}
+
+function buildWorkspaceYamlTitleContent(existingContent, { sessionId = '', title = '', updatedAt = '' } = {}) {
+  const sid = String(sessionId || '').trim();
+  const nextTitle = normalizeConversationTitle(title);
+  const iso = String(updatedAt || '').trim() || new Date().toISOString();
+  const existingText = String(existingContent || '');
+
+  if (!existingText.trim()) {
+    return [
+      `id: ${sid}`,
+      `summary: ${nextTitle}`,
+      `name: ${nextTitle}`,
+      `updated_at: ${iso}`,
+      `modified: ${iso}`,
+      '',
+    ].join('\n');
+  }
+
+  return replaceYamlScalarLine(
+    replaceYamlScalarLine(
+      replaceYamlScalarLine(
+        replaceYamlScalarLine(existingText, 'summary', nextTitle),
+        'name',
+        nextTitle,
+      ),
+      'updated_at',
+      iso,
+    ),
+    'modified',
+    iso,
+  ).replace(/\s*$/, '\n');
+}
+
+function updateConversationWorkspaceTitle({
+  resolveSessionStateRoot = null,
+  conversationId = '',
+  sdkSessionId = '',
+  title = '',
+  updatedAt = '',
+} = {}) {
+  if (typeof resolveSessionStateRoot !== 'function') {
+    return { ok: true, updated: false, reason: 'missing-session-root-resolver' };
+  }
+
+  const sid = String(sdkSessionId || conversationId || '').trim();
+  if (!sid) {
+    return { ok: true, updated: false, reason: 'missing-session-id' };
+  }
+
+  const root = String(resolveSessionStateRoot() || '').trim();
+  if (!root) {
+    return { ok: true, updated: false, reason: 'missing-session-root' };
+  }
+
+  const sessionRootPath = path.join(root, sid);
+  if (!fs.existsSync(sessionRootPath)) {
+    return { ok: true, updated: false, reason: 'missing-session-directory', sessionRootPath };
+  }
+
+  const stat = fs.statSync(sessionRootPath);
+  if (!stat.isDirectory()) {
+    return { ok: true, updated: false, reason: 'session-root-not-directory', sessionRootPath };
+  }
+
+  const workspaceYamlPath = path.join(sessionRootPath, 'workspace.yaml');
+  const existingContent = fs.existsSync(workspaceYamlPath)
+    ? fs.readFileSync(workspaceYamlPath, 'utf8')
+    : '';
+  const nextContent = buildWorkspaceYamlTitleContent(existingContent, {
+    sessionId: sid,
+    title,
+    updatedAt,
+  });
+  fs.writeFileSync(workspaceYamlPath, nextContent, 'utf8');
+  return {
+    ok: true,
+    updated: true,
+    workspaceYamlPath,
+  };
+}
+
 export function resolveConversationTitle({ title = '', titleSource = '', discoveredTitle = '' } = {}) {
   const storedTitle = String(title || '').trim();
   const source = String(titleSource || '').trim().toLowerCase();
@@ -40,6 +134,7 @@ export function persistConversationTitle({
   io = null,
   conversationId = '',
   title = '',
+  resolveSessionStateRoot = null,
 } = {}) {
   const id = String(conversationId || '').trim();
   const nextTitle = normalizeConversationTitle(title);
@@ -74,10 +169,19 @@ export function persistConversationTitle({
     db.prepare(`UPDATE conversations SET title = ?, title_source = 'manual', updated_at = ? WHERE id = ?`).run(nextTitle, updatedAt, id);
   }
 
+  const workspaceResult = updateConversationWorkspaceTitle({
+    resolveSessionStateRoot,
+    conversationId: id,
+    sdkSessionId: existing?.sdk_session_id || id,
+    title: nextTitle,
+    updatedAt,
+  });
+
   const payload = {
     conversationId: id,
     title: nextTitle,
     updatedAt,
+    workspaceYamlPath: workspaceResult.updated ? workspaceResult.workspaceYamlPath : null,
   };
   io?.emit?.('conversation_title_updated', payload);
   return { ok: true, ...payload, created: !existing };
@@ -201,7 +305,7 @@ export function buildConversationSessionRootPayload({
   return {
     sdkSessionId: sid,
     sessionRootPath: rootPath,
-    sessionRootName: String(title || '').trim() || `Session ${sid.slice(0, 8)}`,
+    sessionRootName: String(title || '').trim() || 'Session',
   };
 }
 
@@ -215,6 +319,17 @@ function mergeUniqueActivityTexts(primary = [], secondary = []) {
     merged.push(text);
   }
   return merged;
+}
+
+function normalizeConversationMessageIdentityText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function conversationMessageIdentityKey(message) {
+  const role = String(message?.role || '').trim().toLowerCase();
+  const timestamp = String(message?.timestamp || '').trim();
+  const text = normalizeConversationMessageIdentityText(message?.text);
+  return `${role}::${timestamp}::${text}`;
 }
 
 function normalizeConversationTimestampMs(value) {
@@ -324,13 +439,26 @@ export function buildConversationMessages({
         };
       })
     : [];
+  const normalizedTranscriptMessages = (Array.isArray(transcriptMessages) ? transcriptMessages : []).map((message) => {
+    const id = String(message?.id || '').trim();
+    return {
+      ...message,
+      id,
+      activities: mergeUniqueActivityTexts(
+        Array.isArray(message?.activities) ? message.activities : [],
+        id ? (relayActivitiesByMessageId.get(id) || []) : [],
+      ),
+      text: stripRelayPromptContext(message?.text, message?.mode),
+      sourceMessageId: message?.role === 'assistant'
+        ? (responseMessageToSourceId.get(id) || message?.sourceMessageId || undefined)
+        : message?.sourceMessageId,
+    };
+  });
 
   const transcriptById = new Map(
-    Array.isArray(transcriptMessages)
-      ? transcriptMessages
-          .map((message) => [String(message?.id || '').trim(), message])
-          .filter(([id]) => !!id)
-      : [],
+    normalizedTranscriptMessages
+      .map((message) => [String(message?.id || '').trim(), message])
+      .filter(([id]) => !!id),
   );
 
   const messagesById = new Map();
@@ -339,23 +467,12 @@ export function buildConversationMessages({
   }
 
   if (normalizedDbMessages.length === 0) {
-    const transcriptOnlyMessages = Array.isArray(transcriptMessages) ? transcriptMessages : [];
-    const normalizedTranscriptMessages = transcriptOnlyMessages.map((message) => {
-      const id = String(message?.id || '').trim();
-      return {
-        ...message,
-        activities: mergeUniqueActivityTexts(
-          Array.isArray(message?.activities) ? message.activities : [],
-          id ? (relayActivitiesByMessageId.get(id) || []) : [],
-        ),
-        text: stripRelayPromptContext(message?.text, message?.mode),
-        sourceMessageId: message?.role === 'assistant'
-          ? (responseMessageToSourceId.get(id) || message?.sourceMessageId || undefined)
-          : message?.sourceMessageId,
-      };
-    });
     return normalizedTranscriptMessages.slice().sort(compareConversationMessageOrder);
   }
+
+  const dbIdentityKeys = new Set(
+    normalizedDbMessages.map((message) => conversationMessageIdentityKey(message)),
+  );
 
   for (const message of transcriptById.values()) {
     const id = String(message?.id || '').trim();
@@ -373,6 +490,16 @@ export function buildConversationMessages({
       ),
       text: stripRelayPromptContext(existing.text, existing.mode),
     });
+  }
+
+  for (const message of normalizedTranscriptMessages) {
+    const id = String(message?.id || '').trim();
+    if (id && messagesById.has(id)) continue;
+    const identityKey = conversationMessageIdentityKey(message);
+    if (dbIdentityKeys.has(identityKey)) continue;
+    dbIdentityKeys.add(identityKey);
+    if (!id) continue;
+    messagesById.set(id, message);
   }
 
   return Array.from(messagesById.values()).sort(compareConversationMessageOrder);
@@ -586,7 +713,7 @@ export function registerSessionsRoutes(app, deps) {
       const syntheticConversation = {
         id: sdkSessionId,
         sdkSessionId,
-        title: String(item?.title || '').trim() || `Session ${sdkSessionId.slice(0, 8)}`,
+        title: String(item?.title || '').trim() || 'Session',
         archived: false,
         compactedInto: null,
         compactedFrom: null,
@@ -866,7 +993,7 @@ export function registerSessionsRoutes(app, deps) {
       if (!match) return res.status(404).json({ error: 'Conversation not found' });
       const runtimeSession = stmts.getRuntimeSessionBySdkSessionId.get(requestedId) || null;
       const updatedAt = String(match?.updatedAt || '').trim() || new Date().toISOString();
-      const discoveredTitle = String(match?.title || '').trim() || `Session ${requestedId.slice(0, 8)}`;
+      const discoveredTitle = String(match?.title || '').trim() || 'Session';
       const transcriptMessages = readSessionTranscriptMessages(requestedId, { limit: Number.POSITIVE_INFINITY });
       const history = selectConversationHistoryPage(
         buildConversationMessages({
@@ -993,6 +1120,7 @@ export function registerSessionsRoutes(app, deps) {
       io,
       conversationId,
       title: req.body?.title,
+      resolveSessionStateRoot,
     });
     if (!result.ok) {
       return res.status(result.statusCode || 500).json({ error: result.error || 'Failed to update conversation title' });

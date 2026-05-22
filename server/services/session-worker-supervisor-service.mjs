@@ -62,6 +62,8 @@ export function createSessionWorkerSupervisor({
   heartbeatTimeoutMs = 30_000,
   degradedRecoveryGraceMs = 10_000,
   isPidAlive = defaultIsPidAlive,
+  diagnosticPlanReference = null,
+  log = null,
 } = {}) {
   if (!registry) {
     throw new Error('createSessionWorkerSupervisor requires registry');
@@ -75,6 +77,13 @@ export function createSessionWorkerSupervisor({
   const idleTimeoutMs = clampInt(idleEvictionMs, 0);
   const heartbeatStaleAfterMs = Math.max(1_000, clampInt(heartbeatTimeoutMs, 30_000));
   const recoveryGraceMs = Math.max(0, clampInt(degradedRecoveryGraceMs, 10_000));
+  const planReference = normalizeSessionId(diagnosticPlanReference);
+
+  function emitMonitorLog(message) {
+    if (typeof log === 'function') {
+      log(message);
+    }
+  }
 
   function nowMs() {
     return toSafeNowMs(now);
@@ -95,10 +104,6 @@ export function createSessionWorkerSupervisor({
     if (existing) return existing;
     const seed = registry.getWorker(sessionId);
     const nowAtMs = nowMs();
-    const seededLastHeartbeatAtMs = Date.parse(String(seed?.updatedAt || ''));
-    const initialHeartbeatAtMs = Number.isFinite(seededLastHeartbeatAtMs)
-      ? seededLastHeartbeatAtMs
-      : nowAtMs;
     const state = {
       retryCount: Math.max(0, clampInt(seed?.retryCount, 0)),
       backoffMs: 0,
@@ -110,11 +115,17 @@ export function createSessionWorkerSupervisor({
       uiState: 'white',
       degradedReason: null,
       degradedAtMs: null,
-      lastHeartbeatAtMs: initialHeartbeatAtMs,
+      lastHeartbeatAtMs: null,
       failureCount: 0,
       stalePidDetected: false,
       recoveryCandidateAtMs: null,
       questionPending: false,
+      launchMode: null,
+      launchPid: null,
+      launchAtMs: null,
+      awaitingHeartbeat: false,
+      firstObservedHeartbeatAtMs: null,
+      monitorLoggedAtMs: null,
     };
     lifecycleBySession.set(sessionId, state);
     return state;
@@ -144,6 +155,15 @@ export function createSessionWorkerSupervisor({
       failureCount: clampInt(lifecycle.failureCount, 0),
       stalePidDetected: Boolean(lifecycle.stalePidDetected),
       questionPending: Boolean(lifecycle.questionPending),
+      launchMode: lifecycle.launchMode || null,
+      launchPid: Number.isInteger(Number(lifecycle.launchPid)) ? Number(lifecycle.launchPid) : null,
+      launchAt: lifecycle.launchAtMs ? new Date(lifecycle.launchAtMs).toISOString() : null,
+      awaitingHeartbeat: Boolean(lifecycle.awaitingHeartbeat),
+      firstObservedHeartbeatAt: lifecycle.firstObservedHeartbeatAtMs ? new Date(lifecycle.firstObservedHeartbeatAtMs).toISOString() : null,
+      readyWithoutHeartbeatMs: lifecycle.awaitingHeartbeat && lifecycle.launchAtMs
+        ? Math.max(0, nowMs() - lifecycle.launchAtMs)
+        : 0,
+      diagnosticPlanReference: planReference || null,
     };
   }
 
@@ -152,10 +172,46 @@ export function createSessionWorkerSupervisor({
   }
 
   function noteHeartbeat(sessionId, atMs = nowMs()) {
-    return setLifecycle(sessionId, {
+    const lifecycle = getOrCreateLifecycle(sessionId);
+    const patch = {
       lastHeartbeatAtMs: atMs,
       lastActivityAtMs: atMs,
+    };
+    if (lifecycle.awaitingHeartbeat) {
+      patch.awaitingHeartbeat = false;
+      patch.firstObservedHeartbeatAtMs = lifecycle.firstObservedHeartbeatAtMs || atMs;
+      patch.monitorLoggedAtMs = null;
+    }
+    return setLifecycle(sessionId, patch);
+  }
+
+  function noteLaunch(sessionId, { mode = null, pid = null, atMs = nowMs() } = {}) {
+    return setLifecycle(sessionId, {
+      launchMode: String(mode || '').trim() || null,
+      launchPid: Number.isInteger(Number(pid)) ? Number(pid) : null,
+      launchAtMs: atMs,
+      awaitingHeartbeat: true,
+      firstObservedHeartbeatAtMs: null,
+      monitorLoggedAtMs: null,
+      uiState: 'white',
+      degradedReason: null,
+      degradedAtMs: null,
+      stalePidDetected: false,
+      recoveryCandidateAtMs: null,
     });
+  }
+
+  function maybeLogStartupIssue(sessionId, reason, worker, nowAtMs) {
+    const lifecycle = getOrCreateLifecycle(sessionId);
+    if (lifecycle.monitorLoggedAtMs) return;
+    const pid = Number.isInteger(Number(worker?.pid)) ? Number(worker.pid) : null;
+    const readyWithoutHeartbeatMs = lifecycle.launchAtMs
+      ? Math.max(0, nowAtMs - lifecycle.launchAtMs)
+      : 0;
+    emitMonitorLog(
+      `[worker-monitor] session=${sessionId} reason=${String(reason || 'unknown')} mode=${String(lifecycle.launchMode || 'unknown')} pid=${pid || 'none'} readyWithoutHeartbeatMs=${readyWithoutHeartbeatMs}${planReference ? ` plan=${planReference}` : ''}`,
+    );
+    setLifecycle(sessionId, { monitorLoggedAtMs: nowAtMs });
   }
 
   function registerDegradedState(sessionId, reason, {
@@ -218,11 +274,16 @@ export function createSessionWorkerSupervisor({
     const hasErrorStatus = workerStatus === 'error';
     const expectingReply = Boolean(questionPending) || workerStatus === 'processing';
     const pidProbe = checkPidLiveness(worker);
+    const awaitingHeartbeat = Boolean(lifecycle.awaitingHeartbeat);
+    const startupHeartbeatOverdue = awaitingHeartbeat
+      && lifecycle.launchAtMs
+      && (nowAtMs - lifecycle.launchAtMs) >= heartbeatStaleAfterMs;
     const healthyCandidate = workerPresent
       && ACTIVE_WORKER_STATUSES.has(workerStatus)
       && hasWorkerIdentity(worker)
       && (!pidProbe.checked || pidProbe.alive)
       && !hasErrorStatus
+      && !awaitingHeartbeat
       && !questionPending;
 
     if (lifecycle.restartExhausted && healthyCandidate) {
@@ -235,8 +296,12 @@ export function createSessionWorkerSupervisor({
       registerDegradedState(sessionId, 'restart-exhausted', { atMs: nowAtMs });
     } else if (hasErrorStatus) {
       registerDegradedState(sessionId, String(worker?.lastError || lifecycle.lastError || 'worker-error'), { atMs: nowAtMs });
-    } else if (expectedAlive && pidProbe.checked && !pidProbe.alive && expectingReply) {
+    } else if (expectedAlive && pidProbe.checked && !pidProbe.alive && (expectingReply || awaitingHeartbeat)) {
       registerDegradedState(sessionId, 'stale-pid', { atMs: nowAtMs, stalePidDetected: true });
+      maybeLogStartupIssue(sessionId, 'stale-pid', worker, nowAtMs);
+    } else if (startupHeartbeatOverdue) {
+      registerDegradedState(sessionId, 'startup-heartbeat-timeout', { atMs: nowAtMs });
+      maybeLogStartupIssue(sessionId, 'startup-heartbeat-timeout', worker, nowAtMs);
     }
 
     const afterDetection = getOrCreateLifecycle(sessionId);
@@ -248,6 +313,7 @@ export function createSessionWorkerSupervisor({
     const effectiveHealthyCandidate = expectedAlive
       && (!pidProbe.checked || pidProbe.alive)
       && !hasErrorStatus
+      && !awaitingHeartbeat
       && !afterRecovery.restartExhausted;
 
     if (stickyYellow) {
@@ -377,11 +443,7 @@ export function createSessionWorkerSupervisor({
       status: requestedStatus,
       updatedAt: nowIso(),
     });
-    const nowAtMs = nowMs();
-    touchActivity(sessionId, nowAtMs);
-    if (ACTIVE_WORKER_STATUSES.has(requestedStatus)) {
-      noteHeartbeat(sessionId, nowAtMs);
-    }
+    touchActivity(sessionId, nowMs());
     return next;
   }
 
@@ -406,9 +468,21 @@ export function createSessionWorkerSupervisor({
     }
     if (shouldReuseLiveWorker(existing)) {
       const nowAtMs = nowMs();
-      noteHeartbeat(sessionId, nowAtMs);
-      assessSessionHealth(sessionId, existing, { nowAtMs, questionPending: false });
-      return { ok: true, reused: true, worker: existing, lifecycle: toLifecycleSnapshot(sessionId) };
+      const reusedWorker = setWorkerState(sessionId, {
+        ...existing,
+        sdkSessionId: sessionId,
+        status: 'ready',
+      });
+      const lifecycle = getOrCreateLifecycle(sessionId);
+      if (!lifecycle.awaitingHeartbeat && !lifecycle.firstObservedHeartbeatAtMs) {
+        noteLaunch(sessionId, {
+          mode: 'reused',
+          pid: existing?.pid || null,
+          atMs: nowAtMs,
+        });
+      }
+      assessSessionHealth(sessionId, reusedWorker, { nowAtMs, questionPending: false });
+      return { ok: true, reused: true, worker: reusedWorker, lifecycle: toLifecycleSnapshot(sessionId) };
     }
 
     const inFlight = pendingStarts.get(sessionId);
@@ -436,6 +510,11 @@ export function createSessionWorkerSupervisor({
             retryCount: 0,
             lastError: null,
           });
+          noteLaunch(sessionId, {
+            mode: 'spawned',
+            pid: spawned?.pid || null,
+            atMs: nowMs(),
+          });
           clearRestartSchedule(sessionId);
           assessSessionHealth(sessionId, readyState, { questionPending: false });
           return { ok: true, reused: false, worker: readyState, lifecycle: toLifecycleSnapshot(sessionId) };
@@ -446,6 +525,11 @@ export function createSessionWorkerSupervisor({
           status: 'ready',
           retryCount: 0,
           lastError: null,
+        });
+        noteLaunch(sessionId, {
+          mode: 'spawned',
+          pid: simulatedReady?.pid || null,
+          atMs: nowMs(),
         });
         clearRestartSchedule(sessionId);
         assessSessionHealth(sessionId, simulatedReady, { questionPending: false });
@@ -621,6 +705,13 @@ export function createSessionWorkerSupervisor({
           failureCount: lifecycleSnapshot?.failureCount || 0,
           stalePidDetected: lifecycleSnapshot?.stalePidDetected === true,
           questionPending: lifecycleSnapshot?.questionPending === true,
+          launchMode: lifecycleSnapshot?.launchMode || null,
+          launchPid: lifecycleSnapshot?.launchPid || null,
+          launchAt: lifecycleSnapshot?.launchAt || null,
+          awaitingHeartbeat: lifecycleSnapshot?.awaitingHeartbeat === true,
+          firstObservedHeartbeatAt: lifecycleSnapshot?.firstObservedHeartbeatAt || null,
+          readyWithoutHeartbeatMs: lifecycleSnapshot?.readyWithoutHeartbeatMs ?? 0,
+          diagnosticPlanReference: lifecycleSnapshot?.diagnosticPlanReference || null,
         });
       }
     }
