@@ -1867,7 +1867,7 @@ function fetchBrowsableDrives(cb) {
     '$drives | ConvertTo-Json -Depth 4 -Compress',
   ].join(' ');
 
-  execFile('powershell.exe', ['-NoProfile', '-Command', psScript], (err, stdout, stderr) => {
+  execFile('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', psScript], { windowsHide: true }, (err, stdout, stderr) => {
     if (err) return cb(new Error(`drive enumeration failed: ${stderr || err.message}`));
 
     const text = String(stdout || '').trim();
@@ -1924,7 +1924,7 @@ function fetchDriveDirectoryEntries(absoluteDirPath, { includeHidden = false } =
     '$rows | ConvertTo-Json -Depth 4 -Compress',
   ].join(' ');
 
-  execFile('powershell.exe', ['-NoProfile', '-Command', psScript], (err, stdout, stderr) => {
+  execFile('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', psScript], { windowsHide: true }, (err, stdout, stderr) => {
     if (err) return cb(new Error(`drive list failed: ${stderr || err.message}`));
     const text = String(stdout || '').trim();
     if (!text) return cb(null, []);

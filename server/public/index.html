@@ -972,6 +972,7 @@
   #repo-browser-modal.visible { display: flex; }
   .repo-browser-dialog {
     width: min(1200px, 100%);
+    height: min(92vh, 920px);
     max-height: min(92vh, 920px);
     display: flex;
     flex-direction: column;
@@ -1511,6 +1512,7 @@
     #repo-browser-modal { padding: 8px; }
     .repo-browser-dialog {
       width: 100%;
+      height: calc(var(--app-height) - 16px);
       max-height: calc(var(--app-height) - 16px);
       border-radius: 10px;
     }
