@@ -204,6 +204,83 @@ export function buildConversationSessionRootPayload({
   };
 }
 
+function mergeUniqueActivityTexts(primary = [], secondary = []) {
+  const merged = [];
+  const seen = new Set();
+  for (const value of [...(Array.isArray(primary) ? primary : []), ...(Array.isArray(secondary) ? secondary : [])]) {
+    const text = String(value || '').trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    merged.push(text);
+  }
+  return merged;
+}
+
+export function buildConversationMessages({
+  dbMessages = [],
+  transcriptMessages = [],
+  relayActivitiesByMessageId = new Map(),
+  responseMessageToSourceId = new Map(),
+} = {}) {
+  const normalizedDbMessages = Array.isArray(dbMessages)
+    ? dbMessages.map((message) => {
+        const id = String(message?.id || '').trim();
+        return {
+          activities: message?.role === 'assistant' ? (relayActivitiesByMessageId.get(id) || []) : [],
+          id,
+          role: message?.role,
+          text: message?.text,
+          model: message?.model || undefined,
+          attachments: message?.attachments || [],
+          mode: message?.mode || undefined,
+          timestamp: message?.timestamp,
+          sourceMessageId: message?.role === 'assistant'
+            ? (responseMessageToSourceId.get(id) || undefined)
+            : undefined,
+        };
+      })
+    : [];
+
+  if (normalizedDbMessages.length === 0) {
+    return Array.isArray(transcriptMessages)
+      ? transcriptMessages.map((message) => {
+          const id = String(message?.id || '').trim();
+          return {
+            ...message,
+            activities: mergeUniqueActivityTexts(
+              Array.isArray(message?.activities) ? message.activities : [],
+              id ? (relayActivitiesByMessageId.get(id) || []) : [],
+            ),
+            sourceMessageId: message?.role === 'assistant'
+              ? (responseMessageToSourceId.get(id) || message?.sourceMessageId || undefined)
+              : message?.sourceMessageId,
+          };
+        })
+      : [];
+  }
+
+  const transcriptById = new Map(
+    Array.isArray(transcriptMessages)
+      ? transcriptMessages
+          .map((message) => [String(message?.id || '').trim(), message])
+          .filter(([id]) => !!id)
+      : [],
+  );
+
+  return normalizedDbMessages.map((message) => {
+    if (message.role !== 'assistant') return message;
+    const transcriptMessage = transcriptById.get(String(message.id || '').trim());
+    if (!transcriptMessage) return message;
+    return {
+      ...message,
+      activities: mergeUniqueActivityTexts(
+        Array.isArray(message.activities) ? message.activities : [],
+        Array.isArray(transcriptMessage.activities) ? transcriptMessage.activities : [],
+      ),
+    };
+  });
+}
+
 export function registerSessionsRoutes(app, deps) {
   const {
     auth,
@@ -759,38 +836,15 @@ export function registerSessionsRoutes(app, deps) {
         .filter((m) => m.role === 'assistant')
         .map((m) => [m.id, relayActivityForResponse(m.id)]),
     );
-    let messages = dbMessages.map(m => ({
-      activities: m.role === 'assistant' ? (relayActivitiesByMessageId.get(m.id) || []) : [],
-      id:        m.id,
-      role:      m.role,
-      text:      m.text,
-      model:     m.model || undefined,
-      attachments: parseAttachments(m.attachments).map(hydrateAttachment).filter(Boolean),
-      mode:      m.mode || undefined,
-      timestamp: m.timestamp,
-      sourceMessageId: m.role === 'assistant' ? (responseMessageToSourceId.get(String(m.id || '').trim()) || undefined) : undefined,
-    }));
-    if (transcriptMessages.length > messages.length) {
-      messages = transcriptMessages.map((message) => {
-        if (message.role !== 'assistant') return message;
-        const relayActivities = relayActivitiesByMessageId.get(message.id) || [];
-        if (!relayActivities.length) return message;
-        const existingActivities = Array.isArray(message.activities) ? message.activities : [];
-        const mergedActivities = [];
-        const seen = new Set();
-        for (const activity of existingActivities.concat(relayActivities)) {
-          const text = String(activity || '').trim();
-          if (!text || seen.has(text)) continue;
-          seen.add(text);
-          mergedActivities.push(text);
-        }
-        return {
-          ...message,
-          activities: mergedActivities,
-          sourceMessageId: responseMessageToSourceId.get(String(message.id || '').trim()) || message.sourceMessageId || undefined,
-        };
-      });
-    }
+    let messages = buildConversationMessages({
+      dbMessages: dbMessages.map((message) => ({
+        ...message,
+        attachments: parseAttachments(message.attachments).map(hydrateAttachment).filter(Boolean),
+      })),
+      transcriptMessages,
+      relayActivitiesByMessageId,
+      responseMessageToSourceId,
+    });
     messages = messages.map((message) => {
       if (message.role !== 'assistant') return message;
       const sourceMessageId = responseMessageToSourceId.get(String(message.id || '').trim()) || message.sourceMessageId || undefined;

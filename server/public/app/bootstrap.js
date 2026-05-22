@@ -712,8 +712,12 @@ function initChatTitleCopy() {
   const title = document.getElementById('chat-title');
   if (!title || title.dataset.copyBound === '1') return;
   title.dataset.copyBound = '1';
+  if (title.dataset.fullscreenBound) delete title.dataset.fullscreenBound;
 
-  title.addEventListener('click', () => {
+  title.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
     const sessionId = String(title.dataset.copilotSessionId || '').trim();
     if (!sessionId) return;
     copyTextToClipboard(sessionId).then((ok) => {
@@ -723,7 +727,7 @@ function initChatTitleCopy() {
         showTransientRelayNotice('Could not copy session ID.');
       }
     }).catch(() => {});
-  });
+  }, true);
 }
 
 function getChatTitleElements() {
