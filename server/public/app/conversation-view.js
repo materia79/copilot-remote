@@ -29,20 +29,182 @@ import {
   showTransientRelayNotice,
   repoBrowserState,
 } from './store.js';
-import { sendMessage as sendMessageApi, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation } from './api-client.js';
+import { sendMessage as sendMessageApi, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi } from './api-client.js';
 import { linkifyWorkspaceMentionsInNode } from './router.js';
 import { renderAttachmentMarkup, clearAttachments, uploadAttachments, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { renderRelayQuestions } from './ask-user-view.js';
 import { getMessageThreadAnchor, sortConversationMessages } from './thread-order.mjs';
 
+const CONVERSATION_HISTORY_PAGE_SIZE = 20;
+const HISTORY_LOAD_MORE_ID = 'history-load-more';
+
 let thinkingMessageId = null;
 let thinkingText = '';
 let sendInFlight = false;
+let conversationHistoryState = {
+  conversationId: '',
+  hasMoreHistory: false,
+  oldestMessageId: '',
+  newestMessageId: '',
+  loadedMessageCount: 0,
+  loadingOlder: false,
+};
 
 function setSendInFlight(value) {
   sendInFlight = !!value;
   const btn = document.getElementById('send-btn');
   if (btn) btn.disabled = sendInFlight;
+}
+
+function getMessagesElement() {
+  return document.getElementById('messages');
+}
+
+function resetConversationHistoryState() {
+  conversationHistoryState = {
+    conversationId: String(currentConvId || '').trim(),
+    hasMoreHistory: false,
+    oldestMessageId: '',
+    newestMessageId: '',
+    loadedMessageCount: 0,
+    loadingOlder: false,
+  };
+  syncHistoryLoadMoreControl();
+}
+
+function setConversationHistoryState(next = {}) {
+  conversationHistoryState = {
+    conversationId: String(next.conversationId || currentConvId || '').trim(),
+    hasMoreHistory: !!next.hasMoreHistory,
+    oldestMessageId: String(next.oldestMessageId || '').trim(),
+    newestMessageId: String(next.newestMessageId || '').trim(),
+    loadedMessageCount: Math.max(0, Number(next.loadedMessageCount) || 0),
+    loadingOlder: !!next.loadingOlder,
+  };
+  syncHistoryLoadMoreControl();
+}
+
+function getConversationHistoryCursor() {
+  return String(conversationHistoryState.oldestMessageId || '').trim();
+}
+
+export function getConversationLoadedMessageCount() {
+  return Math.max(0, Number(conversationHistoryState.loadedMessageCount) || 0);
+}
+
+function buildHistoryLoadMoreMarkup(loading = false) {
+  const text = loading ? 'Loading older…' : 'Load older messages';
+  return `
+    <div id="${HISTORY_LOAD_MORE_ID}" class="history-load-more">
+      <button type="button" class="history-load-more-btn" onclick="loadOlderConversationMessages()" ${loading ? 'disabled' : ''}>${text}</button>
+    </div>`;
+}
+
+function syncHistoryLoadMoreControl() {
+  const el = getMessagesElement();
+  if (!el) return;
+  let box = document.getElementById(HISTORY_LOAD_MORE_ID);
+  if (!conversationHistoryState.hasMoreHistory) {
+    box?.remove();
+    return;
+  }
+  if (!box) {
+    const marker = el.querySelector('.msg');
+    if (!marker) {
+      el.insertAdjacentHTML('beforeend', buildHistoryLoadMoreMarkup(conversationHistoryState.loadingOlder));
+      return;
+    }
+    marker.insertAdjacentHTML('beforebegin', buildHistoryLoadMoreMarkup(conversationHistoryState.loadingOlder));
+    return;
+  }
+  const btn = box.querySelector('button');
+  if (!btn) return;
+  btn.disabled = conversationHistoryState.loadingOlder;
+  btn.textContent = conversationHistoryState.loadingOlder ? 'Loading older…' : 'Load older messages';
+}
+
+function createMessageNode(msg, msgId = null, force = false) {
+  const el = getMessagesElement();
+  if (!el) return null;
+
+  if (msgId) {
+    const existing = el.querySelector(`[data-message-id="${msgId}"]`);
+    if (existing) return existing;
+    if (!force && seenMessageIds.has(msgId)) return null;
+    seenMessageIds.add(msgId);
+  }
+
+  const div = document.createElement('div');
+  div.className = `msg ${msg.role}`;
+  if (msgId) div.dataset.messageId = msgId;
+
+  const label = msg.role === 'user' ? 'You' : 'Copilot';
+  const modelTag = (msg.role === 'assistant' && msg.model)
+    ? ` <span class="msg-model">${escHtml(msg.model)}</span>` : '';
+  const modeTag = msg.mode
+    ? ` <span class="msg-mode">${escHtml(msg.mode)}</span>` : '';
+  const content = msg.role === 'assistant'
+    ? marked.parse(msg.text || '')
+    : (msg.text ? `<p>${escHtml(msg.text)}</p>` : '');
+  const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
+  const activities = Array.isArray(msg.activities) ? msg.activities.filter(Boolean).slice(0, 48) : [];
+  const attachmentHtml = attachments.length ? renderAttachmentMarkup(attachments) : '';
+  const activityHtml = activities.length ? renderActivityMarkup(activities) : '';
+  const hasVisibleText = Boolean(String(msg.text || '').trim());
+  const bubbleClass = (!hasVisibleText && attachments.length && !activities.length)
+    ? 'msg-bubble msg-bubble-media-only'
+    : 'msg-bubble';
+
+  div.innerHTML = `
+    <div class="${bubbleClass}">${content}${attachmentHtml}${activityHtml}</div>
+    <div class="msg-label">${label}${modelTag}${modeTag} · ${fmtDate(msg.timestamp)}</div>`;
+
+  linkifyWorkspaceMentionsInNode(div.querySelector('.msg-bubble'));
+  div.querySelectorAll('pre code').forEach((b) => hljs.highlightElement(b));
+  return div;
+}
+
+function insertMessageNode(node, scroll = true, insertAfterId = null) {
+  if (!node) return null;
+  if (node.parentNode) return node;
+  const el = getMessagesElement();
+  if (!el) return null;
+  const anchorId = String(insertAfterId || '').trim();
+  const anchor = anchorId ? el.querySelector(`[data-message-id="${anchorId}"]`) : null;
+  if (anchor && anchor.parentNode === el) {
+    const next = anchor.nextSibling;
+    if (next) el.insertBefore(node, next);
+    else el.appendChild(node);
+  } else {
+    el.appendChild(node);
+  }
+  if (scroll) scrollBottom();
+  return node;
+}
+
+function prependMessageNodes(msgs) {
+  const el = getMessagesElement();
+  if (!el) return { inserted: 0, firstMessageId: '' };
+  const ordered = sortConversationMessages(msgs || []);
+  const fragment = document.createDocumentFragment();
+  let inserted = 0;
+  let firstMessageId = '';
+  for (const m of ordered) {
+    const msgId = String(m?.id || '').trim() || null;
+    const node = createMessageNode(m, msgId, true);
+    if (!node || node.parentNode) continue;
+    if (!firstMessageId && msgId) firstMessageId = msgId;
+    fragment.appendChild(node);
+    inserted += 1;
+  }
+  if (!inserted) return { inserted: 0, firstMessageId: '' };
+  const marker = el.querySelector('.msg');
+  if (marker && marker.parentNode === el) {
+    el.insertBefore(fragment, marker);
+  } else {
+    el.appendChild(fragment);
+  }
+  return { inserted, firstMessageId };
 }
 
 export function decorateActivityText(text) {
@@ -196,59 +358,26 @@ export function updateThinkingText(text, messageId = null, done = false) {
   scrollBottom();
 }
 
-export function appendMessage(msg, scroll = true, msgId = null, force = false, insertAfterId = null) {
-  const el = document.getElementById('messages');
+export function appendMessage(msg, scroll = true, msgId = null, force = false, insertAfterId = null, trackHistory = true) {
+  const el = getMessagesElement();
+  if (!el) return null;
   const empty = el.querySelector('.empty-state');
   if (empty) empty.remove();
-
-  if (msgId) {
-    const existing = el.querySelector(`[data-message-id="${msgId}"]`);
-    if (existing) return existing;
-    if (!force && seenMessageIds.has(msgId)) return;
-    seenMessageIds.add(msgId);
+  const node = createMessageNode(msg, msgId, force);
+  const isNewNode = !!node && !node.parentNode;
+  const insertedNode = insertMessageNode(node, scroll, insertAfterId);
+  if (trackHistory && isNewNode && insertedNode) {
+    setConversationHistoryState({
+      ...conversationHistoryState,
+      loadedMessageCount: getConversationLoadedMessageCount() + 1,
+    });
   }
-
-  const div = document.createElement('div');
-  div.className = `msg ${msg.role}`;
-  if (msgId) div.dataset.messageId = msgId;
-
-  const label = msg.role === 'user' ? 'You' : 'Copilot';
-  const modelTag = (msg.role === 'assistant' && msg.model)
-    ? ` <span class="msg-model">${escHtml(msg.model)}</span>` : '';
-  const modeTag = msg.mode
-    ? ` <span class="msg-mode">${escHtml(msg.mode)}</span>` : '';
-  const content = msg.role === 'assistant'
-    ? marked.parse(msg.text || '')
-    : (msg.text ? `<p>${escHtml(msg.text)}</p>` : '');
-  const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
-  const activities = Array.isArray(msg.activities) ? msg.activities.filter(Boolean).slice(0, 48) : [];
-  const attachmentHtml = attachments.length ? renderAttachmentMarkup(attachments) : '';
-  const activityHtml = activities.length ? renderActivityMarkup(activities) : '';
-  const hasVisibleText = Boolean(String(msg.text || '').trim());
-  const bubbleClass = (!hasVisibleText && attachments.length && !activities.length)
-    ? 'msg-bubble msg-bubble-media-only'
-    : 'msg-bubble';
-
-  div.innerHTML = `
-    <div class="${bubbleClass}">${content}${attachmentHtml}${activityHtml}</div>
-    <div class="msg-label">${label}${modelTag}${modeTag} · ${fmtDate(msg.timestamp)}</div>`;
-
-  linkifyWorkspaceMentionsInNode(div.querySelector('.msg-bubble'));
-  div.querySelectorAll('pre code').forEach((b) => hljs.highlightElement(b));
-  const anchorId = String(insertAfterId || msg?.sourceMessageId || msg?.parentMessageId || '').trim();
-  const anchor = anchorId ? el.querySelector(`[data-message-id="${anchorId}"]`) : null;
-  if (anchor && anchor.parentNode === el) {
-    const next = anchor.nextSibling;
-    if (next) el.insertBefore(div, next);
-    else el.appendChild(div);
-  } else {
-    el.appendChild(div);
-  }
-  if (scroll) scrollBottom();
+  return insertedNode;
 }
 
-export function renderMessages(msgs, scroll = true) {
-  const el = document.getElementById('messages');
+export function renderMessages(msgs, scroll = true, meta = {}) {
+  const el = getMessagesElement();
+  if (!el) return;
   const ordered = sortConversationMessages(msgs || []);
   const messageById = new Map(
     ordered
@@ -262,14 +391,84 @@ export function renderMessages(msgs, scroll = true) {
       <h3>${currentConvId ? 'No messages yet' : 'New Conversation'}</h3>
       <p>${currentConvId ? 'Start the conversation below' : 'Type your first message below'}</p>
     </div>`;
+    resetConversationHistoryState();
     renderRelayQuestions();
     return;
   }
-  el.innerHTML = '';
-  el.insertAdjacentHTML('afterbegin', '<div id="pull-refresh-indicator" aria-hidden="true"><span>↻ Pull down to refresh</span></div>');
-  for (const m of ordered) appendMessage(m, false, m.id || null, true, getMessageThreadAnchor(m, messageById));
+  const conversationId = String(meta.conversationId || currentConvId || '').trim();
+  const pageInfo = meta.pageInfo && typeof meta.pageInfo === 'object' ? meta.pageInfo : null;
+  const hasMoreHistory = typeof meta.hasMoreHistory === 'boolean'
+    ? meta.hasMoreHistory
+    : !!pageInfo?.hasMore;
+  const oldestMessageId = String(
+    meta.historyCursor
+    || pageInfo?.nextCursor?.beforeMessageId
+    || ordered[0]?.id
+    || '',
+  ).trim();
+  const newestMessageId = String(meta.historyNewestMessageId || ordered[ordered.length - 1]?.id || '').trim();
+  el.innerHTML = `<div id="pull-refresh-indicator" aria-hidden="true"><span>↻ Pull down to refresh</span></div>${hasMoreHistory ? buildHistoryLoadMoreMarkup(false) : ''}`;
+  setConversationHistoryState({
+    conversationId,
+    hasMoreHistory,
+    oldestMessageId,
+    newestMessageId,
+    loadedMessageCount: ordered.length,
+    loadingOlder: false,
+  });
+  for (const m of ordered) appendMessage(m, false, m.id || null, true, getMessageThreadAnchor(m, messageById), false);
   renderRelayQuestions();
   if (scroll) scrollBottom();
+}
+
+export async function loadOlderConversationMessages() {
+  const currentId = String(currentConvId || '').trim();
+  if (!currentId) return;
+  if (conversationHistoryState.loadingOlder || !conversationHistoryState.hasMoreHistory) return;
+  if (conversationHistoryState.conversationId && conversationHistoryState.conversationId !== currentId) return;
+
+  const beforeMessageId = getConversationHistoryCursor();
+  if (!beforeMessageId) return;
+
+  const el = getMessagesElement();
+  if (!el) return;
+
+  const previousScrollTop = el.scrollTop;
+  const previousScrollHeight = el.scrollHeight;
+  setConversationHistoryState({
+    ...conversationHistoryState,
+    loadingOlder: true,
+  });
+
+  const r = await loadConversationApi(currentId, {
+    limit: CONVERSATION_HISTORY_PAGE_SIZE,
+    beforeMessageId,
+  });
+  if (String(currentConvId || '').trim() !== currentId) return;
+  if (!r) {
+    setConversationHistoryState({
+      ...conversationHistoryState,
+      loadingOlder: false,
+    });
+    showTransientRelayNotice('Could not load older messages. Please try again.');
+    return;
+  }
+
+  const inserted = prependMessageNodes(r.messages || []);
+  setConversationHistoryState({
+    conversationId: currentId,
+    hasMoreHistory: !!r.pageInfo?.hasMore,
+    oldestMessageId: String(r.pageInfo?.nextCursor?.beforeMessageId || r.historyCursor || conversationHistoryState.oldestMessageId || '').trim(),
+    newestMessageId: String(r.historyNewestMessageId || conversationHistoryState.newestMessageId || '').trim(),
+    loadedMessageCount: getConversationLoadedMessageCount() + inserted.inserted,
+    loadingOlder: false,
+  });
+  renderRelayQuestions();
+  requestAnimationFrame(() => {
+    if (!el || String(currentConvId || '').trim() !== currentId) return;
+    const nextScrollHeight = el.scrollHeight;
+    el.scrollTop = previousScrollTop + (nextScrollHeight - previousScrollHeight);
+  });
 }
 
 export function compactCurrentConversation() {
@@ -448,7 +647,7 @@ async function validateSelectedConversationBeforeSend() {
   const convId = String(currentConvId || '').trim();
   if (!convId) return true;
 
-  const current = await loadConversation(convId);
+  const current = await loadConversationApi(convId, { limit: 1 });
   if (!current) {
     setModelBanner('⚠️ Selected conversation is unavailable. Please choose another conversation.');
     await window.refreshConversations?.();

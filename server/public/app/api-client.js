@@ -80,10 +80,18 @@ export async function loadConversations() {
   return apiFetch('/api/conversations');
 }
 
-export async function loadConversation(id) {
+export async function loadConversation(id, options = {}) {
   const convId = String(id || '').trim();
   if (!convId) return null;
-  return apiFetch(`/api/conversation/${convId}`);
+  const params = new URLSearchParams();
+  const limit = Math.max(1, Math.trunc(Number(options.limit) || 0));
+  if (limit) params.set('limit', String(limit));
+  const beforeMessageId = String(options.beforeMessageId || options.before || '').trim();
+  if (beforeMessageId) params.set('beforeMessageId', beforeMessageId);
+  const beforeTimestamp = String(options.beforeTimestamp || '').trim();
+  if (beforeTimestamp) params.set('beforeTimestamp', beforeTimestamp);
+  const query = params.toString();
+  return apiFetch(`/api/conversation/${convId}${query ? `?${query}` : ''}`);
 }
 
 export async function deleteConversation(id) {

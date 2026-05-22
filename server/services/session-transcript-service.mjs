@@ -19,9 +19,30 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
     if (oldestKey) transcriptCache.delete(oldestKey);
   }
 
-  function limitMessages(messages, limit) {
-    if (messages.length <= limit) return messages;
-    return messages.slice(messages.length - limit);
+  function sliceMessages(messages, options = {}) {
+    const limit = Math.max(1, Number(options.limit) || 300);
+    const beforeId = String(options.before || options.beforeMessageId || '').trim();
+    const totalCount = Array.isArray(messages) ? messages.length : 0;
+    const safeMessages = Array.isArray(messages) ? messages : [];
+
+    let startIndex = Math.max(0, safeMessages.length - limit);
+    let endIndex = safeMessages.length;
+    if (beforeId) {
+      const beforeIndex = safeMessages.findIndex((message) => String(message?.id || '').trim() === beforeId);
+      if (beforeIndex >= 0) {
+        endIndex = beforeIndex;
+        startIndex = Math.max(0, endIndex - limit);
+      }
+    }
+
+    const windowMessages = safeMessages.slice(startIndex, endIndex);
+    return {
+      messages: windowMessages,
+      hasMoreHistory: startIndex > 0,
+      historyCursor: String(windowMessages[0]?.id || '').trim() || null,
+      newestMessageId: String(windowMessages[windowMessages.length - 1]?.id || '').trim() || null,
+      totalCount,
+    };
   }
 
   function appendTurnActivity(map, turnId, text) {
@@ -81,7 +102,6 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
   function readSessionTranscriptMessages(sessionId, options = {}) {
     const sid = String(sessionId || '').trim();
     if (!sid) return [];
-    const limit = Math.max(1, Number(options.limit) || 300);
     const root = resolveSessionStateRoot();
     const eventsPath = path.join(root, sid, 'events.jsonl');
     if (!fs.existsSync(eventsPath)) return [];
@@ -97,7 +117,8 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
     const cached = transcriptCache.get(sid);
     if (cached && cached.mtimeMs === mtimeMs && cached.sizeBytes === sizeBytes) {
       cached.cachedAt = Date.now();
-      return limitMessages(cached.messages, limit);
+      const windowed = sliceMessages(cached.messages, options);
+      return options.withMeta === true ? windowed : windowed.messages;
     }
 
     let content = '';
@@ -195,7 +216,8 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
       cachedAt: Date.now(),
       messages,
     });
-    return limitMessages(messages, limit);
+    const windowed = sliceMessages(messages, options);
+    return options.withMeta === true ? windowed : windowed.messages;
   }
 
   return {

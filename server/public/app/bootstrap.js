@@ -53,7 +53,7 @@ import { loadConversations, refreshConversations, openConversation, renderConvLi
 import { newConversation, deleteConv } from './journal-view.js';
 import { loadRelayQuestions, renderRelayQuestions, upsertRelayQuestion, updatePendingQuestionBanner } from './ask-user-view.js';
 import { openPendingQuestionFromBanner, submitRelayQuestionChoice, submitRelayQuestionAnswer, onRelayQuestionDraftInput, handleRelayQuestionKey } from './ask-user-view.js';
-import { showThinking, removeThinking, renderThinkingActivities, appendThinkingActivity, updateThinkingText, restoreInFlightThinking, renderMessages, appendMessage, compactCurrentConversation, sendMessage, handleKey } from './conversation-view.js';
+import { showThinking, removeThinking, renderThinkingActivities, appendThinkingActivity, updateThinkingText, restoreInFlightThinking, renderMessages, appendMessage, compactCurrentConversation, sendMessage, handleKey, getConversationLoadedMessageCount, loadOlderConversationMessages } from './conversation-view.js';
 import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { handleAttachmentInput, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
 import { initEmojiPicker, toggleEmojiPicker } from './emoji-view.js';
@@ -668,10 +668,10 @@ async function refreshCurrentView() {
     return;
   }
 
-  const r = await loadConversation(currentId);
+  const r = await loadConversation(currentId, { limit: Math.max(20, getConversationLoadedMessageCount() || 20) });
   if (r) {
     setRepoBrowserSessionInfo(r.sessionRootPath || '', r.sessionRootName || r.title || '');
-    renderMessages(r.messages, false);
+    renderMessages(r.messages, false, r);
     restoreInFlightThinking(r.inFlight || null);
   } else {
     setRepoBrowserSessionInfo('', '');
@@ -1156,6 +1156,7 @@ window.openPendingQuestionFromBanner = openPendingQuestionFromBanner;
 window.compactCurrentConversation = compactCurrentConversation;
 window.sendMessage = sendMessage;
 window.appendMessage = appendMessage;
+window.loadOlderConversationMessages = loadOlderConversationMessages;
 window.handleKey = handleKey;
 window.autoResize = autoResize;
 window.closeSummaryModal = closeSummaryModal;

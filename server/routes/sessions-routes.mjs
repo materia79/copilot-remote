@@ -216,6 +216,89 @@ function mergeUniqueActivityTexts(primary = [], secondary = []) {
   return merged;
 }
 
+function normalizeConversationTimestampMs(value) {
+  const parsed = Date.parse(String(value || '').trim());
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function compareConversationMessageOrder(a, b) {
+  const aTs = normalizeConversationTimestampMs(a?.timestamp);
+  const bTs = normalizeConversationTimestampMs(b?.timestamp);
+  if (aTs !== bTs) return aTs - bTs;
+  const aId = String(a?.id || '').trim();
+  const bId = String(b?.id || '').trim();
+  return aId.localeCompare(bId);
+}
+
+export function normalizeConversationHistoryLimit(value, fallback = 20) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.min(100, Math.max(1, Math.trunc(numeric)));
+}
+
+function resolveConversationHistoryCursor(messages = [], {
+  beforeMessageId = '',
+  beforeTimestamp = '',
+} = {}) {
+  const cursorMessageId = String(beforeMessageId || '').trim();
+  const cursorTimestampText = String(beforeTimestamp || '').trim();
+  const list = Array.isArray(messages) ? messages : [];
+
+  if (cursorMessageId) {
+    const cursorMessage = list.find((message) => String(message?.id || '').trim() === cursorMessageId) || null;
+    if (cursorMessage) {
+      return {
+        beforeMessageId: cursorMessageId,
+        beforeTimestamp: String(cursorMessage.timestamp || '').trim() || null,
+        timestampMs: normalizeConversationTimestampMs(cursorMessage.timestamp),
+      };
+    }
+  }
+
+  if (cursorTimestampText) {
+    return {
+      beforeMessageId: cursorMessageId || null,
+      beforeTimestamp: cursorTimestampText,
+      timestampMs: normalizeConversationTimestampMs(cursorTimestampText),
+    };
+  }
+
+  return null;
+}
+
+export function selectConversationHistoryPage(messages = [], {
+  limit = 20,
+  beforeMessageId = '',
+  beforeTimestamp = '',
+} = {}) {
+  const pageLimit = normalizeConversationHistoryLimit(limit);
+  const ordered = Array.isArray(messages)
+    ? messages.filter((message) => !!message).slice().sort(compareConversationMessageOrder)
+    : [];
+  const cursor = resolveConversationHistoryCursor(ordered, { beforeMessageId, beforeTimestamp });
+  const olderMessages = cursor
+    ? ordered.filter((message) => {
+        const messageTimestampMs = normalizeConversationTimestampMs(message?.timestamp);
+        if (messageTimestampMs < cursor.timestampMs) return true;
+        if (messageTimestampMs > cursor.timestampMs) return false;
+        if (!cursor.beforeMessageId) return false;
+        return String(message?.id || '').trim().localeCompare(cursor.beforeMessageId) < 0;
+      })
+    : ordered;
+  const pageMessages = olderMessages.slice(-pageLimit);
+  const oldestMessage = pageMessages[0] || null;
+  return {
+    messages: pageMessages,
+    pageInfo: {
+      hasMore: olderMessages.length > pageMessages.length,
+      nextCursor: oldestMessage ? {
+        beforeMessageId: String(oldestMessage.id || '').trim(),
+        beforeTimestamp: String(oldestMessage.timestamp || '').trim() || null,
+      } : null,
+    },
+  };
+}
+
 export function buildConversationMessages({
   dbMessages = [],
   transcriptMessages = [],
@@ -241,24 +324,6 @@ export function buildConversationMessages({
       })
     : [];
 
-  if (normalizedDbMessages.length === 0) {
-    return Array.isArray(transcriptMessages)
-      ? transcriptMessages.map((message) => {
-          const id = String(message?.id || '').trim();
-          return {
-            ...message,
-            activities: mergeUniqueActivityTexts(
-              Array.isArray(message?.activities) ? message.activities : [],
-              id ? (relayActivitiesByMessageId.get(id) || []) : [],
-            ),
-            sourceMessageId: message?.role === 'assistant'
-              ? (responseMessageToSourceId.get(id) || message?.sourceMessageId || undefined)
-              : message?.sourceMessageId,
-          };
-        })
-      : [];
-  }
-
   const transcriptById = new Map(
     Array.isArray(transcriptMessages)
       ? transcriptMessages
@@ -267,18 +332,59 @@ export function buildConversationMessages({
       : [],
   );
 
-  return normalizedDbMessages.map((message) => {
-    if (message.role !== 'assistant') return message;
-    const transcriptMessage = transcriptById.get(String(message.id || '').trim());
-    if (!transcriptMessage) return message;
-    return {
-      ...message,
+  const messagesById = new Map();
+  for (const message of normalizedDbMessages) {
+    messagesById.set(String(message.id || '').trim(), message);
+  }
+
+  if (normalizedDbMessages.length === 0) {
+    const transcriptOnlyMessages = Array.isArray(transcriptMessages) ? transcriptMessages : [];
+    const normalizedTranscriptMessages = transcriptOnlyMessages.map((message) => {
+      const id = String(message?.id || '').trim();
+      return {
+        ...message,
+        activities: mergeUniqueActivityTexts(
+          Array.isArray(message?.activities) ? message.activities : [],
+          id ? (relayActivitiesByMessageId.get(id) || []) : [],
+        ),
+        sourceMessageId: message?.role === 'assistant'
+          ? (responseMessageToSourceId.get(id) || message?.sourceMessageId || undefined)
+          : message?.sourceMessageId,
+      };
+    });
+    return normalizedTranscriptMessages.slice().sort(compareConversationMessageOrder);
+  }
+
+  for (const message of transcriptById.values()) {
+    const id = String(message?.id || '').trim();
+    if (!id) continue;
+    const existing = messagesById.get(id);
+    if (!existing) {
+      messagesById.set(id, {
+        ...message,
+        activities: mergeUniqueActivityTexts(
+          Array.isArray(message?.activities) ? message.activities : [],
+          id ? (relayActivitiesByMessageId.get(id) || []) : [],
+        ),
+        sourceMessageId: message?.role === 'assistant'
+          ? (responseMessageToSourceId.get(id) || message?.sourceMessageId || undefined)
+          : message?.sourceMessageId,
+      });
+      continue;
+    }
+    if (existing.role !== 'assistant') continue;
+    const transcriptMessage = transcriptById.get(id) || null;
+    if (!transcriptMessage) continue;
+    messagesById.set(id, {
+      ...existing,
       activities: mergeUniqueActivityTexts(
-        Array.isArray(message.activities) ? message.activities : [],
+        Array.isArray(existing.activities) ? existing.activities : [],
         Array.isArray(transcriptMessage.activities) ? transcriptMessage.activities : [],
       ),
-    };
-  });
+    });
+  }
+
+  return Array.from(messagesById.values()).sort(compareConversationMessageOrder);
 }
 
 export function registerSessionsRoutes(app, deps) {
@@ -753,9 +859,12 @@ export function registerSessionsRoutes(app, deps) {
     });
   });
 
-  // GET /api/conversation/:id — get full conversation
+  // GET /api/conversation/:id — get paginated conversation history
   app.get('/api/conversation/:id', auth, (req, res) => {
     const requestedId = String(req.params.id || '').trim();
+    const limit = normalizeConversationHistoryLimit(req.query.limit, 20);
+    const beforeMessageId = String(req.query.beforeMessageId || '').trim();
+    const beforeTimestamp = String(req.query.beforeTimestamp || '').trim();
     if (stmts.getDeletedSdkSession.get(requestedId)) {
       return res.status(404).json({ error: 'Conversation not found' });
     }
@@ -767,7 +876,14 @@ export function registerSessionsRoutes(app, deps) {
       const runtimeSession = stmts.getRuntimeSessionBySdkSessionId.get(requestedId) || null;
       const updatedAt = String(match?.updatedAt || '').trim() || new Date().toISOString();
       const discoveredTitle = String(match?.title || '').trim() || `Session ${requestedId.slice(0, 8)}`;
-      const messages = readSessionTranscriptMessages(requestedId, { limit: 400 });
+      const transcriptMessages = readSessionTranscriptMessages(requestedId, { limit: Number.POSITIVE_INFINITY });
+      const history = selectConversationHistoryPage(
+        buildConversationMessages({
+          dbMessages: [],
+          transcriptMessages,
+        }),
+        { limit, beforeMessageId, beforeTimestamp },
+      );
       const sessionRoot = buildConversationSessionRootPayload({
         conversationId: requestedId,
         sdkSessionId: requestedId,
@@ -795,7 +911,8 @@ export function registerSessionsRoutes(app, deps) {
         createdAt: updatedAt,
         updatedAt,
         inFlight: null,
-        messages,
+        messages: history.messages,
+        pageInfo: history.pageInfo,
       });
     }
     const runtimeSession = stmts.getRuntimeSessionByConversation.get(req.params.id) || null;
@@ -813,7 +930,7 @@ export function registerSessionsRoutes(app, deps) {
       discoveredTitle,
     });
     const inFlight = inFlightStateForConversation(req.params.id);
-    const transcriptMessages = readSessionTranscriptMessages(String(conv.sdk_session_id || req.params.id || '').trim(), { limit: 400 });
+    const transcriptMessages = readSessionTranscriptMessages(String(conv.sdk_session_id || req.params.id || '').trim(), { limit: Number.POSITIVE_INFINITY });
     const sessionRoot = buildConversationSessionRootPayload({
       conversationId: req.params.id,
       sdkSessionId: conv.sdk_session_id || req.params.id,
@@ -850,6 +967,7 @@ export function registerSessionsRoutes(app, deps) {
       const sourceMessageId = responseMessageToSourceId.get(String(message.id || '').trim()) || message.sourceMessageId || undefined;
       return sourceMessageId ? { ...message, sourceMessageId } : message;
     });
+    const history = selectConversationHistoryPage(messages, { limit, beforeMessageId, beforeTimestamp });
     res.json({
       id: conv.id,
       sdkSessionId: conv.sdk_session_id || null,
@@ -871,7 +989,8 @@ export function registerSessionsRoutes(app, deps) {
       createdAt: conv.created_at,
       updatedAt: conv.updated_at,
       inFlight,
-      messages,
+      messages: history.messages,
+      pageInfo: history.pageInfo,
     });
   });
 

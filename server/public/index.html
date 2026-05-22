@@ -384,6 +384,30 @@
     font-size: 0.8rem;
   }
 
+  #history-load-more {
+    display: flex;
+    justify-content: center;
+    margin: 6px 0 2px;
+  }
+  .history-load-more-btn {
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 6px 12px;
+    background: rgba(13, 17, 23, 0.92);
+    color: var(--text);
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: border-color 0.15s ease, color 0.15s ease, opacity 0.15s ease;
+  }
+  .history-load-more-btn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .history-load-more-btn:disabled {
+    opacity: 0.65;
+    cursor: wait;
+  }
+
   .empty-state {
     flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
     color: var(--muted); text-align: center; padding: 24px;

@@ -117,15 +117,16 @@ export async function openConversation(id) {
   updateCompactButton();
   renderConvList();
 
-  const r = await loadConversation(id);
+  const r = await loadConversation(id, { limit: 20 });
   if (r) {
     setRepoBrowserSessionInfo(r.sessionRootPath || '', r.sessionRootName || r.title || '');
-    renderMessages(r.messages);
+    renderMessages(r.messages, true, r);
     restoreInFlightThinking(r.inFlight || null);
     updateSessionPill(conversations[id], r.runtimeSession || null);
   } else {
     setRepoBrowserSessionInfo('', '');
     restoreInFlightThinking(null);
+    renderMessages([]);
   }
   await loadRelayQuestions(id);
   applyContextUsageBar(null);
