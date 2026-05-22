@@ -53,6 +53,7 @@
     --chat-header-top-pad-mobile: calc(var(--chat-header-top-base-mobile) + var(--header-safe-top));
     --sidebar-header-top-pad-desktop: calc(var(--sidebar-header-top-base-desktop) + var(--header-safe-top));
     --sidebar-header-top-pad-mobile: calc(var(--sidebar-header-top-base-mobile) + var(--header-safe-top));
+    --immersive-top-shift: 0px;
   }
 
   html, body {
@@ -66,11 +67,11 @@
     overflow: hidden;
   }
   body.immersive-top {
-    --header-safe-top: 0px;
     --chat-header-top-base-desktop: 8px;
     --chat-header-top-base-mobile: 6px;
     --sidebar-header-top-base-desktop: 8px;
     --sidebar-header-top-base-mobile: 6px;
+    --immersive-top-shift: calc(var(--header-safe-top) * -1);
   }
   :root {
     --app-height: 100vh;
@@ -113,6 +114,7 @@
   .sidebar-header {
     padding: var(--sidebar-header-top-pad-desktop) 16px 16px; border-bottom: 1px solid var(--border);
     display: flex; align-items: center; gap: 10px;
+    margin-top: var(--immersive-top-shift);
   }
   .sidebar-header h2 { font-size: 1rem; font-weight: 600; flex: 1; }
   #sidebar-actions {
@@ -231,6 +233,7 @@
   #chat-header {
     padding: var(--chat-header-top-pad-desktop) 18px 14px; border-bottom: 1px solid var(--border);
     display: flex; align-items: center; gap: 12px; background: var(--bg2);
+    margin-top: var(--immersive-top-shift);
   }
   #sidebar-toggle {
     display: none; background: none; border: none; color: var(--text);

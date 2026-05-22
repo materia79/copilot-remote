@@ -541,7 +541,7 @@ export function syncViewportMetrics() {
     const offsetTop = Math.max(0, vv.offsetTop || 0);
     const baselineCandidate = Math.max(layoutHeight, visibleHeight + offsetTop);
     if (baselineCandidate > viewportBaseHeight) viewportBaseHeight = baselineCandidate;
-    appHeight = visibleHeight || layoutHeight;
+    appHeight = baselineCandidate;
   } else if (layoutHeight > viewportBaseHeight) {
     viewportBaseHeight = layoutHeight;
   }
