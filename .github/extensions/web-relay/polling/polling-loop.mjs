@@ -3,6 +3,7 @@ import { buildTerminalFailureText, isTerminalSendAndWaitError } from "../runtime
 import { getActiveSession } from "../runtime/session-registry.mjs";
 import { DEFAULT_QUESTION_TIMEOUT_MS } from "../../../../shared/question-timeout.mjs";
 import { QUESTION_TIMEOUT_CONTINUATION_TEXT } from "../../../../shared/question-timeout.mjs";
+import { stripPromptContextPrefix } from "../skills/prompt-context.mjs";
 
 function isImageAttachment(att) {
   const type = String(att?.type || "").toLowerCase();
@@ -474,7 +475,8 @@ export function createPollingLoop({
             }
             dbg("session.sendAndWait: completed for msgId", message.id);
 
-            const text = extractFinalText(finalEvent);
+            const promptPrefix = String(buildPromptWithRelayContext?.(message) || '').trim();
+            const text = stripPromptContextPrefix(extractFinalText(finalEvent), message, promptPrefix);
             const model = await getCurrentModelId() || finalEvent?.data?.model || finalEvent?.data?.modelId || message.model || null;
             const bridgedViaAskUser = !!getLastAskUserBridge?.();
             const pendingAskUserReq = !bridgedViaAskUser ? getPendingAskUserRequest?.() : null;

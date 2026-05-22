@@ -5,6 +5,7 @@ import {
   normalizeConversationHistoryLimit,
   selectConversationHistoryPage,
 } from './sessions-routes.mjs';
+import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 
 test('selectConversationHistoryPage clamps limit and advances cursors', () => {
   const messages = [
@@ -41,7 +42,7 @@ test('selectConversationHistoryPage clamps limit and advances cursors', () => {
   assert.deepEqual(timestampPage.messages.map((message) => message.id), ['m2', 'm3']);
 });
 
-test('buildConversationMessages keeps DB rows canonical while backfilling transcript-only rows', () => {
+test('buildConversationMessages keeps DB rows canonical when persisted history exists', () => {
   const responseMessageToSourceId = new Map([
     ['a1', 'u1'],
     ['a2', 'u2'],
@@ -93,13 +94,57 @@ test('buildConversationMessages keeps DB rows canonical while backfilling transc
     responseMessageToSourceId,
   });
 
-  assert.deepEqual(messages.map((message) => message.id), ['u1', 'a1', 'u2', 'a2']);
+  assert.deepEqual(messages.map((message) => message.id), ['u2', 'a2']);
   assert.equal(messages.find((message) => message.id === 'u2')?.text, 'db user 2');
   assert.equal(messages.find((message) => message.id === 'a2')?.text, 'db assistant 2');
-  assert.equal(messages.find((message) => message.id === 'a1')?.sourceMessageId, 'u1');
-  assert.deepEqual(messages.find((message) => message.id === 'a1')?.activities, ['Thought: transcript progress']);
+  assert.equal(messages.find((message) => message.id === 'a2')?.sourceMessageId, 'u2');
+  assert.deepEqual(messages.find((message) => message.id === 'a2')?.activities, ['Tool (view): transcript file']);
 
   const history = selectConversationHistoryPage(messages, { limit: 4 });
-  assert.deepEqual(history.messages.map((message) => message.id), ['u1', 'a1', 'u2', 'a2']);
+  assert.deepEqual(history.messages.map((message) => message.id), ['u2', 'a2']);
   assert.equal(history.pageInfo.hasMore, false);
+});
+
+test('buildConversationMessages falls back to transcript rows when no DB messages exist', () => {
+  const messages = buildConversationMessages({
+    dbMessages: [],
+    transcriptMessages: [
+      {
+        id: 'u1',
+        role: 'user',
+        text: 'transcript user 1',
+        timestamp: '2026-05-22T00:00:01.000Z',
+      },
+      {
+        id: 'a1',
+        role: 'assistant',
+        text: 'transcript assistant 1',
+        timestamp: '2026-05-22T00:00:02.000Z',
+        activities: ['Thought: transcript progress'],
+      },
+    ],
+  });
+
+  assert.deepEqual(messages.map((message) => message.id), ['u1', 'a1']);
+  assert.equal(messages.find((message) => message.id === 'a1')?.activities.length, 1);
+});
+
+test('stripRelayPromptContext removes the relay banner from visible text', () => {
+  const message = {
+    text: 'after a refresh it even came twice...',
+    mode: 'ask',
+  };
+  const polluted = [
+    '[Relay mode: ask]',
+    'Prioritize clarification questions before doing any implementation work.',
+    'If the request is ambiguous or underspecified, pause and ask through the web relay before making assumptions.',
+    'Do not make broad assumptions when a question would materially change the result.',
+    '# Relay Tool Guidance',
+    'For any user-facing question or clarification, use the ask_user tool so the web relay can render question cards and buttons. Never ask questions in plain assistant text.',
+    'In autopilot, still call ask_user when user input is truly blocking, because the relay bridge can surface the question even when the direct SDK question hook is bypassed.',
+    'after a refresh it even came twice...',
+  ].join(' ');
+
+  assert.equal(stripRelayPromptContext(polluted, message.mode), 'after a refresh it even came twice...');
+  assert.equal(stripRelayPromptContext('plain text', message.mode), 'plain text');
 });

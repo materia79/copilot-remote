@@ -218,8 +218,20 @@ export function createSessionWorkerSupervisor({
     const hasErrorStatus = workerStatus === 'error';
     const expectingReply = Boolean(questionPending) || workerStatus === 'processing';
     const pidProbe = checkPidLiveness(worker);
+    const healthyCandidate = workerPresent
+      && ACTIVE_WORKER_STATUSES.has(workerStatus)
+      && hasWorkerIdentity(worker)
+      && (!pidProbe.checked || pidProbe.alive)
+      && !hasErrorStatus
+      && !questionPending;
 
-    if (lifecycle.restartExhausted) {
+    if (lifecycle.restartExhausted && healthyCandidate) {
+      clearRestartSchedule(sessionId);
+    }
+
+    const refreshedLifecycle = getOrCreateLifecycle(sessionId);
+
+    if (refreshedLifecycle.restartExhausted) {
       registerDegradedState(sessionId, 'restart-exhausted', { atMs: nowAtMs });
     } else if (hasErrorStatus) {
       registerDegradedState(sessionId, String(worker?.lastError || lifecycle.lastError || 'worker-error'), { atMs: nowAtMs });
@@ -233,13 +245,13 @@ export function createSessionWorkerSupervisor({
     }
     const afterRecovery = getOrCreateLifecycle(sessionId);
     let stickyYellow = afterRecovery.uiState === 'yellow';
-    const healthyCandidate = expectedAlive
+    const effectiveHealthyCandidate = expectedAlive
       && (!pidProbe.checked || pidProbe.alive)
       && !hasErrorStatus
       && !afterRecovery.restartExhausted;
 
     if (stickyYellow) {
-      if (healthyCandidate) {
+      if (effectiveHealthyCandidate) {
         const recoveryCandidateAtMs = afterRecovery.recoveryCandidateAtMs || nowAtMs;
         const graceSatisfied = (nowAtMs - recoveryCandidateAtMs) >= recoveryGraceMs;
         const noNewFailures = !afterRecovery.lastFailureAtMs || afterRecovery.lastFailureAtMs <= recoveryCandidateAtMs;
@@ -262,7 +274,7 @@ export function createSessionWorkerSupervisor({
 
     const current = getOrCreateLifecycle(sessionId);
     const effectiveYellow = current.uiState === 'yellow';
-    const effectiveHealthy = healthyCandidate && !effectiveYellow;
+    const effectiveHealthy = effectiveHealthyCandidate && !effectiveYellow;
     const finalUiState = effectiveYellow
       ? 'yellow'
       : (questionPending ? 'red' : (effectiveHealthy ? 'green' : 'white'));

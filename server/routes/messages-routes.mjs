@@ -2,6 +2,7 @@
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
+import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 import {
   shouldParkForRestart,
   parkPendingQueueForRestart,
@@ -1207,7 +1208,8 @@ export function registerMessagesRoutes(app, deps) {
     const requesterSessionId = normalizeSessionWorkerId(requesterIdentity?.sessionId);
     const sessionWorkerRoutingEnabled = isSessionWorkerRoutingEnabled(featureFlags);
     let conversationSdkSessionId = null;
-    const trimmedText = String(text || '').trim();
+    const requestedRelayMode = normalizeRelayMode(relayMode || mode);
+    const trimmedText = stripRelayPromptContext(text, requestedRelayMode || relayMode || mode);
     const normalizedAttachments = normalizeAttachments(rawAttachments);
     const referenceResolution = collectReferenceAttachmentsFromText(trimmedText);
     const attachments = mergeMessageAttachments(normalizedAttachments, referenceResolution.attachments);
@@ -1234,7 +1236,6 @@ export function registerMessagesRoutes(app, deps) {
     const modelResolution = resolveRequestedModel(model);
     if (!modelResolution.ok) return res.status(400).json({ error: modelResolution.error, supportedModels: modelResolution.available || [] });
     const requestedModel = modelResolution.model;
-    const requestedRelayMode = normalizeRelayMode(relayMode || mode);
     if (!requestedRelayMode) return res.status(400).json({ error: 'Unsupported relay mode' });
     const workspaceRootUpdate = attachments.length === 0
       ? maybeApplyWorkspaceRootFromMessage(trimmedText)

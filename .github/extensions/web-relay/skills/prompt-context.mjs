@@ -56,3 +56,17 @@ export function buildPromptWithMode(message, toolInstructions = "") {
   const body = buildPrompt(message);
   return [modePrompt, body].filter(Boolean).join(" ");
 }
+
+export function stripPromptPrefix(text, promptPrefix = "") {
+  const value = String(text || "").trim();
+  if (!value) return "";
+  const prompt = String(promptPrefix || "").trim();
+  if (!prompt) return value;
+  if (!value.startsWith(prompt)) return value;
+  const remainder = value.slice(prompt.length).trim();
+  return remainder || "";
+}
+
+export function stripPromptContextPrefix(text, message, toolInstructions = "") {
+  return stripPromptPrefix(text, buildPromptWithMode(message, toolInstructions));
+}

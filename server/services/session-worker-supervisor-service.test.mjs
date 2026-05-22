@@ -344,6 +344,51 @@ test('snapshot marks stale pid and sticky yellow while reply is expected', async
   assert.equal(worker.degradedReason, null);
 });
 
+test('heartbeat clears restart exhaustion once a live worker comes back', async () => {
+  const registry = createSessionWorkerRegistry();
+  let currentTime = Date.parse('2026-01-01T00:00:00.000Z');
+  let pidAlive = false;
+  let spawnCalls = 0;
+  const supervisor = createSessionWorkerSupervisor({
+    registry,
+    now: () => currentTime,
+    isPidAlive: () => pidAlive,
+    spawnWorker: async () => {
+      spawnCalls += 1;
+      throw new Error(`spawn failed ${spawnCalls}`);
+    },
+    maxRestartRetries: 1,
+  });
+
+  const first = await supervisor.ensureWorker('sdk-recover');
+  assert.equal(first.ok, false);
+  assert.equal(first.error, 'spawn-failed');
+
+  currentTime += 1_000;
+  const exhausted = await supervisor.ensureWorker('sdk-recover');
+  assert.equal(exhausted.ok, false);
+  assert.equal(exhausted.error, 'restart-exhausted');
+  assert.equal(exhausted.lifecycle.restartExhausted, true);
+  assert.equal(spawnCalls, 2);
+
+  registry.upsertWorker({
+    sdkSessionId: 'sdk-recover',
+    workerId: 'worker-recover-live',
+    pid: 2468,
+    status: 'ready',
+  });
+  pidAlive = true;
+
+  const lifecycle = supervisor.noteSessionHeartbeat('sdk-recover', currentTime + 2_000);
+  assert.equal(lifecycle.restartExhausted, false);
+
+  const snapshot = supervisor.snapshot();
+  const worker = snapshot.workers.find((row) => row.sdkSessionId === 'sdk-recover');
+  assert.equal(worker.uiState, 'green');
+  assert.equal(worker.degradedReason, null);
+  assert.equal(worker.stalePidDetected, false);
+});
+
 test('stale heartbeat alone does not turn a live worker yellow', async () => {
   const registry = createSessionWorkerRegistry();
   let currentTime = Date.parse('2026-01-01T00:00:00.000Z');

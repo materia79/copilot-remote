@@ -3,6 +3,7 @@
 import fs from 'fs';
 import path from 'path';
 import { createSdkSessionSyncService } from '../services/sdk-session-sync-service.mjs';
+import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 
 const SESSION_WORKER_STATUS_QUEUE_STATES = Object.freeze(['pending', 'processing', 'parked']);
 
@@ -312,7 +313,7 @@ export function buildConversationMessages({
           activities: message?.role === 'assistant' ? (relayActivitiesByMessageId.get(id) || []) : [],
           id,
           role: message?.role,
-          text: message?.text,
+          text: stripRelayPromptContext(message?.text, message?.mode),
           model: message?.model || undefined,
           attachments: message?.attachments || [],
           mode: message?.mode || undefined,
@@ -347,6 +348,7 @@ export function buildConversationMessages({
           Array.isArray(message?.activities) ? message.activities : [],
           id ? (relayActivitiesByMessageId.get(id) || []) : [],
         ),
+        text: stripRelayPromptContext(message?.text, message?.mode),
         sourceMessageId: message?.role === 'assistant'
           ? (responseMessageToSourceId.get(id) || message?.sourceMessageId || undefined)
           : message?.sourceMessageId,
@@ -359,19 +361,7 @@ export function buildConversationMessages({
     const id = String(message?.id || '').trim();
     if (!id) continue;
     const existing = messagesById.get(id);
-    if (!existing) {
-      messagesById.set(id, {
-        ...message,
-        activities: mergeUniqueActivityTexts(
-          Array.isArray(message?.activities) ? message.activities : [],
-          id ? (relayActivitiesByMessageId.get(id) || []) : [],
-        ),
-        sourceMessageId: message?.role === 'assistant'
-          ? (responseMessageToSourceId.get(id) || message?.sourceMessageId || undefined)
-          : message?.sourceMessageId,
-      });
-      continue;
-    }
+    if (!existing) continue;
     if (existing.role !== 'assistant') continue;
     const transcriptMessage = transcriptById.get(id) || null;
     if (!transcriptMessage) continue;
@@ -381,6 +371,7 @@ export function buildConversationMessages({
         Array.isArray(existing.activities) ? existing.activities : [],
         Array.isArray(transcriptMessage.activities) ? transcriptMessage.activities : [],
       ),
+      text: stripRelayPromptContext(existing.text, existing.mode),
     });
   }
 
