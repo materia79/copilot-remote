@@ -53,6 +53,8 @@ Mode summary:
 - `npm run start:server:respawn`: legacy/manual watchdog tool (`respawn.bat`, outside extension-managed flow)
 - `npm run start:server:respawn:posix`: legacy/manual watchdog tool (`respawn.sh`, outside extension-managed flow)
 
+On Windows, the visible relay launcher path now targets a stable per-workspace Windows Terminal window name so later foreground launches reuse the same window instead of opening new desktop windows. Keep the hidden/stdio path as a fallback only.
+
 ### Runtime safety checklist (avoid duplicate relay workers)
 
 1. Stop stale detached watchdog/relay processes before restart.

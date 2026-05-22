@@ -105,7 +105,7 @@ export function createRelayCliLauncherService({
       detached: true,
       stdio: 'ignore',
       shell: platform === 'win32',
-      windowsHide: true,
+      windowsHide: platform === 'win32',
     });
     child.unref?.();
     return child?.pid || null;

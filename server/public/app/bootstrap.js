@@ -920,6 +920,7 @@ async function connectSocket() {
       scheduleContextUsageRefresh(conversationId, 120);
     }
     if (sourceMessageId) relayActivities.delete(sourceMessageId);
+    refreshSessionWorkerStatus().catch(() => {});
   });
   socket.on('relay_question', ({ question }) => upsertRelayQuestion(question));
   socket.on('relay_question_updated', ({ question }) => upsertRelayQuestion(question));
@@ -969,6 +970,7 @@ async function connectSocket() {
     if (conversationId === currentConvId && (status === 'done' || status === 'failed' || status === 'dropped')) {
       removeThinking();
       scheduleContextUsageRefresh(conversationId, 220);
+      refreshSessionWorkerStatus().catch(() => {});
     }
     renderConvList();
   });

@@ -846,7 +846,7 @@ function spawnSessionWorkerCli(targetSessionId) {
     detached: true,
     stdio: 'ignore',
     shell: process.platform === 'win32',
-    windowsHide: true,
+    windowsHide: process.platform === 'win32',
   });
   child.unref?.();
   const workerPid = Number.isInteger(Number(child?.pid)) ? Number(child.pid) : null;

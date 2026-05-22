@@ -4,6 +4,10 @@ import { getActiveSession } from "../runtime/session-registry.mjs";
 import { DEFAULT_QUESTION_TIMEOUT_MS } from "../../../../shared/question-timeout.mjs";
 import { QUESTION_TIMEOUT_CONTINUATION_TEXT } from "../../../../shared/question-timeout.mjs";
 import { stripPromptContextPrefix } from "../skills/prompt-context.mjs";
+import {
+  parseQuestionFromText,
+  shouldForceFallbackQuestionBridge,
+} from "./question-text.mjs";
 
 function isImageAttachment(att) {
   const type = String(att?.type || "").toLowerCase();
@@ -110,51 +114,6 @@ export function createPollingLoop({
   handleControl,
 }) {
   let stopRequested = false;
-
-  function stripMarkdown(text) {
-    return String(text || "")
-      .replace(/`([^`]+)`/g, "$1")
-      .replace(/\*\*([^*]+)\*\*/g, "$1")
-      .replace(/\*([^*]+)\*/g, "$1")
-      .replace(/^\s*>+\s?/gm, "")
-      .trim();
-  }
-
-  function parseQuestionFromText(text) {
-    const lines = String(text || "")
-      .split(/\r?\n/)
-      .map((line) => stripMarkdown(line))
-      .filter(Boolean);
-
-    let prompt = lines.find((line) => line.includes("?")) || "";
-    if (!prompt) {
-      prompt = lines.find((line) => /^the\s.+question[:]?$/i.test(line)) || lines[0] || "";
-    }
-
-    const choices = lines
-      .map((line) => {
-        // Match numbered (1. 1) - *) and lettered (A. A) a. a)) choices
-        const numbered = line.match(/^\s*(?:\d+[\.\)]|[a-dA-D][\.\)]|[-*])\s+(.+)$/);
-        return numbered ? stripMarkdown(numbered[1]) : "";
-      })
-      .filter(Boolean)
-      .slice(0, 8);
-
-    return {
-      prompt: stripMarkdown(prompt),
-      choices,
-    };
-  }
-
-  function shouldForceFallbackQuestionBridge(assistantText) {
-    const parsed = parseQuestionFromText(assistantText);
-    // Only force fallback bridge for clear follow-up questions with structured choices
-    // so normal assistant replies are not converted into question cards.
-    const hasQuestionPrompt = String(parsed?.prompt || "").includes("?");
-    const hasChoices = Array.isArray(parsed?.choices) && parsed.choices.length >= 2;
-    if (!hasQuestionPrompt || !hasChoices) return { shouldForce: false, parsed: null };
-    return { shouldForce: true, parsed };
-  }
 
   async function waitForRelayQuestionAnswer(questionId, timeoutMs = DEFAULT_QUESTION_TIMEOUT_MS, pollIntervalMs = 1500) {
     const started = Date.now();

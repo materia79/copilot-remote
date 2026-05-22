@@ -3,10 +3,13 @@
  *
  * Spawns its own Copilot CLI process, polls the web server for pending
  * messages, processes each with sendAndWait(), and posts responses back.
+ * On Windows, foreground mode prefers a stable Windows Terminal window name so
+ * repeated launches reuse the same visible window instead of creating new ones.
  *
  * Usage:
- *   node relay.mjs                        # hidden CLI subprocess (default)
+ *   node relay.mjs                        # hidden CLI subprocess (default off Windows)
  *   node relay.mjs --foreground           # visible terminal window
+ *   node relay.mjs --hidden               # force hidden stdio fallback
  *   node relay.mjs --token <newtoken>     # override auth token
  */
 
@@ -19,13 +22,18 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { resolveStartupWorkspaceRoot } from './workspace-root.mjs';
+import {
+  buildWindowsTerminalForegroundArgs,
+  buildWindowsTerminalWindowName,
+} from './windows-terminal-launcher.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 
 // ─── Args ──────────────────────────────────────────────────────────────────────
 const args = process.argv.slice(2);
-const FOREGROUND = args.includes('--foreground');
+const FORCE_HIDDEN = args.includes('--hidden') || args.includes('--stdio');
+const FOREGROUND = !FORCE_HIDDEN && (args.includes('--foreground') || process.platform === 'win32');
 const VERBOSE = args.includes('--quiet') ? false : true;
 const tokenArgIdx = args.indexOf('--token');
 const TOKEN_OVERRIDE = tokenArgIdx !== -1 ? args[tokenArgIdx + 1] : null;
@@ -111,6 +119,7 @@ function detectCopilotPaths() {
 const { sdkPath: SDK_PATH, cliPath: CLI_PATH } = detectCopilotPaths();
 const NODE_PATH = process.env.COPILOT_WEB_RELAY_NODE || process.execPath;
 const CLI_PORT  = config.cliPort || 4445;
+const foregroundWindowName = buildWindowsTerminalWindowName(launchWorkspaceRoot);
 
 function ts() { return new Date().toISOString().slice(11, 23); }
 function log(...a) { console.log(`[relay ${ts()}]`, ...a); }
@@ -335,16 +344,25 @@ const MODEL_ALIAS_CANDIDATES = {
 
 // ─── Foreground CLI Window ─────────────────────────────────────────────────────
 /**
- * Spawns the Copilot CLI in a visible PowerShell window using TCP server mode.
+ * Spawns the Copilot CLI in a visible terminal window using TCP server mode.
  * Returns { tcpConnectionToken } so the relay can connect via cliUrl.
  */
-async function spawnForegroundCli() {
-  const tcpConnectionToken = randomUUID();
-  const port = CLI_PORT;
+function waitForProcessSpawn(command, commandArgs, options) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, commandArgs, options);
+    let settled = false;
+    child.once('spawn', () => {
+      settled = true;
+      resolve(child);
+    });
+    child.once('error', (error) => {
+      if (settled) return;
+      reject(error);
+    });
+  });
+}
 
-  log(`Spawning visible CLI on port ${port}...`);
-
-  // Build the PowerShell command that runs in the new window
+async function spawnForegroundCliViaPowerShell(tcpConnectionToken, port) {
   const nodeArgs = [
     CLI_PATH,
     '--headless',
@@ -354,15 +372,60 @@ async function spawnForegroundCli() {
   ].join(' ');
 
   const psCommand = `$env:COPILOT_CONNECTION_TOKEN='${tcpConnectionToken}'; & '${NODE_PATH}' ${nodeArgs}`;
-
-  spawn('powershell.exe', [
+  const child = await waitForProcessSpawn('powershell.exe', [
     '-NoExit',
-    '-Command', psCommand,
+    '-Command',
+    psCommand,
   ], {
     detached: true,
     stdio: 'ignore',
     windowStyle: 'Normal',
   });
+  child.unref?.();
+  return child;
+}
+
+async function spawnForegroundCli() {
+  const tcpConnectionToken = randomUUID();
+  const port = CLI_PORT;
+
+  if (process.platform === 'win32') {
+    const wtArgs = buildWindowsTerminalForegroundArgs({
+      workspaceRoot: launchWorkspaceRoot,
+      windowName: foregroundWindowName,
+      title: 'Copilot Relay',
+      commandPath: NODE_PATH,
+      commandArgs: [
+        CLI_PATH,
+        '--headless',
+        '--no-auto-update',
+        '--log-level', 'debug',
+        '--port', String(port),
+      ],
+    });
+
+    try {
+      log(`Spawning visible CLI in Windows Terminal window ${foregroundWindowName} on port ${port}...`);
+      const child = await waitForProcessSpawn('wt.exe', wtArgs, {
+        cwd: launchWorkspaceRoot,
+        env: {
+          ...process.env,
+          COPILOT_WORKSPACE_ROOT: launchWorkspaceRoot,
+          COPILOT_CONNECTION_TOKEN: tcpConnectionToken,
+        },
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: false,
+      });
+      child.unref?.();
+    } catch (error) {
+      log(`Windows Terminal launch failed (${error?.message || String(error)}); falling back to PowerShell window`);
+      await spawnForegroundCliViaPowerShell(tcpConnectionToken, port);
+    }
+  } else {
+    log(`Spawning visible CLI on port ${port}...`);
+    await spawnForegroundCliViaPowerShell(tcpConnectionToken, port);
+  }
 
   // Wait up to 20s for the CLI to open its TCP port
   log(`Waiting for CLI to listen on port ${port}...`);

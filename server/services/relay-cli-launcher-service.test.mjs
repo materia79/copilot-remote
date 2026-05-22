@@ -99,6 +99,8 @@ test('windows launcher spawns when target session is absent and leaves others al
     ['copilot', '--', '--allow-all', '--session-id', targetSessionId],
   );
   assert.equal(spawnCalls[0].options.detached, true);
+  assert.equal(spawnCalls[0].options.shell, true);
+  assert.equal(spawnCalls[0].options.windowsHide, true);
   assert.equal(execCalls.some((args) => String(args?.[2] || '').includes('Stop-Process -Id $id')), false);
   const state = service.getState();
   assert.equal(state?.status, 'spawned');
