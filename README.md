@@ -6,6 +6,37 @@ Use your local GitHub Copilot CLI session from any browser (phone, tablet, or se
 [Browser] <-- WebSocket --> [server.js :3333] <-- HTTP poll --> [Copilot CLI session]
 ```
 
+## In action
+
+Copilot Remote is built to feel at home on both desktop and mobile. Your conversations can follow you from a browser tab to a PWA install, with file browsing and previews built in.
+
+<div align="center">
+<table width="100%" cellspacing="0" cellpadding="0">
+<tr>
+<td rowspan="2" width="40%" align="center" valign="middle">
+<a href="docs/screenshots/mobile_session.jpg" target="_blank" rel="noopener noreferrer">
+<img src="docs/screenshots/mobile_session.jpg" alt="Mobile session view">
+</a>
+<div align="center"><small>Mobile session view with the composer and a PWA-style fullscreen layout.</small></div>
+</td>
+<td width="60%" align="right" valign="top">
+<a href="docs/screenshots/desktop_pwa_chrome.png" target="_blank" rel="noopener noreferrer">
+<img src="docs/screenshots/desktop_pwa_chrome.png" alt="Desktop PWA chat view">
+</a>
+<div align="center"><small>Desktop PWA App (Chrome), chat view with session list.</small></div>
+</td>
+</tr>
+<tr>
+<td width="60%" align="right" valign="bottom">
+<a href="docs/screenshots/desktop_pwa_file_viewer.png" target="_blank" rel="noopener noreferrer">
+<img src="docs/screenshots/desktop_pwa_file_viewer.png" alt="Desktop PWA file viewer">
+</a>
+<div align="center"><small>Integrated file viewer for previews and inline file browsing.</small></div>
+</td>
+</tr>
+</table>
+</div>
+
 ## What this repository provides
 
 Copilot Remote is split into two pieces:
@@ -285,3 +316,45 @@ copilot-remote/
 ├── docs/                           # Project planning notes
 └── README.md
 ```
+
+## Extra screenshots
+
+More views from the same app experience:
+
+<div align="center">
+<table width="100%" cellspacing="0" cellpadding="0">
+<tr>
+<td rowspan="2" width="50%" align="center" valign="middle">
+<a href="docs/screenshots/mobile_session_input.jpg" target="_blank" rel="noopener noreferrer">
+<img src="docs/screenshots/mobile_session_input.jpg" alt="Mobile session composer">
+</a>
+<div align="center"><small>Mobile chat composer in portrait, with the keyboard open and the input ready to send.</small></div>
+</td>
+<td width="50%" align="right" valign="top">
+<a href="docs/screenshots/desktop_pwa_chrome_portrait.png" target="_blank" rel="noopener noreferrer">
+<img src="docs/screenshots/desktop_pwa_chrome_portrait.png" alt="Desktop PWA portrait view">
+</a>
+<div align="center"><small>Desktop PWA running in portrait mode, sized for a narrow browser window.</small></div>
+</td>
+</tr>
+<tr>
+<td width="50%" align="right" valign="bottom">
+<a href="docs/screenshots/desktop_pwa_workspace_file_explorer.png" target="_blank" rel="noopener noreferrer">
+<img src="docs/screenshots/desktop_pwa_workspace_file_explorer.png" alt="Workspace file explorer">
+</a>
+<div align="center"><small>Workspace file explorer with folder browsing and file previews.</small></div>
+</td>
+</tr>
+</table>
+
+<table width="50%" cellspacing="0" cellpadding="0">
+<tr>
+<td align="center">
+<a href="docs/screenshots/mobile_file_viewer.jpg" target="_blank" rel="noopener noreferrer">
+<img src="docs/screenshots/mobile_file_viewer.jpg" alt="Mobile file viewer">
+</a>
+<div align="center"><small>Mobile (PWA/Browser) file viewer showing an image preview and download actions.</small></div>
+</td>
+</tr>
+</table>
+</div>
