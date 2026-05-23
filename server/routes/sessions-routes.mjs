@@ -150,7 +150,7 @@ export function persistConversationTitle({
     return { ok: false, statusCode: 404, error: 'Conversation not found' };
   }
 
-  const updatedAt = new Date().toISOString();
+  const updatedAt = existing?.updated_at || new Date().toISOString();
 
   if (!existing) {
     if (typeof stmts?.insertConv?.run === 'function') {
@@ -161,9 +161,15 @@ export function persistConversationTitle({
   }
 
   if (typeof stmts?.updateConvTitle?.run === 'function') {
-    stmts.updateConvTitle.run(nextTitle, updatedAt, id);
+    stmts.updateConvTitle.run(nextTitle, id);
   } else if (db && typeof db.prepare === 'function') {
-    db.prepare(`UPDATE conversations SET title = ?, title_source = 'manual', updated_at = ? WHERE id = ?`).run(nextTitle, updatedAt, id);
+    db.prepare(`UPDATE conversations SET title = ?, title_source = 'manual' WHERE id = ?`).run(nextTitle, id);
+  }
+
+  if (typeof stmts?.setConvSdkSessionIdIfMissing?.run === 'function') {
+    stmts.setConvSdkSessionIdIfMissing.run(id, updatedAt, id);
+  } else if (db && typeof db.prepare === 'function') {
+    db.prepare(`UPDATE conversations SET sdk_session_id = ?, updated_at = ? WHERE id = ? AND (sdk_session_id IS NULL OR sdk_session_id = '')`).run(id, updatedAt, id);
   }
 
   const workspaceResult = updateConversationWorkspaceTitle({

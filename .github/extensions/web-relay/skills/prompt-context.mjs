@@ -14,45 +14,62 @@ export function buildPrompt(message) {
   return text ? `${text}${suffix}` : suffix.trimStart();
 }
 
-export function buildModePrompt(mode, toolInstructions = "") {
+function normalizeRelayMode(mode) {
   const value = String(mode || "agent").trim().toLowerCase();
-  const parts = [];
-  if (value === "plan") {
-    parts.push(
-      "[Relay mode: plan]",
+  if (value === "plan" || value === "ask" || value === "autopilot" || value === "agent") return value;
+  return "agent";
+}
+
+function buildModeInstructionText(mode) {
+  if (mode === "plan") {
+    return [
       "Draft a concise plan only.",
       "Do not edit files or run tools unless the user explicitly asks for implementation.",
       "If clarification is required, pause and ask through the web relay.",
-    );
-  } else if (value === "ask") {
-    parts.push(
-      "[Relay mode: ask]",
+      "These instructions remain in effect until relay mode changes.",
+    ].join(" ");
+  }
+  if (mode === "ask") {
+    return [
       "Prioritize clarification questions before doing any implementation work.",
       "If the request is ambiguous or underspecified, pause and ask through the web relay before making assumptions.",
       "Do not make broad assumptions when a question would materially change the result.",
-    );
-  } else if (value === "autopilot") {
-    parts.push(
-      "[Relay mode: autopilot]",
+      "These instructions remain in effect until relay mode changes.",
+    ].join(" ");
+  }
+  if (mode === "autopilot") {
+    return [
       "Act directly on the request and use tools when needed.",
       "Keep moving unless user input is truly blocking.",
-    );
-  } else {
-    parts.push(
-      "[Relay mode: agent]",
-      "Proceed as an interactive coding agent and use tools as needed.",
-      "If you need clarification, pause and ask through the web relay instead of stalling silently.",
-    );
+      "These instructions remain in effect until relay mode changes.",
+    ].join(" ");
   }
-  if (toolInstructions) {
-    parts.push(toolInstructions);
-  }
+  return [
+    "Proceed as an interactive coding agent and use tools as needed.",
+    "If you need clarification, pause and ask through the web relay instead of stalling silently.",
+    "These instructions remain in effect until relay mode changes.",
+  ].join(" ");
+}
 
+export function buildModeMarker(mode) {
+  return `[Relay mode: ${normalizeRelayMode(mode)}]`;
+}
+
+export function buildModePrompt(mode, toolInstructions = "", options = {}) {
+  const normalizedMode = normalizeRelayMode(mode);
+  const includeInstructions = options?.includeInstructions !== false;
+  const parts = [buildModeMarker(normalizedMode)];
+  if (includeInstructions) {
+    parts.push(buildModeInstructionText(normalizedMode));
+    if (toolInstructions) {
+      parts.push(toolInstructions);
+    }
+  }
   return parts.join(" ");
 }
 
-export function buildPromptWithMode(message, toolInstructions = "") {
-  const modePrompt = buildModePrompt(message?.relayMode, toolInstructions);
+export function buildPromptWithMode(message, toolInstructions = "", options = {}) {
+  const modePrompt = buildModePrompt(message?.relayMode, toolInstructions, options);
   const body = buildPrompt(message);
   return [modePrompt, body].filter(Boolean).join(" ");
 }
@@ -67,6 +84,18 @@ export function stripPromptPrefix(text, promptPrefix = "") {
   return remainder || "";
 }
 
-export function stripPromptContextPrefix(text, message, toolInstructions = "") {
-  return stripPromptPrefix(text, buildPromptWithMode(message, toolInstructions));
+export function stripPromptContextPrefix(text, message, toolInstructions = "", promptPrefix = "") {
+  const value = String(text || "").trim();
+  if (!value) return "";
+  const candidates = [
+    String(promptPrefix || "").trim(),
+    buildPromptWithMode(message, toolInstructions),
+    buildPromptWithMode(message, toolInstructions, { includeInstructions: false }),
+    buildModeMarker(message?.relayMode),
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    const stripped = stripPromptPrefix(value, candidate);
+    if (stripped !== value) return stripped;
+  }
+  return value;
 }

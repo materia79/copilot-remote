@@ -434,8 +434,7 @@ export function createPollingLoop({
             }
             dbg("session.sendAndWait: completed for msgId", message.id);
 
-            const promptPrefix = String(buildPromptWithRelayContext?.(message) || '').trim();
-            const text = stripPromptContextPrefix(extractFinalText(finalEvent), message, promptPrefix);
+            const text = stripPromptContextPrefix(extractFinalText(finalEvent), message, "", prompt);
             const model = await getCurrentModelId() || finalEvent?.data?.model || finalEvent?.data?.modelId || message.model || null;
             const bridgedViaAskUser = !!getLastAskUserBridge?.();
             const pendingAskUserReq = !bridgedViaAskUser ? getPendingAskUserRequest?.() : null;

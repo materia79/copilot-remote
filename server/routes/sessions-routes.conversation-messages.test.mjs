@@ -262,6 +262,7 @@ test('stripRelayPromptContext removes the relay banner from visible text', () =>
     'Prioritize clarification questions before doing any implementation work.',
     'If the request is ambiguous or underspecified, pause and ask through the web relay before making assumptions.',
     'Do not make broad assumptions when a question would materially change the result.',
+    'These instructions remain in effect until relay mode changes.',
     '# Relay Tool Guidance',
     'For any user-facing question or clarification, use the ask_user tool so the web relay can render question cards and buttons. Never ask questions in plain assistant text.',
     'In autopilot, still call ask_user when user input is truly blocking, because the relay bridge can surface the question even when the direct SDK question hook is bypassed.',
@@ -269,5 +270,6 @@ test('stripRelayPromptContext removes the relay banner from visible text', () =>
   ].join(' ');
 
   assert.equal(stripRelayPromptContext(polluted, message.mode), 'after a refresh it even came twice...');
+  assert.equal(stripRelayPromptContext('[Relay mode: ask] after a refresh it even came twice...', message.mode), 'after a refresh it even came twice...');
   assert.equal(stripRelayPromptContext('plain text', message.mode), 'plain text');
 });

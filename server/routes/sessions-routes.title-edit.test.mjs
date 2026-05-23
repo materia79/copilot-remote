@@ -31,7 +31,7 @@ function createHarness() {
   const stmts = {
     getConvAnyStatus: db.prepare(`SELECT * FROM conversations WHERE id = ?`),
     insertConv: db.prepare(`INSERT OR IGNORE INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)`),
-    updateConvTitle: db.prepare(`UPDATE conversations SET title = ?, title_source = 'manual', updated_at = ? WHERE id = ?`),
+    updateConvTitle: db.prepare(`UPDATE conversations SET title = ?, title_source = 'manual' WHERE id = ?`),
     setConvSdkSessionIdIfMissing: db.prepare(`UPDATE conversations SET sdk_session_id = ?, updated_at = ? WHERE id = ? AND (sdk_session_id IS NULL OR sdk_session_id = '')`),
   };
   const events = [];
@@ -75,9 +75,11 @@ test('persistConversationTitle updates existing conversations and emits the sock
   assert.equal(row.title, 'Renamed conversation');
   assert.equal(row.title_source, 'manual');
   assert.equal(row.sdk_session_id, 'sdk-1');
+  assert.equal(row.updated_at, now);
   assert.equal(events.length, 1);
   assert.equal(events[0].event, 'conversation_title_updated');
   assert.equal(events[0].payload.conversationId, 'conv-1');
+  assert.equal(events[0].payload.updatedAt, now);
   db.close();
 });
 

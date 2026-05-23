@@ -84,7 +84,25 @@ const bannerStateStore = createBannerStateStore({
   ttlMs: BANNER_DEDUPE_TTL_MS,
   cooldownMs: BANNER_DEDUPE_COOLDOWN_MS,
 });
-const buildPromptWithRelayContext = (message) => buildPromptWithMode(message, RELAY_TOOL_INSTRUCTIONS);
+
+function normalizeRelayMode(value) {
+  const mode = String(value || "agent").trim().toLowerCase();
+  if (mode === "plan" || mode === "ask" || mode === "autopilot" || mode === "agent") return mode;
+  return "agent";
+}
+
+let lastPromptedRelayMode = null;
+const buildPromptWithRelayContext = (message) => {
+  const relayMode = normalizeRelayMode(message?.relayMode);
+  const includeInstructions = lastPromptedRelayMode !== relayMode;
+  const prompt = buildPromptWithMode(
+    { ...message, relayMode },
+    RELAY_TOOL_INSTRUCTIONS,
+    { includeInstructions },
+  );
+  lastPromptedRelayMode = relayMode;
+  return prompt;
+};
 
 const managedServerLifecycle = createManagedServerLifecycle({
   api,
