@@ -45,3 +45,16 @@ test("stripPromptContextPrefix removes echoed full and marker-only relay prompt 
   );
   assert.equal(stripPromptContextPrefix("plain answer", message), "plain answer");
 });
+
+test("stripPromptContextPrefix removes echoed prompt context with whitespace variation", () => {
+  const message = {
+    text: "Please investigate startup replay behavior.",
+    relayMode: "ask",
+  };
+  const fullPrompt = buildPromptWithMode(message, "# Relay Tool Guidance");
+  const whitespaceVariedEcho = `${fullPrompt.replace(/\s+/g, "\n   ")}\n\nActual answer starts here.`;
+  assert.equal(
+    stripPromptContextPrefix(whitespaceVariedEcho, message, "# Relay Tool Guidance"),
+    "Actual answer starts here.",
+  );
+});

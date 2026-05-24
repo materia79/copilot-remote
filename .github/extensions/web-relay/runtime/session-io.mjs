@@ -102,6 +102,16 @@ function extractFinalText(finalEvent, _dbg) {
 }
 
 export function createSessionIoHelpers({ getSession, sleep, dbg = () => {} }) {
+  const STREAM_WAIT_POLL_MS = 5_000;
+  const WAIT_TICK = Symbol("relay-stream-wait-tick");
+
+  function buildRelayStreamTimeoutError(timeoutMs) {
+    const error = new Error(`Hard timeout after ${timeoutMs}ms while streaming session.send`);
+    error.code = "RELAY_STREAM_TIMEOUT";
+    error.stableCode = "relay.stream-timeout";
+    return error;
+  }
+
   async function sendAndWaitWithHardTimeout(payload, timeoutMs) {
     return Promise.race([
       getSession().sendAndWait(payload, timeoutMs),
@@ -111,7 +121,7 @@ export function createSessionIoHelpers({ getSession, sleep, dbg = () => {} }) {
     ]);
   }
 
-  async function sendWithBestEffortStreaming(payload, timeoutMs, onEvent) {
+  async function sendWithBestEffortStreaming(payload, timeoutMs, onEvent, options = {}) {
     const session = getSession();
     if (!session) throw new Error("No active Copilot session");
     if (typeof session.send !== "function") {
@@ -122,13 +132,43 @@ export function createSessionIoHelpers({ getSession, sleep, dbg = () => {} }) {
     if (streamOrResult && typeof streamOrResult[Symbol.asyncIterator] === "function") {
       const deadline = Date.now() + timeoutMs + 5_000;
       let finalEvent = null;
-      for await (const event of streamOrResult) {
-        finalEvent = event;
-        if (typeof onEvent === "function") {
-          try { await onEvent(event); } catch {}
+      const iterator = streamOrResult[Symbol.asyncIterator]();
+      const onWaiting = typeof options?.onWaiting === "function" ? options.onWaiting : null;
+      const waitPollMs = Math.max(250, Math.min(Number(options?.waitPollMs) || STREAM_WAIT_POLL_MS, 30_000));
+
+      try {
+        while (true) {
+          const remainingMs = deadline - Date.now();
+          if (remainingMs <= 0) {
+            throw buildRelayStreamTimeoutError(timeoutMs);
+          }
+
+          const nextOrTick = await Promise.race([
+            iterator.next(),
+            sleep(Math.min(waitPollMs, remainingMs)).then(() => WAIT_TICK),
+          ]);
+
+          if (nextOrTick === WAIT_TICK) {
+            if (onWaiting) {
+              await onWaiting({
+                timeoutMs,
+                deadline,
+                remainingMs: Math.max(0, deadline - Date.now()),
+              });
+            }
+            continue;
+          }
+
+          if (nextOrTick?.done) break;
+          const event = nextOrTick?.value;
+          finalEvent = event;
+          if (typeof onEvent === "function") {
+            try { await onEvent(event); } catch {}
+          }
         }
-        if (Date.now() > deadline) {
-          throw new Error(`Hard timeout after ${timeoutMs}ms while streaming session.send`);
+      } finally {
+        if (typeof iterator?.return === "function") {
+          try { await iterator.return(); } catch {}
         }
       }
       return finalEvent || {};

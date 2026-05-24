@@ -7,6 +7,14 @@ import {
 } from './sessions-routes.mjs';
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 
+const FULL_RELAY_TOOL_GUIDANCE = [
+  '# Relay Tool Guidance',
+  'For any user-facing question or clarification, use the ask_user tool so the web relay can render question cards and buttons. Never ask questions in plain assistant text.',
+  'In autopilot, still call ask_user when user input is truly blocking, because the relay bridge can surface the question even when the direct SDK question hook is bypassed.',
+  'For relay restarts in extension-managed mode, require explicit user permission first, then use the authenticated localhost API POST /api/relay/shutdown. Do not restart by killing processes or using respawn scripts.',
+  'Note: shutdown is queued and only completes when the current turn finishes, so it is pointless to wait for it to interrupt an active turn.',
+].join(' ');
+
 test('selectConversationHistoryPage clamps limit and advances cursors', () => {
   const messages = [
     { id: 'm1', role: 'user', text: 'one', timestamp: '2026-05-22T00:00:01.000Z' },
@@ -228,6 +236,45 @@ test('buildConversationMessages de-dupes transcript user rows with inline attach
   assert.deepEqual(messages.map((message) => message.id), ['db-u1']);
 });
 
+test('buildConversationMessages de-dupes transcript user rows with the full first-turn relay wrapper', () => {
+  const userText = 'Write a nodejs script to get the current time of all major cities in the world (top 20 is fine) and also run it for me one time and show me its output';
+  const wrappedTranscriptText = [
+    '[Relay mode: agent]',
+    'Proceed as an interactive coding agent and use tools as needed.',
+    'If you need clarification, pause and ask through the web relay instead of stalling silently.',
+    'These instructions remain in effect until relay mode changes.',
+    FULL_RELAY_TOOL_GUIDANCE,
+    userText,
+  ].join(' ');
+
+  const messages = buildConversationMessages({
+    dbMessages: [
+      {
+        id: 'db-u1',
+        role: 'user',
+        text: userText,
+        timestamp: '2026-05-24T14:12:39.530Z',
+      },
+      {
+        id: 'db-a1',
+        role: 'assistant',
+        text: 'Done — added the script and ran it once.',
+        timestamp: '2026-05-24T14:13:21.107Z',
+      },
+    ],
+    transcriptMessages: [
+      {
+        id: 'tx-u1',
+        role: 'user',
+        text: wrappedTranscriptText,
+        timestamp: '2026-05-24T14:12:46.561Z',
+      },
+    ],
+  });
+
+  assert.deepEqual(messages.map((message) => message.id), ['db-u1', 'db-a1']);
+});
+
 test('buildConversationMessages falls back to transcript rows when no DB messages exist', () => {
   const messages = buildConversationMessages({
     dbMessages: [],
@@ -263,13 +310,16 @@ test('stripRelayPromptContext removes the relay banner from visible text', () =>
     'If the request is ambiguous or underspecified, pause and ask through the web relay before making assumptions.',
     'Do not make broad assumptions when a question would materially change the result.',
     'These instructions remain in effect until relay mode changes.',
-    '# Relay Tool Guidance',
-    'For any user-facing question or clarification, use the ask_user tool so the web relay can render question cards and buttons. Never ask questions in plain assistant text.',
-    'In autopilot, still call ask_user when user input is truly blocking, because the relay bridge can surface the question even when the direct SDK question hook is bypassed.',
+    FULL_RELAY_TOOL_GUIDANCE,
     'after a refresh it even came twice...',
   ].join(' ');
 
   assert.equal(stripRelayPromptContext(polluted, message.mode), 'after a refresh it even came twice...');
   assert.equal(stripRelayPromptContext('[Relay mode: ask] after a refresh it even came twice...', message.mode), 'after a refresh it even came twice...');
   assert.equal(stripRelayPromptContext('plain text', message.mode), 'plain text');
+});
+
+test('stripRelayPromptContext keeps plain text that mentions relay restart guidance later in the message', () => {
+  const text = `Please document this exactly: ${FULL_RELAY_TOOL_GUIDANCE}`;
+  assert.equal(stripRelayPromptContext(text, 'agent'), text);
 });

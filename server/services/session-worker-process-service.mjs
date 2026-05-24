@@ -85,11 +85,36 @@ export function createSessionWorkerProcessInspector({
     return findWindowsProcessesForSession(targetSessionId)[0] || null;
   }
 
+  function parsePositiveInt(value) {
+    const num = Number.parseInt(String(value || ''), 10);
+    return Number.isInteger(num) && num > 0 ? num : null;
+  }
+
+  function stopWindowsPids(pids) {
+    const ids = Array.from(new Set(
+      (Array.isArray(pids) ? pids : [pids])
+        .map((value) => parsePositiveInt(value))
+        .filter(Boolean),
+    ));
+    if (!ids.length) return [];
+    const script = [
+      '$ids = @(' + ids.join(',') + ')',
+      'foreach ($id in $ids) {',
+      '  try { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue } catch {}',
+      '}',
+    ].join('; ');
+    execFileSyncImpl('powershell.exe', ['-NoProfile', '-Command', script], {
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    return ids;
+  }
+
   return {
     normalizeSessionId,
     parseSessionIdFromCommandLine,
     findWindowsProcessesForSession,
     findWindowsProcessForSession,
     getWindowsProcessSnapshot,
+    stopWindowsPids,
   };
 }

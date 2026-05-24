@@ -329,6 +329,8 @@
     flex-shrink: 0;
   }
   .chat-title-action-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .danger-btn { border-color: rgba(255, 107, 107, 0.55); color: #ff8d8d; }
+  .danger-btn:hover { border-color: #ff6b6b; color: #ffb1b1; }
   #chat-title-save-btn {
     background: var(--accent);
     border-color: transparent;
@@ -930,6 +932,13 @@
     padding: 18px;
   }
   #summary-modal.visible { display: flex; }
+  .summary-modal-actions {
+    display: flex;
+    gap: 10px;
+    justify-content: flex-end;
+    margin-top: 16px;
+    flex-wrap: wrap;
+  }
   .summary-dialog {
     width: min(920px, 100%);
     max-height: min(88vh, 860px);
@@ -1734,6 +1743,7 @@
           <div id="chat-actions-menu" role="menu" hidden>
             <button id="chat-menu-edit-title" class="chat-actions-menu-item" type="button" role="menuitem">✍️ Edit conversation title</button>
             <button id="chat-menu-compact" class="chat-actions-menu-item" type="button" role="menuitem">🗜️ Compact</button>
+            <button id="chat-menu-kill-session" class="chat-actions-menu-item" type="button" role="menuitem">☠️ Kill session</button>
           </div>
         </div>
         <button id="fullscreen-btn" class="header-icon-btn" onclick="toggleFullscreen()" title="Toggle fullscreen" aria-label="Toggle fullscreen">⛶</button>

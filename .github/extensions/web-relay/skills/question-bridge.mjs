@@ -6,6 +6,7 @@ export function createQuestionBridge({
   dbg,
   sleep,
   questionWaitTimeoutMs,
+  getQuestionWaitTimeoutMs,
   questionPollMs,
   getActiveMessage,
   extractQuestionPrompt,
@@ -34,8 +35,22 @@ export function createQuestionBridge({
     return !!value;
   }
 
-  async function waitForRelayQuestionAnswer(questionId) {
+  function resolveQuestionWaitTimeoutMs(timeoutMs = null) {
+    if (timeoutMs !== null && timeoutMs !== undefined) {
+      const requested = Number(timeoutMs);
+      if (Number.isFinite(requested) && requested >= 0) return requested;
+    }
+    if (typeof getQuestionWaitTimeoutMs === "function") {
+      const dynamic = Number(getQuestionWaitTimeoutMs());
+      if (Number.isFinite(dynamic) && dynamic >= 0) return dynamic;
+    }
+    const fallback = Number(questionWaitTimeoutMs);
+    return Number.isFinite(fallback) && fallback >= 0 ? fallback : 0;
+  }
+
+  async function waitForRelayQuestionAnswer(questionId, timeoutMs = null) {
     const started = Date.now();
+    const effectiveTimeoutMs = resolveQuestionWaitTimeoutMs(timeoutMs);
 
     while (true) {
       const { question } = await api("GET", `/api/relay-question/${questionId}`);
@@ -52,7 +67,7 @@ export function createQuestionBridge({
           timedOut: true,
         };
       }
-      if (Date.now() - started >= questionWaitTimeoutMs) {
+      if (Date.now() - started >= effectiveTimeoutMs) {
         await api("POST", `/api/relay-question/${questionId}/timeout`, {}).catch(() => {});
         return {
           answer: QUESTION_TIMEOUT_CONTINUATION_TEXT,
@@ -68,6 +83,7 @@ export function createQuestionBridge({
     const choices = extractQuestionChoices(request);
     const allowFreeform = extractAllowFreeform(request);
     const activeSession = getActiveSession();
+    const questionTimeoutMs = resolveQuestionWaitTimeoutMs();
     const questionPayload = {
       queueId: activeMsg?.id,
       messageId: activeMsg?.id,
@@ -77,6 +93,7 @@ export function createQuestionBridge({
       choices,
       allowFreeform: allowFreeform ?? !choices.length,
       sdk_session_id: activeSession?.sdkSessionId || undefined,
+      timeout_ms: questionTimeoutMs,
       context: {
         source: "onUserInputRequest",
         rationale: "Agent requested clarification to continue this turn.",
@@ -104,7 +121,7 @@ export function createQuestionBridge({
       String(questionPayload.choices?.length || 0),
     );
 
-    return waitForRelayQuestionAnswer(questionId);
+    return waitForRelayQuestionAnswer(questionId, questionTimeoutMs);
   }
 
   return {

@@ -52,6 +52,7 @@ import {
   loadModelCatalog,
   loadConversation,
   updateConversationTitle,
+  killSessionWorker,
   scheduleContextUsageRefresh,
 } from './api-client.js';
 import { loadConversations, refreshConversations, openConversation, renderConvList } from './journal-view.js';
@@ -858,6 +859,8 @@ function bindMenuAction(element, handler) {
 function syncChatTitleControls() {
   const { title, editBtn, editor, input } = getChatTitleElements();
   const convId = String(currentConvId || '').trim();
+  const killBtn = document.getElementById('chat-menu-kill-session');
+  const sdkSessionId = String(conversations[convId]?.sdkSessionId || '').trim();
   if (chatTitleEditingConversationId && chatTitleEditingConversationId !== convId) {
     chatTitleEditingConversationId = null;
   }
@@ -867,6 +870,10 @@ function syncChatTitleControls() {
   if (editBtn) {
     editBtn.hidden = !convId;
     editBtn.disabled = !convId || editing;
+  }
+  if (killBtn) {
+    killBtn.disabled = !convId || !sdkSessionId;
+    killBtn.hidden = !convId;
   }
   if (editor) {
     editor.hidden = !editing;
@@ -937,6 +944,75 @@ function applyConversationTitleUpdate(conversationId, title, updatedAt) {
     if (titleEl) titleEl.textContent = nextTitle;
   }
   renderConvList();
+}
+
+function getCurrentConversationSessionInfo() {
+  const convId = String(currentConvId || '').trim();
+  if (!convId) return null;
+  const conversation = conversations[convId] || {};
+  const sdkSessionId = String(conversation.sdkSessionId || '').trim();
+  if (!sdkSessionId) return null;
+  const title = String(conversation.title || document.getElementById('chat-title')?.textContent || convId).trim() || convId;
+  return {
+    conversationId: convId,
+    sdkSessionId,
+    title,
+  };
+}
+
+function openKillSessionConfirmation() {
+  const info = getCurrentConversationSessionInfo();
+  if (!info) {
+    showTransientRelayNotice('No active session is bound to this conversation.');
+    return;
+  }
+  const escapedTitle = escHtml(info.title);
+  openSummaryModal({
+    title: 'Kill session',
+    subtitle: info.sdkSessionId,
+    kind: 'kill-session',
+    bodyHtml: `
+      <p>Kill the session for <strong>${escapedTitle}</strong>?</p>
+      <p>This stops the current worker and any active turn will need a manual retry or a new message.</p>
+      <div class="summary-modal-actions">
+        <button class="chat-title-action-btn danger-btn" type="button" onclick="confirmKillCurrentSession()">☠️ Kill session</button>
+        <button class="chat-title-action-btn" type="button" onclick="closeSummaryModal()">Cancel</button>
+      </div>
+    `,
+  });
+}
+
+let killSessionInFlight = false;
+
+async function confirmKillCurrentSession() {
+  if (killSessionInFlight) return;
+  const info = getCurrentConversationSessionInfo();
+  if (!info) {
+    closeSummaryModal();
+    showTransientRelayNotice('No active session is bound to this conversation.');
+    return;
+  }
+  killSessionInFlight = true;
+  setSummaryModalLoading(true);
+  try {
+    const result = await killSessionWorker(info.sdkSessionId, {
+      conversationId: info.conversationId,
+      title: info.title,
+    });
+    closeSummaryModal();
+    if (!result?.ok) {
+      alert('Failed to kill session');
+      return;
+    }
+    const statusText = result.processStatus === 'killed'
+      ? 'Session killed.'
+      : 'Session state cleared; no live worker process was found.';
+    showTransientRelayNotice(statusText);
+    await refreshSessionWorkerStatus().catch(() => {});
+  } finally {
+    killSessionInFlight = false;
+    setSummaryModalLoading(false);
+  }
 }
 
 async function submitChatTitleEditor() {
@@ -1179,6 +1255,14 @@ async function initApp() {
       alert(error?.message || 'Failed to compact conversation');
     });
   });
+  const chatMenuKillBtn = document.getElementById('chat-menu-kill-session');
+  bindMenuAction(chatMenuKillBtn, (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    lockChatActionsMenuShield(350);
+    closeChatActionsMenu();
+    openKillSessionConfirmation();
+  });
   const sidebarToggleBtn = document.getElementById('sidebar-toggle');
   bindTapAction(sidebarToggleBtn, (event) => {
     event.preventDefault();
@@ -1351,5 +1435,6 @@ window.setSummaryModalLoading = setSummaryModalLoading;
 window.openSummaryModal = openSummaryModal;
 window.syncChatTitleControls = syncChatTitleControls;
 window.closeChatActionsMenu = closeChatActionsMenu;
+window.confirmKillCurrentSession = confirmKillCurrentSession;
 
 bootstrap();

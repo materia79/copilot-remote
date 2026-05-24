@@ -84,6 +84,28 @@ export function stripPromptPrefix(text, promptPrefix = "") {
   return remainder || "";
 }
 
+function escapeRegExp(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function whitespaceFlexiblePattern(value) {
+  return String(value || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((part) => escapeRegExp(part))
+    .join("\\s+");
+}
+
+function stripPromptPrefixFlexible(text, promptPrefix = "") {
+  const value = String(text || "").trim();
+  const prompt = String(promptPrefix || "").trim();
+  if (!value || !prompt) return value;
+  const pattern = new RegExp(`^${whitespaceFlexiblePattern(prompt)}\\s*`, "i");
+  const stripped = value.replace(pattern, "").trim();
+  return stripped || "";
+}
+
 export function stripPromptContextPrefix(text, message, toolInstructions = "", promptPrefix = "") {
   const value = String(text || "").trim();
   if (!value) return "";
@@ -96,6 +118,8 @@ export function stripPromptContextPrefix(text, message, toolInstructions = "", p
   for (const candidate of candidates) {
     const stripped = stripPromptPrefix(value, candidate);
     if (stripped !== value) return stripped;
+    const flexibleStripped = stripPromptPrefixFlexible(value, candidate);
+    if (flexibleStripped !== value) return flexibleStripped;
   }
   return value;
 }

@@ -843,8 +843,16 @@ export function setSummaryModalLoading(loading) {
   summaryModalState.loading = !!loading;
   const refreshBtn = document.getElementById('summary-modal-refresh');
   if (refreshBtn) {
+    refreshBtn.hidden = !summaryModalState.refresh;
     refreshBtn.disabled = summaryModalState.loading || !summaryModalState.refresh;
     refreshBtn.textContent = summaryModalState.loading ? 'Loading…' : 'Refresh';
+  }
+  // Freeze/unfreeze all action buttons inside the modal body while a request is in flight
+  const bodyEl = document.getElementById('summary-modal-body');
+  if (bodyEl) {
+    for (const btn of bodyEl.querySelectorAll('button')) {
+      btn.disabled = summaryModalState.loading;
+    }
   }
 }
 

@@ -2548,6 +2548,7 @@ const sharedRouteDeps = {
   featureFlags,
   sessionWorkerSupervisor,
   sessionWorkerRegistry,
+  sessionWorkerProcessInspector,
   buildContextResponseText,
   readContextFromSessionEvents,
   discoverSessionStateConversations,
@@ -2804,8 +2805,11 @@ function touchCli() {
 
 // ─── Relay Question Routes ────────────────────────────────────────────────────
 
-function questionExpiresAt(createdAt) {
-  return new Date(new Date(createdAt).getTime() + DEFAULT_QUESTION_TIMEOUT_MS).toISOString();
+function questionExpiresAt(createdAt, timeoutMs = DEFAULT_QUESTION_TIMEOUT_MS) {
+  const normalizedTimeoutMs = Number.isFinite(Number(timeoutMs))
+    ? Math.max(0, Math.trunc(Number(timeoutMs)))
+    : DEFAULT_QUESTION_TIMEOUT_MS;
+  return new Date(new Date(createdAt).getTime() + normalizedTimeoutMs).toISOString();
 }
 
 function sanitizeRelayQuestionPrompt(requestBody) {

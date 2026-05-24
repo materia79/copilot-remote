@@ -753,6 +753,7 @@ export function registerMessagesRoutes(app, deps) {
     featureFlags,
     sessionWorkerRegistry,
     sessionWorkerSupervisor,
+    sessionWorkerProcessInspector,
     opaqueResponseRecoveryWaitMs = OPAQUE_RESPONSE_RECOVERY_WAIT_MS,
     opaqueResponseRecoveryPollMs = OPAQUE_RESPONSE_RECOVERY_POLL_MS,
   } = deps;
@@ -937,6 +938,149 @@ export function registerMessagesRoutes(app, deps) {
       timestamp ASC
     LIMIT 1
   `);
+  const findProcessingOwnedBySession = db.prepare(`
+    SELECT *
+    FROM queue
+    WHERE owner_sdk_session_id = ?
+      AND status = 'processing'
+    ORDER BY COALESCE(processing_at, timestamp) DESC, timestamp DESC
+    LIMIT 1
+  `);
+  const findAllProcessingOwnedBySession = db.prepare(`
+    SELECT *
+    FROM queue
+    WHERE owner_sdk_session_id = ?
+      AND status = 'processing'
+    ORDER BY COALESCE(processing_at, timestamp) DESC, timestamp DESC
+  `);
+  const findMostRecentConversationForSession = db.prepare(`
+    SELECT conversation_id
+    FROM queue
+    WHERE owner_sdk_session_id = ?
+    ORDER BY COALESCE(processing_at, timestamp) DESC, timestamp DESC
+    LIMIT 1
+  `);
+
+  function insertSystemMessageForConversation({ conversationId, text, model = null, relayMode = null }) {
+    const now = new Date().toISOString();
+    const messageId = uuidv4();
+    const tx = db.transaction(() => {
+      stmts.insertMsg.run(messageId, conversationId, 'assistant', text, model || null, relayMode || null, null, now);
+      stmts.updateConvTime.run(now, conversationId);
+    });
+    tx();
+    io.emit('assistant_message', {
+      conversationId,
+      sourceMessageId: null,
+      messageId,
+      message: { role: 'assistant', text, model: model || null, mode: relayMode || null, timestamp: now },
+    });
+    return messageId;
+  }
+
+  app.post('/api/session-worker/:sdkSessionId/kill', auth, (req, res) => {
+    const sdkSessionId = normalizeSessionWorkerId(req.params.sdkSessionId);
+    if (!sdkSessionId) return res.status(400).json({ error: 'Missing session worker id' });
+
+    const currentWorker = sessionWorkerRegistry?.getWorker?.(sdkSessionId) || null;
+
+    // Collect ALL matching PIDs (not just first)
+    const discoveredProcesses = sessionWorkerProcessInspector?.findWindowsProcessesForSession?.(sdkSessionId) || [];
+    const allPids = [...new Set([
+      ...discoveredProcesses.map((p) => (p.processId ? Number(p.processId) : null)).filter(Boolean),
+      currentWorker?.pid ? Number(currentWorker.pid) : null,
+    ].filter(Boolean))];
+
+    let processStatus = 'not-running';
+    let killedPids = [];
+
+    if (allPids.length) {
+      try {
+        // Use PowerShell Stop-Process -Force instead of process.kill()
+        killedPids = sessionWorkerProcessInspector.stopWindowsPids(allPids);
+        processStatus = 'killed';
+      } catch (error) {
+        return res.status(500).json({ error: error?.message || 'Failed to kill session worker', pids: allPids });
+      }
+    }
+
+    // Audit marker — always emitted before responding
+    console.log(`[KILL] session=${sdkSessionId} pids=${allPids.join(',') || 'none'} processStatus=${processStatus}`);
+
+    // Post-kill verification — synchronous re-scan to confirm processes are gone
+    const remainingPids = allPids.length
+      ? (sessionWorkerProcessInspector?.findWindowsProcessesForSession?.(sdkSessionId) || []).map((p) => p.processId).filter(Boolean)
+      : [];
+
+    sessionWorkerRegistry?.removeWorker?.(sdkSessionId);
+    sessionWorkerSupervisor?.clearRestartSchedule?.(sdkSessionId);
+    sessionWorkerSupervisor?.resetHealth?.(sdkSessionId, { clearFailureCount: false });
+
+    // Drain ALL owned processing rows, not just first
+    const queueRows = findAllProcessingOwnedBySession.all(sdkSessionId) || [];
+    const failedMessageIds = [];
+
+    if (queueRows.length > 0) {
+      for (const queueRow of queueRows) {
+        const failureRecord = {
+          kind: 'manual-session-kill',
+          code: 'worker-session-killed',
+          stableCode: 'relay.worker-session-killed',
+          message: '[System Message] This session was killed from the relay UI before the turn completed.',
+          guidance: 'Retry the request or send a new message to relaunch the session if needed.',
+          detail: [
+            `session=${sdkSessionId}`,
+            allPids.length ? `pids=${allPids.join(',')}` : 'pid=none',
+            `processStatus=${processStatus}`,
+          ].join(' | '),
+          failedAt: new Date().toISOString(),
+          requesterSessionId: sdkSessionId,
+        };
+        const failureText = buildTerminalFailureTextForChat(failureRecord);
+        const failed = failQueueMessage({
+          queueRow,
+          messageId: queueRow.id,
+          conversationId: queueRow.conversation_id,
+          relayMode: queueRow.relay_mode || DEFAULT_RELAY_MODE,
+          model: queueRow.model || DEFAULT_MODEL,
+          responseText: failureText,
+          failureRecord,
+        });
+        if (failed?.responseId) failedMessageIds.push(failed.responseId);
+      }
+    } else if (processStatus === 'not-running') {
+      // not-running case: emit [System Message] into conversation history
+      const conversationId = currentWorker?.conversationId
+        || findMostRecentConversationForSession.get(sdkSessionId)?.conversation_id
+        || null;
+      if (conversationId) {
+        insertSystemMessageForConversation({
+          conversationId,
+          text: '[System Message] Session kill requested — no live worker process was found.',
+        });
+      }
+    }
+
+    const conversationId = queueRows[0]?.conversation_id || currentWorker?.conversationId || null;
+
+    io.emit('session_worker_killed', {
+      sdkSessionId,
+      conversationId,
+      killedPids,
+      remainingPids,
+      processStatus,
+      failedMessageIds,
+    });
+
+    return res.json({
+      ok: true,
+      sdkSessionId,
+      killedPids,
+      remainingPids,
+      processStatus,
+      failedMessageIds,
+    });
+  });
 
   app.post('/api/upload', auth, express.raw({ type: () => true, limit: `${MAX_UPLOAD_BYTES}b` }), (req, res) => {
     const payload = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);

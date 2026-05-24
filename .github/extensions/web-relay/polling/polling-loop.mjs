@@ -45,6 +45,31 @@ function readImageBlobFromPath(att) {
   };
 }
 
+function normalizeWorkerLivenessIssueReason(reason) {
+  const normalized = String(reason || "").trim().toLowerCase();
+  if (!normalized) return "worker-unavailable";
+  return normalized.replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "") || "worker-unavailable";
+}
+
+function buildWorkerLivenessTerminalFailure({ message, ownerSessionId, issueReason, detail = "" } = {}) {
+  const reason = normalizeWorkerLivenessIssueReason(issueReason);
+  const detailParts = [
+    ownerSessionId ? `session=${ownerSessionId}` : null,
+    detail ? String(detail).trim() : null,
+  ].filter(Boolean);
+  return {
+    kind: "worker-session-unavailable",
+    code: reason,
+    stableCode: `relay.${reason}`,
+    message: "System note: This session worker stopped responding and the relay marked the turn as unavailable.",
+    guidance: "Use ☠️ Kill session from the conversation menu if you want to reset it, then retry or send a new message.",
+    detail: detailParts.join(" | ") || null,
+    failedAt: new Date().toISOString(),
+    requesterSessionId: String(ownerSessionId || "").trim() || null,
+    queueMessageId: String(message?.id || "").trim() || null,
+  };
+}
+
 function buildSdkAttachments(rawAttachments) {
   const input = Array.isArray(rawAttachments) ? rawAttachments : [];
   const sdkAttachments = [];
@@ -241,6 +266,7 @@ export function createPollingLoop({
       prompt: parsed.prompt,
       choices: parsed.choices,
       allowFreeform: parsed.choices.length === 0,
+      timeout_ms: sendTimeout,
         context: {
           source: "fallback-text-question",
           rationale: "Auto-converted a plain-text follow-up question into a relay question card.",
@@ -255,7 +281,7 @@ export function createPollingLoop({
 
     const questionId = created?.question?.id;
     if (!questionId) return null;
-    const answer = await waitForRelayQuestionAnswer(questionId);
+    const answer = await waitForRelayQuestionAnswer(questionId, sendTimeout);
     return {
       questionId,
       answer,
@@ -301,6 +327,7 @@ export function createPollingLoop({
       choices,
       allowFreeform: choices.length === 0,
       sdk_session_id: activeSession?.sdkSessionId || undefined,
+      timeout_ms: sendTimeout,
       context: {
         source: "ask-user-autopilot-bridge",
         rationale: "ask_user called but onUserInputRequest was bypassed (autopilot mode); intercepted via onPreToolUse.",
@@ -315,7 +342,7 @@ export function createPollingLoop({
     if (!questionId) return null;
 
     dbg("ask_user autopilot bridge: relay question created", questionId, "for msgId", message.id, "prompt=", prompt, "choices=", String(choices.length));
-    const result = await waitForRelayQuestionAnswer(questionId);
+    const result = await waitForRelayQuestionAnswer(questionId, sendTimeout);
     return { questionId, prompt, choices, answer: result.answer, timedOut: result.timedOut };
   }
 
@@ -493,6 +520,7 @@ export function createPollingLoop({
 
             let finalEvent;
             let lastStreamedSent = "";
+            let lastWorkerStatusCheckAt = 0;
             const pushRelayStream = async (text, done = false) => {
               const value = String(text || "");
               if (!value && !done) return;
@@ -511,9 +539,57 @@ export function createPollingLoop({
               if (!shouldEmitRelayStreamUpdate(streamedText, lastStreamedSent)) return;
               await pushRelayStream(streamedText, false);
             };
+            const inspectActiveWorkerLiveness = async () => {
+              const ownerSessionId = String(message?.ownerSessionId || "").trim();
+              if (!ownerSessionId) return;
+              const now = Date.now();
+              if ((now - lastWorkerStatusCheckAt) < 10_000) return;
+              lastWorkerStatusCheckAt = now;
+
+              const status = await api("GET", "/api/status").catch(() => null);
+              const workers = Array.isArray(status?.sessionWorker?.workers) ? status.sessionWorker.workers : [];
+              const worker = workers.find((entry) => String(entry?.sdkSessionId || "").trim() === ownerSessionId) || null;
+              if (!worker) {
+                throw Object.assign(new Error("Active session worker is missing from relay status"), {
+                  code: "RELAY_WORKER_UNAVAILABLE",
+                  terminalFailure: buildWorkerLivenessTerminalFailure({
+                    message,
+                    ownerSessionId,
+                    issueReason: "worker-missing",
+                    detail: "No worker snapshot was reported for the owning session.",
+                  }),
+                });
+              }
+
+              const degraded = String(worker?.uiState || "").trim().toLowerCase() === "yellow";
+              const degradedReason = String(worker?.degradedReason || "").trim().toLowerCase();
+              const routingMismatch = (
+                (worker?.conversationId && String(worker.conversationId).trim() !== String(message?.conversationId || "").trim())
+                || (message?.runtimeSessionId && worker?.runtimeSessionId && String(worker.runtimeSessionId).trim() !== String(message.runtimeSessionId).trim())
+              );
+              if (!degraded && !routingMismatch) return;
+
+              const issueReason = routingMismatch
+                ? "worker-routing-mismatch"
+                : (degradedReason || "worker-degraded");
+              const detail = routingMismatch
+                ? `workerConversation=${String(worker?.conversationId || "").trim() || "none"} workerRuntime=${String(worker?.runtimeSessionId || "").trim() || "none"}`
+                : String(worker?.lastError || worker?.degradedReason || "").trim();
+              throw Object.assign(new Error(`Active session worker became unavailable (${issueReason})`), {
+                code: "RELAY_WORKER_UNAVAILABLE",
+                terminalFailure: buildWorkerLivenessTerminalFailure({
+                  message,
+                  ownerSessionId,
+                  issueReason,
+                  detail,
+                }),
+              });
+            };
             try {
               if (typeof sendWithBestEffortStreaming === "function") {
-                finalEvent = await sendWithBestEffortStreaming(payload, sendTimeout, onStreamingEvent);
+                finalEvent = await sendWithBestEffortStreaming(payload, sendTimeout, onStreamingEvent, {
+                  onWaiting: inspectActiveWorkerLiveness,
+                });
               } else {
                 finalEvent = await sendAndWaitWithHardTimeout(payload, sendTimeout);
               }
@@ -527,7 +603,9 @@ export function createPollingLoop({
                 text: `Attachment delivery failed (${attachmentError?.message || "unknown error"}). Retrying without SDK attachments.`,
               }).catch(() => {});
               if (typeof sendWithBestEffortStreaming === "function") {
-                finalEvent = await sendWithBestEffortStreaming({ prompt }, sendTimeout, onStreamingEvent);
+                finalEvent = await sendWithBestEffortStreaming({ prompt }, sendTimeout, onStreamingEvent, {
+                  onWaiting: inspectActiveWorkerLiveness,
+                });
               } else {
                 finalEvent = await sendAndWaitWithHardTimeout({ prompt }, sendTimeout);
               }
@@ -654,6 +732,17 @@ export function createPollingLoop({
                   conversationId: message.conversationId,
                   text: failureText,
                   model: await getCurrentModelId() || message.model || null,
+              }).catch(async () => {
+                await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
+              });
+            } else if (e?.code === "RELAY_WORKER_UNAVAILABLE" && e?.terminalFailure) {
+              await session.log("⚠️ Session worker became unavailable during the turn — marking it failed", { level: "warn" });
+              await pushRelayStream(lastStreamedSent, true);
+              await api("POST", "/api/response", {
+                messageId: message.id,
+                conversationId: message.conversationId,
+                terminalError: e.terminalFailure,
+                model: await getCurrentModelId() || message.model || null,
               }).catch(async () => {
                 await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
               });

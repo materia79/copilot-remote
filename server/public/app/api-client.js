@@ -115,6 +115,15 @@ export async function compactConversation(id) {
   return apiFetch(`/api/conversation/${convId}/compact`, { method: 'POST' });
 }
 
+export async function killSessionWorker(sdkSessionId, body = {}) {
+  const sessionId = String(sdkSessionId || '').trim();
+  if (!sessionId) return null;
+  return apiFetch(`/api/session-worker/${encodeURIComponent(sessionId)}/kill`, {
+    method: 'POST',
+    body: JSON.stringify(body || {}),
+  });
+}
+
 export async function sendMessage(body) {
   return apiFetch('/api/message', { method: 'POST', body: JSON.stringify(body) });
 }
@@ -224,4 +233,3 @@ export async function refreshContextUsageBar(conversationId, requestSeq = ++cont
   if (String(currentConvId || '').trim() !== convId) return;
   applyContextUsageBar(readContextUsageRatio(payload));
 }
-

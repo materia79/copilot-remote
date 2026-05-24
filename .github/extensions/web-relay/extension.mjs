@@ -36,7 +36,6 @@ import { createBannerStateStore } from "./runtime/banner-state.mjs";
 import { clearSession, registerSession } from "./runtime/session-registry.mjs";
 import { syncSessionToServer } from "./runtime/session-sync-bridge.mjs";
 import { joinSessionWithRetry } from "./runtime/session-join-retry.mjs";
-import { DEFAULT_QUESTION_TIMEOUT_MS } from "../../../shared/question-timeout.mjs";
 
 const SERVER_URL   = "http://localhost:3333";
 const POLL_MS      = 2000;
@@ -58,7 +57,6 @@ const CONFIG_TOKEN = loadTokenFromConfig(CONFIG_PATH);
 const TOKEN = CONFIG_TOKEN || TOKEN_FALLBACK;
 const TOKEN_WAS_GENERATED = !CONFIG_TOKEN;
 const RELAY_TOOL_INSTRUCTIONS = loadRelayInstructionsFromFile(RELAY_TOOLS_PATH);
-const QUESTION_WAIT_TIMEOUT_MS = DEFAULT_QUESTION_TIMEOUT_MS;
 const QUESTION_POLL_MS = 1500;
 const MAX_TOOL_DETAIL_LENGTH = 140;
 const RESTART_CONTROL_STARTUP_GRACE_MS = 20_000;
@@ -149,7 +147,7 @@ let activeMsg       = null;   // the web message currently being processed
 let waitingForAI    = false;  // true while the agent is generating a response
 let relayTurnActive = false;  // true while processing a relay-originated turn
 let sessionReady    = false;
-const SEND_TIMEOUT  = 12 * 60 * 60_000; // allow long-running turns to complete without premature relay timeout
+const SEND_TIMEOUT  = 2 * 60 * 60_000; // keep long ask_user pauses viable without letting broken turns linger all day
 let heartbeatTimer  = null;
 let pollingLoopStarted = false;
 let activatingRelay = null;
@@ -367,7 +365,7 @@ const questionBridge = createQuestionBridge({
   api,
   dbg,
   sleep,
-  questionWaitTimeoutMs: QUESTION_WAIT_TIMEOUT_MS,
+  getQuestionWaitTimeoutMs: () => SEND_TIMEOUT,
   questionPollMs: QUESTION_POLL_MS,
   getActiveMessage: () => activeMsg,
   extractQuestionPrompt,
