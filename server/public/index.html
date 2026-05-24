@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content">
-<meta name="theme-color" content="#0d1117">
+<meta name="theme-color" content="#161b22">
 <meta name="application-name" content="Copilot Remote">
 <meta name="apple-mobile-web-app-title" content="Copilot Remote">
 <meta name="mobile-web-app-capable" content="yes">
@@ -11,7 +11,12 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <script>
   const __APP_BASE = window.location.pathname.replace(/\/+$/, '');
-  const __PWA_VERSION = '10';
+  const __PWA_VERSION = '25';
+  window.__COPILOT_PWA_VERSION = __PWA_VERSION;
+  window.addEventListener('DOMContentLoaded', () => {
+    const versionEntry = document.getElementById('chat-menu-pwa-version');
+    if (versionEntry) versionEntry.textContent = `PWA shell version: v${__PWA_VERSION}`;
+  });
   const __PWA_BUST = `v=${__PWA_VERSION}`;
   document.write(`<link rel="manifest" href="${__APP_BASE}/manifest.webmanifest?${__PWA_BUST}">`);
   document.write(`<link rel="icon" type="image/png" sizes="192x192" href="${__APP_BASE}/app-icon-192.png?${__PWA_BUST}">`);
@@ -46,7 +51,8 @@
     --danger:    #f85149;
     --success:   #3fb950;
     --warn:      #d29922;
-    --header-safe-top: env(safe-area-inset-top, 0px);
+    --viewport-top-offset: 0px;
+    --header-safe-top: max(env(safe-area-inset-top, 0px), var(--viewport-top-offset, 0px));
     --chat-header-top-base-desktop: 14px;
     --chat-header-top-base-mobile: 10px;
     --sidebar-header-top-base-desktop: 16px;
@@ -68,14 +74,29 @@
   }
   body {
     overflow: hidden;
+    position: relative;
   }
   body.immersive-top {
-    background: linear-gradient(to bottom, var(--bg2) 0, var(--bg2) var(--header-safe-top), var(--bg) var(--header-safe-top), var(--bg) 100%);
+    background: linear-gradient(to bottom, var(--bg2) 0, var(--bg2) calc(var(--header-safe-top) + 1px), var(--bg) calc(var(--header-safe-top) + 1px), var(--bg) 100%);
     --chat-header-top-base-desktop: 8px;
     --chat-header-top-base-mobile: 6px;
     --sidebar-header-top-base-desktop: 8px;
     --sidebar-header-top-base-mobile: 6px;
     --immersive-top-shift: calc(var(--header-safe-top) * -1);
+  }
+  body.immersive-top::before {
+    content: '';
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: calc(var(--header-safe-top) + 2px);
+    background: var(--bg2);
+    pointer-events: none;
+    z-index: 2;
+  }
+  body.installed-app.immersive-top {
+    --immersive-top-shift: 0px;
   }
   :root {
     --app-height: 100vh;
@@ -397,6 +418,19 @@
   .chat-actions-menu-item:disabled:hover {
     background: transparent;
     border-color: transparent;
+  }
+  .chat-actions-menu-meta {
+    display: inline-flex;
+    align-items: center;
+    width: 100%;
+    min-height: 32px;
+    border: 1px solid transparent;
+    color: var(--muted);
+    border-radius: 8px;
+    padding: 0 10px;
+    font-size: 0.76rem;
+    cursor: default;
+    user-select: text;
   }
   #pending-question-banner {
     display: none;
@@ -1716,8 +1750,6 @@
     <div class="sidebar-header">
       <span id="cli-dot" title="CLI status"></span>
       <div id="sidebar-actions">
-        <button id="usage-btn" class="header-icon-btn" onclick="showUsage()" title="Check Copilot usage" aria-label="Check Copilot usage">📊</button>
-        <button id="context-btn" class="header-icon-btn" onclick="showContext()" title="Check current context" aria-label="Check current context">🧠</button>
         <button id="install-btn" class="header-icon-btn" onclick="promptInstallApp()" title="Install app to home screen" aria-label="Install app">⬇</button>
       </div>
     </div>
@@ -1738,10 +1770,13 @@
         </form>
       </div>
       <div id="chat-header-actions">
+        <button id="context-btn" class="header-icon-btn" onclick="showContext()" title="Check current context" aria-label="Check current context">🧠</button>
         <div id="chat-actions-menu-wrap">
           <button id="chat-actions-menu-btn" class="header-icon-btn" type="button" title="Conversation actions" aria-label="Conversation actions" aria-haspopup="menu" aria-expanded="false">⋯</button>
           <div id="chat-actions-menu" role="menu" hidden>
+            <div id="chat-menu-pwa-version" class="chat-actions-menu-meta" aria-hidden="true">PWA shell version: v?</div>
             <button id="chat-menu-edit-title" class="chat-actions-menu-item" type="button" role="menuitem">✍️ Edit conversation title</button>
+            <button id="chat-menu-usage" class="chat-actions-menu-item" type="button" role="menuitem">📊 Check Usage</button>
             <button id="chat-menu-compact" class="chat-actions-menu-item" type="button" role="menuitem">🗜️ Compact</button>
             <button id="chat-menu-kill-session" class="chat-actions-menu-item" type="button" role="menuitem">☠️ Kill session</button>
           </div>

@@ -800,10 +800,12 @@ export function syncViewportMetrics() {
   const layoutHeight = window.innerHeight || document.documentElement.clientHeight || 0;
   const vv = window.visualViewport;
   let appHeight = layoutHeight;
+  let viewportTopOffset = 0;
 
   if (vv) {
     const visibleHeight = Math.max(0, vv.height || 0);
     const offsetTop = Math.max(0, vv.offsetTop || 0);
+    viewportTopOffset = offsetTop;
     const baselineCandidate = Math.max(layoutHeight, visibleHeight + offsetTop);
     if (baselineCandidate > viewportBaseHeight) viewportBaseHeight = baselineCandidate;
     appHeight = baselineCandidate;
@@ -811,6 +813,7 @@ export function syncViewportMetrics() {
     viewportBaseHeight = layoutHeight;
   }
 
+  document.documentElement.style.setProperty('--viewport-top-offset', `${Math.max(0, Math.round(viewportTopOffset))}px`);
   document.documentElement.style.setProperty('--app-height', `${Math.max(0, Math.round(appHeight))}px`);
 }
 

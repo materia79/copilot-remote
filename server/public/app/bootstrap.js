@@ -68,6 +68,8 @@ const MODEL_STORAGE_KEY = 'copilot_selected_model';
 const MODE_STORAGE_KEY = 'copilot_selected_mode';
 const FALLBACK_MODEL = 'gpt-5.4-mini';
 const FALLBACK_MODE = 'agent';
+const THEME_COLOR_BASE = '#0d1117';
+const THEME_COLOR_IMMERSIVE = '#161b22';
 const MODEL_LABELS = {
   'gpt-5.4': 'GPT-5.4',
   'gpt-5.4-mini': 'GPT-5.4 Mini',
@@ -91,6 +93,7 @@ let viewportBaseHeight = window.innerHeight || document.documentElement.clientHe
 let deferredInstallPrompt = null;
 let chatTitleEditingConversationId = null;
 const INSTALLED_DISPLAY_MODE_QUERIES = ['(display-mode: standalone)', '(display-mode: fullscreen)'];
+let pendingInstalledFullscreenGesture = false;
 let relayQuestionRenderHash = '';
 let modelCatalogState = {
   models: [FALLBACK_MODEL],
@@ -131,6 +134,13 @@ function ensureTrailingSlashPath() {
 
 function showAuthError(msg) {
   document.getElementById('auth-error').textContent = msg;
+}
+
+function syncPwaVersionMenuEntry() {
+  const chip = document.getElementById('chat-menu-pwa-version');
+  if (!chip) return;
+  const version = String(window.__COPILOT_PWA_VERSION || '').trim();
+  chip.textContent = version ? `PWA shell version: v${version}` : 'PWA shell version: v?';
 }
 
 function updateModelCatalogState(payload) {
@@ -255,7 +265,7 @@ async function loadContextSummaryAndRender(convId) {
 }
 
 async function showUsage() {
-  const btn = document.getElementById('usage-btn');
+  const btn = document.getElementById('chat-menu-usage') || document.getElementById('usage-btn');
   if (btn) {
     btn.textContent = '⏳';
     btn.disabled = true;
@@ -280,7 +290,7 @@ async function showUsage() {
     });
   } finally {
     if (btn) {
-      btn.textContent = '📊';
+      btn.textContent = btn.id === 'chat-menu-usage' ? '📊 Check Usage' : '📊';
       btn.disabled = false;
     }
   }
@@ -359,9 +369,14 @@ function matchesDisplayMode(query) {
 
 function isInstalledAppMode() {
   const standalone = matchesDisplayMode('(display-mode: standalone)');
-  const manifestFullscreen = matchesDisplayMode('(display-mode: fullscreen)');
-  const browserFullscreen = !!document.fullscreenElement;
-  return standalone || (manifestFullscreen && !browserFullscreen) || window.navigator.standalone === true;
+  const minimalUi = matchesDisplayMode('(display-mode: minimal-ui)');
+  const launchedFromAndroidApp = String(document.referrer || '').startsWith('android-app://');
+  return (
+    window.navigator.standalone === true
+    || launchedFromAndroidApp
+    || standalone
+    || minimalUi
+  );
 }
 
 function isDisplayModeFullscreen() {
@@ -373,13 +388,21 @@ function isBrowserFullscreenMode() {
 }
 
 function shouldUseImmersiveTopLayout() {
-  return isInstalledAppMode() || isDisplayModeFullscreen() || isBrowserFullscreenMode();
+  return isDisplayModeFullscreen() || isBrowserFullscreenMode();
+}
+
+function syncThemeColor(immersive) {
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (!meta) return;
+  meta.setAttribute('content', immersive ? THEME_COLOR_IMMERSIVE : THEME_COLOR_BASE);
 }
 
 function syncInstalledAppUiState() {
   const installed = isInstalledAppMode();
+  const immersive = shouldUseImmersiveTopLayout();
   document.body.classList.toggle('installed-app', installed);
-  document.body.classList.toggle('immersive-top', shouldUseImmersiveTopLayout());
+  document.body.classList.toggle('immersive-top', immersive);
+  syncThemeColor(immersive);
 }
 
 function canToggleFullscreen() {
@@ -405,6 +428,41 @@ async function ensureInstalledAppFullscreen(options = {}) {
     updateInstallButton();
     updateFullscreenButton();
   }
+}
+
+function shouldQueueInstalledFullscreen() {
+  return isInstalledAppMode()
+    && window.matchMedia('(max-width: 680px)').matches
+    && canToggleFullscreen()
+    && !document.fullscreenElement;
+}
+
+function queueInstalledFullscreenGesture() {
+  pendingInstalledFullscreenGesture = shouldQueueInstalledFullscreen();
+}
+
+function consumeInstalledFullscreenGesture() {
+  if (!pendingInstalledFullscreenGesture || !shouldQueueInstalledFullscreen()) return;
+  pendingInstalledFullscreenGesture = false;
+  ensureInstalledAppFullscreen({ userGesture: true }).catch(() => {
+    pendingInstalledFullscreenGesture = true;
+  });
+}
+
+function initInstalledFullscreenGestureBridge() {
+  if (window.__installedFullscreenGestureBridgeBound) return;
+  window.__installedFullscreenGestureBridgeBound = true;
+  const consume = () => consumeInstalledFullscreenGesture();
+  document.addEventListener('pointerdown', consume, true);
+  document.addEventListener('keydown', consume, true);
+  window.addEventListener('pageshow', () => {
+    queueInstalledFullscreenGesture();
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      queueInstalledFullscreenGesture();
+    }
+  });
 }
 
 function getInstallHelpMessage() {
@@ -458,10 +516,13 @@ async function promptInstallApp() {
 function initInstallButton() {
   if (window.__installButtonBound) {
     updateInstallButton();
+    initInstalledFullscreenGestureBridge();
+    queueInstalledFullscreenGesture();
     ensureInstalledAppFullscreen().catch(() => {});
     return;
   }
   window.__installButtonBound = true;
+  initInstalledFullscreenGestureBridge();
 
   window.addEventListener('beforeinstallprompt', (event) => {
     event.preventDefault();
@@ -474,6 +535,7 @@ function initInstallButton() {
     deferredInstallPrompt = null;
     updateInstallButton();
     updateFullscreenButton();
+    queueInstalledFullscreenGesture();
     ensureInstalledAppFullscreen().catch(() => {});
     showTransientRelayNotice('App installed.');
   });
@@ -489,6 +551,7 @@ function initInstallButton() {
       media.addEventListener('change', () => {
         updateInstallButton();
         updateFullscreenButton();
+        queueInstalledFullscreenGesture();
         ensureInstalledAppFullscreen().catch(() => {});
       });
     }
@@ -496,12 +559,17 @@ function initInstallButton() {
 
   updateInstallButton();
   updateFullscreenButton();
+  queueInstalledFullscreenGesture();
   ensureInstalledAppFullscreen().catch(() => {});
 }
 
 async function toggleFullscreen() {
   if (isInstalledAppMode()) {
-    ensureInstalledAppFullscreen({ userGesture: true }).catch(() => {});
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {});
+    } else {
+      ensureInstalledAppFullscreen({ userGesture: true }).catch(() => {});
+    }
     return;
   }
   if (!canToggleFullscreen()) return;
@@ -522,8 +590,7 @@ function updateFullscreenButton() {
   const btn = document.getElementById('fullscreen-btn');
   if (!btn) return;
   syncInstalledAppUiState();
-
-  if (isInstalledAppMode()) {
+  if (isInstalledAppMode() || isDisplayModeFullscreen()) {
     btn.style.display = 'none';
     return;
   }
@@ -544,7 +611,9 @@ function updateFullscreenButton() {
     btn.title = 'Exit fullscreen';
   } else {
     btn.textContent = '⛶';
-    btn.title = supported ? 'Enter fullscreen' : 'Fullscreen not supported on this browser';
+    btn.title = isInstalledAppMode()
+      ? (supported ? 'Enter fullscreen (recommended for installed app)' : 'Fullscreen not supported on this browser')
+      : (supported ? 'Enter fullscreen' : 'Fullscreen not supported on this browser');
   }
 }
 
@@ -1045,6 +1114,7 @@ function initFullscreenButton() {
   const syncFullscreenUi = () => {
     updateInstallButton();
     updateFullscreenButton();
+    queueInstalledFullscreenGesture();
     ensureInstalledAppFullscreen().catch(() => {});
   };
   document.addEventListener('fullscreenchange', syncFullscreenUi);
@@ -1227,6 +1297,7 @@ function showAuthGate() {
 }
 
 async function initApp() {
+  syncPwaVersionMenuEntry();
   setupViewportTracking();
   document.getElementById('auth-gate').style.display = 'none';
   document.getElementById('app').classList.add('visible');
@@ -1238,6 +1309,16 @@ async function initApp() {
     toggleChatActionsMenu();
   });
   const chatMenuEditBtn = document.getElementById('chat-menu-edit-title');
+  const chatMenuUsageBtn = document.getElementById('chat-menu-usage');
+  bindMenuAction(chatMenuUsageBtn, (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    lockChatActionsMenuShield(350);
+    closeChatActionsMenu();
+    showUsage().catch((error) => {
+      alert(error?.message || 'Failed to load usage');
+    });
+  });
   bindMenuAction(chatMenuEditBtn, (event) => {
     event.preventDefault();
     event.stopPropagation();

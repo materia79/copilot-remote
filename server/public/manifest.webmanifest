@@ -5,11 +5,17 @@
   "id": "./",
   "start_url": "./",
   "scope": "./",
-  "display_override": ["fullscreen", "standalone"],
+  "display_override": ["standalone"],
   "display": "standalone",
-  "background_color": "#0d1117",
-  "theme_color": "#0d1117",
+  "background_color": "#161b22",
+  "theme_color": "#161b22",
   "icons": [
+    {
+      "src": "app-icon.svg?v=25",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
     {
       "src": "app-icon-192.png",
       "sizes": "192x192",
