@@ -88,6 +88,7 @@ const SIDEBAR_WIDTH_PORTRAIT_STORAGE_KEY = 'copilot_sidebar_width_pct_portrait';
 const SIDEBAR_WIDTH_LANDSCAPE_STORAGE_KEY = 'copilot_sidebar_width_pct_landscape';
 const SIDEBAR_COLLAPSED_DESKTOP_STORAGE_KEY = 'copilot_sidebar_collapsed_desktop';
 let sidebarWidthPercent = SIDEBAR_WIDTH_PERCENT_FALLBACK;
+const CONVERSATION_SCROLL_STORAGE_PREFIX = 'copilot_message_scroll_';
 
 marked.setOptions({ breaks: true });
 
@@ -104,6 +105,77 @@ export function setCurrentConv(id) {
   if (id) localStorage.setItem('copilot_last_conv', id);
   else localStorage.removeItem('copilot_last_conv');
   updateCompactButton();
+}
+
+function conversationScrollStorageKey(conversationId) {
+  const id = String(conversationId || '').trim();
+  return id ? `${CONVERSATION_SCROLL_STORAGE_PREFIX}${id}` : '';
+}
+
+function readConversationViewState(conversationId) {
+  const key = conversationScrollStorageKey(conversationId);
+  if (!key) return null;
+  const raw = localStorage.getItem(key);
+  if (raw === null) return null;
+  const trimmed = String(raw || '').trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed && typeof parsed === 'object') {
+      return {
+        scrollTop: Number.isFinite(Number(parsed.scrollTop)) && Number(parsed.scrollTop) >= 0
+          ? Math.trunc(Number(parsed.scrollTop))
+          : null,
+        loadedMessageCount: Number.isFinite(Number(parsed.loadedMessageCount)) && Number(parsed.loadedMessageCount) >= 0
+          ? Math.trunc(Number(parsed.loadedMessageCount))
+          : null,
+      };
+    }
+  } catch {
+    // Legacy numeric storage falls through below.
+  }
+  const legacyScrollTop = Number(trimmed);
+  if (!Number.isFinite(legacyScrollTop) || legacyScrollTop < 0) return null;
+  return {
+    scrollTop: Math.trunc(legacyScrollTop),
+    loadedMessageCount: null,
+  };
+}
+
+function writeConversationViewState(conversationId, nextState = {}) {
+  const key = conversationScrollStorageKey(conversationId);
+  if (!key) return false;
+  const current = readConversationViewState(conversationId) || {};
+  const next = {
+    scrollTop: Number.isFinite(Number(nextState.scrollTop)) && Number(nextState.scrollTop) >= 0
+      ? Math.trunc(Number(nextState.scrollTop))
+      : current.scrollTop ?? null,
+    loadedMessageCount: Number.isFinite(Number(nextState.loadedMessageCount)) && Number(nextState.loadedMessageCount) >= 0
+      ? Math.trunc(Number(nextState.loadedMessageCount))
+      : current.loadedMessageCount ?? null,
+  };
+  localStorage.setItem(key, JSON.stringify(next));
+  return true;
+}
+
+export function saveConversationScrollTop(conversationId, scrollTop) {
+  const value = Number(scrollTop);
+  if (!Number.isFinite(value) || value < 0) return false;
+  return writeConversationViewState(conversationId, { scrollTop: value });
+}
+
+export function saveConversationLoadedMessageCount(conversationId, loadedMessageCount) {
+  const value = Number(loadedMessageCount);
+  if (!Number.isFinite(value) || value < 0) return false;
+  return writeConversationViewState(conversationId, { loadedMessageCount: value });
+}
+
+export function loadConversationScrollTop(conversationId) {
+  return readConversationViewState(conversationId)?.scrollTop ?? null;
+}
+
+export function loadConversationLoadedMessageCount(conversationId) {
+  return readConversationViewState(conversationId)?.loadedMessageCount ?? null;
 }
 
 function normalizePendingMessageText(text) {
@@ -258,6 +330,7 @@ export function scrollBottom() {
   const el = document.getElementById('messages');
   if (!el) return;
   el.scrollTop = el.scrollHeight;
+  saveConversationScrollTop(currentConvId, el.scrollTop);
 }
 
 export function scrollBottomAfterSend() {
@@ -820,4 +893,3 @@ export async function refreshSummaryModal() {
     setSummaryModalLoading(false);
   }
 }
-

@@ -12,6 +12,9 @@ import {
   applyContextUsageBar,
   isMobileComposerViewport,
   releaseComposerFocusAfterSend,
+  loadConversationScrollTop,
+  loadConversationLoadedMessageCount,
+  saveConversationScrollTop,
 } from './store.js';
 import {
   loadConversations as loadConversationsApi,
@@ -22,11 +25,13 @@ import {
 import { renderMessages, restoreInFlightThinking } from './conversation-view.js';
 import { loadRelayQuestions, getPendingQuestionCountsByConversation } from './ask-user-view.js';
 import { clearAttachments, setRepoBrowserSessionInfo } from './attachments-view.js';
+import { shouldApplyConversationLoad } from './activity-replay-state.mjs';
 
 const PROCESSING_DOT_FRAMES = ['', '.', '..', '...'];
 const PROCESSING_DOT_INTERVAL_MS = 450;
 let processingDotFrame = 0;
 let processingDotTimer = null;
+let openConversationVersion = 0;
 
 function isConversationProcessing(conversation, workerState) {
   const workerStatus = String(workerState?.status || '').trim().toLowerCase();
@@ -59,7 +64,7 @@ function ensureProcessingDotTimer(enabled) {
 export async function loadConversations() {
   await refreshConversations();
   const lastId = localStorage.getItem('copilot_last_conv');
-  if (lastId && conversations[lastId]) await openConversation(lastId);
+  if (lastId && conversations[lastId]) await openConversation(lastId, { restoreScroll: true });
 }
 
 export async function refreshConversations() {
@@ -107,7 +112,8 @@ export function renderConvList() {
   ensureProcessingDotTimer(hasProcessingConversation);
 }
 
-export async function openConversation(id) {
+export async function openConversation(id, options = {}) {
+  const capturedVersion = ++openConversationVersion;
   setCurrentConv(id);
   closeSidebar();
   clearAttachments();
@@ -117,18 +123,52 @@ export async function openConversation(id) {
   updateCompactButton();
   renderConvList();
 
-  const r = await loadConversation(id, { limit: 20 });
+  const savedScrollTop = loadConversationScrollTop(id);
+  const restoreScroll = Number.isFinite(savedScrollTop);
+  const savedLoadedCount = loadConversationLoadedMessageCount(id);
+  const requestLimit = Number.isFinite(savedLoadedCount)
+    ? Math.max(20, savedLoadedCount)
+    : 20;
+  const r = await loadConversation(id, { limit: requestLimit });
+  if (!shouldApplyConversationLoad({
+    requestedConversationId: id,
+    activeConversationId: currentConvId,
+    capturedVersion,
+    currentVersion: openConversationVersion,
+  })) {
+    return;
+  }
   if (r) {
     setRepoBrowserSessionInfo(r.sessionRootPath || '', r.sessionRootName || r.title || '');
-    renderMessages(r.messages, true, r);
+    renderMessages(r.messages, !restoreScroll, r);
     restoreInFlightThinking(r.inFlight || null);
     updateSessionPill(conversations[id], r.runtimeSession || null);
+    if (restoreScroll) {
+      const el = document.getElementById('messages');
+      if (el) {
+        if (Number.isFinite(savedScrollTop)) {
+          el.scrollTop = savedScrollTop;
+          saveConversationScrollTop(id, el.scrollTop);
+        } else {
+          el.scrollTop = el.scrollHeight;
+          saveConversationScrollTop(id, el.scrollTop);
+        }
+      }
+    }
   } else {
     setRepoBrowserSessionInfo('', '');
     restoreInFlightThinking(null);
     renderMessages([]);
   }
   await loadRelayQuestions(id);
+  if (!shouldApplyConversationLoad({
+    requestedConversationId: id,
+    activeConversationId: currentConvId,
+    capturedVersion,
+    currentVersion: openConversationVersion,
+  })) {
+    return;
+  }
   applyContextUsageBar(null);
   scheduleContextUsageRefresh(id, 0);
   const composer = document.getElementById('msg-input');
@@ -173,4 +213,3 @@ export async function deleteConv(e, id) {
     scheduleContextUsageRefresh(null);
   }
 }
-

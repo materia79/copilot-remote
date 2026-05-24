@@ -28,18 +28,24 @@ import {
   setModelBanner,
   showTransientRelayNotice,
   repoBrowserState,
+  saveConversationLoadedMessageCount,
 } from './store.js';
 import { sendMessage as sendMessageApi, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi } from './api-client.js';
 import { linkifyWorkspaceMentionsInNode } from './router.js';
 import { renderAttachmentMarkup, clearAttachments, uploadAttachments, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { renderRelayQuestions } from './ask-user-view.js';
 import { getMessageThreadAnchor, sortConversationMessages } from './thread-order.mjs';
+import { normalizeStreamSeq, deriveLatestInFlightStreamEvent, computeNextRelayStreamState } from './stream-state.mjs';
+import { mergeRelayActivityTexts } from './activity-replay-state.mjs';
 
 const CONVERSATION_HISTORY_PAGE_SIZE = 20;
 const HISTORY_LOAD_MORE_ID = 'history-load-more';
+const OPAQUE_RELAY_TEXT_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 let thinkingMessageId = null;
 let thinkingText = '';
+const relayStreamStateByMessageId = new Map();
+const completedMessageIds = new Set();
 let sendInFlight = false;
 let conversationHistoryState = {
   conversationId: '',
@@ -49,6 +55,11 @@ let conversationHistoryState = {
   loadedMessageCount: 0,
   loadingOlder: false,
 };
+
+function isOpaqueRelayText(value) {
+  const text = String(value || '').trim();
+  return !!text && OPAQUE_RELAY_TEXT_PATTERN.test(text);
+}
 
 function setSendInFlight(value) {
   sendInFlight = !!value;
@@ -61,14 +72,16 @@ function getMessagesElement() {
 }
 
 function resetConversationHistoryState() {
+  const conversationId = String(currentConvId || '').trim();
   conversationHistoryState = {
-    conversationId: String(currentConvId || '').trim(),
+    conversationId,
     hasMoreHistory: false,
     oldestMessageId: '',
     newestMessageId: '',
     loadedMessageCount: 0,
     loadingOlder: false,
   };
+  saveConversationLoadedMessageCount(conversationId, 0);
   syncHistoryLoadMoreControl();
 }
 
@@ -81,6 +94,10 @@ function setConversationHistoryState(next = {}) {
     loadedMessageCount: Math.max(0, Number(next.loadedMessageCount) || 0),
     loadingOlder: !!next.loadingOlder,
   };
+  saveConversationLoadedMessageCount(
+    conversationHistoryState.conversationId,
+    conversationHistoryState.loadedMessageCount,
+  );
   syncHistoryLoadMoreControl();
 }
 
@@ -257,13 +274,16 @@ export function renderActivityMarkup(activities) {
 }
 
 export function showThinking(messageId = null) {
-  if (messageId) thinkingMessageId = messageId;
-  removeThinking();
+  const nextMessageId = String(messageId || '').trim();
+  const shouldResetText = !nextMessageId || thinkingMessageId !== nextMessageId;
+  if (shouldResetText) thinkingText = '';
+  if (nextMessageId) thinkingMessageId = nextMessageId;
+  document.getElementById('thinking-indicator')?.remove();
   const el = document.getElementById('messages');
   const div = document.createElement('div');
   div.className = 'msg assistant';
   div.id = 'thinking-indicator';
-  if (messageId) div.dataset.messageId = messageId;
+  if (nextMessageId) div.dataset.messageId = nextMessageId;
   div.innerHTML = `
     <div class="thinking-bubble">
       <div id="thinking-text" class="thinking-text"></div>
@@ -271,7 +291,7 @@ export function showThinking(messageId = null) {
       <div id="thinking-activity" class="thinking-activity"></div>
     </div>
     <div class="msg-label">Copilot</div>`;
-  const target = messageId ? el.querySelector(`[data-message-id="${messageId}"]`) : null;
+  const target = nextMessageId ? el.querySelector(`[data-message-id="${nextMessageId}"]`) : null;
   if (target && target.parentNode === el) {
     const next = target.nextSibling;
     if (next) el.insertBefore(div, next);
@@ -302,6 +322,28 @@ function renderThinkingText(text) {
   box.innerHTML = `<p>${escHtml(value).replace(/\n/g, '<br>')}</p>`;
 }
 
+function clearRelayStreamState(messageId = null) {
+  const id = String(messageId || '').trim();
+  if (!id) {
+    relayStreamStateByMessageId.clear();
+    return;
+  }
+  relayStreamStateByMessageId.delete(id);
+}
+
+function rememberRelayStreamState(messageId, seq, done = false) {
+  const id = String(messageId || '').trim();
+  if (!id) return null;
+  const normalizedSeq = normalizeStreamSeq(seq);
+  const prev = relayStreamStateByMessageId.get(id) || { seq: 0, done: false };
+  const next = {
+    seq: normalizedSeq === null ? prev.seq : normalizedSeq,
+    done: prev.done || !!done,
+  };
+  relayStreamStateByMessageId.set(id, next);
+  return next;
+}
+
 export function renderThinkingActivities() {
   const items = thinkingMessageId ? (relayActivities.get(thinkingMessageId) || []) : [];
   const box = document.getElementById('thinking-activity');
@@ -311,6 +353,7 @@ export function renderThinkingActivities() {
 }
 
 export function restoreInFlightThinking(inFlight) {
+  clearRelayStreamState();
   const messageId = String(inFlight?.messageId || '').trim();
   const status = String(inFlight?.status || '').trim().toLowerCase();
   if (!messageId || status !== 'processing') {
@@ -318,13 +361,26 @@ export function restoreInFlightThinking(inFlight) {
     removeThinking();
     return;
   }
-  const activities = Array.isArray(inFlight.activities)
-    ? inFlight.activities.map((entry) => String(entry || '').trim()).filter(Boolean).slice(-24)
-    : [];
+  const activities = mergeRelayActivityTexts(
+    relayActivities.get(messageId) || [],
+    Array.isArray(inFlight.activities) ? inFlight.activities : [],
+  );
   relayActivities.set(messageId, activities);
-  thinkingMessageId = messageId;
+  thinkingText = '';
   showThinking(messageId);
   renderThinkingActivities();
+  const streamState = deriveLatestInFlightStreamEvent(inFlight);
+  if (streamState) {
+    rememberRelayStreamState(messageId, streamState.seq, streamState.done || !!inFlight?.streamDone);
+    if (!isOpaqueRelayText(streamState.text)) {
+      updateThinkingText(streamState.text, messageId, streamState.done || !!inFlight?.streamDone);
+    }
+    return;
+  }
+  const fallbackSeq = normalizeStreamSeq(inFlight?.lastStreamSeq);
+  if (fallbackSeq !== null || inFlight?.streamDone) {
+    rememberRelayStreamState(messageId, fallbackSeq === null ? 0 : fallbackSeq, !!inFlight?.streamDone);
+  }
 }
 
 export function appendThinkingActivity(text, autoScroll = true) {
@@ -356,6 +412,30 @@ export function updateThinkingText(text, messageId = null, done = false) {
     if (dots) dots.style.display = 'none';
   }
   scrollBottom();
+}
+
+export function applyRelayStreamEvent({ messageId, text, done = false, seq = null } = {}) {
+  const id = String(messageId || '').trim();
+  if (!id) return false;
+  if (completedMessageIds.has(id)) return false;
+  const previous = relayStreamStateByMessageId.get(id) || { seq: 0, done: false };
+  const transition = computeNextRelayStreamState(previous, { seq, done });
+  if (!transition.accept) return false;
+  rememberRelayStreamState(id, transition.state.seq, transition.state.done);
+  if (isOpaqueRelayText(text)) return true;
+  updateThinkingText(String(text || ''), id, !!done);
+  return true;
+}
+
+export function clearRelayStreamStateForMessage(messageId) {
+  const id = String(messageId || '').trim();
+  if (id) {
+    completedMessageIds.add(id);
+    if (completedMessageIds.size > 100) {
+      completedMessageIds.delete(completedMessageIds.values().next().value);
+    }
+  }
+  clearRelayStreamState(messageId);
 }
 
 export function appendMessage(msg, scroll = true, msgId = null, force = false, insertAfterId = null, trackHistory = true) {
@@ -675,4 +755,3 @@ async function validateSelectedConversationBeforeSend() {
   updateSessionPill(conversations[convId], current.runtimeSession || null);
   return true;
 }
-

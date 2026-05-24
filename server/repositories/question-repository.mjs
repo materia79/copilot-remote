@@ -18,5 +18,13 @@ export function createQuestionRepository(db) {
         listActivityByResponse: db.prepare(`SELECT text FROM relay_activity WHERE response_message_id = ? ORDER BY id ASC`),
         listActivityByQueueMessage: db.prepare(`SELECT text FROM relay_activity WHERE queue_message_id = ? ORDER BY id ASC`),
         deleteConvActivity: db.prepare(`DELETE FROM relay_activity WHERE conversation_id = ?`),
+
+        // relay stream events
+        getLastStreamSeqByQueueMessage: db.prepare(`SELECT COALESCE(MAX(seq), 0) AS max_seq FROM relay_stream_events WHERE queue_message_id = ?`),
+        insertStreamEvent: db.prepare(`INSERT INTO relay_stream_events (queue_message_id, response_message_id, conversation_id, relay_mode, seq, text, done, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`),
+        linkStreamEventsToResponse: db.prepare(`UPDATE relay_stream_events SET response_message_id = ? WHERE queue_message_id = ? AND response_message_id IS NULL`),
+        listStreamEventsByResponse: db.prepare(`SELECT seq, text, done, created_at FROM relay_stream_events WHERE response_message_id = ? ORDER BY seq ASC, id ASC`),
+        listStreamEventsByQueueMessage: db.prepare(`SELECT seq, text, done, created_at FROM relay_stream_events WHERE queue_message_id = ? ORDER BY seq ASC, id ASC`),
+        deleteConvStreamEvents: db.prepare(`DELETE FROM relay_stream_events WHERE conversation_id = ?`),
     };
 }

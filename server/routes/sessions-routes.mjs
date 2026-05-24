@@ -609,7 +609,16 @@ export function registerSessionsRoutes(app, deps) {
       AND TRIM(sdk_session_id) <> ''
   `);
   const hardDeleteConversationRows = db.transaction((conversationId) => {
-    db.prepare(`DELETE FROM relay_questions WHERE conversation_id = ?`).run(conversationId);
+    if (typeof stmts.deleteConvQuestions?.run === 'function') {
+      stmts.deleteConvQuestions.run(conversationId);
+    } else {
+      db.prepare(`DELETE FROM relay_questions WHERE conversation_id = ?`).run(conversationId);
+    }
+    if (typeof stmts.deleteConvStreamEvents?.run === 'function') {
+      stmts.deleteConvStreamEvents.run(conversationId);
+    } else {
+      db.prepare(`DELETE FROM relay_stream_events WHERE conversation_id = ?`).run(conversationId);
+    }
     db.prepare(`DELETE FROM queue WHERE conversation_id = ?`).run(conversationId);
     db.prepare(`DELETE FROM messages WHERE conversation_id = ?`).run(conversationId);
     db.prepare(`DELETE FROM runtime_sessions WHERE conversation_id = ?`).run(conversationId);

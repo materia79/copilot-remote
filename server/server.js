@@ -164,12 +164,7 @@ const WORKSPACE_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.w
 const REPO_HEAVY_DIR_NAMES = new Set(['.git', 'node_modules']);
 const MAX_REPO_TREE_NODES = 20_000;
 const MAX_REPO_TREE_DEPTH = 64;
-const DRIVE_BROWSE_TYPES = new Set([2, 3]); // removable + fixed
-const DRIVE_TYPE_LABELS = Object.freeze({
-  2: 'removable',
-  3: 'fixed',
-  4: 'network',
-});
+const DRIVE_ROOT_PATTERN = /\b([A-Z]):\\/g;
 const CURATED_MODEL_IDS = [
   'gpt-5.4',
   'gpt-5.4-mini',
@@ -281,6 +276,7 @@ const runtimeTimers = {
   ownerWatchdog: null,
   staleRecovery: null,
   questionExpiry: null,
+  shutdownDrain: null,
 };
 
 // Remote path prefix when served behind a reverse proxy subpath.
@@ -641,6 +637,27 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_relay_activity_queue ON relay_activity(queue_message_id, id);
   CREATE INDEX IF NOT EXISTS idx_relay_activity_response ON relay_activity(response_message_id, id);
 
+  CREATE TABLE IF NOT EXISTS relay_stream_events (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    queue_message_id    TEXT NOT NULL,
+    response_message_id TEXT,
+    conversation_id     TEXT NOT NULL,
+    relay_mode          TEXT NOT NULL DEFAULT 'agent',
+    seq                 INTEGER NOT NULL,
+    text                TEXT NOT NULL DEFAULT '',
+    done                INTEGER NOT NULL DEFAULT 0,
+    created_at          TEXT NOT NULL,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
+    UNIQUE(queue_message_id, seq)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_relay_stream_events_queue
+    ON relay_stream_events(queue_message_id, seq);
+  CREATE INDEX IF NOT EXISTS idx_relay_stream_events_response
+    ON relay_stream_events(response_message_id, seq);
+  CREATE INDEX IF NOT EXISTS idx_relay_stream_events_conversation
+    ON relay_stream_events(conversation_id, queue_message_id, seq);
+
   CREATE TABLE IF NOT EXISTS uploaded_files (
     sha256        TEXT PRIMARY KEY,
     original_name TEXT,
@@ -868,6 +885,56 @@ function queueCounts() {
   const rows = stmts.countStatus.all();
   const map = Object.fromEntries(rows.map(r => [r.status, r.cnt]));
   return { pendingCount: map.pending || 0, processingCount: map.processing || 0, parkedCount: map.parked || 0 };
+}
+
+let pendingRelayShutdownRequest = null;
+function requestRelayShutdown({ reason = 'manual-request', requestedBy = 'localhost-api' } = {}) {
+  const safeReason = String(reason || 'manual-request').trim().slice(0, 140) || 'manual-request';
+  const safeRequestedBy = String(requestedBy || 'localhost-api').trim().slice(0, 80) || 'localhost-api';
+  if (runtimeShutdownStarted) {
+    return { accepted: false, status: 'shutting_down', reason: safeReason };
+  }
+
+  // Shutdown is intentionally deferred until the queue is idle; it will not interrupt an active turn.
+  if (!pendingRelayShutdownRequest) {
+    pendingRelayShutdownRequest = {
+      reason: safeReason,
+      requestedBy: safeRequestedBy,
+      requestedAt: new Date().toISOString(),
+    };
+  }
+
+  const tryShutdownWhenIdle = () => {
+    if (runtimeShutdownStarted) return;
+    const counts = queueCounts();
+    const queueFree = (counts.pendingCount + counts.processingCount + counts.parkedCount) === 0;
+    if (!queueFree) return;
+    const requestInfo = pendingRelayShutdownRequest;
+    pendingRelayShutdownRequest = null;
+    if (runtimeTimers.shutdownDrain) {
+      try { clearInterval(runtimeTimers.shutdownDrain); } catch {}
+      runtimeTimers.shutdownDrain = null;
+    }
+    console.log(
+      `[${ts()}] Relay shutdown request accepted by ${requestInfo?.requestedBy || 'unknown'}`
+      + `; queue is idle, shutting down now (reason=${requestInfo?.reason || 'manual-request'})`,
+    );
+    void shutdownRuntime(`api-shutdown:${requestInfo?.reason || 'manual-request'}`);
+  };
+
+  if (!runtimeTimers.shutdownDrain) {
+    runtimeTimers.shutdownDrain = setInterval(tryShutdownWhenIdle, 1000);
+  }
+  tryShutdownWhenIdle();
+  const counts = queueCounts();
+  return {
+    accepted: true,
+    status: 'queued',
+    requestedAt: pendingRelayShutdownRequest?.requestedAt || new Date().toISOString(),
+    reason: pendingRelayShutdownRequest?.reason || safeReason,
+    requestedBy: pendingRelayShutdownRequest?.requestedBy || safeRequestedBy,
+    queue: counts,
+  };
 }
 
 function toNullableInt(value) {
@@ -1856,53 +1923,32 @@ function mapDriveDirectoryEntry(entry) {
 }
 
 function fetchBrowsableDrives(cb) {
-  const psScript = [
-    '$drives = Get-CimInstance Win32_LogicalDisk',
-    '| Where-Object { $_.DriveType -in 2,3 }',
-    '| Sort-Object DeviceID',
-    '| ForEach-Object {',
-    '  [pscustomobject]@{',
-    '    drive = [string]$_.DeviceID;',
-    '    label = [string]$_.VolumeName;',
-    '    driveType = [int]$_.DriveType;',
-    '    sizeBytes = [int64]$_.Size;',
-    '    freeBytes = [int64]$_.FreeSpace;',
-    '  }',
-    '};',
-    '$drives | ConvertTo-Json -Depth 4 -Compress',
-  ].join(' ');
-
-  execFile('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', psScript], { windowsHide: true }, (err, stdout, stderr) => {
+  execFile('fsutil.exe', ['fsinfo', 'drives'], { windowsHide: true }, (err, stdout, stderr) => {
     if (err) return cb(new Error(`drive enumeration failed: ${stderr || err.message}`));
 
-    const text = String(stdout || '').trim();
+    const text = String(stdout || '').trim().toUpperCase();
     if (!text) return cb(null, []);
 
-    try {
-      const parsed = JSON.parse(text);
-      const list = Array.isArray(parsed) ? parsed : (parsed ? [parsed] : []);
-      const drives = list
-        .map((item) => {
-          const driveId = String(item?.drive || '').trim().toUpperCase();
-          if (!/^[A-Z]:$/.test(driveId)) return null;
-          const driveTypeNumber = Number(item?.driveType || 0);
-          if (!DRIVE_BROWSE_TYPES.has(driveTypeNumber)) return null;
-          const rootAbsolute = `${driveId}\\`;
-          return {
-            drive: driveId,
-            rootAbsolute,
-            webPath: toDriveWebPath(rootAbsolute),
-            label: item?.label ? String(item.label) : '',
-            driveType: DRIVE_TYPE_LABELS[driveTypeNumber] || 'unknown',
-            sizeBytes: Number(item?.sizeBytes || 0),
-            freeBytes: Number(item?.freeBytes || 0),
-          };
-        })
-        .filter(Boolean);
-      cb(null, drives);
-    } catch (parseErr) {
-      cb(new Error(`drive enumeration parse failed: ${parseErr.message}`));
+    const drives = [];
+    const seen = new Set();
+    DRIVE_ROOT_PATTERN.lastIndex = 0;
+    let match = null;
+    while ((match = DRIVE_ROOT_PATTERN.exec(text)) !== null) {
+      const driveId = String(match[1] || '').trim().toUpperCase();
+      if (!/^[A-Z]$/.test(driveId) || seen.has(driveId)) continue;
+      seen.add(driveId);
+      const rootAbsolute = `${driveId}:\\`;
+      drives.push({
+        drive: `${driveId}:`,
+        rootAbsolute,
+        webPath: toDriveWebPath(rootAbsolute),
+        label: '',
+        driveType: null,
+        sizeBytes: 0,
+        freeBytes: 0,
+      });
     }
+    cb(null, drives);
   });
 }
 
@@ -2304,9 +2350,27 @@ function relayActivityForQueueMessage(queueMessageId) {
     .slice(0, 48);
 }
 
+function relayStreamEventsForQueueMessage(queueMessageId) {
+  const rows = stmts.listStreamEventsByQueueMessage?.all(queueMessageId) || [];
+  return rows
+    .map((row) => {
+      const seq = Math.max(0, Math.trunc(Number(row?.seq || 0)));
+      return {
+        seq,
+        text: String(row?.text || ''),
+        done: Number(row?.done || 0) === 1,
+        timestamp: row?.created_at || null,
+      };
+    })
+    .filter((row) => Number.isFinite(row.seq))
+    .slice(0, 5000);
+}
+
 function inFlightStateForConversation(conversationId) {
   const row = stmts.getLatestProcessingQueueByConversation.get(conversationId);
   if (!row) return null;
+  const streamEvents = relayStreamEventsForQueueMessage(row.id);
+  const lastStreamEvent = streamEvents.length ? streamEvents[streamEvents.length - 1] : null;
   return {
     messageId: row.id,
     status: 'processing',
@@ -2314,6 +2378,9 @@ function inFlightStateForConversation(conversationId) {
     timestamp: row.timestamp || null,
     processingAt: row.processing_at || null,
     activities: relayActivityForQueueMessage(row.id),
+    streamEvents,
+    streamDone: !!lastStreamEvent?.done,
+    lastStreamSeq: lastStreamEvent?.seq || 0,
   };
 }
 
@@ -2505,6 +2572,7 @@ const sharedRouteDeps = {
   formatQuestionRow,
   relayRestartOrchestrator,
   resolveSessionStateRoot,
+  requestRelayShutdown,
 };
 registerMessagesRoutes(app, sharedRouteDeps);
 registerSessionsRoutes(app, sharedRouteDeps);
@@ -2934,6 +3002,7 @@ function clearRuntimeTimers() {
   runtimeTimers.ownerWatchdog = null;
   runtimeTimers.staleRecovery = null;
   runtimeTimers.questionExpiry = null;
+  runtimeTimers.shutdownDrain = null;
 }
 
 let runtimeShutdownPromise = null;

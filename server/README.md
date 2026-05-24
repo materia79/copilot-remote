@@ -17,6 +17,7 @@ the extension auto-starts `server.js` when needed and keeps the relay listener s
 while letting session-affine CLI workers run in parallel.
 
 > **Single-owner rule:** Use either extension-managed polling **or** standalone `relay.mjs`, never both at the same time.
+> Agent/runtime restart policy is defined in `.github/copilot-instructions.md`.
 
 Tell the Copilot CLI agent: **"launch the server"**
 
@@ -77,6 +78,10 @@ On Windows, the visible relay launcher path now targets a stable per-workspace W
 3. The relay singleton lock is stored at `server/data/relay-server.lock` (stale locks are auto-recovered).
 4. In extension-managed mode, do not run `npm start` or `node relay.mjs`.
 5. Verify `/api/status` shows `cliOnline: true` and queue counts are moving or zero.
+6. Follow relay restart policy from `.github/copilot-instructions.md`.
+7. In extension-managed mode, use `POST /api/relay/shutdown` for manual restart requests.
+   - It is queued until the relay is idle, so it will not stop an in-flight turn immediately.
+8. Do not run tests that spawn Copilot CLI clients unless the user explicitly permits it.
 
 Script necessity note:
 
@@ -84,7 +89,8 @@ Script necessity note:
 - Extension-managed relay supervision now includes bounded auto-restart while the CLI session is active.
 - Keep `npm start` for manual local development (starts server + standalone relay).
 - Keep `npm run start:server` for server-only manual runs and extension-parity testing.
-- Treat `npm run start:server:respawn` / `npm run start:server:respawn:posix` as manual fallback only (not the default extension-managed path).
+- Treat `npm run start:server:respawn` / `npm run start:server:respawn:posix` as legacy troubleshooting only; do not use them for manual restarts.
+- Manual restart policy is defined in `.github/copilot-instructions.md`.
 
 ## Global extension install (user-scoped)
 

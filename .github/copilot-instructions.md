@@ -6,12 +6,10 @@ When changing anything related to the web relay (`server/` or `.github/extension
    - **Extension-managed (default):** let `.github/extensions/web-relay/extension.mjs` own server supervision and polling/heartbeat.
    - **Standalone dev mode:** `npm start` (starts `server.js` + `relay.mjs`) only when you intentionally are not relying on extension polling.
    - Never run `npm start`, `node server/relay.mjs`, and extension polling together.
-   - Never kill or restart the node process bound to port `3333` unless the user explicitly asks to kill or restart the web relay.
+   - Never kill or restart the node process bound to port `3333` unless the user explicitly gives permission to restart the web relay.
 2. Before any restart, stop stale relay/watchdog processes from earlier runs (especially detached shells) so only one web relay remains bound to `:3333`.
-3. For extension-managed mode, restart by restarting the CLI extension/session first. Use watchdog scripts only as manual fallback outside extension-managed mode:
-   - `cd <repo-root>`
-   - Windows: `npm run start:server:respawn`
-   - Linux/macOS: `npm run start:server:respawn:posix`
+   3. For extension-managed mode, only restart the web relay after explicit user permission. Manual restarts must use the authenticated localhost API (`POST /api/relay/shutdown`); do not use direct process kills or respawn scripts.
+      - `POST /api/relay/shutdown` is queued and only actually exits once the current turn is idle, so do not wait for it to "interrupt" an in-flight turn.
 4. Keep the main Copilot CLI session running so extension polling can continue.
 5. Verify relay health after changes:
    - `GET /api/status` reports `cliOnline: true`
@@ -24,7 +22,8 @@ When changing anything related to the web relay (`server/` or `.github/extension
 8. Per-message execution mode now lives in the browser composer (`plan` / `ask` / `agent` / `autopilot`) and is stored with each queued turn.
 9. When a turn needs user input, always use `ask_user` rather than asking inline text.
 10. In `autopilot`, still use `ask_user` for clarification; the relay bridge will capture it and show a web question card even if the direct SDK question hook is bypassed.
-11. When tracing a stuck or missing message, follow this exact sequence to locate where it stopped:
+11. Do not spawn Copilot CLI client instances for tests or debugging without explicit user permission; ask first if a test would launch one.
+12. When tracing a stuck or missing message, follow this exact sequence to locate where it stopped:
    - Collect identifiers first: `conversation_id`, approximate timestamp, and message text (or `message_id` if available).
    - Trace server flow in `server/logs/server.log` for that conversation:
      - `QUEUED` (accepted by relay)
@@ -39,6 +38,13 @@ When changing anything related to the web relay (`server/` or `.github/extension
      - `activeBridgeOwner`
      - queue counters (`pendingCount`, `processingCount`)
    - Validate worker PID reality: if status says `ready/processing` but the worker PID is not running, treat as stale worker registration.
-   - Conclude with a one-line stop point: **accepted but not dequeued**, **dequeued but no response**, or **response emitted but UI missed update**.
+    - Conclude with a one-line stop point: **accepted but not dequeued**, **dequeued but no response**, or **response emitted but UI missed update**.
 
 Do not consider relay-related work complete until restart + status + log checks pass.
+
+## Git Commit Policy
+
+- **Never commit on `main` without explicit user instruction.** The user decides when changes are committed to main.
+- On feature branches, only commit autonomously during a large, multi-step implementation where it is clearly expected as part of the work.
+- When in doubt, always ask before committing.
+- Never push without explicit user instruction.

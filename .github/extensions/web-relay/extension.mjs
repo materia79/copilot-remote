@@ -149,7 +149,7 @@ let activeMsg       = null;   // the web message currently being processed
 let waitingForAI    = false;  // true while the agent is generating a response
 let relayTurnActive = false;  // true while processing a relay-originated turn
 let sessionReady    = false;
-const SEND_TIMEOUT  = 10 * 60_000; // allow human-in-the-loop turns (ask_user) to complete
+const SEND_TIMEOUT  = 12 * 60 * 60_000; // allow long-running turns to complete without premature relay timeout
 let heartbeatTimer  = null;
 let pollingLoopStarted = false;
 let activatingRelay = null;
@@ -424,6 +424,7 @@ async function startPolling() {
       setModelForMessage,
       buildPromptWithRelayContext,
       sendAndWaitWithHardTimeout,
+      sendWithBestEffortStreaming,
       extractFinalText,
       getLastActivityText: () => getScopedLastActivityText(),
       getCurrentModelId,
@@ -805,4 +806,4 @@ async function ensureRelayActive(reason) {
 
 const extractFinalText = sessionIo.extractFinalText;
 const sendAndWaitWithHardTimeout = sessionIo.sendAndWaitWithHardTimeout;
-
+const sendWithBestEffortStreaming = sessionIo.sendWithBestEffortStreaming;

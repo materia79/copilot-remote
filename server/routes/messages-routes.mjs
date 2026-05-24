@@ -13,6 +13,9 @@ export const SESSION_WORKER_OWNER_LEASE_MS = 120_000;
 export const SESSION_WORKER_TRANSIENT_DEQUEUE_RETRIES = 2;
 export const SESSION_WORKER_TRANSIENT_DEQUEUE_BACKOFF_MS = 25;
 const DUPLICATE_USER_MESSAGE_WINDOW_MS = 10 * 60 * 1000;
+const OPAQUE_RESPONSE_TEXT_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const OPAQUE_RESPONSE_RECOVERY_WAIT_MS = 600_000;
+const OPAQUE_RESPONSE_RECOVERY_POLL_MS = 250;
 
 function normalizeSessionWorkerId(value) {
   const text = String(value || '').trim();
@@ -324,6 +327,74 @@ function buildTerminalFailureTextForChat(terminalFailure, fallbackMessage = null
     guidance,
     detail ? `Details: ${detail}` : null,
   ].filter(Boolean).join(' ');
+}
+
+function isOpaqueResponseText(value) {
+  const text = String(value || '').trim();
+  return !!text && OPAQUE_RESPONSE_TEXT_PATTERN.test(text);
+}
+
+function findResolvedTranscriptAssistantText({
+  conversation = null,
+  queueTimestamp = null,
+  readSessionTranscriptMessages = null,
+} = {}) {
+  if (typeof readSessionTranscriptMessages !== 'function') return '';
+  const sdkSessionId = String(conversation?.sdk_session_id || conversation?.id || '').trim();
+  if (!sdkSessionId) return '';
+
+  const transcriptMessages = readSessionTranscriptMessages(sdkSessionId, { limit: 200 });
+  if (!Array.isArray(transcriptMessages) || !transcriptMessages.length) return '';
+
+  const queuedAt = Date.parse(String(queueTimestamp || '').trim());
+  const assistantMessages = transcriptMessages
+    .filter((message) => String(message?.role || '').trim().toLowerCase() === 'assistant')
+    .map((message) => ({
+      text: String(message?.text || '').trim(),
+      timestampMs: Date.parse(String(message?.timestamp || '').trim()) || 0,
+    }))
+    .filter((message) => !!message.text);
+
+  if (!assistantMessages.length) return '';
+
+  const nonOpaqueMessages = assistantMessages.filter((message) => !isOpaqueResponseText(message.text));
+  if (!Number.isFinite(queuedAt)) {
+    return nonOpaqueMessages[nonOpaqueMessages.length - 1]?.text
+      || assistantMessages[assistantMessages.length - 1]?.text
+      || '';
+  }
+
+  const afterQueuedAt = assistantMessages.filter((message) => message.timestampMs >= queuedAt);
+  if (!afterQueuedAt.length) return '';
+  const nonOpaqueAfterQueuedAt = afterQueuedAt.filter((message) => !isOpaqueResponseText(message.text));
+  return nonOpaqueAfterQueuedAt[nonOpaqueAfterQueuedAt.length - 1]?.text || '';
+}
+
+async function resolveRelayResponseText({
+  text = '',
+  conversation = null,
+  queueTimestamp = null,
+  readSessionTranscriptMessages = null,
+  opaqueResponseRecoveryWaitMs = OPAQUE_RESPONSE_RECOVERY_WAIT_MS,
+  opaqueResponseRecoveryPollMs = OPAQUE_RESPONSE_RECOVERY_POLL_MS,
+} = {}) {
+  const rawText = String(text || '').trim();
+  if (!isOpaqueResponseText(rawText)) return rawText;
+
+  const maxWaitMs = Math.max(0, Number(opaqueResponseRecoveryWaitMs) || 0);
+  const pollMs = Math.max(1, Number(opaqueResponseRecoveryPollMs) || OPAQUE_RESPONSE_RECOVERY_POLL_MS);
+  const deadline = Date.now() + maxWaitMs;
+
+  while (true) {
+    const transcriptText = findResolvedTranscriptAssistantText({
+      conversation,
+      queueTimestamp,
+      readSessionTranscriptMessages,
+    });
+    if (transcriptText) return transcriptText;
+    if (Date.now() >= deadline) return rawText;
+    await delay(pollMs);
+  }
 }
 
 export function resolveTerminalFailurePayload(payload = {}, { fallbackText = null } = {}) {
@@ -673,14 +744,33 @@ export function registerMessagesRoutes(app, deps) {
     relayActivityForResponse,
     relayActivityForQueueMessage,
     sanitizeActivityText,
+    readSessionTranscriptMessages,
     inFlightStateForConversation,
     emitToClientsExceptSessionId,
     relayBridgeOwnerService,
     relayRestartOrchestrator,
+    requestRelayShutdown,
     featureFlags,
     sessionWorkerRegistry,
     sessionWorkerSupervisor,
+    opaqueResponseRecoveryWaitMs = OPAQUE_RESPONSE_RECOVERY_WAIT_MS,
+    opaqueResponseRecoveryPollMs = OPAQUE_RESPONSE_RECOVERY_POLL_MS,
   } = deps;
+
+  function isLoopbackAddress(value) {
+    const text = String(value || '').trim().toLowerCase();
+    if (!text) return false;
+    return text === '127.0.0.1'
+      || text === '::1'
+      || text === '::ffff:127.0.0.1'
+      || text === '::ffff:7f00:1';
+  }
+
+  function isLoopbackRequest(req) {
+    const socketAddress = req?.socket?.remoteAddress;
+    const ipAddress = req?.ip;
+    return isLoopbackAddress(socketAddress) || isLoopbackAddress(ipAddress);
+  }
 
   function readBridgeIdentity(req) {
     return relayBridgeOwnerService?.normalizeIdentity?.({
@@ -779,6 +869,7 @@ export function registerMessagesRoutes(app, deps) {
         now,
       );
       stmts.linkActivityToResponse?.run(responseId, messageId);
+      stmts.linkStreamEventsToResponse?.run(responseId, messageId);
       stmts.updateConvTime.run(now, conversationId);
       stmts.pruneQueue?.run();
       return true;
@@ -1822,8 +1913,21 @@ export function registerMessagesRoutes(app, deps) {
     return res.json({ ok: true, recovered: rows.length, maxAgeMs });
   });
 
+  app.post('/api/relay/shutdown', auth, (req, res) => {
+    if (!isLoopbackRequest(req)) {
+      return res.status(403).json({ error: 'Relay shutdown endpoint is localhost-only' });
+    }
+    if (typeof requestRelayShutdown !== 'function') {
+      return res.status(501).json({ error: 'Relay shutdown orchestration is unavailable' });
+    }
+    const reason = String(req.body?.reason || 'manual-request').trim().slice(0, 140) || 'manual-request';
+    const requestedBy = String(req.body?.requestedBy || 'localhost-api').trim().slice(0, 80) || 'localhost-api';
+    const result = requestRelayShutdown({ reason, requestedBy });
+    return res.json({ ok: true, ...result });
+  });
+
   // POST /api/response — CLI submits response
-  app.post('/api/response', auth, (req, res) => {
+  app.post('/api/response', auth, async (req, res) => {
     touchCli();
     const { messageId, conversationId, text, model, mode } = req.body;
 
@@ -1878,14 +1982,26 @@ export function registerMessagesRoutes(app, deps) {
       return res.json({ ok: true, terminal: true, code: terminalFailure.stableCode });
     }
 
+    const conversation = stmts.getConvAnyStatus?.get?.(targetConversationId) || null;
+    const resolvedText = await resolveRelayResponseText({
+      text,
+      conversation,
+      queueTimestamp: q?.timestamp || null,
+      readSessionTranscriptMessages,
+      opaqueResponseRecoveryWaitMs,
+      opaqueResponseRecoveryPollMs,
+    });
+    if (!resolvedText) return res.status(400).json({ error: 'Empty response' });
+
     const responseId = uuidv4();
     const now = new Date().toISOString();
     const finalize = db.transaction(() => {
-      const result = stmts.setDone.run(text, messageId);
+      const result = stmts.setDone.run(resolvedText, messageId);
       if (result.changes === 0) return false;
       stmts.setQueueResponseMessageId?.run(responseId, messageId);
-      stmts.insertMsg.run(responseId, targetConversationId, 'assistant', text, model || null, relayMode, null, now);
+      stmts.insertMsg.run(responseId, targetConversationId, 'assistant', resolvedText, model || null, relayMode, null, now);
       stmts.linkActivityToResponse.run(responseId, messageId);
+      stmts.linkStreamEventsToResponse?.run(responseId, messageId);
       stmts.updateConvTime.run(now, targetConversationId);
       stmts.pruneQueue.run();
       return true;
@@ -1940,7 +2056,7 @@ export function registerMessagesRoutes(app, deps) {
       conversationId: targetConversationId,
       sourceMessageId: messageId,
       messageId: responseId,
-      message: { role: 'assistant', text, model: model || null, mode: relayMode, timestamp: now, activities },
+      message: { role: 'assistant', text: resolvedText, model: model || null, mode: relayMode, timestamp: now, activities },
     });
     io.emit('message_status', { messageId, conversationId: targetConversationId, status: 'done' });
     res.json({ ok: true });
@@ -1985,15 +2101,81 @@ export function registerMessagesRoutes(app, deps) {
       return res.status(400).json({ error: 'Missing stream payload' });
     }
 
+    const now = new Date().toISOString();
+    const requestedConversationId = String(conversationId || '').trim();
+    const queueRow = stmts.findQById.get(messageId);
+    if (!queueRow) {
+      return res.status(404).json({ error: 'Queue message not found' });
+    }
+    const queueConversationId = String(queueRow.conversation_id || '').trim();
+    if (!queueConversationId || queueConversationId !== requestedConversationId) {
+      return res.status(409).json({ error: 'Stream conversationId does not match queue conversation' });
+    }
+
+    const isStreamSeqConstraintError = (error) => {
+      const message = String(error?.message || '').toLowerCase();
+      return message.includes('unique constraint failed')
+        && message.includes('relay_stream_events')
+        && message.includes('queue_message_id')
+        && message.includes('seq');
+    };
+
+    let seq = null;
+    try {
+      const insertStreamEventTx = db.transaction(() => {
+        const q = stmts.findQById.get(messageId) || queueRow;
+        const currentConversationId = String(q?.conversation_id || '').trim();
+        if (!currentConversationId || currentConversationId !== requestedConversationId) {
+          const error = new Error('Stream conversationId does not match queue conversation');
+          error.code = 'STREAM_CONVERSATION_MISMATCH';
+          throw error;
+        }
+        const responseMessageId = q?.response_message_id || null;
+        const row = stmts.getLastStreamSeqByQueueMessage?.get(messageId);
+        const maxSeq = Math.max(0, Number(row?.max_seq || 0));
+        const nextSeq = maxSeq + 1;
+        stmts.insertStreamEvent?.run(
+          messageId,
+          responseMessageId,
+          conversationId,
+          normalizeRelayMode(mode) || DEFAULT_RELAY_MODE,
+          nextSeq,
+          streamText,
+          done ? 1 : 0,
+          now,
+        );
+        return nextSeq;
+      });
+      const runInsertStreamEvent = typeof insertStreamEventTx?.immediate === 'function'
+        ? insertStreamEventTx.immediate.bind(insertStreamEventTx)
+        : insertStreamEventTx;
+      const maxRetries = 4;
+      for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
+        try {
+          seq = runInsertStreamEvent();
+          break;
+        } catch (error) {
+          if (error?.code === 'STREAM_CONVERSATION_MISMATCH') {
+            return res.status(409).json({ error: error.message });
+          }
+          const shouldRetry = isStreamSeqConstraintError(error) && attempt < maxRetries;
+          if (!shouldRetry) throw error;
+        }
+      }
+    } catch (error) {
+      return res.status(500).json({ error: error?.message || 'Failed to persist stream event' });
+    }
+
     io.emit('relay_stream', {
       messageId,
       conversationId,
       mode: normalizeRelayMode(mode) || DEFAULT_RELAY_MODE,
       text: streamText,
       done: !!done,
-      timestamp: new Date().toISOString(),
+      seq,
+      timestamp: now,
     });
-    res.json({ ok: true });
+    res.json({ ok: true, seq });
   });
 
   // POST /api/requeue — relay re-queues a message it failed to process

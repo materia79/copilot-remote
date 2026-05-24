@@ -133,12 +133,16 @@ Run only one relay owner at a time:
 2. **Standalone mode**: `npm start` handles polling itself.
 
 Do not run extension polling together with standalone relay polling.
+Do not restart the web relay unless the user has explicitly given permission.
+If a manual restart is requested, use `POST /api/relay/shutdown` only.
+Do not run tests that spawn Copilot CLI clients unless the user explicitly permits it.
 
 In extension-managed mode, polling begins after the CLI session becomes active (typically after the first prompt).
 The extension now supervises managed `server.js` restarts (bounded backoff) while the CLI session is alive, and stops restart attempts on session shutdown.
 When the CLI extension connects, it also prints the relay info window (local/network/remote/auth/polling URLs) directly in the Copilot CLI client.
 
 Respawner scripts (`start:server:respawn*`) are legacy/manual troubleshooting tools only and are not part of the extension-managed startup path.
+Do not use them for manual restarts; use `POST /api/relay/shutdown` instead.
 
 ### Global npm command (Windows first)
 
@@ -155,6 +159,8 @@ Run it from any folder to start the web relay server for that folder's workspace
 Relay server output is written to a logfile under `%LOCALAPPDATA%\copilot-remote\logs` by default (or `COPILOT_WEB_RELAY_LOG_DIR` if you set it), so it stays out of the CLI terminal.
 
 If you want custom token/tunnel settings from a specific `server/config.json`, point `COPILOT_WEB_RELAY_CONFIG` at that file before launching. A plain `npm install -g .` does not bundle the repo-local gitignored config file.
+
+Manual relay shutdowns are queued via `POST /api/relay/shutdown` and only take effect after the current turn goes idle, so they are not a way to interrupt a turn in progress.
 
 Roadmap for later launcher modes:
 

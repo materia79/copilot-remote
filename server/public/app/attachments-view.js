@@ -1029,7 +1029,8 @@ export function setRepoBrowserSessionInfo(sessionRootPath, sessionRootName = '')
   const pathChanged = repoBrowserState.sessionRootPath !== nextPath;
   repoBrowserState.sessionRootPath = nextPath;
   repoBrowserState.sessionRootName = nextName;
-  if (pathChanged) {
+  const sessionRootActive = repoBrowserState.activeRoot === 'session';
+  if (pathChanged && sessionRootActive) {
     setRepoBrowserState({
       tree: null,
       nodeMap: new Map(),
@@ -1041,11 +1042,24 @@ export function setRepoBrowserSessionInfo(sessionRootPath, sessionRootName = '')
       error: '',
     });
   }
-  if (repoBrowserState.activeRoot === 'session') {
+  if (!nextPath && sessionRootActive) {
+    repoBrowserState.activeRoot = 'workspace';
     if (repoBrowserState.open) {
       void loadRepoBrowserTree();
       return;
     }
+    renderRepoBrowser();
+    return;
+  }
+  if (repoBrowserState.open) {
+    if (sessionRootActive && pathChanged) {
+      void loadRepoBrowserTree();
+      return;
+    }
+    renderRepoBrowser();
+    return;
+  }
+  if (sessionRootActive) {
     renderRepoBrowser();
   }
 }
@@ -1208,4 +1222,3 @@ document.addEventListener('keydown', (event) => {
   else if (repoModal.classList.contains('visible')) closeRepoBrowser();
   else if (summaryModal.classList.contains('visible')) window.closeSummaryModal?.();
 });
-

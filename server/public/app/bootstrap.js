@@ -39,6 +39,9 @@ import {
   clearPendingUserMessage,
   initSidebarLayout,
   toggleSidebar,
+  loadConversationScrollTop,
+  loadConversationLoadedMessageCount,
+  saveConversationScrollTop,
 } from './store.js';
 import {
   verifyExistingSession,
@@ -55,7 +58,7 @@ import { loadConversations, refreshConversations, openConversation, renderConvLi
 import { newConversation, deleteConv } from './journal-view.js';
 import { loadRelayQuestions, renderRelayQuestions, upsertRelayQuestion, updatePendingQuestionBanner } from './ask-user-view.js';
 import { openPendingQuestionFromBanner, submitRelayQuestionChoice, submitRelayQuestionAnswer, onRelayQuestionDraftInput, handleRelayQuestionKey } from './ask-user-view.js';
-import { showThinking, removeThinking, renderThinkingActivities, appendThinkingActivity, updateThinkingText, restoreInFlightThinking, renderMessages, appendMessage, compactCurrentConversation, sendMessage, handleKey, getConversationLoadedMessageCount, loadOlderConversationMessages } from './conversation-view.js';
+import { showThinking, removeThinking, renderThinkingActivities, appendThinkingActivity, applyRelayStreamEvent, clearRelayStreamStateForMessage, restoreInFlightThinking, renderMessages, appendMessage, compactCurrentConversation, sendMessage, handleKey, getConversationLoadedMessageCount, loadOlderConversationMessages } from './conversation-view.js';
 import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { handleAttachmentInput, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
 import { initEmojiPicker, toggleEmojiPicker } from './emoji-view.js';
@@ -601,6 +604,17 @@ function initPullToRefresh() {
   el.addEventListener('touchcancel', onMessagesTouchEnd, { passive: true });
 }
 
+function initMessageScrollPersistence() {
+  const el = document.getElementById('messages');
+  if (!el || el.dataset.scrollPersistenceBound === '1') return;
+  el.dataset.scrollPersistenceBound = '1';
+  el.addEventListener('scroll', () => {
+    const convId = String(currentConvId || '').trim();
+    if (!convId) return;
+    saveConversationScrollTop(convId, el.scrollTop);
+  }, { passive: true });
+}
+
 function onMessagesTouchStart(event) {
   const el = event.currentTarget;
   if (!el || el.scrollTop > 0 || pullRefreshState.refreshing) return;
@@ -656,12 +670,16 @@ async function onMessagesTouchEnd() {
   }
 }
 
+let refreshViewVersion = 0;
+
 async function refreshCurrentView() {
-  const currentId = currentConvId;
+  const capturedVersion = ++refreshViewVersion;
   const messagesEl = document.getElementById('messages');
   const scrollTop = messagesEl?.scrollTop || 0;
 
   await refreshConversations();
+
+  const currentId = String(currentConvId || '').trim();
   if (!currentId) {
     setRepoBrowserSessionInfo('', '');
     renderMessages([]);
@@ -670,7 +688,11 @@ async function refreshCurrentView() {
     return;
   }
 
-  const r = await loadConversation(currentId, { limit: Math.max(20, getConversationLoadedMessageCount() || 20) });
+  const savedLoadedCount = loadConversationLoadedMessageCount(currentId);
+  const requestLimit = Math.max(20, getConversationLoadedMessageCount() || 0, savedLoadedCount || 0);
+  const r = await loadConversation(currentId, { limit: requestLimit });
+  if (capturedVersion < refreshViewVersion) return;
+  if (String(currentConvId || '').trim() !== currentId) return;
   if (r) {
     setRepoBrowserSessionInfo(r.sessionRootPath || '', r.sessionRootName || r.title || '');
     renderMessages(r.messages, false, r);
@@ -681,7 +703,14 @@ async function refreshCurrentView() {
   }
   await loadRelayQuestions(currentId);
   scheduleContextUsageRefresh(currentId, 0);
-  if (messagesEl) messagesEl.scrollTop = scrollTop;
+  if (messagesEl && String(currentConvId || '').trim() === currentId) {
+    const savedScrollTop = loadConversationScrollTop(currentId);
+    const nextScrollTop = Number.isFinite(savedScrollTop) ? savedScrollTop : scrollTop;
+    messagesEl.scrollTop = nextScrollTop;
+    if (Number.isFinite(nextScrollTop) && nextScrollTop >= 0) {
+      saveConversationScrollTop(currentId, nextScrollTop);
+    }
+  }
 }
 
 async function copyTextToClipboard(text) {
@@ -962,6 +991,7 @@ async function connectSocket() {
     setRelayOnline(true);
     setCliOnline(true);
     renderConvList();
+    refreshCurrentView().catch(() => {});
     refreshSessionWorkerStatus().catch(() => {});
     refreshModelCatalog().catch(() => {});
   });
@@ -975,6 +1005,7 @@ async function connectSocket() {
   socket.on('cli_status', ({ online }) => {
     setCliOnline(online);
     renderConvList();
+    if (online) refreshCurrentView().catch(() => {});
     refreshSessionWorkerStatus().catch(() => {});
     if (online) refreshModelCatalog().catch(() => {});
   });
@@ -1012,6 +1043,7 @@ async function connectSocket() {
       scheduleContextUsageRefresh(conversationId, 120);
     }
     if (sourceMessageId) relayActivities.delete(sourceMessageId);
+    if (sourceMessageId) clearRelayStreamStateForMessage(sourceMessageId);
     refreshSessionWorkerStatus().catch(() => {});
   });
   socket.on('relay_question', ({ question }) => upsertRelayQuestion(question));
@@ -1026,10 +1058,15 @@ async function connectSocket() {
     if (last !== text) relayActivities.set(messageId, items.concat(text).slice(-24));
     if (conversationId === currentConvId) appendThinkingActivity(text);
   });
-  socket.on('relay_stream', ({ conversationId, messageId, text, done }) => {
+  socket.on('relay_stream', ({ conversationId, messageId, text, done, seq }) => {
     if (!messageId) return;
     if (conversationId !== currentConvId) return;
-    updateThinkingText(String(text || ''), messageId, !!done);
+    applyRelayStreamEvent({
+      messageId,
+      text: String(text || ''),
+      done: !!done,
+      seq,
+    });
   });
   socket.on('conversation_compacted', async ({ sourceConversationId, targetConversationId }) => {
     if (!sourceConversationId || !targetConversationId) return;
@@ -1073,9 +1110,11 @@ async function connectSocket() {
     }
     if (status === 'done' || status === 'failed' || status === 'dropped') {
       clearPendingUserMessage(messageId);
+      if (messageId) clearRelayStreamStateForMessage(messageId);
     }
     if (conversationId === currentConvId && (status === 'done' || status === 'failed' || status === 'dropped')) {
       removeThinking();
+      void refreshCurrentView().catch(() => {});
       scheduleContextUsageRefresh(conversationId, 220);
       refreshSessionWorkerStatus().catch(() => {});
     }
@@ -1198,6 +1237,7 @@ async function initApp() {
   initPullToRefresh();
   initChatTitleCopy();
   initEmojiPicker();
+  initMessageScrollPersistence();
   syncChatTitleControls();
   connectSocket();
   startRelayQuestionPolling();
@@ -1313,4 +1353,3 @@ window.syncChatTitleControls = syncChatTitleControls;
 window.closeChatActionsMenu = closeChatActionsMenu;
 
 bootstrap();
-

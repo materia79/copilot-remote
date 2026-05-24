@@ -76,6 +76,92 @@ function buildSdkAttachments(rawAttachments) {
   return sdkAttachments;
 }
 
+function collectStreamTextCandidates(value, out, depth = 0) {
+  if (depth > 8 || value === null || value === undefined) return;
+  if (typeof value === "string") {
+    const text = value;
+    if (text) out.push(text);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectStreamTextCandidates(item, out, depth + 1);
+    return;
+  }
+  if (typeof value !== "object") return;
+  collectStreamTextCandidates(value.text, out, depth + 1);
+  collectStreamTextCandidates(value.delta, out, depth + 1);
+  collectStreamTextCandidates(value.content, out, depth + 1);
+  collectStreamTextCandidates(value.output_text, out, depth + 1);
+  collectStreamTextCandidates(value.outputText, out, depth + 1);
+  collectStreamTextCandidates(value.message, out, depth + 1);
+  collectStreamTextCandidates(value.response, out, depth + 1);
+  collectStreamTextCandidates(value.result, out, depth + 1);
+  collectStreamTextCandidates(value.output, out, depth + 1);
+}
+
+export function extractStreamTextFromEvent(event) {
+  const candidates = [];
+  collectStreamTextCandidates(event?.data, candidates);
+  collectStreamTextCandidates(event, candidates);
+  if (!candidates.length) return "";
+  const normalized = candidates
+    .map((candidate) => String(candidate || ""))
+    .filter((candidate) => candidate.length > 0);
+  if (!normalized.length) return "";
+  normalized.sort((a, b) => b.length - a.length);
+  return normalized[0];
+}
+
+export function shouldEmitRelayStreamUpdate(nextText, previousText) {
+  const next = String(nextText || "");
+  const prev = String(previousText || "");
+  if (!next) return false;
+  if (!prev) return true;
+  if (next === prev) return false;
+  const delta = next.length - prev.length;
+  if (delta >= 24) return true;
+  if (delta > 0 && /[\n.!?:)]$/.test(next)) return true;
+  if (delta <= 0) return true;
+  return false;
+}
+
+export function resolveEmptyFinalTextHandling({ lastStreamedSent = "", lastActivityText = "" } = {}) {
+  const streamed = String(lastStreamedSent || "").trim();
+  if (streamed) {
+    return { action: "use_stream_text", text: streamed };
+  }
+  const activity = String(lastActivityText || "").trim();
+  return {
+    action: "requeue",
+    reason: activity
+      ? `empty-final-text:last-activity:${activity.slice(0, 120)}`
+      : "empty-final-text:no-stream-or-text",
+  };
+}
+
+export async function publishRelayStreamEvent({
+  api,
+  message,
+  text,
+  done = false,
+  dbg = () => {},
+} = {}) {
+  const value = String(text || "");
+  try {
+    await api("POST", "/api/stream", {
+      messageId: message?.id,
+      conversationId: message?.conversationId,
+      mode: message?.relayMode || "agent",
+      text: value,
+      done: !!done,
+    });
+    return { ok: true, text: value };
+  } catch (streamError) {
+    dbg("relay stream publish failed", `msgId=${message?.id || "none"}`, streamError?.message || String(streamError));
+    return { ok: false, text: value };
+  }
+}
+
 export function createPollingLoop({
   sleep,
   pollMs,
@@ -87,6 +173,7 @@ export function createPollingLoop({
   setModelForMessage,
   buildPromptWithRelayContext,
   sendAndWaitWithHardTimeout,
+  sendWithBestEffortStreaming,
   extractFinalText,
   getLastActivityText,
   getCurrentModelId,
@@ -410,17 +497,26 @@ export function createPollingLoop({
               const value = String(text || "");
               if (!value && !done) return;
               if (!done && value === lastStreamedSent) return;
-              if (!done) lastStreamedSent = value;
-              await api("POST", "/api/stream", {
-                messageId: message.id,
-                conversationId: message.conversationId,
-                mode: message.relayMode || "agent",
+              const publish = await publishRelayStreamEvent({
+                api,
+                message,
                 text: value,
-                done: !!done,
-              }).catch(() => {});
+                done,
+                dbg,
+              });
+              if (!done && publish.ok) lastStreamedSent = value;
+            };
+            const onStreamingEvent = async (event) => {
+              const streamedText = extractStreamTextFromEvent(event);
+              if (!shouldEmitRelayStreamUpdate(streamedText, lastStreamedSent)) return;
+              await pushRelayStream(streamedText, false);
             };
             try {
-              finalEvent = await sendAndWaitWithHardTimeout(payload, sendTimeout);
+              if (typeof sendWithBestEffortStreaming === "function") {
+                finalEvent = await sendWithBestEffortStreaming(payload, sendTimeout, onStreamingEvent);
+              } else {
+                finalEvent = await sendAndWaitWithHardTimeout(payload, sendTimeout);
+              }
             } catch (attachmentError) {
               if (!sdkAttachments.length) throw attachmentError;
               dbg("sdk attachment delivery failed", `msgId=${message.id}`, attachmentError?.message || String(attachmentError));
@@ -430,7 +526,11 @@ export function createPollingLoop({
                 mode: message.relayMode || "agent",
                 text: `Attachment delivery failed (${attachmentError?.message || "unknown error"}). Retrying without SDK attachments.`,
               }).catch(() => {});
-              finalEvent = await sendAndWaitWithHardTimeout({ prompt }, sendTimeout);
+              if (typeof sendWithBestEffortStreaming === "function") {
+                finalEvent = await sendWithBestEffortStreaming({ prompt }, sendTimeout, onStreamingEvent);
+              } else {
+                finalEvent = await sendAndWaitWithHardTimeout({ prompt }, sendTimeout);
+              }
             }
             dbg("session.sendAndWait: completed for msgId", message.id);
 
@@ -523,37 +623,37 @@ export function createPollingLoop({
             }
 
             if (!text) {
-              const lastActivityText = String(getLastActivityText?.() || "").trim();
-              const fallbackText = lastActivityText
-                ? [
-                    "I couldn't capture a direct assistant reply, but the turn completed.",
-                    "This can happen when the answer is routed through a tool or sub-agent instead of the main text channel.",
-                    `Last activity seen: ${lastActivityText}`,
-                  ].join(" ")
-                : [
-                    "I couldn't capture a direct assistant reply, but the turn completed.",
-                    "This can happen when the answer is routed through a tool or sub-agent instead of the main text channel.",
-                    "Try reopening the message or asking for the final answer explicitly if you need a cleaner response.",
-                  ].join(" ");
-              dbg("sendAndWait returned empty content; sending fallback response msgId", message.id);
-              await session.log("⚠️ Empty assistant response — sending fallback reply instead of re-queuing", { level: "warn" });
-              await pushRelayStream("", true);
-              await api("POST", "/api/response", { messageId: message.id, conversationId: message.conversationId, text: fallbackText, model });
+              const emptyHandling = resolveEmptyFinalTextHandling({
+                lastStreamedSent,
+                lastActivityText: String(getLastActivityText?.() || ""),
+              });
+              if (emptyHandling.action === "use_stream_text") {
+                const streamedText = String(emptyHandling.text || "");
+                dbg("sendAndWait returned empty content; finalizing from streamed text msgId", message.id, `len=${streamedText.length}`);
+                await session.log("⚠️ Empty final envelope text — using streamed text as final reply", { level: "warn" });
+                await pushRelayStream(streamedText, true);
+                await api("POST", "/api/response", { messageId: message.id, conversationId: message.conversationId, text: streamedText, model });
+              } else {
+                dbg("sendAndWait returned empty content; re-queueing msgId", message.id, emptyHandling.reason || "empty-final-text");
+                await session.log("⚠️ Empty assistant response envelope — re-queuing instead of sending fallback", { level: "warn" });
+                await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
+              }
             } else {
-              await pushRelayStream(text, true);
+              await pushRelayStream(text || lastStreamedSent, true);
               await api("POST", "/api/response", { messageId: message.id, conversationId: message.conversationId, text, model });
               await session.log(`✅ Sent response to web (${text.length} chars)`, { ephemeral: true });
             }
           } catch (e) {
-            dbg("sendAndWait ERROR for msgId", message.id, ":", e.message);
-            if (isTerminalSendAndWaitError(e)) {
-              const failureText = buildTerminalFailureText(e);
-              await session.log("❌ Terminal SDK/tool-output error — marking turn failed", { level: "error" });
-              await api("POST", "/api/response", {
-                messageId: message.id,
-                conversationId: message.conversationId,
-                text: failureText,
-                model: await getCurrentModelId() || message.model || null,
+              dbg("sendAndWait ERROR for msgId", message.id, ":", e.message);
+              if (isTerminalSendAndWaitError(e)) {
+                const failureText = buildTerminalFailureText(e);
+                await session.log("❌ Terminal SDK/tool-output error — marking turn failed", { level: "error" });
+                await pushRelayStream(lastStreamedSent, true);
+                await api("POST", "/api/response", {
+                  messageId: message.id,
+                  conversationId: message.conversationId,
+                  text: failureText,
+                  model: await getCurrentModelId() || message.model || null,
               }).catch(async () => {
                 await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
               });
