@@ -5,6 +5,7 @@ import {
   conversations,
   seenMessageIds,
   relayQuestions,
+  relayBoards,
   relayQuestionDrafts,
   relayActivities,
   repoBrowserState,
@@ -37,6 +38,7 @@ import {
   releaseComposerFocusAfterSend,
   autoResize,
   clearPendingUserMessage,
+  hasPendingUserMessageDuplicate,
   initSidebarLayout,
   toggleSidebar,
   loadConversationScrollTop,
@@ -60,7 +62,8 @@ import { loadConversations, refreshConversations, openConversation, renderConvLi
 import { newConversation, deleteConv } from './journal-view.js';
 import { loadRelayQuestions, renderRelayQuestions, upsertRelayQuestion, updatePendingQuestionBanner } from './ask-user-view.js';
 import { openPendingQuestionFromBanner, submitRelayQuestionChoice, submitRelayQuestionAnswer, onRelayQuestionDraftInput, handleRelayQuestionKey } from './ask-user-view.js';
-import { showThinking, removeThinking, renderThinkingActivities, appendThinkingActivity, applyRelayStreamEvent, clearRelayStreamStateForMessage, restoreInFlightThinking, applyConversationTurnStatus, renderMessages, appendMessage, compactCurrentConversation, sendMessage, handleKey, getConversationLoadedMessageCount, loadOlderConversationMessages, syncComposerControlState } from './conversation-view.js';
+import { loadRelayBoards, renderRelayBoards, upsertRelayBoard, submitRelayBoardAction } from './relay-board-view.js';
+import { showThinking, removeThinking, renderThinkingActivities, appendThinkingActivity, applyRelayStreamEvent, clearRelayStreamStateForMessage, restoreInFlightThinking, applyConversationTurnStatus, renderMessages, appendMessage, compactCurrentConversation, sendMessage, handleKey, getConversationLoadedMessageCount, loadOlderConversationMessages, syncComposerControlState, getRenderedConversationMessageFingerprints } from './conversation-view.js';
 import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { handleAttachmentInput, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
 import { initEmojiPicker, toggleEmojiPicker } from './emoji-view.js';
@@ -69,6 +72,7 @@ import {
   withUpdatedModelPreference,
   normalizePreferredModelsByMode,
 } from './conversation-preferences.mjs';
+import { isLikelyLiveDuplicateMessage } from './live-message-dedupe.mjs';
 
 const MODEL_STORAGE_KEY = 'copilot_selected_model';
 const MODE_STORAGE_KEY = 'copilot_selected_mode';
@@ -95,6 +99,7 @@ const CHAT_TITLE_MAX_LENGTH = 120;
 
 let socket = null;
 let relayQuestionPollTimer = null;
+let relayBoardPollTimer = null;
 let sessionWorkerStatusPollTimer = null;
 let viewportBaseHeight = window.innerHeight || document.documentElement.clientHeight || 0;
 let deferredInstallPrompt = null;
@@ -772,6 +777,13 @@ function startRelayQuestionPolling() {
   }, 3000);
 }
 
+function startRelayBoardPolling() {
+  if (relayBoardPollTimer) return;
+  relayBoardPollTimer = setInterval(() => {
+    loadRelayBoards().catch(() => {});
+  }, 3000);
+}
+
 async function refreshSessionWorkerStatus() {
   const status = await refreshWorkspaceRootHints();
   if (!status) return;
@@ -921,6 +933,7 @@ async function refreshCurrentView() {
     restoreInFlightThinking(null);
   }
   await loadRelayQuestions(currentId);
+  await loadRelayBoards();
   scheduleContextUsageRefresh(currentId, 0);
   if (messagesEl && String(currentConvId || '').trim() === currentId) {
     const savedScrollTop = loadConversationScrollTop(currentId);
@@ -1324,7 +1337,19 @@ async function connectSocket() {
       pendingUserMessageIds.delete(messageId);
       return;
     }
-    if (conversationId === currentConvId) appendMessage(message, true, messageId);
+    if (conversationId === currentConvId) {
+      const renderedMessages = getRenderedConversationMessageFingerprints(24);
+      const hasPendingTextMatch = hasPendingUserMessageDuplicate(conversationId, message?.text);
+      if (isLikelyLiveDuplicateMessage({
+        incomingMessageId: messageId,
+        incomingMessage: message,
+        existingMessages: renderedMessages,
+        hasPendingTextMatch,
+      })) {
+        return;
+      }
+      appendMessage(message, true, messageId);
+    }
   });
   socket.on('assistant_message', ({ conversationId, message, messageId, sourceMessageId }) => {
     removeThinking();
@@ -1345,6 +1370,11 @@ async function connectSocket() {
   socket.on('relay_question_updated', ({ question }) => upsertRelayQuestion(question));
   socket.on('relay_question_changed', () => {
     loadRelayQuestions(currentConvId);
+  });
+  socket.on('relay_board', ({ board }) => upsertRelayBoard(board));
+  socket.on('relay_board_updated', ({ board }) => upsertRelayBoard(board));
+  socket.on('relay_board_changed', () => {
+    loadRelayBoards();
   });
   socket.on('relay_activity', ({ conversationId, messageId, text }) => {
     if (!messageId || !text) return;
@@ -1437,11 +1467,15 @@ async function connectSocket() {
     for (const [id, question] of relayQuestions.entries()) {
       if (question?.conversationId === conversationId) relayQuestions.delete(id);
     }
+    for (const [id, board] of relayBoards.entries()) {
+      if (board?.conversationId === conversationId) relayBoards.delete(id);
+    }
     for (const id of relayQuestionDrafts.keys()) {
       const q = relayQuestionDrafts.get(id);
       if (!q || q.conversationId === conversationId) relayQuestionDrafts.delete(id);
     }
     updatePendingQuestionBanner();
+    renderRelayBoards();
     renderConvList();
     if (currentConvId === conversationId) {
       setCurrentConv(null);
@@ -1572,9 +1606,11 @@ async function initApp() {
   syncChatTitleControls();
   connectSocket();
   startRelayQuestionPolling();
+  startRelayBoardPolling();
   startSessionWorkerStatusPolling();
   await loadConversations();
   await loadRelayQuestions(currentConvId);
+  await loadRelayBoards();
   updateCompactButton();
   document.getElementById('msg-input').focus();
 }
@@ -1670,6 +1706,7 @@ window.submitRelayQuestionAnswer = submitRelayQuestionAnswer;
 window.onRelayQuestionDraftInput = onRelayQuestionDraftInput;
 window.handleRelayQuestionKey = handleRelayQuestionKey;
 window.openPendingQuestionFromBanner = openPendingQuestionFromBanner;
+window.submitRelayBoardAction = submitRelayBoardAction;
 window.compactCurrentConversation = compactCurrentConversation;
 window.sendMessage = sendMessage;
 window.syncComposerControlState = syncComposerControlState;

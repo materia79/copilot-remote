@@ -537,6 +537,21 @@ export function resolveInitialQueueOwnerSessionId({
   );
 }
 
+export function shouldAutoPrimeStrandedSession({
+  strandedRow = null,
+  requesterSessionId = null,
+} = {}) {
+  const ownerSessionId = normalizeSessionWorkerId(strandedRow?.owner_sdk_session_id);
+  const requesterSid = normalizeSessionWorkerId(requesterSessionId);
+  if (!ownerSessionId || !requesterSid) return false;
+  if (ownerSessionId === requesterSid) return false;
+  const rawRetryCount = Number(strandedRow?.retry_count);
+  if (!Number.isFinite(rawRetryCount)) return false;
+  const retryCount = Math.max(0, Math.trunc(rawRetryCount));
+  if (retryCount > 0) return false;
+  return true;
+}
+
 export function dequeuePendingMessage({
   db,
   stmts,
@@ -993,7 +1008,7 @@ export function registerMessagesRoutes(app, deps) {
   }
 
   const findPendingOwnedByOtherSession = db.prepare(`
-    SELECT id, conversation_id, owner_sdk_session_id
+    SELECT id, conversation_id, owner_sdk_session_id, retry_count
     FROM queue
     WHERE status = 'pending'
       AND owner_sdk_session_id IS NOT NULL
@@ -2331,7 +2346,13 @@ export function registerMessagesRoutes(app, deps) {
     if (!msg && sessionWorkerRoutingEnabled && requesterSessionId && !dequeueBlockedReason) {
       const strandedOwner = findPendingOwnedByOtherSession.get(requesterSessionId, now);
       const strandedSessionId = normalizeSessionWorkerId(strandedOwner?.owner_sdk_session_id);
-      if (strandedSessionId && strandedSessionId !== requesterSessionId && typeof sessionWorkerSupervisor?.ensureWorker === 'function') {
+      if (
+        shouldAutoPrimeStrandedSession({
+          strandedRow: strandedOwner,
+          requesterSessionId,
+        })
+        && typeof sessionWorkerSupervisor?.ensureWorker === 'function'
+      ) {
         try {
           const primeResult = await sessionWorkerSupervisor.ensureWorker(strandedSessionId);
           const primedTerminalFailure = resolvePrimedWorkerTerminalFailure({

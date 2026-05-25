@@ -421,6 +421,36 @@ function normalizeConversationTimestampMs(value) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function isTranscriptUserEchoOfQueuedMessage({
+  transcriptMessage = null,
+  canonicalDbMessages = [],
+  queueRowsById = new Map(),
+  firstAssistantTimestampBySourceId = new Map(),
+  responseGraceMs = 5_000,
+} = {}) {
+  if (String(transcriptMessage?.role || '').trim().toLowerCase() !== 'user') return false;
+  const transcriptTimestampMs = normalizeConversationTimestampMs(transcriptMessage?.timestamp);
+  if (!transcriptTimestampMs) return false;
+  const graceMs = Math.max(0, Number(responseGraceMs) || 0);
+  for (const dbMessage of Array.isArray(canonicalDbMessages) ? canonicalDbMessages : []) {
+    const canonicalId = String(dbMessage?.id || '').trim();
+    if (!canonicalId) continue;
+    const canonicalTimestampMs = normalizeConversationTimestampMs(dbMessage?.timestamp);
+    if (!canonicalTimestampMs || transcriptTimestampMs < canonicalTimestampMs) continue;
+    const queueRow = queueRowsById.get(canonicalId) || null;
+    if (!queueRow) continue;
+    const queueStatus = String(queueRow?.status || '').trim().toLowerCase();
+    if (queueStatus === 'pending' || queueStatus === 'processing' || queueStatus === 'parked') {
+      return true;
+    }
+    const assistantTimestampMs = normalizeConversationTimestampMs(firstAssistantTimestampBySourceId.get(canonicalId));
+    if (assistantTimestampMs && transcriptTimestampMs <= (assistantTimestampMs + graceMs)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function compareConversationMessageOrder(a, b) {
   const aTs = normalizeConversationTimestampMs(a?.timestamp);
   const bTs = normalizeConversationTimestampMs(b?.timestamp);
@@ -504,6 +534,7 @@ export function buildConversationMessages({
   transcriptMessages = [],
   relayActivitiesByMessageId = new Map(),
   responseMessageToSourceId = new Map(),
+  queueRows = [],
 } = {}) {
   const normalizedDbMessages = Array.isArray(dbMessages)
     ? dbMessages.map((message) => {
@@ -565,6 +596,40 @@ export function buildConversationMessages({
     bucket.push(message);
     dbMessagesByRoleText.set(key, bucket);
   }
+  const queueRowsById = new Map(
+    (Array.isArray(queueRows) ? queueRows : [])
+      .map((row) => [String(row?.id || '').trim(), row])
+      .filter(([id]) => !!id),
+  );
+  const firstAssistantTimestampBySourceId = new Map();
+  for (const message of normalizedDbMessages) {
+    if (String(message?.role || '').trim().toLowerCase() !== 'assistant') continue;
+    const sourceMessageId = String(message?.sourceMessageId || '').trim();
+    if (!sourceMessageId) continue;
+    const timestamp = String(message?.timestamp || '').trim();
+    if (!timestamp) continue;
+    const existing = String(firstAssistantTimestampBySourceId.get(sourceMessageId) || '').trim();
+    if (!existing || normalizeConversationTimestampMs(timestamp) < normalizeConversationTimestampMs(existing)) {
+      firstAssistantTimestampBySourceId.set(sourceMessageId, timestamp);
+    }
+  }
+  const retriedQueueRowsByRoleText = new Map();
+  for (const row of Array.isArray(queueRows) ? queueRows : []) {
+    const retryCount = Math.max(0, Number(row?.retry_count || 0));
+    if (retryCount < 1) continue;
+    const key = conversationMessageRoleTextKey({
+      role: 'user',
+      text: row?.text,
+    });
+    if (!key || key.endsWith('::')) continue;
+    const bucket = retriedQueueRowsByRoleText.get(key) || [];
+    bucket.push({
+      id: String(row?.id || '').trim(),
+      timestamp: String(row?.timestamp || '').trim(),
+      retryCount,
+    });
+    retriedQueueRowsByRoleText.set(key, bucket);
+  }
 
   for (const message of transcriptById.values()) {
     const id = String(message?.id || '').trim();
@@ -591,7 +656,32 @@ export function buildConversationMessages({
     if (dbIdentityKeys.has(identityKey)) continue;
     const roleTextKey = conversationMessageRoleTextKey(message);
     const maybeCanonicalRows = roleTextKey ? (dbMessagesByRoleText.get(roleTextKey) || []) : [];
+    const retriedQueueRows = roleTextKey ? (retriedQueueRowsByRoleText.get(roleTextKey) || []) : [];
+    if (
+      message?.role === 'user'
+      && maybeCanonicalRows.length > 0
+      && retriedQueueRows.some((row) => maybeCanonicalRows.some((dbRow) => String(dbRow?.id || '').trim() === row.id))
+    ) {
+      const messageTimestampMs = normalizeConversationTimestampMs(message?.timestamp);
+      const earliestCanonicalTimestampMs = maybeCanonicalRows.reduce((earliest, row) => {
+        const next = normalizeConversationTimestampMs(row?.timestamp);
+        if (!next) return earliest;
+        if (!earliest) return next;
+        return Math.min(earliest, next);
+      }, 0);
+      if (!earliestCanonicalTimestampMs || !messageTimestampMs || messageTimestampMs >= earliestCanonicalTimestampMs) {
+        continue;
+      }
+    }
     if (maybeCanonicalRows.some((row) => isLikelyCanonicalDuplicateMessage(row, message))) continue;
+    if (isTranscriptUserEchoOfQueuedMessage({
+      transcriptMessage: message,
+      canonicalDbMessages: maybeCanonicalRows,
+      queueRowsById,
+      firstAssistantTimestampBySourceId,
+    })) {
+      continue;
+    }
     dbIdentityKeys.add(identityKey);
     if (!id) continue;
     messagesById.set(id, message);
@@ -671,6 +761,11 @@ export function registerSessionsRoutes(app, deps) {
       stmts.deleteConvQuestions.run(conversationId);
     } else {
       db.prepare(`DELETE FROM relay_questions WHERE conversation_id = ?`).run(conversationId);
+    }
+    if (typeof stmts.deleteConvBoards?.run === 'function') {
+      stmts.deleteConvBoards.run(conversationId);
+    } else {
+      db.prepare(`DELETE FROM relay_boards WHERE conversation_id = ?`).run(conversationId);
     }
     if (typeof stmts.deleteConvStreamEvents?.run === 'function') {
       stmts.deleteConvStreamEvents.run(conversationId);
@@ -1187,7 +1282,7 @@ export function registerSessionsRoutes(app, deps) {
     });
     const dbMessages = stmts.getMessages.all(req.params.id);
     const queueRows = db.prepare(`
-      SELECT id, response_message_id
+      SELECT id, response_message_id, text, timestamp, retry_count
       FROM queue
       WHERE conversation_id = ?
     `).all(req.params.id);
@@ -1209,6 +1304,7 @@ export function registerSessionsRoutes(app, deps) {
       transcriptMessages,
       relayActivitiesByMessageId,
       responseMessageToSourceId,
+      queueRows,
     });
     messages = messages.map((message) => {
       if (message.role !== 'assistant') return message;

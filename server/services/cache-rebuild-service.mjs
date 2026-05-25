@@ -83,6 +83,7 @@ export function createCacheRebuildService({
     const orphanedUploads = collectOrphanedUploadsFromConversation(sid);
     db.transaction(() => {
       db.prepare(`DELETE FROM relay_questions WHERE conversation_id = ?`).run(sid);
+      db.prepare(`DELETE FROM relay_boards WHERE conversation_id = ?`).run(sid);
       db.prepare(`DELETE FROM relay_activity WHERE conversation_id = ?`).run(sid);
       db.prepare(`DELETE FROM queue WHERE conversation_id = ?`).run(sid);
       db.prepare(`DELETE FROM messages WHERE conversation_id = ?`).run(sid);
@@ -119,6 +120,7 @@ export function createCacheRebuildService({
 
     db.transaction(() => {
       db.prepare(`DELETE FROM relay_questions`).run();
+      db.prepare(`DELETE FROM relay_boards`).run();
       db.prepare(`DELETE FROM relay_activity`).run();
       db.prepare(`DELETE FROM queue`).run();
       db.prepare(`DELETE FROM messages`).run();

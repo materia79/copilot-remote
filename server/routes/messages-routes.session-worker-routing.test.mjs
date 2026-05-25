@@ -12,6 +12,7 @@ import {
   resolveBlockedWorkerTerminalFailure,
   resolvePrimedWorkerTerminalFailure,
   resolveTerminalFailurePayload,
+  shouldAutoPrimeStrandedSession,
 } from './messages-routes.mjs';
 
 function createQueueHarness() {
@@ -214,6 +215,35 @@ test('resolveInitialQueueOwnerSessionId keeps bound runtime session id when alre
     isNewConversation: false,
   });
   assert.equal(ownerSessionId, 'sdk-bound');
+});
+
+test('shouldAutoPrimeStrandedSession allows fresh rows from other sessions', () => {
+  assert.equal(shouldAutoPrimeStrandedSession({
+    requesterSessionId: 'sdk-a',
+    strandedRow: {
+      owner_sdk_session_id: 'sdk-b',
+      retry_count: 0,
+    },
+  }), true);
+});
+
+test('shouldAutoPrimeStrandedSession blocks retried backlog rows from reviving old sessions', () => {
+  assert.equal(shouldAutoPrimeStrandedSession({
+    requesterSessionId: 'sdk-a',
+    strandedRow: {
+      owner_sdk_session_id: 'sdk-b',
+      retry_count: 1,
+    },
+  }), false);
+});
+
+test('shouldAutoPrimeStrandedSession blocks rows with missing retry metadata', () => {
+  assert.equal(shouldAutoPrimeStrandedSession({
+    requesterSessionId: 'sdk-a',
+    strandedRow: {
+      owner_sdk_session_id: 'sdk-b',
+    },
+  }), false);
 });
 
 test('dequeuePendingMessageForWorkerLoop returns blocked reason when worker cannot restart yet', async () => {

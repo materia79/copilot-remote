@@ -26,5 +26,14 @@ export function createQuestionRepository(db) {
         listStreamEventsByResponse: db.prepare(`SELECT seq, text, done, created_at FROM relay_stream_events WHERE response_message_id = ? ORDER BY seq ASC, id ASC`),
         listStreamEventsByQueueMessage: db.prepare(`SELECT seq, text, done, created_at FROM relay_stream_events WHERE queue_message_id = ? ORDER BY seq ASC, id ASC`),
         deleteConvStreamEvents: db.prepare(`DELETE FROM relay_stream_events WHERE conversation_id = ?`),
+
+        // relay boards
+        insertBoard: db.prepare(`INSERT INTO relay_boards (id, queue_id, conversation_id, message_id, board_type, relay_mode, title, body, actions_json, recommended_action, context_json, status, selected_action, acted_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?)`),
+        getBoard: db.prepare(`SELECT * FROM relay_boards WHERE id = ?`),
+        findBoardByMessageType: db.prepare(`SELECT * FROM relay_boards WHERE message_id = ? AND board_type = ? ORDER BY created_at DESC LIMIT 1`),
+        listBoards: db.prepare(`SELECT * FROM relay_boards WHERE status = ? AND (? IS NULL OR conversation_id = ?) ORDER BY created_at ASC`),
+        markBoardAction: db.prepare(`UPDATE relay_boards SET status = 'acted', selected_action = ?, acted_at = ?, updated_at = ? WHERE id = ? AND status = 'pending'`),
+        dismissBoard: db.prepare(`UPDATE relay_boards SET status = 'dismissed', selected_action = ?, acted_at = ?, updated_at = ? WHERE id = ? AND status = 'pending'`),
+        deleteConvBoards: db.prepare(`DELETE FROM relay_boards WHERE conversation_id = ?`),
     };
 }

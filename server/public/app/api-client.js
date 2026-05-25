@@ -166,6 +166,26 @@ export async function answerRelayQuestion(questionId, answer, sdkSessionId = nul
   });
 }
 
+export async function loadRelayBoards(status = 'pending') {
+  return apiFetch(`/api/relay-boards?status=${encodeURIComponent(status)}`);
+}
+
+export async function loadRelayBoard(boardId) {
+  const id = String(boardId || '').trim();
+  if (!id) return null;
+  return apiFetch(`/api/relay-board/${encodeURIComponent(id)}`);
+}
+
+export async function submitRelayBoardAction(boardId, actionId) {
+  const id = String(boardId || '').trim();
+  const action = String(actionId || '').trim();
+  if (!id || !action) return null;
+  return apiFetch(`/api/relay-board/${encodeURIComponent(id)}/action`, {
+    method: 'POST',
+    body: JSON.stringify({ actionId: action }),
+  });
+}
+
 export async function uploadAttachment(item) {
   if (!item?.file) return null;
   const response = await fetch(`${BASE}/api/upload`, {

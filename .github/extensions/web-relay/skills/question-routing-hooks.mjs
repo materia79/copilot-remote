@@ -1,3 +1,5 @@
+import { extractToolName, parseMaybeJson, toolArgsSnapshot } from "./tool-activity.mjs";
+
 export function createQuestionRoutingHooks({
   api,
   dbg,
@@ -15,6 +17,123 @@ export function createQuestionRoutingHooks({
   setPendingAskUserRequest,
   }) {
   const allowToolUse = { permissionDecision: "allow" };
+
+  function normalizePlanBoardActions(rawActions, recommendedAction = "") {
+    const ids = Array.isArray(rawActions)
+      ? rawActions
+        .map((entry) => {
+          if (typeof entry === "string") return entry.trim().toLowerCase();
+          if (entry && typeof entry === "object") {
+            return String(entry.id || entry.actionId || entry.value || "").trim().toLowerCase();
+          }
+          return "";
+        })
+        .filter(Boolean)
+      : [];
+    const sourceIds = ids.length ? ids : ["autopilot", "interactive", "exit_only"];
+    const seen = new Set();
+    const deduped = [];
+    for (const id of sourceIds) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      deduped.push(id);
+    }
+    const recommended = String(recommendedAction || "").trim().toLowerCase();
+    return {
+      actions: deduped.map((id) => {
+        if (id === "autopilot_fleet") return { id, label: "Implement with autopilot fleet", mode: "autopilot" };
+        if (id === "autopilot") return { id, label: "Implement in autopilot", mode: "autopilot" };
+        if (id === "interactive") return { id, label: "Stop here and prompt myself", mode: "agent" };
+        if (id === "exit_only") return { id, label: "Stop here", mode: "agent" };
+        return { id, label: id.replace(/[_-]+/g, " "), mode: null };
+      }),
+      recommendedAction: recommended || null,
+    };
+  }
+
+  function firstNonEmptyPlanField(...values) {
+    for (const value of values) {
+      const text = String(value || "").trim();
+      if (text) return text;
+    }
+    return "";
+  }
+
+  function extractPlanBoardArgs(request) {
+    const parsedBody = parseMaybeJson(request?.body);
+    const parsedPayload = parseMaybeJson(request?.payload);
+    const parsedRequest = parseMaybeJson(request?.request);
+    const parsedToolCall = parseMaybeJson(request?.toolCall);
+    const rawCandidates = [
+      toolArgsSnapshot(request),
+      parseMaybeJson(request?.input),
+      parseMaybeJson(request?.arguments),
+      parseMaybeJson(request?.args),
+      parseMaybeJson(request?.toolArgs),
+      parseMaybeJson(request?.toolInput),
+      parsedBody,
+      parsedPayload,
+      parsedRequest,
+      parsedToolCall,
+      toolArgsSnapshot(parsedBody),
+      toolArgsSnapshot(parsedPayload),
+      toolArgsSnapshot(parsedRequest),
+      toolArgsSnapshot(parsedToolCall),
+      parseMaybeJson(parsedBody?.input),
+      parseMaybeJson(parsedBody?.arguments),
+      parseMaybeJson(parsedPayload?.input),
+      parseMaybeJson(parsedPayload?.arguments),
+      parseMaybeJson(parsedRequest?.input),
+      parseMaybeJson(parsedRequest?.arguments),
+      parseMaybeJson(parsedToolCall?.input),
+      parseMaybeJson(parsedToolCall?.arguments),
+    ];
+    const seen = new Set();
+    const candidates = rawCandidates.filter((value) => {
+      if (!value || typeof value !== "object") return false;
+      if (seen.has(value)) return false;
+      seen.add(value);
+      return true;
+    });
+    for (const candidate of candidates) {
+      if (firstNonEmptyPlanField(candidate.summary, candidate.result, candidate.output, candidate.message)) {
+        return candidate;
+      }
+    }
+    return candidates[0] || null;
+  }
+
+  function buildPlanBoardPayloadFromRequest(request, activeMsg) {
+    const toolName = extractToolName(request).toLowerCase();
+    const relayMode = String(activeMsg?.relayMode || "").trim().toLowerCase();
+    if (!activeMsg?.id) return null;
+    if (toolName !== "exit_plan_mode" && !(toolName === "task_complete" && relayMode === "plan")) return null;
+
+    const args = extractPlanBoardArgs(request);
+    if (!args || typeof args !== "object") return null;
+
+    const summary = firstNonEmptyPlanField(args.summary, args.result, args.output, args.message);
+    if (!summary) return null;
+
+    const normalized = normalizePlanBoardActions(args.actions, args.recommendedAction);
+    return {
+      queueId: activeMsg.id,
+      messageId: activeMsg.id,
+      conversationId: activeMsg.conversationId,
+      mode: activeMsg.relayMode || "agent",
+      boardType: "plan_ready",
+      title: "Plan ready for review",
+      body: summary,
+      actions: normalized.actions,
+      recommendedAction: normalized.recommendedAction,
+      context: {
+        source: toolName,
+        queueMessageId: activeMsg.id || null,
+        conversationId: activeMsg.conversationId || null,
+        relayMode: activeMsg.relayMode || "agent",
+      },
+    };
+  }
 
   function answerActivityText(answer) {
     const normalized = normalizeActivityText(answer, maxToolDetailLength) || String(answer || "").trim();
@@ -40,6 +159,12 @@ export function createQuestionRoutingHooks({
     }
 
     const activeMsg = getActiveMessage();
+    const planBoardPayload = buildPlanBoardPayloadFromRequest(request, activeMsg);
+    if (planBoardPayload) {
+      await api("POST", "/api/relay-board", planBoardPayload).catch((error) => {
+        dbg("plan board publish failed", `msgId=${activeMsg.id}`, error?.message || String(error));
+      });
+    }
 
     if (isAskUserTool(request) && activeMsg?.id) {
       setLastAskUserBridge(null);

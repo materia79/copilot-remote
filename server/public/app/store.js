@@ -34,6 +34,7 @@ export let workspaceRootEntrySet = new Set([
   'package-lock.json',
 ]);
 export let relayQuestions = new Map();
+export let relayBoards = new Map();
 export let relayActivities = new Map();
 export let sessionWorkerStates = new Map();
 export let thinkingMessageId = null;

@@ -212,6 +212,123 @@ test('buildConversationMessages keeps same-text rows when timestamps are far apa
   assert.deepEqual(messages.map((message) => message.id), ['db-u1', 'tx-u2']);
 });
 
+test('buildConversationMessages suppresses retried transcript user replays when a canonical DB row exists', () => {
+  const messages = buildConversationMessages({
+    dbMessages: [
+      {
+        id: 'db-u1',
+        role: 'user',
+        text: 'please update the plan and search again',
+        timestamp: '2026-05-22T00:00:01.000Z',
+      },
+      {
+        id: 'db-a1',
+        role: 'assistant',
+        text: 'Still running.',
+        timestamp: '2026-05-22T00:10:00.000Z',
+      },
+    ],
+    transcriptMessages: [
+      {
+        id: 'tx-u1',
+        role: 'user',
+        text: 'please update the plan and search again',
+        timestamp: '2026-05-22T00:00:02.000Z',
+      },
+      {
+        id: 'tx-u2',
+        role: 'user',
+        text: 'please update the plan and search again',
+        timestamp: '2026-05-22T00:15:00.000Z',
+      },
+    ],
+    queueRows: [
+      {
+        id: 'db-u1',
+        text: 'please update the plan and search again',
+        timestamp: '2026-05-22T00:00:01.000Z',
+        retry_count: 3,
+      },
+    ],
+  });
+
+  assert.deepEqual(messages.map((message) => message.id), ['db-u1', 'db-a1']);
+});
+
+test('buildConversationMessages suppresses transcript user echoes for an in-flight queued turn', () => {
+  const messages = buildConversationMessages({
+    dbMessages: [
+      {
+        id: 'db-u1',
+        role: 'user',
+        text: 'when you are done, do a second pass please',
+        timestamp: '2026-05-22T00:00:01.000Z',
+      },
+    ],
+    transcriptMessages: [
+      {
+        id: 'tx-u1',
+        role: 'user',
+        text: 'when you are done, do a second pass please',
+        timestamp: '2026-05-22T00:02:15.000Z',
+      },
+    ],
+    queueRows: [
+      {
+        id: 'db-u1',
+        text: 'when you are done, do a second pass please',
+        timestamp: '2026-05-22T00:00:01.000Z',
+        retry_count: 0,
+        status: 'processing',
+      },
+    ],
+  });
+
+  assert.deepEqual(messages.map((message) => message.id), ['db-u1']);
+});
+
+test('buildConversationMessages keeps a later same-text transcript row after the original queued turn finished', () => {
+  const responseMessageToSourceId = new Map([
+    ['db-a1', 'db-u1'],
+  ]);
+  const messages = buildConversationMessages({
+    dbMessages: [
+      {
+        id: 'db-u1',
+        role: 'user',
+        text: 'ping',
+        timestamp: '2026-05-22T00:00:01.000Z',
+      },
+      {
+        id: 'db-a1',
+        role: 'assistant',
+        text: 'pong',
+        timestamp: '2026-05-22T00:00:10.000Z',
+      },
+    ],
+    transcriptMessages: [
+      {
+        id: 'tx-u2',
+        role: 'user',
+        text: 'ping',
+        timestamp: '2026-05-22T00:15:00.000Z',
+      },
+    ],
+    queueRows: [
+      {
+        id: 'db-u1',
+        text: 'ping',
+        timestamp: '2026-05-22T00:00:01.000Z',
+        retry_count: 0,
+        status: 'done',
+      },
+    ],
+    responseMessageToSourceId,
+  });
+
+  assert.deepEqual(messages.map((message) => message.id), ['db-u1', 'db-a1', 'tx-u2']);
+});
+
 test('buildConversationMessages de-dupes transcript user rows with inline attachment marker suffix', () => {
   const messages = buildConversationMessages({
     dbMessages: [

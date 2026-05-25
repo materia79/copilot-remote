@@ -381,6 +381,7 @@ function startHeartbeat() {
       getSessionReady: () => sessionReady,
       getHeartbeatTimer: () => heartbeatTimer,
       setHeartbeatTimer: (timer) => { heartbeatTimer = timer; },
+      getActiveQueueMessageId: () => ((waitingForAI || relayTurnActive) ? activeMsg?.id || null : null),
     });
   }
   heartbeatController.startHeartbeat();

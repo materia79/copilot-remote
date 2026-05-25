@@ -24,6 +24,7 @@ import {
 } from './api-client.js';
 import { renderMessages, restoreInFlightThinking } from './conversation-view.js';
 import { loadRelayQuestions, getPendingQuestionCountsByConversation } from './ask-user-view.js';
+import { loadRelayBoards } from './relay-board-view.js';
 import { clearAttachments, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { shouldApplyConversationLoad } from './activity-replay-state.mjs';
 
@@ -180,6 +181,7 @@ export async function openConversation(id, options = {}) {
     renderMessages([]);
   }
   await loadRelayQuestions(id);
+  await loadRelayBoards();
   if (!shouldApplyConversationLoad({
     requestedConversationId: id,
     activeConversationId: currentConvId,

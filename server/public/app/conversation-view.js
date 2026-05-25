@@ -34,10 +34,12 @@ import { sendMessage as sendMessageApi, cancelConversationTurn, compactConversat
 import { linkifyWorkspaceMentionsInNode, renderMarkdownPreview } from './router.js';
 import { renderAttachmentMarkup, clearAttachments, uploadAttachments, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { renderRelayQuestions } from './ask-user-view.js';
+import { renderRelayBoards } from './relay-board-view.js';
 import { getMessageThreadAnchor, sortConversationMessages } from './thread-order.mjs';
 import { normalizeStreamSeq, deriveLatestInFlightStreamEvent, computeNextRelayStreamState } from './stream-state.mjs';
 import { mergeRelayActivityTexts } from './activity-replay-state.mjs';
 import { deriveComposerControlState, hasComposerDraft } from './composer-control-state.mjs';
+import { buildLiveMessageFingerprint } from './live-message-dedupe.mjs';
 
 const CONVERSATION_HISTORY_PAGE_SIZE = 20;
 const HISTORY_LOAD_MORE_ID = 'history-load-more';
@@ -203,6 +205,14 @@ function createMessageNode(msg, msgId = null, force = false) {
   const div = document.createElement('div');
   div.className = `msg ${msg.role}`;
   if (msgId) div.dataset.messageId = msgId;
+  const fingerprint = buildLiveMessageFingerprint({
+    ...(msg && typeof msg === 'object' ? msg : {}),
+    id: msgId || msg?.id || '',
+  });
+  div.dataset.messageRole = fingerprint.role || '';
+  div.dataset.messageTextFingerprint = fingerprint.text || '';
+  div.dataset.messageTimestamp = String(msg?.timestamp || '').trim();
+  if (fingerprint.sourceMessageId) div.dataset.sourceMessageId = fingerprint.sourceMessageId;
 
   const label = msg.role === 'user' ? 'You' : 'Copilot';
   const modelTag = (msg.role === 'assistant' && msg.model)
@@ -585,6 +595,20 @@ export function appendMessage(msg, scroll = true, msgId = null, force = false, i
   return insertedNode;
 }
 
+export function getRenderedConversationMessageFingerprints(limit = 24) {
+  const el = getMessagesElement();
+  if (!el) return [];
+  const rows = Array.from(el.querySelectorAll('.msg'));
+  const tail = rows.slice(-Math.max(1, Number(limit) || 24));
+  return tail.map((node) => ({
+    id: String(node.dataset.messageId || '').trim(),
+    role: String(node.dataset.messageRole || '').trim(),
+    text: String(node.dataset.messageTextFingerprint || '').trim(),
+    timestamp: String(node.dataset.messageTimestamp || '').trim(),
+    sourceMessageId: String(node.dataset.sourceMessageId || '').trim(),
+  }));
+}
+
 export function renderMessages(msgs, scroll = true, meta = {}) {
   const el = getMessagesElement();
   if (!el) return;
@@ -603,6 +627,7 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
     </div>`;
     resetConversationHistoryState();
     renderRelayQuestions();
+    renderRelayBoards();
     return;
   }
   const conversationId = String(meta.conversationId || currentConvId || '').trim();
@@ -628,6 +653,7 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
   });
   for (const m of ordered) appendMessage(m, false, m.id || null, true, getMessageThreadAnchor(m, messageById), false);
   renderRelayQuestions();
+  renderRelayBoards();
   if (scroll) scrollBottom();
 }
 
@@ -674,6 +700,7 @@ export async function loadOlderConversationMessages() {
     loadingOlder: false,
   });
   renderRelayQuestions();
+  renderRelayBoards();
   requestAnimationFrame(() => {
     if (!el || String(currentConvId || '').trim() !== currentId) return;
     const nextScrollHeight = el.scrollHeight;

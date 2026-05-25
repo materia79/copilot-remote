@@ -43,6 +43,7 @@ export function createDeleteArchiveService(db, sdkClient) {
     `),
     hardDeleteConversation: db.transaction((conversationId) => {
       db.prepare(`DELETE FROM relay_questions WHERE conversation_id = ?`).run(conversationId);
+      db.prepare(`DELETE FROM relay_boards WHERE conversation_id = ?`).run(conversationId);
       db.prepare(`DELETE FROM queue WHERE conversation_id = ?`).run(conversationId);
       db.prepare(`DELETE FROM messages WHERE conversation_id = ?`).run(conversationId);
       db.prepare(`DELETE FROM runtime_sessions WHERE conversation_id = ?`).run(conversationId);

@@ -1,8 +1,18 @@
-export function createHeartbeatController({ api, pollMs, getSessionReady, getHeartbeatTimer, setHeartbeatTimer }) {
+export function createHeartbeatController({
+  api,
+  pollMs,
+  getSessionReady,
+  getHeartbeatTimer,
+  setHeartbeatTimer,
+  getActiveQueueMessageId,
+}) {
   async function pulseHeartbeat() {
     if (!getSessionReady()) return false;
     try {
-      await api("POST", "/api/heartbeat", {});
+      const activeQueueMessageId = typeof getActiveQueueMessageId === "function"
+        ? String(getActiveQueueMessageId() || "").trim()
+        : "";
+      await api("POST", "/api/heartbeat", activeQueueMessageId ? { activeQueueMessageId } : {});
       return true;
     } catch {
       return false;

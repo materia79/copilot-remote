@@ -187,6 +187,121 @@ export async function publishRelayStreamEvent({
   }
 }
 
+function extractToolCallInputObject(value, toolName, depth = 0) {
+  if (!value || typeof value !== "object" || depth > 12) return null;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = extractToolCallInputObject(item, toolName, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+  const name = value.name || value.tool || value.function_name || value.toolName || value.tool_name;
+  if (String(name || "").trim() === toolName) {
+    const input = value.input || value.arguments || value.params || value.args || null;
+    if (input && typeof input === "object") return input;
+    if (typeof value.arguments === "string") {
+      try {
+        const parsed = JSON.parse(value.arguments);
+        if (parsed && typeof parsed === "object") return parsed;
+      } catch {}
+    }
+  }
+  const CONTAINER_KEYS = ["data", "output", "content", "tool_calls", "toolRequests", "calls", "items", "results", "steps", "turns", "messages", "events"];
+  for (const key of CONTAINER_KEYS) {
+    const child = value[key];
+    if (child === undefined || child === null) continue;
+    const found = extractToolCallInputObject(child, toolName, depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+
+function normalizePlanBoardActions(rawActions, recommendedAction = "") {
+  const ids = Array.isArray(rawActions)
+    ? rawActions
+      .map((entry) => {
+        if (typeof entry === "string") return entry.trim().toLowerCase();
+        if (entry && typeof entry === "object") {
+          return String(entry.id || entry.actionId || entry.value || "").trim().toLowerCase();
+        }
+        return "";
+      })
+      .filter(Boolean)
+    : [];
+  const sourceIds = ids.length ? ids : ["autopilot", "interactive", "exit_only"];
+  const seen = new Set();
+  const deduped = [];
+  for (const id of sourceIds) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    deduped.push(id);
+  }
+  const recommended = String(recommendedAction || "").trim().toLowerCase();
+  return {
+    actions: deduped.map((id) => {
+      if (id === "autopilot_fleet") return { id, label: "Implement with autopilot fleet", mode: "autopilot" };
+      if (id === "autopilot") return { id, label: "Implement in autopilot", mode: "autopilot" };
+      if (id === "interactive") return { id, label: "Stop here and prompt myself", mode: "agent" };
+      if (id === "exit_only") return { id, label: "Stop here", mode: "agent" };
+      return { id, label: id.replace(/[_-]+/g, " "), mode: null };
+    }),
+    recommendedAction: recommended || null,
+  };
+}
+
+function countPlanLikeLines(text) {
+  return String(text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => /^([-*]\s+|\d+\.\s+)/.test(line))
+    .length;
+}
+
+export function buildPlanReadyBoardPayload({ finalEvent, message, finalText = "" } = {}) {
+  const exitPlanInput = extractToolCallInputObject(finalEvent, "exit_plan_mode");
+  const taskCompleteInput = extractToolCallInputObject(finalEvent, "task_complete");
+  const toolInput = (exitPlanInput && typeof exitPlanInput === "object")
+    ? exitPlanInput
+    : ((taskCompleteInput && typeof taskCompleteInput === "object") ? taskCompleteInput : null);
+  const fallbackSummary = String(finalText || "").trim();
+  const allowPlanModeFallback =
+    !toolInput
+    && String(message?.relayMode || "").trim().toLowerCase() === "plan"
+    && countPlanLikeLines(fallbackSummary) >= 2;
+  if (!toolInput && !allowPlanModeFallback) return null;
+  const summary = String(
+    toolInput?.summary
+    || toolInput?.result
+    || toolInput?.output
+    || toolInput?.message
+    || fallbackSummary
+    || "",
+  ).trim();
+  if (!summary) return null;
+  const normalized = normalizePlanBoardActions(toolInput?.actions, toolInput?.recommendedAction);
+  const source = exitPlanInput
+    ? "exit_plan_mode"
+    : (taskCompleteInput ? "task_complete" : "plan-mode-fallback");
+  return {
+    queueId: message?.id,
+    messageId: message?.id,
+    conversationId: message?.conversationId,
+    mode: message?.relayMode || "agent",
+    boardType: "plan_ready",
+    title: "Plan ready for review",
+    body: summary,
+    actions: normalized.actions,
+    recommendedAction: normalized.recommendedAction,
+    context: {
+      source,
+      queueMessageId: message?.id || null,
+      conversationId: message?.conversationId || null,
+      relayMode: message?.relayMode || "agent",
+    },
+  };
+}
+
 export function createPollingLoop({
   sleep,
   pollMs,
@@ -637,13 +752,10 @@ export function createPollingLoop({
               }
             };
             try {
-              if (typeof sendWithBestEffortStreaming === "function") {
-                finalEvent = await sendWithBestEffortStreaming(payload, sendTimeout, onStreamingEvent, {
-                  onWaiting: inspectActiveWorkerLiveness,
-                });
-              } else {
-                finalEvent = await sendWithoutStreaming(payload);
-              }
+              // The extension SDK's session.send() can resolve to an opaque request id before
+              // onUserInputRequest fires. For relay turns that would finalize the queue row too
+              // early, so keep using the stable sendAndWait path here.
+              finalEvent = await sendWithoutStreaming(payload);
             } catch (attachmentError) {
               if (!sdkAttachments.length) throw attachmentError;
               dbg("sdk attachment delivery failed", `msgId=${message.id}`, attachmentError?.message || String(attachmentError));
@@ -653,13 +765,7 @@ export function createPollingLoop({
                 mode: message.relayMode || "agent",
                 text: `Attachment delivery failed (${attachmentError?.message || "unknown error"}). Retrying without SDK attachments.`,
               }).catch(() => {});
-              if (typeof sendWithBestEffortStreaming === "function") {
-                finalEvent = await sendWithBestEffortStreaming({ prompt }, sendTimeout, onStreamingEvent, {
-                  onWaiting: inspectActiveWorkerLiveness,
-                });
-              } else {
-                finalEvent = await sendWithoutStreaming({ prompt });
-              }
+              finalEvent = await sendWithoutStreaming({ prompt });
             }
             dbg("session.sendAndWait: completed for msgId", message.id);
 
@@ -667,6 +773,18 @@ export function createPollingLoop({
             const model = await getCurrentModelId() || finalEvent?.data?.model || finalEvent?.data?.modelId || message.model || null;
             const bridgedViaAskUser = !!getLastAskUserBridge?.();
             const pendingAskUserReq = !bridgedViaAskUser ? getPendingAskUserRequest?.() : null;
+            const boardPayload = buildPlanReadyBoardPayload({
+              finalEvent,
+              message,
+              finalText: text,
+            });
+            if (boardPayload) {
+              try {
+                await api("POST", "/api/relay-board", boardPayload);
+              } catch (boardError) {
+                dbg("plan board publish failed", `msgId=${message.id}`, boardError?.message || String(boardError));
+              }
+            }
 
             // Safety-net fallback: ask_user was called but onUserInputRequest did not fire.
             // With onUserInputRequest registered as a top-level joinSession property this should

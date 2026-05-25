@@ -23,6 +23,7 @@ import { createQuestionRepository } from './repositories/question-repository.mjs
 import { registerSessionsRoutes } from './routes/sessions-routes.mjs';
 import { registerMessagesRoutes } from './routes/messages-routes.mjs';
 import { registerAskUserRoutes } from './routes/ask-user-routes.mjs';
+import { registerRelayBoardRoutes } from './routes/relay-board-routes.mjs';
 import { registerCacheRoutes } from './routes/cache-routes.mjs';
 import { createDeleteArchiveService } from './services/delete-archive-service.mjs';
 import { createSessionDiscoveryService } from './services/session-discovery-service.mjs';
@@ -645,6 +646,30 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_relay_questions_status ON relay_questions(status, expires_at, created_at);
   CREATE INDEX IF NOT EXISTS idx_relay_questions_conversation ON relay_questions(conversation_id, status, created_at);
+
+  CREATE TABLE IF NOT EXISTS relay_boards (
+    id                TEXT PRIMARY KEY,
+    queue_id          TEXT NOT NULL,
+    conversation_id   TEXT NOT NULL,
+    message_id        TEXT NOT NULL,
+    board_type        TEXT NOT NULL,
+    relay_mode        TEXT NOT NULL DEFAULT 'agent',
+    title             TEXT NOT NULL,
+    body              TEXT NOT NULL,
+    actions_json      TEXT,
+    recommended_action TEXT,
+    context_json      TEXT,
+    status            TEXT NOT NULL DEFAULT 'pending',
+    selected_action   TEXT,
+    acted_at          TEXT,
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL,
+    FOREIGN KEY (queue_id) REFERENCES queue(id) ON DELETE CASCADE,
+    UNIQUE(message_id, board_type)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_relay_boards_status ON relay_boards(status, created_at);
+  CREATE INDEX IF NOT EXISTS idx_relay_boards_conversation ON relay_boards(conversation_id, status, created_at);
 
   CREATE TABLE IF NOT EXISTS relay_activity (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1279,6 +1304,72 @@ function formatQuestionRow(row) {
     createdAt: row.created_at,
     answeredAt: row.answered_at || null,
     expiresAt: row.expires_at,
+  };
+}
+
+function parseBoardActions(rawActions) {
+  if (!rawActions) return [];
+  let input = rawActions;
+  if (typeof rawActions === 'string') {
+    try {
+      input = JSON.parse(rawActions);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(input)) return [];
+  return input
+    .map((action) => {
+      if (typeof action === 'string') {
+        const id = action.trim().toLowerCase();
+        return id ? { id, label: id } : null;
+      }
+      if (!action || typeof action !== 'object') return null;
+      const id = String(action.id || action.actionId || action.value || '').trim().toLowerCase();
+      if (!id) return null;
+      const label = String(action.label || action.title || id).trim().slice(0, 120) || id;
+      const mode = normalizeRelayMode(action.mode);
+      const prompt = String(action.prompt || '').trim();
+      return {
+        id,
+        label,
+        mode: mode || null,
+        prompt: prompt || null,
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 8);
+}
+
+function parseBoardContext(rawContext) {
+  if (!rawContext) return null;
+  if (typeof rawContext !== 'string') return rawContext;
+  try {
+    return JSON.parse(rawContext);
+  } catch {
+    return null;
+  }
+}
+
+function formatRelayBoardRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    queueId: row.queue_id,
+    conversationId: row.conversation_id,
+    messageId: row.message_id,
+    boardType: String(row.board_type || '').trim().toLowerCase() || 'generic',
+    mode: normalizeRelayMode(row.relay_mode) || DEFAULT_RELAY_MODE,
+    title: String(row.title || '').trim(),
+    body: String(row.body || '').trim(),
+    actions: parseBoardActions(row.actions_json),
+    recommendedAction: String(row.recommended_action || '').trim() || null,
+    context: parseBoardContext(row.context_json),
+    status: String(row.status || 'pending').trim().toLowerCase() || 'pending',
+    selectedAction: String(row.selected_action || '').trim() || null,
+    actedAt: row.acted_at || null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at || row.created_at,
   };
 }
 
@@ -2485,6 +2576,8 @@ const sharedRouteDeps = {
   parseQuestionRequest,
   normalizeQuestionChoices,
   formatQuestionRow,
+  parseBoardActions,
+  formatRelayBoardRow,
   relayRestartOrchestrator,
   resolveSessionStateRoot,
   requestRelayShutdown,
@@ -2492,6 +2585,7 @@ const sharedRouteDeps = {
 registerMessagesRoutes(app, sharedRouteDeps);
 registerSessionsRoutes(app, sharedRouteDeps);
 registerAskUserRoutes(app, sharedRouteDeps);
+registerRelayBoardRoutes(app, sharedRouteDeps);
 registerCacheRoutes(app, sharedRouteDeps);
 function markCliOffline(reason = 'offline', { clearOwner = true } = {}) {
   cliLastSeen = null;
