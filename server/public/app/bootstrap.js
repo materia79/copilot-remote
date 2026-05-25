@@ -52,20 +52,27 @@ import {
   loadModelCatalog,
   loadConversation,
   updateConversationTitle,
+  updateConversationPreferences,
   killSessionWorker,
   scheduleContextUsageRefresh,
 } from './api-client.js';
-import { loadConversations, refreshConversations, openConversation, renderConvList } from './journal-view.js';
+import { loadConversations, refreshConversations, openConversation, renderConvList, applyLoadedConversationState } from './journal-view.js';
 import { newConversation, deleteConv } from './journal-view.js';
 import { loadRelayQuestions, renderRelayQuestions, upsertRelayQuestion, updatePendingQuestionBanner } from './ask-user-view.js';
 import { openPendingQuestionFromBanner, submitRelayQuestionChoice, submitRelayQuestionAnswer, onRelayQuestionDraftInput, handleRelayQuestionKey } from './ask-user-view.js';
-import { showThinking, removeThinking, renderThinkingActivities, appendThinkingActivity, applyRelayStreamEvent, clearRelayStreamStateForMessage, restoreInFlightThinking, renderMessages, appendMessage, compactCurrentConversation, sendMessage, handleKey, getConversationLoadedMessageCount, loadOlderConversationMessages } from './conversation-view.js';
+import { showThinking, removeThinking, renderThinkingActivities, appendThinkingActivity, applyRelayStreamEvent, clearRelayStreamStateForMessage, restoreInFlightThinking, applyConversationTurnStatus, renderMessages, appendMessage, compactCurrentConversation, sendMessage, handleKey, getConversationLoadedMessageCount, loadOlderConversationMessages, syncComposerControlState } from './conversation-view.js';
 import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { handleAttachmentInput, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
 import { initEmojiPicker, toggleEmojiPicker } from './emoji-view.js';
+import {
+  resolveConversationComposerSelection,
+  withUpdatedModelPreference,
+  normalizePreferredModelsByMode,
+} from './conversation-preferences.mjs';
 
 const MODEL_STORAGE_KEY = 'copilot_selected_model';
 const MODE_STORAGE_KEY = 'copilot_selected_mode';
+const MODELS_BY_MODE_STORAGE_KEY = 'copilot_selected_models_by_mode';
 const FALLBACK_MODEL = 'gpt-5.4-mini';
 const FALLBACK_MODE = 'agent';
 const THEME_COLOR_BASE = '#0d1117';
@@ -103,6 +110,9 @@ let modelCatalogState = {
   warning: null,
   refreshedAt: null,
 };
+let activeConversationPreferredModelsByMode = {};
+let suppressConversationPreferenceSync = false;
+let conversationPreferenceWriteVersion = 0;
 let pullRefreshState = {
   active: false,
   ready: false,
@@ -164,6 +174,8 @@ function updateModelCatalogState(payload) {
   };
 
   const selectedBefore = select.value;
+  const selectedMode = String(document.getElementById('mode-select')?.value || '').trim();
+  const preferredForMode = String(activeConversationPreferredModelsByMode?.[selectedMode] || '').trim();
   select.innerHTML = '';
   for (const modelId of nextModels) {
     const opt = document.createElement('option');
@@ -172,10 +184,19 @@ function updateModelCatalogState(payload) {
     select.appendChild(opt);
   }
 
-  const preferred = [selectedBefore, localStorage.getItem(MODEL_STORAGE_KEY), modelCatalogState.currentModel, modelCatalogState.defaultModel, nextModels[0]]
+  const preferred = [preferredForMode, selectedBefore, localStorage.getItem(MODEL_STORAGE_KEY), modelCatalogState.currentModel, modelCatalogState.defaultModel, nextModels[0]]
     .find((value) => value && nextModels.includes(value)) || nextModels[0];
   select.value = preferred;
   localStorage.setItem(MODEL_STORAGE_KEY, preferred);
+  if (selectedMode) {
+    activeConversationPreferredModelsByMode = withUpdatedModelPreference({
+      preferredModelsByMode: activeConversationPreferredModelsByMode,
+      mode: selectedMode,
+      model: preferred,
+      supportedModes: Array.from(document.getElementById('mode-select')?.options || []).map((option) => option.value),
+    });
+    localStorage.setItem(MODELS_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredModelsByMode));
+  }
 
   if (modelCatalogState.warning) {
     setModelBanner(`⚠️ ${modelCatalogState.warning}`);
@@ -193,19 +214,133 @@ function selectedModelValue() {
   return modelCatalogState.currentModel || modelCatalogState.defaultModel || FALLBACK_MODEL;
 }
 
+function readStoredModelsByMode() {
+  const raw = String(localStorage.getItem(MODELS_BY_MODE_STORAGE_KEY) || '').trim();
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    return parsed;
+  } catch {
+    return {};
+  }
+}
+
+function modeOptions() {
+  return Array.from(document.getElementById('mode-select')?.options || []).map((option) => option.value);
+}
+
+function modelOptions() {
+  return Array.from(document.getElementById('model-select')?.options || []).map((option) => option.value);
+}
+
+async function persistCurrentConversationPreferences() {
+  const convId = String(currentConvId || '').trim();
+  if (!convId || suppressConversationPreferenceSync) return;
+  const modeSelect = document.getElementById('mode-select');
+  const modelSelect = document.getElementById('model-select');
+  if (!modeSelect || !modelSelect) return;
+  const mode = String(modeSelect.value || '').trim() || FALLBACK_MODE;
+  const model = String(modelSelect.value || '').trim();
+  const supportedModes = modeOptions();
+  activeConversationPreferredModelsByMode = withUpdatedModelPreference({
+    preferredModelsByMode: activeConversationPreferredModelsByMode,
+    mode,
+    model,
+    supportedModes,
+  });
+  localStorage.setItem(MODELS_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredModelsByMode));
+  localStorage.setItem(MODE_STORAGE_KEY, mode);
+  if (model) localStorage.setItem(MODEL_STORAGE_KEY, model);
+
+  const writeVersion = ++conversationPreferenceWriteVersion;
+  const response = await updateConversationPreferences(convId, {
+    clientId: CLIENT_ID,
+    preferredRelayMode: mode,
+    preferredModelsByMode: activeConversationPreferredModelsByMode,
+  });
+  if (!response || writeVersion !== conversationPreferenceWriteVersion) return;
+  if (conversations[convId]) {
+    conversations[convId] = {
+      ...conversations[convId],
+      preferredRelayMode: response.preferredRelayMode,
+      preferredModelsByMode: response.preferredModelsByMode,
+    };
+  }
+}
+
+function applyConversationPreferences({
+  preferredRelayMode = '',
+  preferredModelsByMode = {},
+} = {}) {
+  const modeSelect = document.getElementById('mode-select');
+  const modelSelect = document.getElementById('model-select');
+  if (!modeSelect || !modelSelect) return;
+
+  const supportedModes = modeOptions();
+  const supportedModels = modelOptions().length ? modelOptions() : modelCatalogState.models;
+  const selection = resolveConversationComposerSelection({
+    preferredRelayMode,
+    preferredModelsByMode: normalizePreferredModelsByMode(preferredModelsByMode, { supportedModes }),
+    selectedMode: modeSelect.value || localStorage.getItem(MODE_STORAGE_KEY) || FALLBACK_MODE,
+    selectedModel: modelSelect.value || localStorage.getItem(MODEL_STORAGE_KEY) || FALLBACK_MODEL,
+    supportedModes,
+    supportedModels,
+    fallbackMode: FALLBACK_MODE,
+    fallbackModel: FALLBACK_MODEL,
+  });
+  suppressConversationPreferenceSync = true;
+  modeSelect.value = selection.mode;
+  if (selection.model) modelSelect.value = selection.model;
+  suppressConversationPreferenceSync = false;
+
+  activeConversationPreferredModelsByMode = {
+    ...readStoredModelsByMode(),
+    ...selection.preferredModelsByMode,
+  };
+  localStorage.setItem(MODELS_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredModelsByMode));
+  localStorage.setItem(MODE_STORAGE_KEY, selection.mode);
+  if (selection.model) localStorage.setItem(MODEL_STORAGE_KEY, selection.model);
+}
+
+function applyConversationPreferencesForConversation(conversationId, payload = {}) {
+  const convId = String(conversationId || currentConvId || '').trim();
+  const conversation = convId ? conversations[convId] : null;
+  const preferredRelayMode = payload?.preferredRelayMode
+    ?? conversation?.preferredRelayMode
+    ?? localStorage.getItem(MODE_STORAGE_KEY)
+    ?? FALLBACK_MODE;
+  const preferredModelsByMode = payload?.preferredModelsByMode
+    ?? conversation?.preferredModelsByMode
+    ?? readStoredModelsByMode();
+  applyConversationPreferences({
+    preferredRelayMode,
+    preferredModelsByMode,
+  });
+}
+
 function initModelSelector() {
   const select = document.getElementById('model-select');
   if (!select) return;
   if (!select.dataset.bound) {
     select.dataset.bound = '1';
     select.addEventListener('change', () => {
-      localStorage.setItem(MODEL_STORAGE_KEY, select.value);
+      if (suppressConversationPreferenceSync) return;
+      const mode = String(document.getElementById('mode-select')?.value || '').trim();
+      activeConversationPreferredModelsByMode = withUpdatedModelPreference({
+        preferredModelsByMode: activeConversationPreferredModelsByMode,
+        mode,
+        model: select.value,
+        supportedModes: modeOptions(),
+      });
+      void persistCurrentConversationPreferences().catch(() => {});
     });
   }
 }
 
 function initModeSelector() {
   const select = document.getElementById('mode-select');
+  if (!select) return;
   const saved = localStorage.getItem(MODE_STORAGE_KEY);
   const available = Array.from(select.options).map(o => o.value);
   if (saved && available.includes(saved)) {
@@ -213,8 +348,21 @@ function initModeSelector() {
   } else if (!saved && available.includes(FALLBACK_MODE)) {
     select.value = FALLBACK_MODE;
   }
+  if (select.dataset.bound === '1') return;
+  select.dataset.bound = '1';
   select.addEventListener('change', () => {
-    localStorage.setItem(MODE_STORAGE_KEY, select.value);
+    if (suppressConversationPreferenceSync) return;
+    const modelSelect = document.getElementById('model-select');
+    if (modelSelect) {
+      const mode = String(select.value || '').trim();
+      const modeModel = String(activeConversationPreferredModelsByMode?.[mode] || '').trim();
+      if (modeModel && modelOptions().includes(modeModel)) {
+        suppressConversationPreferenceSync = true;
+        modelSelect.value = modeModel;
+        suppressConversationPreferenceSync = false;
+      }
+    }
+    void persistCurrentConversationPreferences().catch(() => {});
   });
 }
 
@@ -653,6 +801,9 @@ function setupViewportTracking() {
   const input = document.getElementById('msg-input');
   if (input && input.dataset.viewportBound !== '1') {
     input.dataset.viewportBound = '1';
+    input.addEventListener('input', () => {
+      syncComposerControlState();
+    }, { passive: true });
     input.addEventListener('focus', () => {
       document.body.classList.add('keyboard-open');
       syncViewportMetrics();
@@ -764,9 +915,7 @@ async function refreshCurrentView() {
   if (capturedVersion < refreshViewVersion) return;
   if (String(currentConvId || '').trim() !== currentId) return;
   if (r) {
-    setRepoBrowserSessionInfo(r.sessionRootPath || '', r.sessionRootName || r.title || '');
-    renderMessages(r.messages, false, r);
-    restoreInFlightThinking(r.inFlight || null);
+    applyLoadedConversationState(currentId, r, { restoreScroll: false });
   } else {
     setRepoBrowserSessionInfo('', '');
     restoreInFlightThinking(null);
@@ -1227,6 +1376,22 @@ async function connectSocket() {
     applyConversationTitleUpdate(conversationId, title, updatedAt);
     syncChatTitleControls();
   });
+  socket.on('conversation_preferences_updated', ({ conversationId, preferredRelayMode, preferredModelsByMode, senderClientId }) => {
+    if (senderClientId && senderClientId === CLIENT_ID) return;
+    const id = String(conversationId || '').trim();
+    if (!id || !conversations[id]) return;
+    conversations[id] = {
+      ...conversations[id],
+      preferredRelayMode: preferredRelayMode || conversations[id].preferredRelayMode || FALLBACK_MODE,
+      preferredModelsByMode: preferredModelsByMode || conversations[id].preferredModelsByMode || {},
+    };
+    if (String(currentConvId || '').trim() === id) {
+      applyConversationPreferencesForConversation(id, {
+        preferredRelayMode,
+        preferredModelsByMode,
+      });
+    }
+  });
   socket.on('conversation_session_bound', async ({ conversationId, sdkSessionId, runtimeSessionId }) => {
     const id = String(conversationId || '').trim();
     if (!id) return;
@@ -1243,6 +1408,7 @@ async function connectSocket() {
     }
   });
   socket.on('message_status', ({ messageId, conversationId, status }) => {
+    applyConversationTurnStatus({ conversationId, messageId, status });
     if (conversationId && conversations[conversationId]) {
       if (status === 'processing') {
         conversations[conversationId].runtimeSessionStatus = 'processing';
@@ -1473,6 +1639,7 @@ window.initModelSelector = initModelSelector;
 window.refreshModelCatalog = refreshModelCatalog;
 window.selectedModelValue = selectedModelValue;
 window.getPreferredModelSelection = () => selectedModelValue();
+window.applyConversationPreferences = applyConversationPreferencesForConversation;
 window.applyModelCatalogState = updateModelCatalogState;
 window.updateCliStatus = updateCliStatus;
 window.showAuthError = showAuthError;
@@ -1505,6 +1672,7 @@ window.handleRelayQuestionKey = handleRelayQuestionKey;
 window.openPendingQuestionFromBanner = openPendingQuestionFromBanner;
 window.compactCurrentConversation = compactCurrentConversation;
 window.sendMessage = sendMessage;
+window.syncComposerControlState = syncComposerControlState;
 window.appendMessage = appendMessage;
 window.loadOlderConversationMessages = loadOlderConversationMessages;
 window.handleKey = handleKey;

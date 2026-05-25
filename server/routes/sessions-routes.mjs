@@ -4,6 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import { createSdkSessionSyncService } from '../services/sdk-session-sync-service.mjs';
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
+import { persistConversationPreferences } from '../services/conversation-preferences-service.mjs';
 
 const SESSION_WORKER_STATUS_QUEUE_STATES = Object.freeze(['pending', 'processing', 'parked']);
 
@@ -19,11 +20,68 @@ function toSafeNonNegativeInt(value, fallback = 0) {
 }
 
 const MAX_CONVERSATION_TITLE_LENGTH = 120;
+const FALLBACK_RELAY_MODE = 'agent';
 
 export function normalizeConversationTitle(value) {
   const title = String(value || '').replace(/[\r\n]+/g, ' ').trim();
   if (!title) return '';
   return title.slice(0, MAX_CONVERSATION_TITLE_LENGTH);
+}
+
+export function normalizeRelayModePreference(value, {
+  supportedRelayModes = [],
+  fallbackMode = FALLBACK_RELAY_MODE,
+} = {}) {
+  const allowedModes = Array.isArray(supportedRelayModes)
+    ? supportedRelayModes.map((mode) => String(mode || '').trim()).filter(Boolean)
+    : [];
+  const fallback = allowedModes.includes(fallbackMode)
+    ? fallbackMode
+    : (allowedModes[0] || FALLBACK_RELAY_MODE);
+  const mode = String(value || '').trim();
+  if (!mode) return fallback;
+  return allowedModes.includes(mode) ? mode : fallback;
+}
+
+export function normalizePreferredModelsByMode(value, {
+  supportedRelayModes = [],
+} = {}) {
+  const allowedModes = Array.isArray(supportedRelayModes)
+    ? supportedRelayModes.map((mode) => String(mode || '').trim()).filter(Boolean)
+    : [];
+  let parsed = value;
+  if (typeof parsed === 'string') {
+    const trimmed = parsed.trim();
+    if (!trimmed) return {};
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      return {};
+    }
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+  const normalized = {};
+  for (const mode of allowedModes) {
+    const model = String(parsed[mode] || '').trim();
+    if (!model) continue;
+    normalized[mode] = model;
+  }
+  return normalized;
+}
+
+function resolveConversationPreferences(row, {
+  supportedRelayModes = [],
+  defaultRelayMode = FALLBACK_RELAY_MODE,
+} = {}) {
+  return {
+    preferredRelayMode: normalizeRelayModePreference(row?.preferred_relay_mode, {
+      supportedRelayModes,
+      fallbackMode: defaultRelayMode,
+    }),
+    preferredModelsByMode: normalizePreferredModelsByMode(row?.preferred_models_by_mode, {
+      supportedRelayModes,
+    }),
+  };
 }
 
 function replaceYamlScalarLine(content, key, value) {
@@ -719,6 +777,10 @@ export function registerSessionsRoutes(app, deps) {
       const discoveredItem = sid ? discoveredBySdkSessionId.get(sid) : null;
       const discoveredUpdatedAt = String(discoveredItem?.updatedAt || '').trim();
       const discoveredTitle = String(discoveredItem?.title || '').trim();
+      const preferences = resolveConversationPreferences(r, {
+        supportedRelayModes: SUPPORTED_RELAY_MODES,
+        defaultRelayMode: DEFAULT_RELAY_MODE,
+      });
       return {
         id:           r.id,
         sdkSessionId: sid || null,
@@ -737,6 +799,8 @@ export function registerSessionsRoutes(app, deps) {
         createdAt:    r.created_at,
         updatedAt:    discoveredUpdatedAt || r.updated_at,
         messageCount: resolveMessageCount(r.sdk_session_id, r.message_count),
+        preferredRelayMode: preferences.preferredRelayMode,
+        preferredModelsByMode: preferences.preferredModelsByMode,
       };
     });
 
@@ -770,6 +834,11 @@ export function registerSessionsRoutes(app, deps) {
         createdAt: updatedAt,
         updatedAt,
         messageCount: resolveMessageCount(sdkSessionId, 0),
+        preferredRelayMode: normalizeRelayModePreference(null, {
+          supportedRelayModes: SUPPORTED_RELAY_MODES,
+          fallbackMode: DEFAULT_RELAY_MODE,
+        }),
+        preferredModelsByMode: {},
       };
       conversations.push(syntheticConversation);
       knownById.add(sdkSessionId);
@@ -1081,6 +1150,11 @@ export function registerSessionsRoutes(app, deps) {
         createdAt: updatedAt,
         updatedAt,
         inFlight: null,
+        preferredRelayMode: normalizeRelayModePreference(null, {
+          supportedRelayModes: SUPPORTED_RELAY_MODES,
+          fallbackMode: DEFAULT_RELAY_MODE,
+        }),
+        preferredModelsByMode: {},
         messages: history.messages,
         pageInfo: history.pageInfo,
       });
@@ -1098,6 +1172,10 @@ export function registerSessionsRoutes(app, deps) {
       title: conv.title,
       titleSource: conv.title_source,
       discoveredTitle,
+    });
+    const preferences = resolveConversationPreferences(conv, {
+      supportedRelayModes: SUPPORTED_RELAY_MODES,
+      defaultRelayMode: DEFAULT_RELAY_MODE,
     });
     const inFlight = inFlightStateForConversation(req.params.id);
     const transcriptMessages = readSessionTranscriptMessages(String(conv.sdk_session_id || req.params.id || '').trim(), { limit: Number.POSITIVE_INFINITY });
@@ -1159,6 +1237,8 @@ export function registerSessionsRoutes(app, deps) {
       createdAt: conv.created_at,
       updatedAt: conv.updated_at,
       inFlight,
+      preferredRelayMode: preferences.preferredRelayMode,
+      preferredModelsByMode: preferences.preferredModelsByMode,
       messages: history.messages,
       pageInfo: history.pageInfo,
     });
@@ -1183,6 +1263,54 @@ export function registerSessionsRoutes(app, deps) {
       title: result.title,
       updatedAt: result.updatedAt,
       created: result.created === true,
+    });
+  });
+
+  app.patch('/api/conversation/:id/preferences', auth, (req, res) => {
+    const conversationId = String(req.params.id || '').trim();
+    if (!conversationId) return res.status(400).json({ error: 'Missing conversation id' });
+    const senderClientId = String(req.body?.clientId || '').trim() || null;
+
+    const existing = stmts.getConvAnyStatus.get(conversationId);
+    if (existing && String(existing.status || '').trim() === 'deleted') {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+
+    const now = new Date().toISOString();
+    const preferredRelayMode = normalizeRelayModePreference(req.body?.preferredRelayMode, {
+      supportedRelayModes: SUPPORTED_RELAY_MODES,
+      fallbackMode: DEFAULT_RELAY_MODE,
+    });
+    const preferredModelsByMode = normalizePreferredModelsByMode(req.body?.preferredModelsByMode, {
+      supportedRelayModes: SUPPORTED_RELAY_MODES,
+    });
+    const persisted = persistConversationPreferences({
+      db,
+      stmts,
+      conversationId,
+      preferredRelayMode,
+      preferredModelsByMode,
+      updatedAt: now,
+      createIfMissing: !existing,
+      createTitle: 'Session',
+    });
+
+    io.emit('conversation_preferences_updated', {
+      conversationId,
+      preferredRelayMode: persisted.preferredRelayMode,
+      preferredModelsByMode: persisted.preferredModelsByMode,
+      updatedAt: persisted.updatedAt,
+      senderClientId,
+    });
+
+    return res.json({
+      ok: true,
+      conversationId,
+      preferredRelayMode: persisted.preferredRelayMode,
+      preferredModelsByMode: persisted.preferredModelsByMode,
+      updatedAt: persisted.updatedAt,
+      created: persisted.created,
+      senderClientId,
     });
   });
 

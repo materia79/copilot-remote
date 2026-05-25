@@ -27,8 +27,8 @@ import { loadRelayQuestions, getPendingQuestionCountsByConversation } from './as
 import { clearAttachments, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { shouldApplyConversationLoad } from './activity-replay-state.mjs';
 
-const PROCESSING_DOT_FRAMES = ['', '.', '..', '...'];
-const PROCESSING_DOT_INTERVAL_MS = 450;
+const PROCESSING_DOT_FRAMES = ['   ', '.  ', '.. ', '...'];
+const PROCESSING_DOT_INTERVAL_MS = 1000;
 let processingDotFrame = 0;
 let processingDotTimer = null;
 let openConversationVersion = 0;
@@ -112,6 +112,40 @@ export function renderConvList() {
   ensureProcessingDotTimer(hasProcessingConversation);
 }
 
+export function applyLoadedConversationState(id, response, { restoreScroll = false, savedScrollTop = null } = {}) {
+  if (!response) {
+    setRepoBrowserSessionInfo('', '');
+    restoreInFlightThinking(null);
+    renderMessages([]);
+    return;
+  }
+  if (conversations[id]) {
+    conversations[id] = {
+      ...conversations[id],
+      preferredRelayMode: response.preferredRelayMode ?? conversations[id].preferredRelayMode,
+      preferredModelsByMode: response.preferredModelsByMode ?? conversations[id].preferredModelsByMode,
+    };
+  }
+  window.applyConversationPreferences?.(id, {
+    preferredRelayMode: response.preferredRelayMode,
+    preferredModelsByMode: response.preferredModelsByMode,
+  });
+  setRepoBrowserSessionInfo(response.sessionRootPath || '', response.sessionRootName || response.title || '');
+  renderMessages(response.messages, !restoreScroll, response);
+  restoreInFlightThinking(response.inFlight || null);
+  updateSessionPill(conversations[id], response.runtimeSession || null);
+  if (!restoreScroll) return;
+  const el = document.getElementById('messages');
+  if (!el) return;
+  if (Number.isFinite(savedScrollTop)) {
+    el.scrollTop = savedScrollTop;
+    saveConversationScrollTop(id, el.scrollTop);
+    return;
+  }
+  el.scrollTop = el.scrollHeight;
+  saveConversationScrollTop(id, el.scrollTop);
+}
+
 export async function openConversation(id, options = {}) {
   const capturedVersion = ++openConversationVersion;
   setCurrentConv(id);
@@ -139,22 +173,7 @@ export async function openConversation(id, options = {}) {
     return;
   }
   if (r) {
-    setRepoBrowserSessionInfo(r.sessionRootPath || '', r.sessionRootName || r.title || '');
-    renderMessages(r.messages, !restoreScroll, r);
-    restoreInFlightThinking(r.inFlight || null);
-    updateSessionPill(conversations[id], r.runtimeSession || null);
-    if (restoreScroll) {
-      const el = document.getElementById('messages');
-      if (el) {
-        if (Number.isFinite(savedScrollTop)) {
-          el.scrollTop = savedScrollTop;
-          saveConversationScrollTop(id, el.scrollTop);
-        } else {
-          el.scrollTop = el.scrollHeight;
-          saveConversationScrollTop(id, el.scrollTop);
-        }
-      }
-    }
+    applyLoadedConversationState(id, r, { restoreScroll, savedScrollTop });
   } else {
     setRepoBrowserSessionInfo('', '');
     restoreInFlightThinking(null);
@@ -188,9 +207,11 @@ export async function newConversation() {
   window.syncChatTitleControls?.();
   updateSessionPill(null, null);
   updateCompactButton();
+  restoreInFlightThinking(null);
   renderMessages([]);
   renderConvList();
   scheduleContextUsageRefresh(null);
+  window.applyConversationPreferences?.(null, null);
   document.getElementById('msg-input').focus();
 }
 
@@ -205,6 +226,7 @@ export async function deleteConv(e, id) {
     setCurrentConv(null);
     clearAttachments();
     setRepoBrowserSessionInfo('', '');
+    restoreInFlightThinking(null);
     renderMessages([]);
     document.getElementById('chat-title').textContent = 'Select or start a conversation';
     window.syncChatTitleControls?.();

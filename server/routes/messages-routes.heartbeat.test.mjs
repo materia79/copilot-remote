@@ -1304,3 +1304,387 @@ test('api stream links late events to existing response id on queue row', () => 
   assert.equal(streamRows.length, 1);
   assert.equal(streamRows[0].responseMessageId, 'resp-1');
 });
+
+test('api response defers finalization while a relay question is pending or recently answered', async () => {
+  const handlers = {};
+  const app = {
+    post(path, ...fns) {
+      handlers[path] = fns[fns.length - 1];
+    },
+    get() {},
+  };
+
+  const setDoneCalls = [];
+  const preparedStatement = {
+    run() { return { changes: 0, lastInsertRowid: 0 }; },
+    get() { return null; },
+    all() { return []; },
+  };
+
+  // Mutable state simulating the relay_questions table
+  let pendingQuestion = { id: 'q-1', message_id: 'msg-1', status: 'pending' };
+  let answeredAt = null;
+
+  registerMessagesRoutes(app, {
+    auth: (_req, _res, next) => next(),
+    io: { emit() {} },
+    db: {
+      prepare: () => preparedStatement,
+      transaction: (fn) => (...args) => fn(...args),
+    },
+    stmts: {
+      getConvAnyStatus: {
+        get: () => ({ id: 'conv-1', sdk_session_id: 'sdk-1', status: 'active' }),
+      },
+      findQById: {
+        get: () => ({
+          id: 'msg-1',
+          conversation_id: 'conv-1',
+          status: 'processing',
+          relay_mode: 'agent',
+          model: 'gpt-5.4-mini',
+          runtime_session_id: null,
+          owner_sdk_session_id: null,
+          retry_count: 0,
+          timestamp: '2026-05-24T00:51:25.565Z',
+        }),
+      },
+      findPendingQuestionByMessage: {
+        get: (msgId) => (pendingQuestion?.status === 'pending' ? pendingQuestion : null),
+      },
+      findRecentlyAnsweredQuestionByMessage: {
+        get: (msgId, cutoffIso) => {
+          if (!answeredAt) return null;
+          return answeredAt >= cutoffIso ? { id: 'q-1', status: 'answered', answered_at: answeredAt } : null;
+        },
+      },
+      setDone: {
+        run: (value) => {
+          setDoneCalls.push(value);
+          return { changes: 1 };
+        },
+      },
+      setQueueResponseMessageId: { run: () => ({ changes: 1 }) },
+      insertMsg: { run: () => ({ changes: 1 }) },
+      linkActivityToResponse: { run: () => ({ changes: 1 }) },
+      linkStreamEventsToResponse: { run: () => ({ changes: 1 }) },
+      updateConvTime: { run: () => ({ changes: 1 }) },
+      pruneQueue: { run: () => ({ changes: 0 }) },
+    },
+    runtimeState: { relayPaused: false },
+    config: {},
+    uuidv4: () => 'resp-1',
+    ts: () => 'ts',
+    MAX_UPLOAD_BYTES: 1,
+    MAX_UPLOAD_ATTACHMENTS: 1,
+    MAX_REPO_TREE_NODES: 1,
+    MAX_REQUEUE_RETRIES: 1,
+    MAX_IMAGE_DATA_URL_LENGTH: 1,
+    MAX_WORKSPACE_PREVIEW_BYTES: 1,
+    MAX_REFERENCE_IMAGE_ATTACHMENT_BYTES: 1,
+    remotePath: () => '',
+    parseBooleanQueryFlag: () => false,
+    buildRepositoryTreeSnapshot: () => ({}),
+    fetchBrowsableDrives: async () => [],
+    fetchDriveDirectoryEntries: async () => [],
+    mapDriveDirectoryEntry: () => ({}),
+    driveDisplayName: () => '',
+    normalizeDriveAbsolutePath: (value) => value,
+    driveRootFromAbsolutePath: (value) => value,
+    toDriveWebPath: (value) => value,
+    readWorkspaceFileMeta: async () => null,
+    resolveWorkspaceFilePath: () => null,
+    normalizeWorkspaceRelativePath: (value) => value,
+    previewLanguageForWorkspaceFile: () => 'plaintext',
+    readWorkspaceFilePreviewBuffer: async () => Buffer.alloc(0),
+    isLikelyBinaryPreviewBuffer: () => false,
+    isLikelyTextContentType: () => true,
+    workspacePreviewKindForMeta: () => 'text',
+    workspaceContentType: () => 'text/plain',
+    persistUploadBuffer: async () => null,
+    isSha256: () => false,
+    uploadPathForSha: () => '',
+    uploadContentUrlForSha: () => '',
+    maybeApplyWorkspaceRootFromMessage: () => ({}),
+    getOrCreateConversation: () => ({}),
+    ensureRuntimeSessionBinding: () => ({}),
+    linkUploadReferences: () => {},
+    normalizeAttachments: () => [],
+    collectReferenceAttachmentsFromText: () => ({ attachments: [], skipped: [] }),
+    mergeMessageAttachments: () => [],
+    attachmentSummary: () => '',
+    createCompactedConversation: () => ({}),
+    workspaceRootPayload: () => ({}),
+    queueCounts: () => ({ pendingCount: 0, processingCount: 0, parkedCount: 0 }),
+    getModelCatalogState: () => ({}),
+    buildRelayReadyBannerData: () => ({}),
+    ensureSessionId: () => 'session-1',
+    touchCli: () => {},
+    recoverProcessingOlderThan: () => [],
+    addMsIso: () => '',
+    computeRetryDelayMs: () => 0,
+    resolveRequestedModel: () => ({}),
+    normalizeRelayMode: (value) => value,
+    DEFAULT_RELAY_MODE: 'agent',
+    DEFAULT_MODEL: 'gpt-5.4-mini',
+    configuredConversationSessionMode: 'isolated',
+    parseAttachments: () => [],
+    hydrateAttachment: () => null,
+    relayActivityForResponse: () => [],
+    relayActivityForQueueMessage: () => [],
+    sanitizeActivityText: (value) => value,
+    readSessionTranscriptMessages: () => ([
+      { role: 'user', text: 'Test', timestamp: '2026-05-24T00:51:25.565Z' },
+      { role: 'assistant', text: 'Final answer.', timestamp: '2026-05-24T00:51:27.271Z' },
+    ]),
+    inFlightStateForConversation: () => null,
+    emitToClientsExceptSessionId: () => {},
+    relayBridgeOwnerService: {
+      normalizeIdentity: () => null,
+      observe: () => ({ accepted: true }),
+      getOwner: () => null,
+    },
+    relayRestartOrchestrator: { getState: () => null },
+    featureFlags: {},
+    sessionWorkerRegistry: { getWorker: () => null, upsertWorker: () => {} },
+    sessionWorkerSupervisor: {
+      noteSessionHeartbeat: () => {},
+      markIdle: () => {},
+      ensureWorker: async () => ({ ok: true }),
+    },
+    opaqueResponseRecoveryWaitMs: 500,
+    opaqueResponseRecoveryPollMs: 10,
+    relayQuestionFinalizationHoldMs: 40,
+  });
+
+  const res = {
+    statusCode: 200,
+    status(code) { this.statusCode = code; return this; },
+    json(value) { this.payload = value; return this; },
+  };
+
+  // Start the response handler (will be blocked by pending question)
+  const responsePromise = handlers['/api/response']({
+    body: {
+      messageId: 'msg-1',
+      conversationId: 'conv-1',
+      text: 'f21fe718-8f05-4388-9275-2768fc04ee46',
+      model: 'gpt-5.4-mini',
+      mode: 'agent',
+    },
+  }, res);
+
+  // While question is pending the handler must not finalize
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(setDoneCalls.length, 0, 'should not finalize while question is pending');
+
+  // Simulate question being answered (still within the hold window)
+  pendingQuestion = null;
+  answeredAt = new Date().toISOString();
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(setDoneCalls.length, 0, 'should not finalize immediately after answer (hold window)');
+
+  // Wait for hold window to expire (40ms) then finalization should proceed
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  await responsePromise;
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.payload?.ok, true);
+  assert.equal(setDoneCalls[0], 'Final answer.', 'should finalize with transcript text after hold expires');
+});
+
+test('api response remains blocked when a second relay question arrives during the hold window', async () => {
+  const handlers = {};
+  const app = {
+    post(path, ...fns) {
+      handlers[path] = fns[fns.length - 1];
+    },
+    get() {},
+  };
+
+  const setDoneCalls = [];
+  const preparedStatement = {
+    run() { return { changes: 0, lastInsertRowid: 0 }; },
+    get() { return null; },
+    all() { return []; },
+  };
+
+  let pendingQuestion = { id: 'q-1', message_id: 'msg-1', status: 'pending' };
+  let answeredAt = null;
+
+  registerMessagesRoutes(app, {
+    auth: (_req, _res, next) => next(),
+    io: { emit() {} },
+    db: {
+      prepare: () => preparedStatement,
+      transaction: (fn) => (...args) => fn(...args),
+    },
+    stmts: {
+      getConvAnyStatus: {
+        get: () => ({ id: 'conv-1', sdk_session_id: 'sdk-1', status: 'active' }),
+      },
+      findQById: {
+        get: () => ({
+          id: 'msg-1',
+          conversation_id: 'conv-1',
+          status: 'processing',
+          relay_mode: 'agent',
+          model: 'gpt-5.4-mini',
+          runtime_session_id: null,
+          owner_sdk_session_id: null,
+          retry_count: 0,
+          timestamp: '2026-05-24T00:51:25.565Z',
+        }),
+      },
+      findPendingQuestionByMessage: {
+        get: () => (pendingQuestion?.status === 'pending' ? pendingQuestion : null),
+      },
+      findRecentlyAnsweredQuestionByMessage: {
+        get: (_msgId, cutoffIso) => {
+          if (!answeredAt) return null;
+          return answeredAt >= cutoffIso ? { id: pendingQuestion?.id || 'q-1', status: 'answered', answered_at: answeredAt } : null;
+        },
+      },
+      setDone: {
+        run: (value) => {
+          setDoneCalls.push(value);
+          return { changes: 1 };
+        },
+      },
+      setQueueResponseMessageId: { run: () => ({ changes: 1 }) },
+      insertMsg: { run: () => ({ changes: 1 }) },
+      linkActivityToResponse: { run: () => ({ changes: 1 }) },
+      linkStreamEventsToResponse: { run: () => ({ changes: 1 }) },
+      updateConvTime: { run: () => ({ changes: 1 }) },
+      pruneQueue: { run: () => ({ changes: 0 }) },
+    },
+    runtimeState: { relayPaused: false },
+    config: {},
+    uuidv4: () => 'resp-1',
+    ts: () => 'ts',
+    MAX_UPLOAD_BYTES: 1,
+    MAX_UPLOAD_ATTACHMENTS: 1,
+    MAX_REPO_TREE_NODES: 1,
+    MAX_REQUEUE_RETRIES: 1,
+    MAX_IMAGE_DATA_URL_LENGTH: 1,
+    MAX_WORKSPACE_PREVIEW_BYTES: 1,
+    MAX_REFERENCE_IMAGE_ATTACHMENT_BYTES: 1,
+    remotePath: () => '',
+    parseBooleanQueryFlag: () => false,
+    buildRepositoryTreeSnapshot: () => ({}),
+    fetchBrowsableDrives: async () => [],
+    fetchDriveDirectoryEntries: async () => [],
+    mapDriveDirectoryEntry: () => ({}),
+    driveDisplayName: () => '',
+    normalizeDriveAbsolutePath: (value) => value,
+    driveRootFromAbsolutePath: (value) => value,
+    toDriveWebPath: (value) => value,
+    readWorkspaceFileMeta: async () => null,
+    resolveWorkspaceFilePath: () => null,
+    normalizeWorkspaceRelativePath: (value) => value,
+    previewLanguageForWorkspaceFile: () => 'plaintext',
+    readWorkspaceFilePreviewBuffer: async () => Buffer.alloc(0),
+    isLikelyBinaryPreviewBuffer: () => false,
+    isLikelyTextContentType: () => true,
+    workspacePreviewKindForMeta: () => 'text',
+    workspaceContentType: () => 'text/plain',
+    persistUploadBuffer: async () => null,
+    isSha256: () => false,
+    uploadPathForSha: () => '',
+    uploadContentUrlForSha: () => '',
+    maybeApplyWorkspaceRootFromMessage: () => ({}),
+    getOrCreateConversation: () => ({}),
+    ensureRuntimeSessionBinding: () => ({}),
+    linkUploadReferences: () => {},
+    normalizeAttachments: () => [],
+    collectReferenceAttachmentsFromText: () => ({ attachments: [], skipped: [] }),
+    mergeMessageAttachments: () => [],
+    attachmentSummary: () => '',
+    createCompactedConversation: () => ({}),
+    workspaceRootPayload: () => ({}),
+    queueCounts: () => ({ pendingCount: 0, processingCount: 0, parkedCount: 0 }),
+    getModelCatalogState: () => ({}),
+    buildRelayReadyBannerData: () => ({}),
+    ensureSessionId: () => 'session-1',
+    touchCli: () => {},
+    recoverProcessingOlderThan: () => [],
+    addMsIso: () => '',
+    computeRetryDelayMs: () => 0,
+    resolveRequestedModel: () => ({}),
+    normalizeRelayMode: (value) => value,
+    DEFAULT_RELAY_MODE: 'agent',
+    DEFAULT_MODEL: 'gpt-5.4-mini',
+    configuredConversationSessionMode: 'isolated',
+    parseAttachments: () => [],
+    hydrateAttachment: () => null,
+    relayActivityForResponse: () => [],
+    relayActivityForQueueMessage: () => [],
+    sanitizeActivityText: (value) => value,
+    readSessionTranscriptMessages: () => ([
+      { role: 'user', text: 'Test', timestamp: '2026-05-24T00:51:25.565Z' },
+      { role: 'assistant', text: 'Final answer.', timestamp: '2026-05-24T00:51:27.271Z' },
+    ]),
+    inFlightStateForConversation: () => null,
+    emitToClientsExceptSessionId: () => {},
+    relayBridgeOwnerService: {
+      normalizeIdentity: () => null,
+      observe: () => ({ accepted: true }),
+      getOwner: () => null,
+    },
+    relayRestartOrchestrator: { getState: () => null },
+    featureFlags: {},
+    sessionWorkerRegistry: { getWorker: () => null, upsertWorker: () => {} },
+    sessionWorkerSupervisor: {
+      noteSessionHeartbeat: () => {},
+      markIdle: () => {},
+      ensureWorker: async () => ({ ok: true }),
+    },
+    opaqueResponseRecoveryWaitMs: 500,
+    opaqueResponseRecoveryPollMs: 10,
+    relayQuestionFinalizationHoldMs: 40,
+  });
+
+  const res = {
+    statusCode: 200,
+    status(code) { this.statusCode = code; return this; },
+    json(value) { this.payload = value; return this; },
+  };
+
+  const responsePromise = handlers['/api/response']({
+    body: {
+      messageId: 'msg-1',
+      conversationId: 'conv-1',
+      text: 'f21fe718-8f05-4388-9275-2768fc04ee46',
+      model: 'gpt-5.4-mini',
+      mode: 'agent',
+    },
+  }, res);
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(setDoneCalls.length, 0, 'should stay blocked while first question is pending');
+
+  pendingQuestion = null;
+  answeredAt = new Date().toISOString();
+
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(setDoneCalls.length, 0, 'should stay blocked during first hold window');
+
+  pendingQuestion = { id: 'q-2', message_id: 'msg-1', status: 'pending' };
+
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(setDoneCalls.length, 0, 'should re-block when a second question arrives during the hold window');
+
+  pendingQuestion = null;
+  answeredAt = new Date().toISOString();
+
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(setDoneCalls.length, 0, 'should stay blocked during second hold window');
+
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  await responsePromise;
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.payload?.ok, true);
+  assert.equal(setDoneCalls[0], 'Final answer.');
+});

@@ -8,14 +8,22 @@ import {
   parkPendingQueueForRestart,
   releaseParkedQueueForReadyState,
 } from '../services/relay-queue-gate-service.mjs';
+import {
+  persistConversationModeModelPreference as persistConversationModeModelPreferenceTx,
+} from '../services/conversation-preferences-service.mjs';
 
 export const SESSION_WORKER_OWNER_LEASE_MS = 120_000;
 export const SESSION_WORKER_TRANSIENT_DEQUEUE_RETRIES = 2;
 export const SESSION_WORKER_TRANSIENT_DEQUEUE_BACKOFF_MS = 25;
+const SESSION_WORKER_IDLE_RECOVERY_GRACE_MS = 5_000;
 const DUPLICATE_USER_MESSAGE_WINDOW_MS = 10 * 60 * 1000;
 const OPAQUE_RESPONSE_TEXT_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const OPAQUE_RESPONSE_RECOVERY_WAIT_MS = 600_000;
 const OPAQUE_RESPONSE_RECOVERY_POLL_MS = 250;
+// Hold finalization after a relay question is answered so the SDK has time to fire the next
+// onUserInputRequest (multi-step ask_user). Without this, the transcript is used prematurely and
+// the queue row is marked done while additional questions are still pending.
+const RELAY_QUESTION_FINALIZATION_HOLD_MS = 5_000;
 
 function normalizeSessionWorkerId(value) {
   const text = String(value || '').trim();
@@ -377,6 +385,8 @@ async function resolveRelayResponseText({
   readSessionTranscriptMessages = null,
   opaqueResponseRecoveryWaitMs = OPAQUE_RESPONSE_RECOVERY_WAIT_MS,
   opaqueResponseRecoveryPollMs = OPAQUE_RESPONSE_RECOVERY_POLL_MS,
+  messageId = null,
+  checkHasActiveRelayQuestion = null,
 } = {}) {
   const rawText = String(text || '').trim();
   if (!isOpaqueResponseText(rawText)) return rawText;
@@ -386,12 +396,22 @@ async function resolveRelayResponseText({
   const deadline = Date.now() + maxWaitMs;
 
   while (true) {
-    const transcriptText = findResolvedTranscriptAssistantText({
-      conversation,
-      queueTimestamp,
-      readSessionTranscriptMessages,
-    });
-    if (transcriptText) return transcriptText;
+    // Don't finalize while there's a pending relay question or a recently-answered one for this
+    // message. The SDK may fire another onUserInputRequest shortly after an answer is returned
+    // (multi-step ask_user). Consuming transcript text before that window expires would mark the
+    // queue row done and cause subsequent onUserInputRequest calls to get a 409.
+    const hasActiveQuestion = messageId && typeof checkHasActiveRelayQuestion === 'function'
+      ? checkHasActiveRelayQuestion(messageId)
+      : false;
+
+    if (!hasActiveQuestion) {
+      const transcriptText = findResolvedTranscriptAssistantText({
+        conversation,
+        queueTimestamp,
+        readSessionTranscriptMessages,
+      });
+      if (transcriptText) return transcriptText;
+    }
     if (Date.now() >= deadline) return rawText;
     await delay(pollMs);
   }
@@ -756,6 +776,7 @@ export function registerMessagesRoutes(app, deps) {
     sessionWorkerProcessInspector,
     opaqueResponseRecoveryWaitMs = OPAQUE_RESPONSE_RECOVERY_WAIT_MS,
     opaqueResponseRecoveryPollMs = OPAQUE_RESPONSE_RECOVERY_POLL_MS,
+    relayQuestionFinalizationHoldMs = RELAY_QUESTION_FINALIZATION_HOLD_MS,
   } = deps;
 
   function isLoopbackAddress(value) {
@@ -819,6 +840,33 @@ export function registerMessagesRoutes(app, deps) {
     return text || null;
   }
 
+  function persistConversationModeModelPreference(conversationId, relayMode, model, nowIso = new Date().toISOString()) {
+    const convId = String(conversationId || '').trim();
+    const mode = normalizeRelayMode(relayMode) || DEFAULT_RELAY_MODE;
+    const modelId = String(model || '').trim();
+    if (!convId || !mode || !modelId) {
+      return {
+        preferredRelayMode: mode || DEFAULT_RELAY_MODE,
+        preferredModelsByMode: {},
+      };
+    }
+    const persisted = persistConversationModeModelPreferenceTx({
+      db,
+      stmts,
+      conversationId: convId,
+      relayMode: mode,
+      model: modelId,
+      normalizeMode: (value) => normalizeRelayMode(value) || null,
+      fallbackRelayMode: DEFAULT_RELAY_MODE,
+      updatedAt: nowIso,
+      tolerateMissingColumns: true,
+    });
+    return {
+      preferredRelayMode: persisted.preferredRelayMode || mode,
+      preferredModelsByMode: persisted.preferredModelsByMode || {},
+    };
+  }
+
   function getConversationSessionState(conversationId) {
     const normalizedConversationId = String(conversationId || '').trim();
     if (!normalizedConversationId) {
@@ -852,6 +900,7 @@ export function registerMessagesRoutes(app, deps) {
     model,
     responseText,
     failureRecord,
+    markWorkerError = true,
   }) {
     const now = new Date().toISOString();
     const responseId = uuidv4();
@@ -894,25 +943,51 @@ export function registerMessagesRoutes(app, deps) {
       ? normalizeSessionWorkerId(queueRow?.owner_sdk_session_id)
       : null;
     if (ownerSessionId) {
-      sessionWorkerSupervisor?.markError?.(ownerSessionId, `queue-failed:${failureRecord?.code || failureRecord?.error || 'unknown'}`);
-      emitSessionWorkerTelemetry('queue.message.failed', {
-        sessionId: ownerSessionId,
-        workerId: sessionWorkerRegistry?.getWorker?.(ownerSessionId)?.workerId || null,
-        conversationId,
-        messageId,
-        continuationId: null,
-        state: 'error',
-        retry: Number(queueRow?.retry_count || 0),
-        pid: null,
-        extra: failureRecord?.code
-          ? {
-              failureKind: failureRecord?.kind || null,
-              failureCode: failureRecord?.code || null,
-              functionCallId: failureRecord?.functionCallId || null,
-              requestId: failureRecord?.requestId || null,
-            }
-          : null,
-      });
+      if (markWorkerError) {
+        sessionWorkerSupervisor?.markError?.(ownerSessionId, `queue-failed:${failureRecord?.code || failureRecord?.error || 'unknown'}`);
+        emitSessionWorkerTelemetry('queue.message.failed', {
+          sessionId: ownerSessionId,
+          workerId: sessionWorkerRegistry?.getWorker?.(ownerSessionId)?.workerId || null,
+          conversationId,
+          messageId,
+          continuationId: null,
+          state: 'error',
+          retry: Number(queueRow?.retry_count || 0),
+          pid: null,
+          extra: failureRecord?.code
+            ? {
+                failureKind: failureRecord?.kind || null,
+                failureCode: failureRecord?.code || null,
+                functionCallId: failureRecord?.functionCallId || null,
+                requestId: failureRecord?.requestId || null,
+              }
+            : null,
+        });
+      } else {
+        const existingWorker = sessionWorkerRegistry?.getWorker?.(ownerSessionId) || null;
+        sessionWorkerRegistry?.upsertWorker?.({
+          ...existingWorker,
+          sessionId: ownerSessionId,
+          status: 'ready',
+        });
+        sessionWorkerSupervisor?.markIdle?.(ownerSessionId, queueCounts?.().pendingCount || 0);
+        emitSessionWorkerTelemetry('queue.message.stopped', {
+          sessionId: ownerSessionId,
+          workerId: existingWorker?.workerId || null,
+          conversationId,
+          messageId,
+          continuationId: null,
+          state: 'ready',
+          retry: Number(queueRow?.retry_count || 0),
+          pid: existingWorker?.pid || null,
+          extra: failureRecord?.code
+            ? {
+                failureKind: failureRecord?.kind || null,
+                failureCode: failureRecord?.code || null,
+              }
+            : null,
+        });
+      }
     }
     return { responseId, now };
   }
@@ -953,12 +1028,121 @@ export function registerMessagesRoutes(app, deps) {
       AND status = 'processing'
     ORDER BY COALESCE(processing_at, timestamp) DESC, timestamp DESC
   `);
+  const listRecoverableProcessingOwnedBySession = db.prepare(`
+    SELECT *
+    FROM queue
+    WHERE owner_sdk_session_id = ?
+      AND status = 'processing'
+      AND (? = '' OR id != ?)
+      AND COALESCE(owner_last_claimed_at, processing_at, timestamp) <= ?
+    ORDER BY COALESCE(processing_at, timestamp) DESC, timestamp DESC
+  `);
+  const refreshProcessingLeaseForOwnedMessage = db.prepare(`
+    UPDATE queue
+    SET owner_lease_expires_at = ?,
+        owner_last_claimed_at = ?
+    WHERE id = ?
+      AND owner_sdk_session_id = ?
+      AND status = 'processing'
+  `);
+  const recoverOwnedProcessingMessage = db.prepare(`
+    UPDATE queue
+    SET status = 'pending',
+        processing_at = NULL,
+        next_attempt_at = ?,
+        owner_lease_expires_at = NULL
+    WHERE id = ?
+      AND owner_sdk_session_id = ?
+      AND status = 'processing'
+  `);
   const findMostRecentConversationForSession = db.prepare(`
     SELECT conversation_id
     FROM queue
     WHERE owner_sdk_session_id = ?
     ORDER BY COALESCE(processing_at, timestamp) DESC, timestamp DESC
     LIMIT 1
+  `);
+  const findActiveRelayControlByQueueMessage = db.prepare(`
+    SELECT *
+    FROM relay_control_requests
+    WHERE queue_message_id = ?
+      AND type = ?
+      AND status IN ('pending', 'processing')
+    ORDER BY created_at DESC
+    LIMIT 1
+  `);
+  const insertRelayControlRequest = db.prepare(`
+    INSERT INTO relay_control_requests (
+      id,
+      type,
+      conversation_id,
+      queue_message_id,
+      sdk_session_id,
+      status,
+      request,
+      created_at,
+      updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+  `);
+  const findPendingRelayControlForSession = db.prepare(`
+    SELECT *
+    FROM relay_control_requests
+    WHERE sdk_session_id = ?
+      AND status = 'pending'
+    ORDER BY created_at ASC
+    LIMIT 1
+  `);
+  const findPendingRelayControlForSessionAndMessage = db.prepare(`
+    SELECT *
+    FROM relay_control_requests
+    WHERE sdk_session_id = ?
+      AND queue_message_id = ?
+      AND status = 'pending'
+    ORDER BY created_at ASC
+    LIMIT 1
+  `);
+  const claimRelayControlRequest = db.prepare(`
+    UPDATE relay_control_requests
+    SET status = 'processing', updated_at = ?
+    WHERE id = ?
+      AND status = 'pending'
+  `);
+  const getRelayControlRequestById = db.prepare(`
+    SELECT *
+    FROM relay_control_requests
+    WHERE id = ?
+    LIMIT 1
+  `);
+  const completeRelayControlRequest = db.prepare(`
+    UPDATE relay_control_requests
+    SET status = 'done',
+        result = ?,
+        error = NULL,
+        updated_at = ?,
+        completed_at = ?
+    WHERE id = ?
+      AND status IN ('pending', 'processing')
+  `);
+  const failRelayControlRequest = db.prepare(`
+    UPDATE relay_control_requests
+    SET status = 'failed',
+        error = ?,
+        updated_at = ?,
+        completed_at = ?
+    WHERE id = ?
+      AND status IN ('pending', 'processing')
+  `);
+  const settleRelayControlsForQueueMessage = db.prepare(`
+    UPDATE relay_control_requests
+    SET status = ?,
+        result = ?,
+        error = ?,
+        updated_at = ?,
+        completed_at = ?
+    WHERE queue_message_id = ?
+      AND type = 'abort_turn'
+      AND status IN ('pending', 'processing')
   `);
 
   function insertSystemMessageForConversation({ conversationId, text, model = null, relayMode = null }) {
@@ -976,6 +1160,104 @@ export function registerMessagesRoutes(app, deps) {
       message: { role: 'assistant', text, model: model || null, mode: relayMode || null, timestamp: now },
     });
     return messageId;
+  }
+
+  function parseJsonObject(value) {
+    const text = String(value || '').trim();
+    if (!text) return null;
+    try {
+      const parsed = JSON.parse(text);
+      return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function formatRelayControlResponse(row) {
+    if (!row) return null;
+    return {
+      id: String(row.id || '').trim(),
+      type: String(row.type || '').trim(),
+      conversationId: String(row.conversation_id || '').trim() || null,
+      queueMessageId: String(row.queue_message_id || '').trim() || null,
+      sdkSessionId: String(row.sdk_session_id || '').trim() || null,
+      status: String(row.status || '').trim() || null,
+      request: parseJsonObject(row.request),
+      result: parseJsonObject(row.result),
+      error: String(row.error || '').trim() || null,
+      createdAt: String(row.created_at || '').trim() || null,
+      updatedAt: String(row.updated_at || '').trim() || null,
+      completedAt: String(row.completed_at || '').trim() || null,
+    };
+  }
+
+  function buildRelayStopFailurePayload() {
+    return {
+      kind: 'turn-aborted',
+      error: 'turn-aborted',
+      code: 'turn-aborted',
+      stableCode: 'relay.turn-aborted',
+      message: 'System note: This turn was stopped from the relay UI before completion.',
+      guidance: 'Send a new message to continue when you are ready.',
+      failedAt: new Date().toISOString(),
+    };
+  }
+
+  function settleRelayAbortControlsForQueueMessage(queueMessageId, { ok = true, note = null, error = null } = {}) {
+    const id = String(queueMessageId || '').trim();
+    if (!id) return 0;
+    const now = new Date().toISOString();
+    const result = ok
+      ? JSON.stringify({ source: 'relay-runtime', note: String(note || '').trim() || null })
+      : null;
+    const settled = settleRelayControlsForQueueMessage.run(
+      ok ? 'done' : 'failed',
+      result,
+      ok ? null : String(error || 'stale-control').trim() || 'stale-control',
+      now,
+      now,
+      id,
+    );
+    return Number(settled?.changes || 0);
+  }
+
+  function recoverOwnedProcessingRowsForSession(
+    sdkSessionId,
+    {
+      excludeMessageId = null,
+      reason = 'owner-heartbeat-idle',
+      graceMs = SESSION_WORKER_IDLE_RECOVERY_GRACE_MS,
+    } = {},
+  ) {
+    const normalizedSessionId = normalizeSessionWorkerId(sdkSessionId);
+    if (!normalizedSessionId) return [];
+    const excludedId = String(excludeMessageId || '').trim();
+    const cutoffIso = new Date(Date.now() - Math.max(1_000, Number(graceMs) || SESSION_WORKER_IDLE_RECOVERY_GRACE_MS)).toISOString();
+    const rows = listRecoverableProcessingOwnedBySession.all(
+      normalizedSessionId,
+      excludedId,
+      excludedId,
+      cutoffIso,
+    ) || [];
+    if (!rows.length) return [];
+    const requeueAt = addMsIso(2_000);
+    const tx = db.transaction((recoverRows) => {
+      for (const row of recoverRows) {
+        recoverOwnedProcessingMessage.run(requeueAt, row.id, normalizedSessionId);
+      }
+    });
+    tx(rows);
+    for (const row of rows) {
+      settleRelayAbortControlsForQueueMessage(row.id, {
+        ok: false,
+        error: reason,
+      });
+      io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'pending' });
+    }
+    if (rows.length) {
+      io.emit('queue_updated', { recovered: rows.length, ownerSessionId: normalizedSessionId });
+    }
+    return rows;
   }
 
   app.post('/api/session-worker/:sdkSessionId/kill', auth, (req, res) => {
@@ -1046,6 +1328,7 @@ export function registerMessagesRoutes(app, deps) {
           responseText: failureText,
           failureRecord,
         });
+
         if (failed?.responseId) failedMessageIds.push(failed.responseId);
       }
     } else if (processStatus === 'not-running') {
@@ -1080,6 +1363,176 @@ export function registerMessagesRoutes(app, deps) {
       processStatus,
       failedMessageIds,
     });
+  });
+
+  app.post('/api/conversation/:conversationId/cancel-turn', auth, (req, res) => {
+    const conversationId = String(req.params.conversationId || '').trim();
+    const requestedMessageId = String(req.body?.messageId || req.body?.queueMessageId || '').trim();
+    const sessionState = getConversationSessionState(conversationId);
+    if (!sessionState.ok) {
+      return rejectSessionBinding(res, sessionState.status, sessionState.error);
+    }
+
+    const queueRow = stmts.getLatestProcessingQueueByConversation.get(conversationId) || null;
+    if (!queueRow) {
+      return res.json({
+        ok: true,
+        queued: false,
+        acknowledgement: 'no-active-turn',
+        requestedMessageId: requestedMessageId || null,
+        activeMessageId: null,
+      });
+    }
+
+    const activeMessageId = String(queueRow.id || '').trim();
+    if (requestedMessageId && activeMessageId && requestedMessageId !== activeMessageId) {
+      const requestedRow = stmts.findQById.get(requestedMessageId) || null;
+      const requestedStatus = String(requestedRow?.status || '').trim().toLowerCase();
+      return res.json({
+        ok: true,
+        queued: false,
+        acknowledgement: requestedStatus === 'processing' ? 'message-mismatch' : 'already-finished',
+        requestedMessageId,
+        activeMessageId,
+      });
+    }
+
+    const sdkSessionId = normalizeSessionWorkerId(
+      queueRow.owner_sdk_session_id
+      || sessionState.runtimeSessionSdkSessionId
+      || sessionState.conversationSdkSessionId,
+    );
+    if (!sdkSessionId) {
+      return res.json({
+        ok: true,
+        queued: false,
+        acknowledgement: 'active-turn-unbound',
+        requestedMessageId: activeMessageId || requestedMessageId || null,
+        activeMessageId,
+      });
+    }
+
+    const existing = findActiveRelayControlByQueueMessage.get(activeMessageId, 'abort_turn') || null;
+    if (existing) {
+      return res.json({
+        ok: true,
+        queued: true,
+        duplicate: true,
+        acknowledgement: 'already-requested',
+        requestedMessageId: activeMessageId || requestedMessageId || null,
+        activeMessageId,
+        control: formatRelayControlResponse(existing),
+      });
+    }
+
+    const now = new Date().toISOString();
+    const controlId = uuidv4();
+    const requestPayload = JSON.stringify({
+      source: 'relay-ui',
+      requestedByClientId: String(req.body?.clientId || '').trim() || null,
+    });
+    insertRelayControlRequest.run(
+      controlId,
+      'abort_turn',
+      conversationId,
+      activeMessageId,
+      sdkSessionId,
+      requestPayload,
+      now,
+      now,
+    );
+    const control = getRelayControlRequestById.get(controlId) || null;
+    return res.json({
+      ok: true,
+      queued: true,
+      acknowledgement: 'stop-queued',
+      requestedMessageId: activeMessageId || requestedMessageId || null,
+      activeMessageId,
+      control: formatRelayControlResponse(control),
+    });
+  });
+
+  app.get('/api/control/active', auth, (req, res) => {
+    const bridgeIdentity = readBridgeIdentity(req);
+    const sdkSessionId = normalizeSessionWorkerId(req.query?.sdkSessionId || bridgeIdentity?.sessionId);
+    const queueMessageId = String(req.query?.queueMessageId || req.query?.messageId || '').trim();
+    if (!sdkSessionId) {
+      return res.status(400).json({ error: 'Missing sdkSessionId' });
+    }
+
+    const pending = queueMessageId
+      ? (findPendingRelayControlForSessionAndMessage.get(sdkSessionId, queueMessageId) || null)
+      : (findPendingRelayControlForSession.get(sdkSessionId) || null);
+    if (!pending) {
+      return res.json({ ok: true, control: null });
+    }
+    if (String(pending.type || '').trim() === 'abort_turn') {
+      const targetMessageId = String(pending.queue_message_id || '').trim();
+      const targetRow = targetMessageId ? (stmts.findQById.get(targetMessageId) || null) : null;
+      const targetOwnerSessionId = normalizeSessionWorkerId(targetRow?.owner_sdk_session_id);
+      if (!targetRow || String(targetRow.status || '').trim().toLowerCase() !== 'processing' || targetOwnerSessionId !== sdkSessionId) {
+        settleRelayAbortControlsForQueueMessage(targetMessageId || pending.queue_message_id, {
+          ok: false,
+          error: 'stale-control',
+        });
+        return res.json({ ok: true, control: null });
+      }
+    }
+
+    const now = new Date().toISOString();
+    const claimed = claimRelayControlRequest.run(now, pending.id);
+    if (claimed.changes === 0) {
+      return res.json({ ok: true, control: null });
+    }
+
+    const control = getRelayControlRequestById.get(pending.id) || pending;
+    return res.json({ ok: true, control: formatRelayControlResponse(control) });
+  });
+
+  app.post('/api/control/:controlId/result', auth, (req, res) => {
+    const controlId = String(req.params.controlId || '').trim();
+    if (!controlId) {
+      return res.status(400).json({ error: 'Missing control id' });
+    }
+
+    const control = getRelayControlRequestById.get(controlId) || null;
+    if (!control) {
+      return res.status(404).json({ error: 'Control request not found' });
+    }
+
+    const now = new Date().toISOString();
+    const ok = req.body?.ok === true;
+    if (!ok) {
+      const errorText = String(req.body?.error || 'relay control failed').trim() || 'relay control failed';
+      failRelayControlRequest.run(errorText, now, now, controlId);
+      return res.json({ ok: true, control: formatRelayControlResponse(getRelayControlRequestById.get(controlId) || control) });
+    }
+
+    const resultPayload = JSON.stringify({
+      source: 'relay-runtime',
+      note: String(req.body?.note || '').trim() || null,
+    });
+    completeRelayControlRequest.run(resultPayload, now, now, controlId);
+
+    if (String(control.type || '').trim() === 'abort_turn') {
+      const queueMessageId = String(control.queue_message_id || '').trim();
+      const queueRow = queueMessageId ? (stmts.findQById.get(queueMessageId) || null) : null;
+      if (queueRow) {
+        const failureRecord = buildRelayStopFailurePayload();
+        failQueueMessage({
+          queueRow,
+          messageId: queueMessageId,
+          conversationId: String(control.conversation_id || queueRow.conversation_id || '').trim(),
+          relayMode: normalizeRelayMode(queueRow.relay_mode) || DEFAULT_RELAY_MODE,
+          model: queueRow.model || null,
+          responseText: buildTerminalFailureTextForChat(failureRecord),
+          failureRecord,
+          markWorkerError: false,
+        });
+      }
+    }
+
+    return res.json({ ok: true, control: formatRelayControlResponse(getRelayControlRequestById.get(controlId) || control) });
   });
 
   app.post('/api/upload', auth, express.raw({ type: () => true, limit: `${MAX_UPLOAD_BYTES}b` }), (req, res) => {
@@ -1558,6 +2011,12 @@ export function registerMessagesRoutes(app, deps) {
     stmts.insertMsg.run(msgId, convId, 'user', trimmedText, requestedModel, requestedRelayMode, attachments.length ? JSON.stringify(attachments) : null, now);
     linkUploadReferences(convId, msgId, attachments);
     stmts.updateConvTime.run(now, convId);
+    const conversationPreferences = persistConversationModeModelPreference(
+      convId,
+      requestedRelayMode,
+      requestedModel,
+      now,
+    );
     stmts.insertQ.run(
       msgId,
       convId,
@@ -1655,6 +2114,8 @@ export function registerMessagesRoutes(app, deps) {
       conversationId: convId,
       runtimeSessionId: runtimeSession?.id || null,
       ownerSessionId: ownerSessionId || null,
+      preferredRelayMode: conversationPreferences.preferredRelayMode,
+      preferredModelsByMode: conversationPreferences.preferredModelsByMode,
       warning: modelResolution.warning || null,
       workspaceRootWarning: workspaceRootUpdate.error || null,
       workspaceRootChanged: !!workspaceRootUpdate.changed,
@@ -1668,8 +2129,22 @@ export function registerMessagesRoutes(app, deps) {
     touchCli();
     const requester = readBridgeIdentity(req);
     const requesterSessionId = normalizeSessionWorkerId(requester?.sessionId);
+    const activeQueueMessageId = String(req.body?.activeQueueMessageId || '').trim();
     if (requesterSessionId) {
       sessionWorkerSupervisor?.noteSessionHeartbeat?.(requesterSessionId);
+      if (activeQueueMessageId) {
+        const now = new Date().toISOString();
+        const leaseExpiresAt = addMsToIso(now, SESSION_WORKER_OWNER_LEASE_MS);
+        refreshProcessingLeaseForOwnedMessage.run(leaseExpiresAt, now, activeQueueMessageId, requesterSessionId);
+        recoverOwnedProcessingRowsForSession(requesterSessionId, {
+          excludeMessageId: activeQueueMessageId,
+          reason: 'owner-heartbeat-mismatch',
+        });
+      } else {
+        recoverOwnedProcessingRowsForSession(requesterSessionId, {
+          reason: 'owner-heartbeat-idle',
+        });
+      }
     }
     relayBridgeOwnerService?.observe?.(requester);
     const { pendingCount } = queueCounts();
@@ -2118,6 +2593,10 @@ export function registerMessagesRoutes(app, deps) {
         console.log(`[${ts()}] RESPONSE  ${messageId?.slice(0,8)} ignored=not_pending_or_processing`);
         return res.json({ ok: true, ignored: 'not_pending_or_processing' });
       }
+      settleRelayAbortControlsForQueueMessage(messageId, {
+        ok: false,
+        error: 'queue-terminal-failure',
+      });
       console.warn(
         `[${ts()}] FAILED    ${messageId?.slice(0,8)} conv=${targetConversationId?.slice(0,8)} code=${terminalFailure.stableCode}`
         + `${terminalFailure.functionCallId ? ` call=${terminalFailure.functionCallId}` : ''}`
@@ -2134,6 +2613,15 @@ export function registerMessagesRoutes(app, deps) {
       readSessionTranscriptMessages,
       opaqueResponseRecoveryWaitMs,
       opaqueResponseRecoveryPollMs,
+      messageId,
+      checkHasActiveRelayQuestion: (msgId) => {
+        // Block finalization if there's a pending relay question for this turn.
+        if (stmts.findPendingQuestionByMessage?.get(msgId)) return true;
+        // Also hold for a short window after a question was answered. The SDK may fire another
+        // onUserInputRequest (next ask_user call) within a few seconds of the previous answer.
+        const holdCutoff = new Date(Date.now() - relayQuestionFinalizationHoldMs).toISOString();
+        return !!(stmts.findRecentlyAnsweredQuestionByMessage?.get(msgId, holdCutoff));
+      },
     });
     if (!resolvedText) return res.status(400).json({ error: 'Empty response' });
 
@@ -2156,6 +2644,10 @@ export function registerMessagesRoutes(app, deps) {
       console.log(`[${ts()}] RESPONSE  ${messageId?.slice(0,8)} ignored=not_pending_or_processing`);
       return res.json({ ok: true, ignored: 'not_pending_or_processing' });
     }
+    settleRelayAbortControlsForQueueMessage(messageId, {
+      ok: true,
+      note: 'queue message completed before stop control was applied',
+    });
     if (q?.runtime_session_id) {
       const nowIso = new Date().toISOString();
       const existing = stmts.getRuntimeSessionById.get(q.runtime_session_id);
@@ -2356,6 +2848,10 @@ export function registerMessagesRoutes(app, deps) {
         },
       });
       if (failed) {
+        settleRelayAbortControlsForQueueMessage(messageId, {
+          ok: false,
+          error: 'queue-terminal-failure',
+        });
         console.warn(
           `[${ts()}] FAILED    ${messageId?.slice(0,8)} retry=${Number(q?.retry_count || 0)} reason=terminal code=${terminalFailure.stableCode}`,
         );
@@ -2412,6 +2908,10 @@ export function registerMessagesRoutes(app, deps) {
           messageId,
         );
         if (result.changes > 0) {
+          settleRelayAbortControlsForQueueMessage(messageId, {
+            ok: false,
+            error: parkForRestart ? 'queue-parked' : 'queue-requeued',
+          });
           if (ownerSessionId) {
             sessionWorkerSupervisor?.markError?.(ownerSessionId, `requeue-retry:${retryCount}`);
             emitSessionWorkerTelemetry('queue.message.requeued', {

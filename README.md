@@ -176,7 +176,7 @@ Roadmap for later launcher modes:
 - Click file/folder copy controls to insert ``@file:...`` / ``@folder:...`` tokens.
 - Answer clarification prompts in relay question cards (from `ask_user`).
 - Use the usage button (`📊`) for live Copilot usage summary.
-- Use the **Context** button to read the latest token/context metrics in a modal from local session-state events.
+- Use the **Context** button to read the latest token/context metrics in a modal from local session-state events, with a clearly labeled lower-bound fallback when newer sessions no longer emit the full legacy bucket breakdown.
 - Workspace browsing is locked to the Copilot CLI startup CWD (your active repo root) and does not retarget via chat `cd ...` commands.
 
 ## Relay modes

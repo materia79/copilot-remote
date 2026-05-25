@@ -30,13 +30,14 @@ import {
   repoBrowserState,
   saveConversationLoadedMessageCount,
 } from './store.js';
-import { sendMessage as sendMessageApi, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi } from './api-client.js';
-import { linkifyWorkspaceMentionsInNode } from './router.js';
+import { sendMessage as sendMessageApi, cancelConversationTurn, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi } from './api-client.js';
+import { linkifyWorkspaceMentionsInNode, renderMarkdownPreview } from './router.js';
 import { renderAttachmentMarkup, clearAttachments, uploadAttachments, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { renderRelayQuestions } from './ask-user-view.js';
 import { getMessageThreadAnchor, sortConversationMessages } from './thread-order.mjs';
 import { normalizeStreamSeq, deriveLatestInFlightStreamEvent, computeNextRelayStreamState } from './stream-state.mjs';
 import { mergeRelayActivityTexts } from './activity-replay-state.mjs';
+import { deriveComposerControlState, hasComposerDraft } from './composer-control-state.mjs';
 
 const CONVERSATION_HISTORY_PAGE_SIZE = 20;
 const HISTORY_LOAD_MORE_ID = 'history-load-more';
@@ -47,6 +48,7 @@ let thinkingText = '';
 const relayStreamStateByMessageId = new Map();
 const completedMessageIds = new Set();
 let sendInFlight = false;
+const activeTurnsByConversation = new Map();
 let conversationHistoryState = {
   conversationId: '',
   hasMoreHistory: false,
@@ -63,8 +65,55 @@ function isOpaqueRelayText(value) {
 
 function setSendInFlight(value) {
   sendInFlight = !!value;
+  syncSendButtonState();
+}
+
+function getActiveTurnForConversation(conversationId) {
+  const conversationKey = String(conversationId || '').trim();
+  if (!conversationKey) return null;
+  return activeTurnsByConversation.get(conversationKey) || null;
+}
+
+function syncSendButtonState() {
   const btn = document.getElementById('send-btn');
-  if (btn) btn.disabled = sendInFlight;
+  if (!btn) return;
+  const currentTurn = getActiveTurnForConversation(currentConvId);
+  const state = deriveComposerControlState({
+    hasActiveTurn: !!currentTurn,
+    cancelRequested: currentTurn?.cancelRequested === true,
+    hasDraft: hasComposerDraft({
+      text: document.getElementById('msg-input')?.value || '',
+      attachmentCount: selectedAttachments.length,
+    }),
+    sendInFlight,
+  });
+  btn.disabled = state.disabled;
+  btn.dataset.action = state.action;
+  btn.textContent = state.label;
+  btn.title = state.title;
+}
+
+export function syncComposerControlState() {
+  syncSendButtonState();
+}
+
+function setConversationTurnState(conversationId, state = null) {
+  const conversationKey = String(conversationId || '').trim();
+  if (!conversationKey) {
+    syncSendButtonState();
+    return;
+  }
+  if (!state || !String(state.messageId || '').trim()) {
+    activeTurnsByConversation.delete(conversationKey);
+    syncSendButtonState();
+    return;
+  }
+  activeTurnsByConversation.set(conversationKey, {
+    messageId: String(state.messageId || '').trim(),
+    status: String(state.status || 'processing').trim().toLowerCase() || 'processing',
+    cancelRequested: state.cancelRequested === true,
+  });
+  syncSendButtonState();
 }
 
 function getMessagesElement() {
@@ -162,7 +211,7 @@ function createMessageNode(msg, msgId = null, force = false) {
     ? ` <span class="msg-mode">${escHtml(msg.mode)}</span>` : '';
   const content = msg.role === 'assistant'
     ? marked.parse(msg.text || '')
-    : (msg.text ? `<p>${escHtml(msg.text)}</p>` : '');
+    : renderMarkdownPreview(msg.text || '', false);
   const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
   const activities = Array.isArray(msg.activities) ? msg.activities.filter(Boolean).slice(0, 48) : [];
   const attachmentHtml = attachments.length ? renderAttachmentMarkup(attachments) : '';
@@ -357,10 +406,12 @@ export function restoreInFlightThinking(inFlight) {
   const messageId = String(inFlight?.messageId || '').trim();
   const status = String(inFlight?.status || '').trim().toLowerCase();
   if (!messageId || status !== 'processing') {
+    setConversationTurnState(currentConvId, null);
     thinkingMessageId = null;
     removeThinking();
     return;
   }
+  setConversationTurnState(currentConvId, { messageId, status: 'processing' });
   const activities = mergeRelayActivityTexts(
     relayActivities.get(messageId) || [],
     Array.isArray(inFlight.activities) ? inFlight.activities : [],
@@ -436,6 +487,85 @@ export function clearRelayStreamStateForMessage(messageId) {
     }
   }
   clearRelayStreamState(messageId);
+}
+
+export function applyConversationTurnStatus({ conversationId, messageId, status }) {
+  const conversationKey = String(conversationId || '').trim();
+  const messageKey = String(messageId || '').trim();
+  const normalizedStatus = String(status || '').trim().toLowerCase();
+  if (!conversationKey) {
+    syncSendButtonState();
+    return;
+  }
+  if (normalizedStatus === 'processing' && messageKey) {
+    const previous = getActiveTurnForConversation(conversationKey);
+    setConversationTurnState(conversationKey, {
+      messageId: messageKey,
+      status: normalizedStatus,
+      cancelRequested: previous?.messageId === messageKey ? previous.cancelRequested === true : false,
+    });
+    return;
+  }
+  if (['done', 'failed', 'dropped', 'pending', 'parked', 'cancelled'].includes(normalizedStatus)) {
+    const previous = getActiveTurnForConversation(conversationKey);
+    if (!previous || !messageKey || previous.messageId === messageKey) {
+      setConversationTurnState(conversationKey, null);
+      return;
+    }
+  }
+  syncSendButtonState();
+}
+
+async function stopCurrentConversationTurn(conversationId) {
+  const conversationKey = String(conversationId || '').trim();
+  const activeTurn = getActiveTurnForConversation(conversationKey);
+  if (!conversationKey || !activeTurn?.messageId) return;
+  if (activeTurn.cancelRequested) return;
+  if (isMobileComposerViewport() && !confirm('Stop the current turn?')) return;
+  setConversationTurnState(conversationKey, {
+    messageId: activeTurn.messageId,
+    status: activeTurn.status || 'processing',
+    cancelRequested: true,
+  });
+  const expectedMessageId = activeTurn.messageId;
+  const result = await cancelConversationTurn(conversationKey, {
+    clientId: CLIENT_ID,
+    messageId: expectedMessageId,
+  });
+  if (!result?.ok) {
+    setConversationTurnState(conversationKey, {
+      messageId: expectedMessageId,
+      status: activeTurn.status || 'processing',
+      cancelRequested: false,
+    });
+    showTransientRelayNotice('Could not stop the current turn.');
+    return;
+  }
+  if (
+    result.acknowledgement === 'already-finished'
+    || result.acknowledgement === 'no-active-turn'
+    || result.acknowledgement === 'message-mismatch'
+  ) {
+    const latestTurn = getActiveTurnForConversation(conversationKey);
+    if (latestTurn?.messageId === expectedMessageId) {
+      setConversationTurnState(conversationKey, null);
+    }
+    showTransientRelayNotice('That turn already finished.');
+    return;
+  }
+  if (result.acknowledgement === 'active-turn-unbound') {
+    const latestTurn = getActiveTurnForConversation(conversationKey);
+    if (latestTurn?.messageId === expectedMessageId) {
+      setConversationTurnState(conversationKey, {
+        messageId: expectedMessageId,
+        status: activeTurn.status || 'processing',
+        cancelRequested: false,
+      });
+    }
+    showTransientRelayNotice('The active turn is not bound to a live SDK session.');
+    return;
+  }
+  showTransientRelayNotice('Stopping the current turn…');
 }
 
 export function appendMessage(msg, scroll = true, msgId = null, force = false, insertAfterId = null, trackHistory = true) {
@@ -580,12 +710,18 @@ export function compactCurrentConversation() {
 export async function sendMessage() {
   const input = document.getElementById('msg-input');
   const text = input.value.trim();
-  if (!text && selectedAttachments.length === 0) return;
   const mobileSend = isMobileComposerViewport();
+  const activeTurn = getActiveTurnForConversation(currentConvId);
+  const hasDraft = hasComposerDraft({ text, attachmentCount: selectedAttachments.length });
   if (sendInFlight) {
     showTransientRelayNotice('Please wait for the current message to finish sending.');
     return;
   }
+  if (activeTurn?.messageId && !hasDraft) {
+    await stopCurrentConversationTurn(currentConvId);
+    return;
+  }
+  if (!hasDraft) return;
 
   if (text.toLowerCase() === '/compact' && selectedAttachments.length === 0) {
     input.value = '';
@@ -689,6 +825,8 @@ export async function sendMessage() {
         updatedAt: new Date().toISOString(),
         messageCount: 1,
         runtimeSessionId: r.runtimeSessionId || null,
+        preferredRelayMode: r.preferredRelayMode || selectedMode,
+        preferredModelsByMode: r.preferredModelsByMode || { [selectedMode]: selectedModel },
       };
       document.getElementById('chat-title').textContent = titleSeed.slice(0, 60);
       window.syncChatTitleControls?.();

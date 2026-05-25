@@ -80,6 +80,7 @@ export function renderAttachmentPreview() {
   if (!selectedAttachments.length) {
     el.innerHTML = '';
     el.classList.remove('visible');
+    window.syncComposerControlState?.();
     return;
   }
 
@@ -91,6 +92,7 @@ export function renderAttachmentPreview() {
     </div>
   `).join('');
   el.classList.add('visible');
+  window.syncComposerControlState?.();
 }
 
 export function removeAttachment(idx) {

@@ -226,6 +226,8 @@ export function createPollingLoop({
   handleControl,
 }) {
   let stopRequested = false;
+  let lastAbortControlCheckAt = 0;
+  let activeTurnMessageId = "";
 
   async function waitForRelayQuestionAnswer(questionId, timeoutMs = DEFAULT_QUESTION_TIMEOUT_MS, pollIntervalMs = 1500) {
     const started = Date.now();
@@ -396,6 +398,39 @@ export function createPollingLoop({
     return true;
   }
 
+  async function checkActiveAbortControl(message, { force = false } = {}) {
+    const ownerSessionId = String(message?.ownerSessionId || "").trim();
+    if (!ownerSessionId || !getWaitingForAI()) return false;
+    const now = Date.now();
+    if (!force && (now - lastAbortControlCheckAt) < 1200) return false;
+    lastAbortControlCheckAt = now;
+    const queueMessageId = String(message?.id || "").trim();
+    const pending = await api("GET", `/api/control/active?sdkSessionId=${encodeURIComponent(ownerSessionId)}&queueMessageId=${encodeURIComponent(queueMessageId)}`).catch(() => null);
+    const control = pending?.control || null;
+    if (!control || String(control.type || "").trim() !== "abort_turn") return false;
+
+    if (!session || typeof session.abort !== "function") {
+      const error = "SDK abort() is unavailable in this CLI runtime";
+      await api("POST", `/api/control/${encodeURIComponent(control.id)}/result`, {
+        ok: false,
+        error,
+      }).catch(() => {});
+      await session?.log?.(`⚠️ Stop request could not be executed: ${error}`, { level: "warn" });
+      return false;
+    }
+
+    await session.log(`⛔ Stop requested for relay turn ${String(message?.id || "").slice(0, 8)}`, { ephemeral: true });
+    await session.abort();
+    await api("POST", `/api/control/${encodeURIComponent(control.id)}/result`, {
+      ok: true,
+      note: "session.abort() completed",
+    }).catch(() => {});
+    const abortError = new Error("Relay turn aborted by user request");
+    abortError.code = "RELAY_TURN_ABORTED";
+    abortError.controlId = control.id;
+    throw abortError;
+  }
+
   async function startPolling() {
     if (getPollingLoopStarted()) return;
     setPollingLoopStarted(true);
@@ -409,7 +444,9 @@ export function createPollingLoop({
       if (!getSessionReady()) continue;
 
       try {
-        await api("POST", "/api/heartbeat", {});
+        await api("POST", "/api/heartbeat", {
+          activeQueueMessageId: getWaitingForAI() ? activeTurnMessageId || undefined : undefined,
+        });
         await publishModelSnapshot("poll");
 
         if (getWaitingForAI()) continue;
@@ -425,6 +462,7 @@ export function createPollingLoop({
         const { message } = pending || {};
 
         if (message) {
+          activeTurnMessageId = String(message.id || "");
           setActiveMsg(message);
           if (typeof ensureSessionForConversation !== "function") {
             dbg("session routing unavailable for msgId", message.id, "ensureSessionForConversation is not configured");
@@ -535,11 +573,13 @@ export function createPollingLoop({
               if (!done && publish.ok) lastStreamedSent = value;
             };
             const onStreamingEvent = async (event) => {
+              await checkActiveAbortControl(message);
               const streamedText = extractStreamTextFromEvent(event);
               if (!shouldEmitRelayStreamUpdate(streamedText, lastStreamedSent)) return;
               await pushRelayStream(streamedText, false);
             };
             const inspectActiveWorkerLiveness = async () => {
+              await checkActiveAbortControl(message, { force: true });
               const ownerSessionId = String(message?.ownerSessionId || "").trim();
               if (!ownerSessionId) return;
               const now = Date.now();
@@ -585,13 +625,24 @@ export function createPollingLoop({
                 }),
               });
             };
+            const sendWithoutStreaming = async (sendPayload) => {
+              const turnPromise = Promise.resolve().then(() => sendAndWaitWithHardTimeout(sendPayload, sendTimeout));
+              while (true) {
+                const outcome = await Promise.race([
+                  turnPromise.then((value) => ({ done: true, value })),
+                  sleep(1000).then(() => ({ done: false })),
+                ]);
+                if (outcome.done) return outcome.value;
+                await inspectActiveWorkerLiveness();
+              }
+            };
             try {
               if (typeof sendWithBestEffortStreaming === "function") {
                 finalEvent = await sendWithBestEffortStreaming(payload, sendTimeout, onStreamingEvent, {
                   onWaiting: inspectActiveWorkerLiveness,
                 });
               } else {
-                finalEvent = await sendAndWaitWithHardTimeout(payload, sendTimeout);
+                finalEvent = await sendWithoutStreaming(payload);
               }
             } catch (attachmentError) {
               if (!sdkAttachments.length) throw attachmentError;
@@ -607,7 +658,7 @@ export function createPollingLoop({
                   onWaiting: inspectActiveWorkerLiveness,
                 });
               } else {
-                finalEvent = await sendAndWaitWithHardTimeout({ prompt }, sendTimeout);
+                finalEvent = await sendWithoutStreaming({ prompt });
               }
             }
             dbg("session.sendAndWait: completed for msgId", message.id);
@@ -723,7 +774,9 @@ export function createPollingLoop({
             }
           } catch (e) {
               dbg("sendAndWait ERROR for msgId", message.id, ":", e.message);
-              if (isTerminalSendAndWaitError(e)) {
+              if (String(e?.code || "").trim() === "RELAY_TURN_ABORTED") {
+                await pushRelayStream(lastStreamedSent, true);
+              } else if (isTerminalSendAndWaitError(e)) {
                 const failureText = buildTerminalFailureText(e);
                 await session.log("❌ Terminal SDK/tool-output error — marking turn failed", { level: "error" });
                 await pushRelayStream(lastStreamedSent, true);
@@ -757,6 +810,7 @@ export function createPollingLoop({
             setRelayTurnActive(false, message);
             setActiveMsg(null);
             setWaitingForAI(false);
+            activeTurnMessageId = "";
           }
         }
       } catch {

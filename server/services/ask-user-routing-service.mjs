@@ -25,7 +25,7 @@ export function createAskUserRoutingService(db, options = {}) {
   const findQuestion = db.prepare(`SELECT * FROM relay_questions WHERE id = ?`);
   const updateAnswered = db.prepare(`
     UPDATE relay_questions
-    SET status = 'answered', answer = ?, answered_at = datetime('now')
+    SET status = 'answered', answer = ?, answered_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
     WHERE id = ?
   `);
   const findBySdkSessionAndMessage = db.prepare(`

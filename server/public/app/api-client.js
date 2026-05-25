@@ -109,6 +109,15 @@ export async function updateConversationTitle(id, title) {
   });
 }
 
+export async function updateConversationPreferences(id, preferences = {}) {
+  const convId = String(id || '').trim();
+  if (!convId) return null;
+  return apiFetch(`/api/conversation/${convId}/preferences`, {
+    method: 'PATCH',
+    body: JSON.stringify(preferences || {}),
+  });
+}
+
 export async function compactConversation(id) {
   const convId = String(id || '').trim();
   if (!convId) return null;
@@ -126,6 +135,15 @@ export async function killSessionWorker(sdkSessionId, body = {}) {
 
 export async function sendMessage(body) {
   return apiFetch('/api/message', { method: 'POST', body: JSON.stringify(body) });
+}
+
+export async function cancelConversationTurn(conversationId, body = {}) {
+  const convId = String(conversationId || '').trim();
+  if (!convId) return null;
+  return apiFetch(`/api/conversation/${encodeURIComponent(convId)}/cancel-turn`, {
+    method: 'POST',
+    body: JSON.stringify(body || {}),
+  });
 }
 
 export async function loadRelayQuestions(status = 'pending') {

@@ -27,6 +27,7 @@ import { registerCacheRoutes } from './routes/cache-routes.mjs';
 import { createDeleteArchiveService } from './services/delete-archive-service.mjs';
 import { createSessionDiscoveryService } from './services/session-discovery-service.mjs';
 import { createSessionTranscriptService } from './services/session-transcript-service.mjs';
+import { createContextSnapshotService } from './services/context-snapshot-service.mjs';
 import { createRelaySingletonGuard } from './services/relay-singleton-guard.mjs';
 import { createRelayRestartOrchestrator } from './services/relay-restart-orchestrator-service.mjs';
 import { createRelayBridgeOwnerService } from './services/relay-bridge-owner-service.mjs';
@@ -512,6 +513,8 @@ db.exec(`
     title      TEXT NOT NULL,
     title_source TEXT NOT NULL DEFAULT 'auto',
     sdk_session_id TEXT,
+    preferred_relay_mode TEXT,
+    preferred_models_by_mode TEXT,
     archived   INTEGER NOT NULL DEFAULT 0,
     status     TEXT NOT NULL DEFAULT 'active',
     compacted_into TEXT,
@@ -598,6 +601,26 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_sdk_delete_requests_status
     ON sdk_delete_requests(status, requested_at, next_attempt_at);
+
+  CREATE TABLE IF NOT EXISTS relay_control_requests (
+    id              TEXT PRIMARY KEY,
+    type            TEXT NOT NULL,
+    conversation_id TEXT,
+    queue_message_id TEXT,
+    sdk_session_id  TEXT,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    request         TEXT,
+    result          TEXT,
+    error           TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    completed_at    TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_relay_control_requests_status
+    ON relay_control_requests(status, sdk_session_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_relay_control_requests_queue
+    ON relay_control_requests(queue_message_id, type, status, created_at);
 
   CREATE TABLE IF NOT EXISTS relay_questions (
     id              TEXT PRIMARY KEY,
@@ -773,6 +796,12 @@ if (!conversationColumns.includes('archived')) {
 }
 if (!conversationColumns.includes('sdk_session_id')) {
   db.exec(`ALTER TABLE conversations ADD COLUMN sdk_session_id TEXT`);
+}
+if (!conversationColumns.includes('preferred_relay_mode')) {
+  db.exec(`ALTER TABLE conversations ADD COLUMN preferred_relay_mode TEXT`);
+}
+if (!conversationColumns.includes('preferred_models_by_mode')) {
+  db.exec(`ALTER TABLE conversations ADD COLUMN preferred_models_by_mode TEXT`);
 }
 if (!conversationColumns.includes('compacted_into')) {
   db.exec(`ALTER TABLE conversations ADD COLUMN compacted_into TEXT`);
@@ -1166,144 +1195,6 @@ function resolveSessionStateRoot() {
   return candidates.find(Boolean) || path.join('.copilot', 'session-state');
 }
 
-function extractSessionIdFromEventsPath(eventsPath) {
-  const parent = path.basename(path.dirname(String(eventsPath || '')));
-  return parent || null;
-}
-
-function readContextFromSessionEvents(runtimeSessionId, runtimeSessionKey = null) {
-  const sessionId = String(runtimeSessionId || '').trim();
-  const sessionKey = String(runtimeSessionKey || runtimeSessionId || '').trim();
-  if (!sessionKey) return { snapshot: null, eventsPath: null, error: 'Missing runtime session ID' };
-  const root = resolveSessionStateRoot();
-  const expectedEventsPath = path.join(root, sessionKey, 'events.jsonl');
-  let eventsPath = expectedEventsPath;
-  if (!fs.existsSync(eventsPath)) {
-    // Never fall back to the newest events file here: that can belong to a
-    // different conversation and would cross-wire context for the wrong session.
-    return { snapshot: null, eventsPath, error: `Session events file not found at ${expectedEventsPath}` };
-  }
-
-  let content = '';
-  try {
-    content = fs.readFileSync(eventsPath, 'utf8');
-  } catch (e) {
-    return { snapshot: null, eventsPath, error: `Failed reading events file: ${e?.message || String(e)}` };
-  }
-
-  const lines = String(content || '').split(/\r?\n/).filter(Boolean);
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i];
-    let event = null;
-    try { event = JSON.parse(line); } catch { continue; }
-    const data = event?.data && typeof event.data === 'object' ? event.data : null;
-    if (!data) continue;
-    const hasContextFields =
-      Number.isFinite(Number(data.currentTokens)) ||
-      Number.isFinite(Number(data.systemTokens)) ||
-      Number.isFinite(Number(data.conversationTokens)) ||
-      Number.isFinite(Number(data.toolDefinitionsTokens));
-    const hasUsageSignals = hasContextFields
-      || Number.isFinite(Number(data.inputTokens))
-      || Number.isFinite(Number(data.outputTokens))
-      || Number.isFinite(Number(data.reasoningTokens))
-      || Number.isFinite(Number(data.cacheReadTokens))
-      || Number.isFinite(Number(data.cacheWriteTokens));
-    if (!hasUsageSignals) continue;
-
-    const currentModel = String(data.currentModel || data.model || data.newModel || '').trim() || null;
-    const copilotSessionId = extractSessionIdFromEventsPath(eventsPath) || sessionId;
-    const modelUsage = currentModel && data.modelMetrics?.[currentModel]?.usage && typeof data.modelMetrics[currentModel].usage === 'object'
-      ? data.modelMetrics[currentModel].usage
-      : null;
-    const systemTokens = toNullableInt(data.systemTokens);
-    const conversationTokens = toNullableInt(data.conversationTokens);
-    const toolsTokens = toNullableInt(data.toolDefinitionsTokens);
-    const usedTotalTokens = toNullableInt(data.currentTokens)
-      ?? toNullableInt(findFirstNumericByKey(data, ['usedTokens', 'totalTokens', 'usedTotalTokens']))
-      ?? ((systemTokens !== null || conversationTokens !== null || toolsTokens !== null)
-        ? (Number(systemTokens || 0) + Number(conversationTokens || 0) + Number(toolsTokens || 0))
-        : null);
-    const contextLimitTokens = resolveContextLimitTokens(currentModel, data, modelUsage);
-    const usedPercent = toNullablePercent(data.usedPercent)
-      ?? toNullablePercent(findFirstNumericByKey(data, ['usedPercent', 'contextUsagePercent', 'tokenUsagePercent']))
-      ?? ((usedTotalTokens !== null && contextLimitTokens !== null && contextLimitTokens > 0)
-        ? Math.round((usedTotalTokens / contextLimitTokens) * 10000) / 100
-        : null);
-    const freeTokens = toNullableInt(data.freeTokens)
-      ?? toNullableInt(data.remainingTokens)
-      ?? toNullableInt(findFirstNumericByKey(data, ['freeTokens', 'remainingTokens', 'availableTokens']))
-      ?? ((usedTotalTokens !== null && contextLimitTokens !== null)
-        ? Math.max(0, contextLimitTokens - usedTotalTokens)
-        : null);
-    const bufferTokens = toNullableInt(data.bufferTokens)
-      ?? toNullableInt(findFirstNumericByKey(data, ['bufferTokens', 'safeBufferTokens']))
-      ?? null;
-    const systemToolsTokens = ((systemTokens !== null || toolsTokens !== null)
-      ? Number(systemTokens || 0) + Number(toolsTokens || 0)
-      : null);
-    const cacheReadTokens = toNullableInt(modelUsage?.cacheReadTokens)
-      ?? toNullableInt(data.cacheReadTokens)
-      ?? toNullableInt(data.compactionTokensUsed?.cacheReadTokens)
-      ?? null;
-    const cacheWriteTokens = toNullableInt(modelUsage?.cacheWriteTokens)
-      ?? toNullableInt(data.cacheWriteTokens)
-      ?? toNullableInt(data.compactionTokensUsed?.cacheWriteTokens)
-      ?? null;
-    const partialMetricsWarning = !hasContextFields
-      ? 'Legacy context-window metrics are unavailable in current session events; showing partial token data only.'
-      : null;
-    return {
-      eventsPath,
-      error: partialMetricsWarning,
-      snapshot: {
-        runtime_session_id: sessionId,
-        copilot_session_id: copilotSessionId,
-        model: currentModel,
-        used_total_tokens: usedTotalTokens,
-        max_context_tokens: contextLimitTokens,
-        used_percent: usedPercent,
-        free_tokens: freeTokens,
-        buffer_tokens: bufferTokens,
-        system_tokens: systemTokens,
-        messages_tokens: conversationTokens,
-        tools_tokens: toolsTokens,
-        system_tools_tokens: toNullableInt(systemToolsTokens),
-        used_prompt_tokens: toNullableInt(modelUsage?.inputTokens) ?? toNullableInt(data.inputTokens),
-        used_completion_tokens: toNullableInt(modelUsage?.outputTokens) ?? toNullableInt(data.outputTokens),
-        reasoning_tokens: toNullableInt(modelUsage?.reasoningTokens),
-        cache_read_tokens: cacheReadTokens,
-        cache_write_tokens: cacheWriteTokens,
-        captured_at: String(event.timestamp || '').trim() || null,
-      },
-    };
-  }
-
-  return { snapshot: null, eventsPath, error: 'No context-bearing events found for this session' };
-}
-
-function resolveConversationContext(conversationId) {
-  const normalizedConversationId = String(conversationId || '').trim();
-  if (!normalizedConversationId) {
-    return { ok: false, status: 404, error: 'Missing conversationId' };
-  }
-
-  const runtimeSession = stmts.getRuntimeSessionByConversation.get(normalizedConversationId) || null;
-  if (!runtimeSession?.id) {
-    return { ok: false, status: 404, error: 'Conversation context not found' };
-  }
-
-  const parsed = readContextFromSessionEvents(runtimeSession.id, runtimeSession.runtime_key || runtimeSession.id || null);
-  if (!parsed.snapshot) {
-    const missingContextFile = String(parsed.error || '').startsWith('Session events file not found at ');
-    if (missingContextFile || parsed.error === 'Missing runtime session ID') {
-      return { ok: false, status: 404, error: 'Conversation context not found' };
-    }
-  }
-
-  return { ok: true, conversationId: normalizedConversationId, runtimeSession, parsed };
-}
-
 function buildContextResponseText({ snapshot, runtimeSession, conversationId, eventsPath, error }) {
   const hasText = (value) => {
     const text = String(value || '').trim();
@@ -1337,6 +1228,9 @@ function buildContextResponseText({ snapshot, runtimeSession, conversationId, ev
   }
 
   pushDetail('Copilot session ID', canonicalCopilotSessionId);
+  if (snapshot?.estimate_kind === 'assistant-output-lower-bound') {
+    pushDetail('Estimate', 'Lower bound from assistant completion tokens');
+  }
   pushDetailCount('Prompt/Input', snapshot.used_prompt_tokens);
   pushDetailCount('Completion/Output', snapshot.used_completion_tokens);
   pushDetailCount('Reasoning', snapshot.reasoning_tokens);
@@ -2390,6 +2284,20 @@ function recoverProcessingOlderThan(cutoffIso, requeueAtIso) {
 
   const tx = db.transaction(() => {
     stmts.recoverProcessingBefore.run(requeueAtIso, cutoffIso);
+    const settleRecoveredAbortControls = db.prepare(`
+      UPDATE relay_control_requests
+      SET status = 'failed',
+          error = ?,
+          updated_at = ?,
+          completed_at = ?
+      WHERE queue_message_id = ?
+        AND type = 'abort_turn'
+        AND status IN ('pending', 'processing')
+    `);
+    const now = new Date().toISOString();
+    for (const row of rows) {
+      settleRecoveredAbortControls.run('queue-recovered', now, now, row.id);
+    }
   });
   tx();
 
@@ -2444,6 +2352,12 @@ const sessionTranscriptService = createSessionTranscriptService({
   resolveSessionStateRoot,
 });
 const readSessionTranscriptMessages = sessionTranscriptService.readSessionTranscriptMessages;
+const contextSnapshotService = createContextSnapshotService({
+  fs,
+  path,
+  resolveSessionStateRoot,
+});
+const readContextFromSessionEvents = contextSnapshotService.readContextFromSessionEvents;
 
 // ─── Express + Socket.io Setup ────────────────────────────────────────────────
 const app        = express();
