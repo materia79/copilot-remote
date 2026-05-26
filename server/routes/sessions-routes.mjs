@@ -19,11 +19,24 @@ function toSafeNonNegativeInt(value, fallback = 0) {
   return Math.max(0, Math.trunc(numeric));
 }
 
+function isPidAlive(pidValue) {
+  const pid = Number(pidValue);
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const code = String(error?.code || '').trim().toUpperCase();
+    if (code === 'EPERM') return true;
+    return false;
+  }
+}
+
 export function canUpdateWorkspaceRoot(runtimeState = {}) {
   return true;
 }
 
-export async function launchWorkspaceRootSession(runtimeState = {}, sessionWorkerSupervisor = null, sdkSessionId = '') {
+export async function launchWorkspaceRootSession(runtimeState = {}, sessionWorkerSupervisor = null, sdkSessionId = '', sessionWorkerRegistry = null) {
   const sid = String(sdkSessionId || '').trim();
   if (!sid) {
     return { ok: false, statusCode: 400, error: 'Missing session id' };
@@ -31,9 +44,15 @@ export async function launchWorkspaceRootSession(runtimeState = {}, sessionWorke
   const selectedWorkerState = typeof sessionWorkerSupervisor?.getWorkerState === 'function'
     ? sessionWorkerSupervisor.getWorkerState(sid)
     : null;
+  const selectedWorkerPid = Number(selectedWorkerState?.pid);
+  const selectedWorkerPidAlive = isPidAlive(selectedWorkerPid);
   const selectedWorkerStatus = String(selectedWorkerState?.status || '').trim().toLowerCase();
-  if (['starting', 'ready', 'processing'].includes(selectedWorkerStatus)) {
+  if (['starting', 'ready', 'processing'].includes(selectedWorkerStatus) && selectedWorkerPidAlive) {
     return { ok: false, statusCode: 409, error: 'Selected CLI is already running' };
+  }
+  if (['starting', 'ready', 'processing'].includes(selectedWorkerStatus) && !selectedWorkerPidAlive) {
+    sessionWorkerSupervisor?.clearRestartSchedule?.(sid);
+    sessionWorkerRegistry?.removeWorker?.(sid);
   }
   if (!sessionWorkerSupervisor || typeof sessionWorkerSupervisor.ensureWorker !== 'function') {
     return { ok: false, statusCode: 500, error: 'Session worker launcher is unavailable' };
@@ -1849,7 +1868,7 @@ export function registerSessionsRoutes(app, deps) {
 
   app.post('/api/session-worker/:sdkSessionId/launch', auth, async (req, res) => {
     const sdkSessionId = String(req.params.sdkSessionId || '').trim();
-    const result = await launchWorkspaceRootSession(runtimeState, sessionWorkerSupervisor, sdkSessionId);
+    const result = await launchWorkspaceRootSession(runtimeState, sessionWorkerSupervisor, sdkSessionId, sessionWorkerRegistry);
     if (!result?.ok) {
       return res.status(result?.statusCode || 400).json({
         ok: false,

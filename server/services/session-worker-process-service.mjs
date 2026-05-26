@@ -14,7 +14,7 @@ function escapeRegExp(value) {
 function parseSessionIdFromCommandLine(commandLine) {
   const text = String(commandLine || '');
   if (!text) return null;
-  const match = text.match(/--session-id(?:=|\s+)(?:"([^"]+)"|'([^']+)'|([^\s"'=]+))/i);
+  const match = text.match(/--(?:session-id|resume)(?:=|\s+)(?:"([^"]+)"|'([^']+)'|([^\s"'=]+))/i);
   const value = match?.[1] || match?.[2] || match?.[3] || '';
   return normalizeSessionId(value);
 }
@@ -23,7 +23,7 @@ function looksLikeCopilotWorkerProcess(proc) {
   const name = String(proc?.name || '').trim().toLowerCase();
   const cmd = String(proc?.commandLine || '').trim().toLowerCase();
   if (!name && !cmd) return false;
-  if (cmd.includes('\\server\\server.js')) return false;
+  if (cmd.includes('\\server\\server.js') || cmd.includes('/server/server.js')) return false;
   if (name === 'copilot.exe') return true;
   if (name === 'gh.exe' && cmd.includes('gh') && cmd.includes('copilot')) return true;
   if (cmd.includes('gh copilot')) return true;
@@ -39,6 +39,28 @@ export function createSessionWorkerProcessInspector({
   platform = process.platform,
   execFileSyncImpl = execFileSync,
 } = {}) {
+  function getPosixProcessSnapshot() {
+    if (platform === 'win32') return [];
+    const output = execFileSyncImpl('ps', ['-eo', 'pid=,ppid=,comm=,args=', '-ww'], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const text = String(output || '').trim();
+    if (!text) return [];
+    return text
+      .split(/\r?\n/)
+      .map((line) => {
+        const match = String(line || '').match(/^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/);
+        if (!match) return null;
+        return {
+          processId: Number.parseInt(match[1], 10),
+          parentProcessId: Number.parseInt(match[2], 10),
+          name: String(match[3] || ''),
+          commandLine: String(match[4] || ''),
+        };
+      })
+      .filter(Boolean);
+  }
+
   function getWindowsProcessSnapshot() {
     if (platform !== 'win32') return [];
     const script = [
@@ -85,6 +107,30 @@ export function createSessionWorkerProcessInspector({
     return findWindowsProcessesForSession(targetSessionId)[0] || null;
   }
 
+  function findPosixProcessesForSession(targetSessionId) {
+    const target = normalizeSessionId(targetSessionId);
+    if (platform === 'win32' || !target) return [];
+    const targetPattern = new RegExp(`--(?:session-id|resume)(?:=|\\s+)(?:"${escapeRegExp(target)}"|'${escapeRegExp(target)}'|${escapeRegExp(target)})(?:\\s|$)`, 'i');
+    return getPosixProcessSnapshot()
+      .map((proc) => ({
+        processId: Number.isInteger(Number(proc?.processId)) ? Number(proc.processId) : null,
+        parentProcessId: Number.isInteger(Number(proc?.parentProcessId)) ? Number(proc.parentProcessId) : null,
+        name: String(proc?.name || ''),
+        commandLine: String(proc?.commandLine || ''),
+      }))
+      .filter((proc) => proc.processId)
+      .filter((proc) => looksLikeCopilotWorkerProcess(proc))
+      .filter((proc) => {
+        const parsedSessionId = parseSessionIdFromCommandLine(proc.commandLine);
+        if (parsedSessionId) return parsedSessionId === target;
+        return targetPattern.test(proc.commandLine);
+      });
+  }
+
+  function findPosixProcessForSession(targetSessionId) {
+    return findPosixProcessesForSession(targetSessionId)[0] || null;
+  }
+
   function parsePositiveInt(value) {
     const num = Number.parseInt(String(value || ''), 10);
     return Number.isInteger(num) && num > 0 ? num : null;
@@ -109,9 +155,26 @@ export function createSessionWorkerProcessInspector({
     return ids;
   }
 
+  function findProcessesForSession(targetSessionId) {
+    return platform === 'win32'
+      ? findWindowsProcessesForSession(targetSessionId)
+      : findPosixProcessesForSession(targetSessionId);
+  }
+
+  function findProcessForSession(targetSessionId) {
+    return platform === 'win32'
+      ? findWindowsProcessForSession(targetSessionId)
+      : findPosixProcessForSession(targetSessionId);
+  }
+
   return {
     normalizeSessionId,
     parseSessionIdFromCommandLine,
+    findProcessForSession,
+    findProcessesForSession,
+    findPosixProcessForSession,
+    findPosixProcessesForSession,
+    getPosixProcessSnapshot,
     findWindowsProcessesForSession,
     findWindowsProcessForSession,
     getWindowsProcessSnapshot,

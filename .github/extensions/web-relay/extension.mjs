@@ -33,7 +33,7 @@ import { createModelSwitchingService } from "./model-api/model-switching.mjs";
 import { createSessionIoHelpers } from "./runtime/session-io.mjs";
 import { resolveSessionBinding } from "./runtime/session-binding.mjs";
 import { createBannerStateStore } from "./runtime/banner-state.mjs";
-import { clearSession, registerSession } from "./runtime/session-registry.mjs";
+import { clearSession, getActiveSession, registerSession } from "./runtime/session-registry.mjs";
 import { syncSessionToServer, syncWorkspaceRootToServer } from "./runtime/session-sync-bridge.mjs";
 import { joinSessionWithRetry } from "./runtime/session-join-retry.mjs";
 import { resolveWorkspaceRootPath } from "./runtime/workspace-root.mjs";
@@ -170,7 +170,9 @@ let deferredSessionEnd = false;
 
 function getCurrentConversationId() {
   const conversationId = String(activeMsg?.conversationId || "").trim();
-  return conversationId || null;
+  if (conversationId) return conversationId;
+  const persistedConversationId = String(getActiveSession()?.conversationId || "").trim();
+  return persistedConversationId || null;
 }
 
 function getCurrentWorkspaceRootPath() {
@@ -269,7 +271,9 @@ function refreshSessionRegistry() {
     return null;
   }
 
-  return registerSession(sdkSessionId, getCurrentConversationId());
+  const currentConversationId = getCurrentConversationId();
+  const existingConversationId = String(getActiveSession()?.conversationId || "").trim() || null;
+  return registerSession(sdkSessionId, currentConversationId || existingConversationId);
 }
 
 async function syncActiveSession(reason, forceSync = false) {

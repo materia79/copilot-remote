@@ -441,8 +441,10 @@ async function spawnForegroundCli() {
       await spawnForegroundCliViaPowerShell(tcpConnectionToken, port);
     }
   } else {
-    log(`Spawning visible CLI on port ${port}...`);
-    await spawnForegroundCliViaPowerShell(tcpConnectionToken, port);
+    throw new Error(
+      'Foreground CLI spawn is currently Windows-only in standalone relay mode. '
+      + 'Use hidden mode (default) on Linux/macOS.'
+    );
   }
 
   // Wait up to 20s for the CLI to open its TCP port

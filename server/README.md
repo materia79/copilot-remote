@@ -16,6 +16,10 @@ If you run `gh copilot` and the web-relay extension is loaded (project-local or 
 the extension auto-starts `server.js` when needed and keeps the relay listener singleton
 while letting session-affine CLI workers run in parallel.
 
+On Linux/macOS, session-affine worker launches prefer detached `tmux` sessions when `tmux`
+is available, using the worker SDK session id as the tmux session name so you can attach
+for debugging without changing the Windows launch path.
+
 > **Single-owner rule:** Use either extension-managed polling **or** standalone `relay.mjs`, never both at the same time.
 > Agent/runtime restart policy is defined in `.github/copilot-instructions.md`.
 
@@ -44,6 +48,9 @@ If you install this repo locally with `npm link` or `npm install -g .`, the `cop
 command starts the web relay server if needed and then launches `gh copilot` in the same shell
 from whatever folder you run it in. If a relay is already live, it reuses it instead of starting
 a second owner.
+
+`copilot-remote` also prepares a user-global `web-relay` extension wrapper by default. You can run
+`copilot-remote --install-extension` to install/update only the wrapper and exit.
 
 Relay server output is redirected to a logfile under `%LOCALAPPDATA%\copilot-remote\logs` by
 default (or `COPILOT_WEB_RELAY_LOG_DIR` if set), so the terminal stays reserved for the CLI.
@@ -108,8 +115,9 @@ the relay tied to that workspace CWD instead of forcing a fixed repo launcher.
 If you also keep a project-local copy, extension management can show two `web-relay` entries.
 Keep only one active to prevent duplicate loading.
 
-For global install, copy the full `web-relay` extension folder there and set one of these
-environment variables so it can find your relay server files:
+For global install, use `copilot-remote --install-extension` (recommended) or manually place a
+wrapper `extension.mjs` there that imports your repository extension entrypoint. Then set one of
+these environment variables so it can find your relay server files:
 
 - `COPILOT_WEB_RELAY_SERVER_DIR` (recommended) → absolute path to the `server` folder
 - `COPILOT_WEB_RELAY_ROOT` → repo root that contains `server\`

@@ -2,6 +2,7 @@
 
 import { execFileSync, spawn } from 'child_process';
 import { createSessionWorkerProcessInspector } from './session-worker-process-service.mjs';
+import { launchSessionCli } from './session-worker-launch-service.mjs';
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -107,17 +108,17 @@ export function createRelayCliLauncherService({
     return Array.from(killed);
   }
 
-  function spawnSessionCli(targetSessionId) {
-    const child = spawnImpl('gh', ['copilot', '--', '--allow-all', '--session-id', targetSessionId], {
+  async function spawnSessionCli(targetSessionId) {
+    const launched = await launchSessionCli({
+      targetSessionId,
       cwd: resolveCwd(targetSessionId),
       env,
-      detached: true,
-      stdio: 'ignore',
-      shell: platform === 'win32',
-      windowsHide: platform === 'win32',
+      platform,
+      spawnImpl,
+      execFileSyncImpl,
+      processInspector,
     });
-    child.unref?.();
-    return child?.pid || null;
+    return launched;
   }
 
   async function runJob(job) {
@@ -125,7 +126,7 @@ export function createRelayCliLauncherService({
     if (restartDelayMs > 0) {
       await sleepImpl(restartDelayMs);
     }
-    const liveTarget = platform === 'win32' ? processInspector.findWindowsProcessForSession(job.targetSessionId) : null;
+    const liveTarget = processInspector.findProcessForSession(job.targetSessionId);
     if (liveTarget?.processId) {
       job.killedPids = [];
       job.spawnedPid = liveTarget.processId;
@@ -138,7 +139,11 @@ export function createRelayCliLauncherService({
     log(`relay cli launcher: retiring cli processes for ${job.targetSessionId} tx=${job.transactionId || 'none'}`);
     job.killedPids = await retireCliProcesses(job);
     log(`relay cli launcher: spawning session-bound cli for ${job.targetSessionId}`);
-    job.spawnedPid = spawnSessionCli(job.targetSessionId);
+    const launched = await spawnSessionCli(job.targetSessionId);
+    job.spawnedPid = launched?.pid || null;
+    if (launched?.launchMode === 'tmux' && launched?.tmuxSessionName) {
+      log(`relay cli launcher: worker session ${job.targetSessionId} running in tmux session ${launched.tmuxSessionName}`);
+    }
     job.status = 'spawned';
     job.completedAt = isoNow(now);
   }
@@ -156,18 +161,16 @@ export function createRelayCliLauncherService({
       }
       return { ok: false, error: 'launcher-busy', state: getState() };
     }
-    if (platform === 'win32') {
-      const liveTarget = processInspector.findWindowsProcessForSession(target);
-      if (liveTarget?.processId) {
-        return {
-          ok: true,
-          accepted: false,
-          reused: true,
-          reason: 'target-already-running',
-          livePid: liveTarget.processId,
-          state: getState(),
-        };
-      }
+    const liveTarget = processInspector.findProcessForSession(target);
+    if (liveTarget?.processId) {
+      return {
+        ok: true,
+        accepted: false,
+        reused: true,
+        reason: 'target-already-running',
+        livePid: liveTarget.processId,
+        state: getState(),
+      };
     }
 
     const job = {

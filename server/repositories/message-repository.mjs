@@ -32,6 +32,44 @@ export function createMessageRepository(db) {
             timestamp ASC
           LIMIT 1
         `),
+        findPendingForSessionAffinity: db.prepare(`
+          SELECT q.*
+          FROM queue q
+          LEFT JOIN runtime_sessions rs
+            ON rs.id = q.runtime_session_id
+          LEFT JOIN conversations c
+            ON c.id = q.conversation_id
+          WHERE q.status = 'pending'
+            AND (q.next_attempt_at IS NULL OR q.next_attempt_at <= ?)
+            AND COALESCE(
+              NULLIF(q.owner_sdk_session_id, ''),
+              NULLIF(rs.sdk_session_id, ''),
+              NULLIF(c.sdk_session_id, '')
+            ) = ?
+          ORDER BY
+            q.retry_count ASC,
+            CASE WHEN q.next_attempt_at IS NULL THEN 0 ELSE 1 END ASC,
+            COALESCE(q.next_attempt_at, q.timestamp) ASC,
+            q.timestamp ASC
+          LIMIT 1
+        `),
+        countQueueWorkForSessionAffinity: db.prepare(`
+          SELECT COUNT(*) AS cnt
+          FROM queue q
+          LEFT JOIN runtime_sessions rs
+            ON rs.id = q.runtime_session_id
+          LEFT JOIN conversations c
+            ON c.id = q.conversation_id
+          WHERE (
+            (q.status = 'pending' AND (q.next_attempt_at IS NULL OR q.next_attempt_at <= ?))
+            OR q.status = 'processing'
+          )
+            AND COALESCE(
+              NULLIF(q.owner_sdk_session_id, ''),
+              NULLIF(rs.sdk_session_id, ''),
+              NULLIF(c.sdk_session_id, '')
+            ) = ?
+        `),
         countStatus:    db.prepare(`SELECT status, COUNT(*) as cnt FROM queue WHERE status IN ('pending','processing','parked') GROUP BY status`),
         countRuntimeSessions: db.prepare(`SELECT COUNT(*) AS cnt FROM runtime_sessions WHERE status = 'active'`),
         setProcessing:  db.prepare(`UPDATE queue SET status = 'processing', processing_at = ? WHERE id = ?`),
@@ -53,9 +91,9 @@ export function createMessageRepository(db) {
         deleteConvQ:    db.prepare(`DELETE FROM queue WHERE conversation_id = ?`),
         findQById:      db.prepare(`SELECT * FROM queue WHERE id = ?`),
         pruneQueue:     db.prepare(`DELETE FROM queue WHERE status = 'done' AND id NOT IN (SELECT id FROM queue WHERE status = 'done' ORDER BY timestamp DESC LIMIT 200)`),
-        recoverStale:   db.prepare(`UPDATE queue SET status = 'pending', processing_at = NULL, next_attempt_at = ?, owner_lease_expires_at = NULL WHERE status = 'processing' AND processing_at < ?`),
+        recoverStale:   db.prepare(`UPDATE queue SET status = 'pending', processing_at = NULL, next_attempt_at = ?, owner_sdk_session_id = NULL, owner_assigned_at = NULL, owner_lease_expires_at = NULL, owner_last_claimed_at = NULL WHERE status = 'processing' AND processing_at < ?`),
         listRecoverableProcessing: db.prepare(`SELECT id, conversation_id FROM queue WHERE status = 'processing' AND processing_at < ?`),
-        recoverProcessingBefore: db.prepare(`UPDATE queue SET status = 'pending', processing_at = NULL, next_attempt_at = ?, owner_lease_expires_at = NULL WHERE status = 'processing' AND processing_at < ?`),
+        recoverProcessingBefore: db.prepare(`UPDATE queue SET status = 'pending', processing_at = NULL, next_attempt_at = ?, owner_sdk_session_id = NULL, owner_assigned_at = NULL, owner_lease_expires_at = NULL, owner_last_claimed_at = NULL WHERE status = 'processing' AND processing_at < ?`),
         listQueueForPauseDrop: db.prepare(`SELECT id, conversation_id FROM queue WHERE status IN ('pending', 'processing', 'parked')`),
         deleteQueueById: db.prepare(`DELETE FROM queue WHERE id = ?`),
         getLatestProcessingQueueByConversation: db.prepare(`SELECT id, relay_mode, timestamp, processing_at FROM queue WHERE conversation_id = ? AND status = 'processing' ORDER BY COALESCE(processing_at, timestamp) DESC LIMIT 1`),
