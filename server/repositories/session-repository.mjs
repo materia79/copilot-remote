@@ -66,6 +66,30 @@ export function createSessionRepository(db) {
         clearDeletedSdkSession: db.prepare(`DELETE FROM deleted_sdk_sessions WHERE sdk_session_id = ?`),
         deleteDeletedSdkSessions: db.prepare(`DELETE FROM deleted_sdk_sessions`),
 
+        // recent workspace roots (relay-owned CWD history)
+        upsertRecentWorkspaceRoot: db.prepare(`
+          INSERT INTO recent_workspace_roots (path, last_seen_at)
+          VALUES (?, ?)
+          ON CONFLICT(path) DO UPDATE SET
+            last_seen_at = excluded.last_seen_at
+        `),
+        listRecentWorkspaceRoots: db.prepare(`
+          SELECT path, last_seen_at
+          FROM recent_workspace_roots
+          ORDER BY last_seen_at DESC
+          LIMIT ?
+        `),
+        pruneRecentWorkspaceRoots: db.prepare(`
+          DELETE FROM recent_workspace_roots
+          WHERE path NOT IN (
+            SELECT path
+            FROM recent_workspace_roots
+            ORDER BY last_seen_at DESC
+            LIMIT ?
+          )
+        `),
+        deleteRecentWorkspaceRoots: db.prepare(`DELETE FROM recent_workspace_roots`),
+
         // SDK session delete bridge queue (server <-> extension)
         upsertSdkDeleteRequest: db.prepare(`
           INSERT INTO sdk_delete_requests (

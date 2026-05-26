@@ -1232,6 +1232,7 @@ export function registerSessionsRoutes(app, deps) {
         runtimeSessionId: sync?.runtimeSessionId || null,
       });
       if (workspaceRootSync.ok && workspaceRootSync.state?.conversationId) {
+        const workspaceHints = workspaceRootPayload();
         io.emit('conversation_workspace_root_updated', {
           conversationId: workspaceRootSync.state.conversationId,
           sdkSessionId: workspaceRootSync.state.sdkSessionId || sync?.sdkSessionId || sdkSessionId,
@@ -1241,8 +1242,10 @@ export function registerSessionsRoutes(app, deps) {
           runtimeWorkspaceRootName: workspaceRootSync.state.runtimeWorkspaceRootName || null,
           currentWorkspaceRootPath: workspaceRootSync.state.currentWorkspaceRootPath || null,
           currentWorkspaceRootName: workspaceRootSync.state.currentWorkspaceRootName || null,
+          recentWorkspaceRoots: Array.isArray(workspaceHints?.recentWorkspaceRoots) ? workspaceHints.recentWorkspaceRoots : [],
         });
       }
+      const workspaceHints = workspaceRootPayload();
       return res.json({
         ok: true,
         session: {
@@ -1256,6 +1259,7 @@ export function registerSessionsRoutes(app, deps) {
           changed: workspaceRootSync.changed === true,
           rootPath: workspaceRootSync.rootPath || workspaceRootPath || null,
           rootName: workspaceRootSync.rootName || null,
+          recentWorkspaceRoots: Array.isArray(workspaceHints?.recentWorkspaceRoots) ? workspaceHints.recentWorkspaceRoots : [],
         } : null,
         rebind: rebind ? {
           considered: rebind.considered === true,
@@ -1306,6 +1310,7 @@ export function registerSessionsRoutes(app, deps) {
       });
     }
     if (result.state?.conversationId) {
+      const workspaceHints = workspaceRootPayload();
       io.emit('conversation_workspace_root_updated', {
         conversationId: result.state.conversationId,
         sdkSessionId: result.state.sdkSessionId || sdkSessionId || null,
@@ -1315,6 +1320,7 @@ export function registerSessionsRoutes(app, deps) {
         runtimeWorkspaceRootName: result.state.runtimeWorkspaceRootName || null,
         currentWorkspaceRootPath: result.state.currentWorkspaceRootPath || null,
         currentWorkspaceRootName: result.state.currentWorkspaceRootName || null,
+        recentWorkspaceRoots: Array.isArray(workspaceHints?.recentWorkspaceRoots) ? workspaceHints.recentWorkspaceRoots : [],
       });
     }
     return res.json({
@@ -1663,6 +1669,7 @@ export function registerSessionsRoutes(app, deps) {
       return res.status(400).json({ error: result?.error || 'Failed to update conversation workspace root' });
     }
     const state = result.state || null;
+    const workspaceHints = workspaceRootPayload();
     io.emit('conversation_workspace_root_updated', {
       conversationId,
       sdkSessionId: state?.sdkSessionId || null,
@@ -1672,6 +1679,7 @@ export function registerSessionsRoutes(app, deps) {
       runtimeWorkspaceRootName: state?.runtimeWorkspaceRootName || null,
       currentWorkspaceRootPath: state?.currentWorkspaceRootPath || null,
       currentWorkspaceRootName: state?.currentWorkspaceRootName || null,
+      recentWorkspaceRoots: Array.isArray(workspaceHints?.recentWorkspaceRoots) ? workspaceHints.recentWorkspaceRoots : [],
     });
     return res.json({
       ok: true,
@@ -1683,6 +1691,7 @@ export function registerSessionsRoutes(app, deps) {
       runtimeWorkspaceRootName: state?.runtimeWorkspaceRootName || null,
       currentWorkspaceRootPath: state?.currentWorkspaceRootPath || null,
       currentWorkspaceRootName: state?.currentWorkspaceRootName || null,
+      recentWorkspaceRoots: Array.isArray(workspaceHints?.recentWorkspaceRoots) ? workspaceHints.recentWorkspaceRoots : [],
     });
   });
 

@@ -79,6 +79,7 @@ const REFERENCE_TOKEN_PATTERN_PLAIN = /(^|[\s(])@(file|folder):([^\s`]+)/gi;
 const WORKSPACE_META_CACHE_TTL_MS = 2_000;
 const MAX_WORKSPACE_PREVIEW_BYTES = 512 * 1024;
 const WORKSPACE_PREVIEW_BINARY_SAMPLE_BYTES = 8 * 1024;
+const MAX_RECENT_WORKSPACE_ROOTS = 12;
 const WORKSPACE_RECURSIVE_WATCH_SUPPORTED = process.platform === 'win32' || process.platform === 'darwin';
 const WORKSPACE_CONTENT_TYPES = Object.freeze({
   '.md': 'text/markdown; charset=utf-8',
@@ -313,6 +314,7 @@ function workspaceRootPayload() {
     workspaceRootName: currentWorkspaceRootName(),
     workspaceRootPath: currentWorkspaceRootPath(),
     workspaceRootEntries: listWorkspaceRootEntries(),
+    recentWorkspaceRoots: listRecentWorkspaceRoots(),
   };
 }
 
@@ -321,6 +323,24 @@ const ACTIVE_SESSION_CWD_STATUSES = new Set(['starting', 'ready', 'processing'])
 function normalizeConversationWorkspaceRootPath(candidatePath) {
   const normalized = normalizeWorkspaceRootPath(candidatePath);
   return normalized || null;
+}
+
+function listRecentWorkspaceRoots(limit = MAX_RECENT_WORKSPACE_ROOTS) {
+  const maxItems = Math.max(1, Math.min(MAX_RECENT_WORKSPACE_ROOTS, Number(limit) || MAX_RECENT_WORKSPACE_ROOTS));
+  if (!stmts?.listRecentWorkspaceRoots?.all) return [];
+  return stmts.listRecentWorkspaceRoots.all(maxItems)
+    .map((row) => String(row?.path || '').trim())
+    .filter(Boolean);
+}
+
+function rememberRecentWorkspaceRoot(rootPath) {
+  const normalized = normalizeConversationWorkspaceRootPath(rootPath);
+  if (!normalized) return null;
+  if (!stmts?.upsertRecentWorkspaceRoot?.run || !stmts?.pruneRecentWorkspaceRoots?.run) return normalized;
+  const nowIso = new Date().toISOString();
+  stmts.upsertRecentWorkspaceRoot.run(normalized, nowIso);
+  stmts.pruneRecentWorkspaceRoots.run(MAX_RECENT_WORKSPACE_ROOTS);
+  return normalized;
 }
 
 function resolveConversationRecord({ conversationId = '', sdkSessionId = '' } = {}) {
@@ -387,6 +407,7 @@ function updateConversationConfiguredWorkspaceRoot({ conversationId = '', sdkSes
   if (!normalizedRootPath) {
     return { ok: false, error: `Directory not found: ${String(rootPath || '').trim() || '(empty path)'}` };
   }
+  rememberRecentWorkspaceRoot(normalizedRootPath);
   const nowIso = new Date().toISOString();
   stmts.updateConvConfiguredWorkspaceRoot.run(normalizedRootPath, nowIso, row.id);
   const updated = resolveConversationRecord({ conversationId: row.id }) || row;
@@ -411,6 +432,7 @@ function learnConversationWorkspaceRoot({ sdkSessionId = '', conversationId = ''
   if (!normalizedRootPath) {
     return { ok: false, error: `Directory not found: ${String(rootPath || '').trim() || '(empty path)'}` };
   }
+  rememberRecentWorkspaceRoot(normalizedRootPath);
   const nowIso = new Date().toISOString();
   stmts.updateConvRuntimeWorkspaceRoot.run(normalizedRootPath, nowIso, row.id);
   if (seedConfigured) {
@@ -456,6 +478,7 @@ function applyWorkspaceRoot(nextRootPath, options = {}) {
 
   const current = path.resolve(currentWorkspaceRootPath());
   if (path.resolve(normalized) === current) {
+    rememberRecentWorkspaceRoot(current);
     return {
       changed: false,
       rootPath: current,
@@ -474,6 +497,7 @@ function applyWorkspaceRoot(nextRootPath, options = {}) {
   workspaceFileMetaCache.clear();
   stopWorkspaceFileWatcher();
   startWorkspaceFileWatcher();
+  rememberRecentWorkspaceRoot(normalized);
 
   const reason = String(options.reason || 'runtime-update').trim() || 'runtime-update';
   console.log(`[server] Workspace root updated (${reason}): ${normalized}`);
@@ -716,6 +740,14 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_sdk_delete_requests_status
     ON sdk_delete_requests(status, requested_at, next_attempt_at);
+
+  CREATE TABLE IF NOT EXISTS recent_workspace_roots (
+    path         TEXT PRIMARY KEY,
+    last_seen_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_recent_workspace_roots_last_seen
+    ON recent_workspace_roots(last_seen_at DESC);
 
   CREATE TABLE IF NOT EXISTS relay_control_requests (
     id              TEXT PRIMARY KEY,

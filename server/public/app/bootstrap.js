@@ -48,6 +48,7 @@ import {
   loadConversationScrollTop,
   loadConversationLoadedMessageCount,
   saveConversationScrollTop,
+  getRecentWorkspaceRoots,
 } from './store.js';
 import {
   verifyExistingSession,
@@ -90,8 +91,7 @@ const FALLBACK_MODEL = 'gpt-5.4-mini';
 const FALLBACK_MODE = 'agent';
 const THEME_COLOR_BASE = '#0d1117';
 const THEME_COLOR_IMMERSIVE = '#161b22';
-const KNOWN_CWD_HISTORY_KEY = 'copilot_known_cwds';
-const MAX_KNOWN_CWD_HISTORY = 12;
+const LEGACY_KNOWN_CWD_HISTORY_KEY = 'copilot_known_cwds';
 const MODEL_LABELS = {
   'gpt-5.4': 'GPT-5.4',
   'gpt-5.4-mini': 'GPT-5.4 Mini',
@@ -1053,28 +1053,8 @@ function normalizeKnownCwdPath(value) {
   return String(value || '').trim().replace(/[\\/]+$/, '');
 }
 
-function readKnownCwdHistory() {
-  const raw = String(localStorage.getItem(KNOWN_CWD_HISTORY_KEY) || '').trim();
-  if (!raw) return [];
-  try {
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed
-      .map((value) => normalizeKnownCwdPath(value))
-      .filter(Boolean);
-  } catch {
-    return [];
-  }
-}
-
-function rememberKnownCwdPath(pathValue) {
-  const nextPath = normalizeKnownCwdPath(pathValue);
-  if (!nextPath) return [];
-  const existing = readKnownCwdHistory().filter((item) => item.toLowerCase() !== nextPath.toLowerCase());
-  existing.unshift(nextPath);
-  const trimmed = existing.slice(0, MAX_KNOWN_CWD_HISTORY);
-  localStorage.setItem(KNOWN_CWD_HISTORY_KEY, JSON.stringify(trimmed));
-  return trimmed;
+function clearLegacyKnownCwdHistoryStorage() {
+  localStorage.removeItem(LEGACY_KNOWN_CWD_HISTORY_KEY);
 }
 
 function buildKnownCwdOptions() {
@@ -1096,9 +1076,9 @@ function buildKnownCwdOptions() {
   if (browserCwd && browserCwd.toLowerCase() !== normalizeKnownCwdPath(selectedCurrentCwd).toLowerCase()) {
     add('Current browser folder', browserCwd, 'From file explorer');
   }
-  const history = readKnownCwdHistory();
+  const history = getRecentWorkspaceRoots();
   history.forEach((pathValue, index) => {
-    add(`Recent CWD ${index + 1}`, pathValue, 'Previously selected');
+    add(`Recent CWD ${index + 1}`, pathValue, 'Relay history');
   });
   return options;
 }
@@ -1239,7 +1219,6 @@ async function submitChangeCwd(launchAfterChange = false) {
     ...result,
   });
   const updatedPath = result.configuredWorkspaceRootPath || result.currentWorkspaceRootPath || result.workspaceRootPath || selectedPath;
-  rememberKnownCwdPath(updatedPath);
   if (launchAfterChange) {
     const launchResult = await launchSessionWorker(launchableSessionId);
       if (!launchResult) {
@@ -1622,7 +1601,6 @@ async function connectSocket() {
   });
   socket.on('workspace_root_changed', (payload) => {
     updateWorkspaceRootHints(payload || {});
-    rememberKnownCwdPath(payload?.workspaceRootPath || workspaceRootPath);
     if (repoBrowserState.activeRoot !== 'workspace') return;
     repoBrowserState.currentPath = '';
     if (repoBrowserState.open) {
@@ -1630,13 +1608,8 @@ async function connectSocket() {
     }
   });
   socket.on('conversation_workspace_root_updated', (payload) => {
+    updateWorkspaceRootHints(payload || {});
     applyConversationWorkspaceRootUpdate(payload || {});
-    rememberKnownCwdPath(
-      payload?.currentWorkspaceRootPath
-      || payload?.configuredWorkspaceRootPath
-      || payload?.runtimeWorkspaceRootPath
-      || '',
-    );
   });
   socket.on('user_message', ({ conversationId, messageId, senderClientId, message }) => {
     const normalizedMessage = {
@@ -1811,6 +1784,7 @@ function showAuthGate() {
 }
 
 async function initApp() {
+  clearLegacyKnownCwdHistoryStorage();
   syncPwaVersionMenuEntry();
   setupViewportTracking();
   document.getElementById('auth-gate').style.display = 'none';
@@ -1925,7 +1899,6 @@ async function initApp() {
   initModeSelector();
   initModelSelector();
   const status = await refreshWorkspaceRootHints();
-  rememberKnownCwdPath(status?.workspaceRootPath || workspaceRootPath);
   setSessionWorkerStatesFromStatusPayload(status?.sessionWorker || null);
   await refreshModelCatalog(true);
   initFullscreenButton();

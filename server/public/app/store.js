@@ -35,6 +35,7 @@ export let workspaceRootEntrySet = new Set([
   'package.json',
   'package-lock.json',
 ]);
+export let recentWorkspaceRoots = [];
 export let relayQuestions = new Map();
 export let relayBoards = new Map();
 export let relayActivities = new Map();
@@ -271,13 +272,37 @@ export function fmtDate(iso) {
 }
 
 export function updateWorkspaceRootHints(payload) {
-  const rootName = String(payload?.workspaceRootName || '').trim().toLowerCase();
-  workspaceRootPath = String(payload?.workspaceRootPath || '').trim();
-  const entries = Array.isArray(payload?.workspaceRootEntries) ? payload.workspaceRootEntries : [];
-  workspaceRootName = rootName;
-  if (entries.length) {
+  const normalizedPayload = payload && typeof payload === 'object' ? payload : {};
+  if (Object.prototype.hasOwnProperty.call(normalizedPayload, 'workspaceRootName')) {
+    workspaceRootName = String(normalizedPayload.workspaceRootName || '').trim().toLowerCase();
+  }
+  if (Object.prototype.hasOwnProperty.call(normalizedPayload, 'workspaceRootPath')) {
+    workspaceRootPath = String(normalizedPayload.workspaceRootPath || '').trim();
+  }
+  if (Object.prototype.hasOwnProperty.call(normalizedPayload, 'workspaceRootEntries')) {
+    const entries = Array.isArray(normalizedPayload.workspaceRootEntries) ? normalizedPayload.workspaceRootEntries : [];
     workspaceRootEntrySet = new Set(entries.map((entry) => String(entry || '').trim().toLowerCase()).filter(Boolean));
   }
+  const recentRoots = Array.isArray(normalizedPayload.recentWorkspaceRoots)
+    ? normalizedPayload.recentWorkspaceRoots
+    : (Array.isArray(normalizedPayload.recentCwds) ? normalizedPayload.recentCwds : null);
+  if (Array.isArray(recentRoots)) {
+    const deduped = [];
+    const seen = new Set();
+    for (const candidate of recentRoots) {
+      const text = String(candidate || '').trim();
+      if (!text) continue;
+      const key = text.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(text);
+    }
+    recentWorkspaceRoots = deduped;
+  }
+}
+
+export function getRecentWorkspaceRoots() {
+  return recentWorkspaceRoots.slice();
 }
 
 export function getConversationWorkspaceState(conversationId = currentConvId) {

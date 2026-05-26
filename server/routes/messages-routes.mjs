@@ -2200,6 +2200,7 @@ export function registerMessagesRoutes(app, deps) {
     );
     io.emit('message_status', { messageId: msgId, conversationId: convId, status: 'pending' });
     if (conversationWorkspaceRootState?.conversationId) {
+      const workspaceHints = workspaceRootPayload();
       io.emit('conversation_workspace_root_updated', {
         conversationId: conversationWorkspaceRootState.conversationId,
         sdkSessionId: conversationWorkspaceRootState.sdkSessionId || null,
@@ -2209,6 +2210,7 @@ export function registerMessagesRoutes(app, deps) {
         runtimeWorkspaceRootName: conversationWorkspaceRootState.runtimeWorkspaceRootName || null,
         currentWorkspaceRootPath: conversationWorkspaceRootState.currentWorkspaceRootPath || null,
         currentWorkspaceRootName: conversationWorkspaceRootState.currentWorkspaceRootName || null,
+        recentWorkspaceRoots: Array.isArray(workspaceHints?.recentWorkspaceRoots) ? workspaceHints.recentWorkspaceRoots : [],
       });
     }
     res.json({
