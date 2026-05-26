@@ -138,3 +138,34 @@ test('launcher reuses the same in-flight transaction', async () => {
   await service.waitForIdle();
   assert.equal(spawnCalls.length, 1);
 });
+
+test('launcher resolves cwd lazily from the provided getter', async () => {
+  let cwdValue = 'C:\\root-one';
+  const spawnCalls = [];
+  const service = createRelayCliLauncherService({
+    platform: 'win32',
+    restartDelayMs: 1,
+    killWaitMs: 0,
+    maxKillAttempts: 1,
+    cwd: () => cwdValue,
+    now: () => Date.parse('2026-05-21T00:10:00.000Z'),
+    sleepImpl: async () => {},
+    execFileSyncImpl: (_file, args) => {
+      const command = String(args?.[2] || '');
+      if (command.includes('ConvertTo-Json')) return Buffer.from('[]');
+      return Buffer.from('');
+    },
+    spawnImpl: (command, args, options) => {
+      spawnCalls.push({ command, args, options });
+      return { pid: 9292, unref() {} };
+    },
+  });
+
+  const scheduled = service.scheduleRestart({ transactionId: 'tx-3', targetSessionId: 'session-c' });
+  assert.equal(scheduled.ok, true);
+  cwdValue = 'C:\\root-two';
+  await service.waitForIdle();
+
+  assert.equal(spawnCalls.length, 1);
+  assert.equal(spawnCalls[0].options.cwd, 'C:\\root-two');
+});

@@ -752,8 +752,10 @@ export function registerMessagesRoutes(app, deps) {
     uploadPathForSha,
     uploadContentUrlForSha,
     maybeApplyWorkspaceRootFromMessage,
+    updateConversationConfiguredWorkspaceRoot,
     getOrCreateConversation,
     ensureRuntimeSessionBinding,
+    resolveConversationWorkspaceState,
     linkUploadReferences,
     normalizeAttachments,
     collectReferenceAttachmentsFromText,
@@ -816,6 +818,42 @@ export function registerMessagesRoutes(app, deps) {
       sessionId: req.headers['x-relay-session-id'],
       conversationId: req.headers['x-relay-conversation-id'],
     }) || null;
+  }
+
+  function resolveConversationWorkspaceScope(req) {
+    const conversationId = String(
+      req?.query?.conversationId
+      || req?.query?.conversation_id
+      || req?.headers?.['x-conversation-id']
+      || '',
+    ).trim();
+    const sdkSessionId = String(
+      req?.query?.sdkSessionId
+      || req?.query?.sdk_session_id
+      || req?.headers?.['x-sdk-session-id']
+      || '',
+    ).trim();
+    if (!conversationId && !sdkSessionId) return null;
+    return { conversationId, sdkSessionId };
+  }
+
+  function resolveScopedWorkspaceRootPath(req) {
+    if (typeof resolveConversationWorkspaceState !== 'function') return null;
+    const scope = resolveConversationWorkspaceScope(req);
+    if (!scope) return null;
+    const state = resolveConversationWorkspaceState(scope);
+    const rootPath = String(state?.currentWorkspaceRootPath || '').trim();
+    return rootPath || null;
+  }
+
+  function scopedWorkspaceQuerySuffix(req) {
+    const scope = resolveConversationWorkspaceScope(req);
+    if (!scope) return '';
+    const params = new URLSearchParams();
+    if (scope.conversationId) params.set('conversationId', scope.conversationId);
+    if (scope.sdkSessionId) params.set('sdkSessionId', scope.sdkSessionId);
+    const text = params.toString();
+    return text ? `?${text}` : '';
   }
 
   function emitSessionWorkerTelemetry(event, {
@@ -1584,7 +1622,8 @@ export function registerMessagesRoutes(app, deps) {
 
   app.get('/api/files/*', auth, (req, res) => {
     const requestedPath = String(req.params?.[0] || '').trim();
-    const filePath = resolveWorkspaceFilePath(requestedPath);
+    const rootOverride = resolveScopedWorkspaceRootPath(req);
+    const filePath = resolveWorkspaceFilePath(requestedPath, rootOverride);
     if (!filePath) return res.status(400).json({ error: 'Invalid file path' });
 
     let meta = null;
@@ -1623,7 +1662,8 @@ export function registerMessagesRoutes(app, deps) {
   app.get('/api/files-preview/*', auth, (req, res) => {
     const requestedPath = String(req.params?.[0] || '').trim();
     const normalizedPath = normalizeWorkspaceRelativePath(requestedPath);
-    const filePath = resolveWorkspaceFilePath(requestedPath);
+    const rootOverride = resolveScopedWorkspaceRootPath(req);
+    const filePath = resolveWorkspaceFilePath(requestedPath, rootOverride);
     if (!filePath || !normalizedPath) return res.status(400).json({ error: 'Invalid file path' });
 
     let meta = null;
@@ -1670,6 +1710,7 @@ export function registerMessagesRoutes(app, deps) {
     }
 
     const normalizedWebPath = normalizedPath.replace(/\\/g, '/');
+    const scopeSuffix = scopedWorkspaceQuerySuffix(req);
     const payload = {
       ok: true,
       path: normalizedWebPath,
@@ -1680,7 +1721,7 @@ export function registerMessagesRoutes(app, deps) {
       size,
       truncated,
       previewBytes: contentBuffer.length,
-      rawUrl: `${remotePath}/api/files/${normalizedWebPath.split('/').map((part) => encodeURIComponent(part)).join('/')}`,
+      rawUrl: `${remotePath}/api/files/${normalizedWebPath.split('/').map((part) => encodeURIComponent(part)).join('/')}${scopeSuffix}`,
     };
 
     if (kind !== 'binary' && kind !== 'image') {
@@ -1694,7 +1735,13 @@ export function registerMessagesRoutes(app, deps) {
   app.get('/api/repo/tree', auth, (req, res) => {
     const includeHidden = parseBooleanQueryFlag(req.query.includeHidden, false);
     const includeHeavy = parseBooleanQueryFlag(req.query.includeHeavy, false);
-    const snapshot = buildRepositoryTreeSnapshot({ includeHidden, includeHeavy, maxNodes: MAX_REPO_TREE_NODES });
+    const rootOverride = resolveScopedWorkspaceRootPath(req);
+    const snapshot = buildRepositoryTreeSnapshot({
+      includeHidden,
+      includeHeavy,
+      maxNodes: MAX_REPO_TREE_NODES,
+      rootPath: rootOverride,
+    });
     res.setHeader('Cache-Control', 'no-store');
     res.json({
       ok: true,
@@ -1949,10 +1996,16 @@ export function registerMessagesRoutes(app, deps) {
     if (!modelResolution.ok) return res.status(400).json({ error: modelResolution.error, supportedModels: modelResolution.available || [] });
     const requestedModel = modelResolution.model;
     if (!requestedRelayMode) return res.status(400).json({ error: 'Unsupported relay mode' });
-    const workspaceRootUpdate = attachments.length === 0
-      ? maybeApplyWorkspaceRootFromMessage(trimmedText)
-      : { attempted: false, changed: false };
     const shouldCreateConversation = !!newConversation || !conversationId;
+    const conversationWorkspaceState = (!shouldCreateConversation && typeof resolveConversationWorkspaceState === 'function')
+      ? resolveConversationWorkspaceState({ conversationId })
+      : null;
+    let workspaceRootUpdate = attachments.length === 0
+      ? maybeApplyWorkspaceRootFromMessage(
+          trimmedText,
+          conversationWorkspaceState?.currentWorkspaceRootPath || null,
+        )
+      : { attempted: false, changed: false };
 
     if (!shouldCreateConversation) {
       const sessionState = getConversationSessionState(conversationId);
@@ -1998,6 +2051,36 @@ export function registerMessagesRoutes(app, deps) {
     const convId = shouldCreateConversation ? uuidv4() : conversationId;
     if (shouldCreateConversation) {
       getOrCreateConversation(convId, trimmedText || attachmentSummary(attachments) || 'Image');
+    }
+    let conversationWorkspaceRootState = null;
+    if (workspaceRootUpdate.changed && workspaceRootUpdate.resolvedPath) {
+      if (typeof updateConversationConfiguredWorkspaceRoot !== 'function') {
+        workspaceRootUpdate = {
+          ...workspaceRootUpdate,
+          changed: false,
+          error: 'Conversation workspace updates are unavailable',
+        };
+      } else {
+        const updateResult = updateConversationConfiguredWorkspaceRoot({
+          conversationId: convId,
+          rootPath: workspaceRootUpdate.resolvedPath,
+        });
+        if (!updateResult?.ok) {
+          workspaceRootUpdate = {
+            ...workspaceRootUpdate,
+            changed: false,
+            error: updateResult?.error || 'Failed to update conversation workspace root',
+          };
+        } else {
+          conversationWorkspaceRootState = updateResult?.state || null;
+          workspaceRootUpdate = {
+            ...workspaceRootUpdate,
+            changed: true,
+            rootPath: conversationWorkspaceRootState?.configuredWorkspaceRootPath || workspaceRootUpdate.resolvedPath,
+            rootName: conversationWorkspaceRootState?.configuredWorkspaceRootName || workspaceRootUpdate.rootName || null,
+          };
+        }
+      }
     }
     const convSeed = stmts.getConvSeed.get(convId);
     const shouldApplySeed = Number(convSeed?.seed_pending || 0) > 0 && String(convSeed?.summary_seed || '').trim().length > 0;
@@ -2116,11 +2199,16 @@ export function registerMessagesRoutes(app, deps) {
       sessionId,
     );
     io.emit('message_status', { messageId: msgId, conversationId: convId, status: 'pending' });
-    if (workspaceRootUpdate.changed) {
-      io.emit('workspace_root_changed', {
-        source: 'chat-cd-command',
-        commandTarget: workspaceRootUpdate.target || null,
-        ...workspaceRootPayload(),
+    if (conversationWorkspaceRootState?.conversationId) {
+      io.emit('conversation_workspace_root_updated', {
+        conversationId: conversationWorkspaceRootState.conversationId,
+        sdkSessionId: conversationWorkspaceRootState.sdkSessionId || null,
+        configuredWorkspaceRootPath: conversationWorkspaceRootState.configuredWorkspaceRootPath || null,
+        configuredWorkspaceRootName: conversationWorkspaceRootState.configuredWorkspaceRootName || null,
+        runtimeWorkspaceRootPath: conversationWorkspaceRootState.runtimeWorkspaceRootPath || null,
+        runtimeWorkspaceRootName: conversationWorkspaceRootState.runtimeWorkspaceRootName || null,
+        currentWorkspaceRootPath: conversationWorkspaceRootState.currentWorkspaceRootPath || null,
+        currentWorkspaceRootName: conversationWorkspaceRootState.currentWorkspaceRootName || null,
       });
     }
     res.json({
@@ -2562,7 +2650,12 @@ export function registerMessagesRoutes(app, deps) {
     }
     const reason = String(req.body?.reason || 'manual-request').trim().slice(0, 140) || 'manual-request';
     const requestedBy = String(req.body?.requestedBy || 'localhost-api').trim().slice(0, 80) || 'localhost-api';
-    const result = requestRelayShutdown({ reason, requestedBy });
+    const rawRestart = req.body?.restart;
+    const restart = rawRestart === true
+      || rawRestart === 1
+      || String(rawRestart || '').trim().toLowerCase() === 'true'
+      || String(rawRestart || '').trim() === '1';
+    const result = requestRelayShutdown({ reason, requestedBy, restart });
     return res.json({ ok: true, ...result });
   });
 

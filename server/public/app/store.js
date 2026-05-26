@@ -13,6 +13,7 @@ export const pendingUserMessageIds = new Set();
 export const pendingUserMessageEntries = new Map();
 export let cliOnline = false;
 export let relayOnline = false;
+export let activeRuntimeSessionCount = 0;
 export let conversations = {};
 export let selectedAttachments = [];
 export const RELAY_QUESTION_POLL_MS = 3000;
@@ -25,6 +26,7 @@ export const WORKSPACE_FILE_EXTENSIONS = new Set([
   'hpp', 'rs', 'lock', 'log', 'svg', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'pdf',
 ]);
 export let workspaceRootName = '';
+export let workspaceRootPath = '';
 export let workspaceRootEntrySet = new Set([
   '.github',
   'server',
@@ -270,11 +272,55 @@ export function fmtDate(iso) {
 
 export function updateWorkspaceRootHints(payload) {
   const rootName = String(payload?.workspaceRootName || '').trim().toLowerCase();
+  workspaceRootPath = String(payload?.workspaceRootPath || '').trim();
   const entries = Array.isArray(payload?.workspaceRootEntries) ? payload.workspaceRootEntries : [];
   workspaceRootName = rootName;
   if (entries.length) {
     workspaceRootEntrySet = new Set(entries.map((entry) => String(entry || '').trim().toLowerCase()).filter(Boolean));
   }
+}
+
+export function getConversationWorkspaceState(conversationId = currentConvId) {
+  const convId = String(conversationId || '').trim();
+  if (!convId) return null;
+  const conversation = conversations?.[convId] || null;
+  if (!conversation) return null;
+  const configuredWorkspaceRootPath = String(
+    conversation.configuredWorkspaceRootPath || conversation.configured_workspace_root_path || '',
+  ).trim();
+  const configuredWorkspaceRootName = String(
+    conversation.configuredWorkspaceRootName || conversation.configured_workspace_root_name || '',
+  ).trim();
+  const runtimeWorkspaceRootPath = String(
+    conversation.runtimeWorkspaceRootPath || conversation.runtime_workspace_root_path || '',
+  ).trim();
+  const runtimeWorkspaceRootName = String(
+    conversation.runtimeWorkspaceRootName || conversation.runtime_workspace_root_name || '',
+  ).trim();
+  const currentWorkspaceRootPath = String(
+    conversation.currentWorkspaceRootPath || conversation.current_workspace_root_path || runtimeWorkspaceRootPath || configuredWorkspaceRootPath || '',
+  ).trim();
+  const currentWorkspaceRootName = String(
+    conversation.currentWorkspaceRootName || conversation.current_workspace_root_name || runtimeWorkspaceRootName || configuredWorkspaceRootName || '',
+  ).trim();
+  return {
+    configuredWorkspaceRootPath,
+    configuredWorkspaceRootName,
+    runtimeWorkspaceRootPath,
+    runtimeWorkspaceRootName,
+    currentWorkspaceRootPath,
+    currentWorkspaceRootName,
+  };
+}
+
+export function getConversationCurrentWorkspaceRootPath(conversationId = currentConvId) {
+  return String(getConversationWorkspaceState(conversationId)?.currentWorkspaceRootPath || '').trim();
+}
+
+export function setActiveRuntimeSessionCount(value) {
+  const numeric = Number(value);
+  activeRuntimeSessionCount = Number.isFinite(numeric) && numeric > 0 ? Math.trunc(numeric) : 0;
+  updateCliStatus();
 }
 
 export function clampContextUsageRatio(value) {
@@ -398,6 +444,7 @@ export function updateCliStatus() {
   const dot = document.getElementById('cli-dot');
   const text = document.getElementById('cli-status-text');
   const banner = document.getElementById('offline-banner');
+  const changeCwdBtn = document.getElementById('chat-menu-change-cwd');
   const workerStates = Array.from(sessionWorkerStates.values());
   const processingCount = workerStates.filter((state) => String(state?.status || '').trim().toLowerCase() === 'processing').length;
   const errorCount = workerStates.filter((state) => String(state?.uiState || state?.derivedUiState || '').trim().toLowerCase() === 'error').length;
@@ -419,6 +466,10 @@ export function updateCliStatus() {
     }
   }
   if (text) text.textContent = cliOnline ? 'CLI online' : 'CLI offline';
+  if (changeCwdBtn) {
+    changeCwdBtn.disabled = false;
+    changeCwdBtn.title = 'Change the next launch CWD';
+  }
   if (banner) {
     if (cliOnline) banner.classList.remove('visible');
     else banner.classList.add('visible');

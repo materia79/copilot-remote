@@ -35,6 +35,15 @@ export function createRelayCliLauncherService({
     execFileSyncImpl: typeof execFileSyncImpl === 'function' ? execFileSyncImpl : undefined,
   });
 
+  function resolveCwd(targetSessionId = null) {
+    if (typeof cwd === 'function') {
+      const next = String(cwd(targetSessionId) || '').trim();
+      return next || process.cwd();
+    }
+    const next = String(cwd || '').trim();
+    return next || process.cwd();
+  }
+
   function getState() {
     if (!activeJob) return null;
     return {
@@ -100,7 +109,7 @@ export function createRelayCliLauncherService({
 
   function spawnSessionCli(targetSessionId) {
     const child = spawnImpl('gh', ['copilot', '--', '--allow-all', '--session-id', targetSessionId], {
-      cwd,
+      cwd: resolveCwd(targetSessionId),
       env,
       detached: true,
       stdio: 'ignore',

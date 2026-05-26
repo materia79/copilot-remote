@@ -1,4 +1,4 @@
-import { BASE, TOKEN, authHeaders, updateWorkspaceRootHints, applyContextUsageBar, readContextUsageRatio, currentConvId, conversations } from './store.js';
+import { BASE, TOKEN, authHeaders, updateWorkspaceRootHints, applyContextUsageBar, readContextUsageRatio, currentConvId, conversations, setCliOnline, setActiveRuntimeSessionCount } from './store.js';
 
 export async function apiFetch(url, opts = {}) {
   try {
@@ -27,6 +27,8 @@ export async function verifyExistingSession() {
     if (!response.ok) return false;
     const payload = await response.json().catch(() => null);
     if (payload) updateWorkspaceRootHints(payload);
+    setCliOnline(!!payload?.cliOnline);
+    setActiveRuntimeSessionCount(payload?.activeRuntimeSessionCount);
     return true;
   } catch {
     return false;
@@ -41,6 +43,8 @@ export async function verifyToken(token) {
     if (!response.ok) return false;
     const payload = await response.json().catch(() => null);
     if (payload) updateWorkspaceRootHints(payload);
+    setCliOnline(!!payload?.cliOnline);
+    setActiveRuntimeSessionCount(payload?.activeRuntimeSessionCount);
     return true;
   } catch {
     return false;
@@ -49,8 +53,35 @@ export async function verifyToken(token) {
 
 export async function refreshWorkspaceRootHints() {
   const status = await apiFetch('/api/status');
-  if (status) updateWorkspaceRootHints(status);
+  if (status) {
+    updateWorkspaceRootHints(status);
+    setCliOnline(!!status?.cliOnline);
+    setActiveRuntimeSessionCount(status?.activeRuntimeSessionCount);
+  }
   return status;
+}
+
+export async function updateWorkspaceRoot(rootPath, conversationId = null) {
+  const pathValue = String(rootPath || '').trim();
+  if (!pathValue) return null;
+  const convId = String(conversationId || '').trim();
+  const endpoint = convId
+    ? `/api/conversation/${encodeURIComponent(convId)}/workspace-root`
+    : '/api/workspace-root';
+  const response = await apiFetch(endpoint, {
+    method: 'POST',
+    body: JSON.stringify({ rootPath: pathValue }),
+  });
+  if (response && !convId) updateWorkspaceRootHints(response);
+  return response;
+}
+
+export async function launchSessionWorker(sdkSessionId) {
+  const sessionId = String(sdkSessionId || '').trim();
+  if (!sessionId) return null;
+  return apiFetch(`/api/session-worker/${encodeURIComponent(sessionId)}/launch`, {
+    method: 'POST',
+  });
 }
 
 export async function loadUsageSummary() {
@@ -133,6 +164,18 @@ export async function killSessionWorker(sdkSessionId, body = {}) {
   });
 }
 
+export async function requestRelayRestart(body = {}) {
+  return apiFetch('/api/relay/shutdown', {
+    method: 'POST',
+    body: JSON.stringify({
+      reason: 'manual-restart',
+      requestedBy: 'localhost-api',
+      restart: true,
+      ...(body || {}),
+    }),
+  });
+}
+
 export async function sendMessage(body) {
   return apiFetch('/api/message', { method: 'POST', body: JSON.stringify(body) });
 }
@@ -204,11 +247,14 @@ export async function uploadAttachment(item) {
   return response.json();
 }
 
-export async function loadRepoTree(includeHidden = false, includeHeavy = false) {
-  return apiFetch(`/api/repo/tree?${new URLSearchParams({
+export async function loadRepoTree(includeHidden = false, includeHeavy = false, conversationId = null) {
+  const params = new URLSearchParams({
     includeHidden: includeHidden ? '1' : '0',
     includeHeavy: includeHeavy ? '1' : '0',
-  }).toString()}`);
+  });
+  const convId = String(conversationId || '').trim();
+  if (convId) params.set('conversationId', convId);
+  return apiFetch(`/api/repo/tree?${params.toString()}`);
 }
 
 export async function loadDrivesRoots() {
@@ -221,11 +267,13 @@ export async function loadDriveChildren(pathValue, includeHidden = false) {
   return apiFetch(`/api/drives/list?path=${encodeURIComponent(path)}&includeHidden=${includeHidden ? '1' : '0'}`);
 }
 
-export async function loadWorkspaceFilePreview(pathValue) {
+export async function loadWorkspaceFilePreview(pathValue, conversationId = null) {
   const path = String(pathValue || '').trim();
   if (!path) return null;
   const encodedPath = path.split('/').map((segment) => encodeURIComponent(segment)).join('/');
-  return apiFetch(`/api/files-preview/${encodedPath}`);
+  const convId = String(conversationId || '').trim();
+  const suffix = convId ? `?conversationId=${encodeURIComponent(convId)}` : '';
+  return apiFetch(`/api/files-preview/${encodedPath}${suffix}`);
 }
 
 export async function loadDriveFilePreview(pathValue) {

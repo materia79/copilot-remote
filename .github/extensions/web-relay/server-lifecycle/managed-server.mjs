@@ -23,8 +23,11 @@ export function createManagedServerLifecycle({
   let restartTimer = null;
   let restartAttempts = 0;
   let attemptedSqliteRepair = false;
+  const RELAY_SUPERVISED_ENV = "COPILOT_WEB_RELAY_SUPERVISED";
 
   const RESTART_BACKOFF_MS = [1000, 2000, 5000, 10000, 20000];
+  // Keep in sync with server/relay-exit-codes.mjs
+  const RELAY_RESTART_EXIT_CODE = 75;
   const STARTUP_LOG_TAIL_BYTES = 24 * 1024;
   const STATUS_PATH = "/api/status";
   const RELAY_PORT = 3333;
@@ -266,7 +269,7 @@ export function createManagedServerLifecycle({
         fs.mkdirSync(logDir, { recursive: true });
         managedServerStdoutFd = fs.openSync(serverLogPath, "a");
         managedServerStderrFd = fs.openSync(serverErrPath, "a");
-        const startupWorkspaceRoot = String(process.env.COPILOT_WORKSPACE_ROOT || process.cwd() || "").trim() || process.cwd();
+        const startupWorkspaceRoot = String(process.env.COPILOT_WORKSPACE_ROOT || "").trim();
 
         dbg("starting managed web server", serverDir);
         managedServerOwned = true;
@@ -275,22 +278,40 @@ export function createManagedServerLifecycle({
         if (legacyOwnerPidWatchdog) {
           serverArgs.push("--owner-pid", String(process.pid));
         }
+        const serverEnv = { ...process.env, [RELAY_SUPERVISED_ENV]: "1" };
+        if (startupWorkspaceRoot) {
+          serverEnv.COPILOT_WORKSPACE_ROOT = startupWorkspaceRoot;
+        }
         managedServerProc = spawn(nodeBin, serverArgs, {
           cwd: serverDir,
-          env: { ...process.env, COPILOT_WORKSPACE_ROOT: startupWorkspaceRoot },
+          env: serverEnv,
           stdio: ["ignore", managedServerStdoutFd, managedServerStderrFd],
           detached: persistentManagedServer || process.platform !== "win32",
           windowsHide: false,
         });
 
         managedServerProc.once("exit", (code, signal) => {
-          dbg("managed web server exited", `code=${code ?? "null"}`, `signal=${signal ?? "none"}`);
+          const normalizedCode = Number.isInteger(Number(code)) ? Number(code) : null;
+          const intentionalRestart = normalizedCode === RELAY_RESTART_EXIT_CODE;
+          dbg(
+            "managed web server exited",
+            `code=${code ?? "null"}`,
+            `signal=${signal ?? "none"}`,
+            intentionalRestart ? "intentionalRestart=true" : "intentionalRestart=false",
+          );
           const shouldRestart = desiredRunning && managedServerOwned && !stoppingManagedServer;
           closeManagedServerStreams();
           managedServerProc = null;
           managedServerOwned = false;
           if (shouldRestart) {
-            scheduleManagedServerRestart("process-exit");
+            if (intentionalRestart) {
+              restartAttempts = 0;
+              void ensureManagedServer().catch((error) => {
+                dbg("managed web server immediate restart failed", error?.message || String(error));
+              });
+            } else {
+              scheduleManagedServerRestart("process-exit");
+            }
           }
         });
 

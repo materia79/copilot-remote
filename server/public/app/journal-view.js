@@ -3,6 +3,7 @@ import {
   currentConvId,
   fmtDate,
   escHtml,
+  repoBrowserState,
   getSessionWorkerState,
   resolveConversationUiState,
   setCurrentConv,
@@ -25,7 +26,7 @@ import {
 import { renderMessages, restoreInFlightThinking } from './conversation-view.js';
 import { loadRelayQuestions, getPendingQuestionCountsByConversation } from './ask-user-view.js';
 import { loadRelayBoards } from './relay-board-view.js';
-import { clearAttachments, setRepoBrowserSessionInfo } from './attachments-view.js';
+import { clearAttachments, setRepoBrowserSessionInfo, loadRepoBrowserTree } from './attachments-view.js';
 import { shouldApplyConversationLoad } from './activity-replay-state.mjs';
 
 const PROCESSING_DOT_FRAMES = ['   ', '.  ', '.. ', '...'];
@@ -118,6 +119,7 @@ export function applyLoadedConversationState(id, response, { restoreScroll = fal
     setRepoBrowserSessionInfo('', '');
     restoreInFlightThinking(null);
     renderMessages([]);
+    window.syncChatTitleControls?.();
     return;
   }
   if (conversations[id]) {
@@ -125,6 +127,12 @@ export function applyLoadedConversationState(id, response, { restoreScroll = fal
       ...conversations[id],
       preferredRelayMode: response.preferredRelayMode ?? conversations[id].preferredRelayMode,
       preferredModelsByMode: response.preferredModelsByMode ?? conversations[id].preferredModelsByMode,
+      configuredWorkspaceRootPath: response.configuredWorkspaceRootPath ?? conversations[id].configuredWorkspaceRootPath ?? null,
+      configuredWorkspaceRootName: response.configuredWorkspaceRootName ?? conversations[id].configuredWorkspaceRootName ?? null,
+      runtimeWorkspaceRootPath: response.runtimeWorkspaceRootPath ?? conversations[id].runtimeWorkspaceRootPath ?? null,
+      runtimeWorkspaceRootName: response.runtimeWorkspaceRootName ?? conversations[id].runtimeWorkspaceRootName ?? null,
+      currentWorkspaceRootPath: response.currentWorkspaceRootPath ?? conversations[id].currentWorkspaceRootPath ?? null,
+      currentWorkspaceRootName: response.currentWorkspaceRootName ?? conversations[id].currentWorkspaceRootName ?? null,
     };
   }
   window.applyConversationPreferences?.(id, {
@@ -132,9 +140,13 @@ export function applyLoadedConversationState(id, response, { restoreScroll = fal
     preferredModelsByMode: response.preferredModelsByMode,
   });
   setRepoBrowserSessionInfo(response.sessionRootPath || '', response.sessionRootName || response.title || '');
+  if (repoBrowserState.open && repoBrowserState.activeRoot === 'workspace') {
+    void loadRepoBrowserTree();
+  }
   renderMessages(response.messages, !restoreScroll, response);
   restoreInFlightThinking(response.inFlight || null);
   updateSessionPill(conversations[id], response.runtimeSession || null);
+  window.syncChatTitleControls?.();
   if (!restoreScroll) return;
   const el = document.getElementById('messages');
   if (!el) return;
@@ -150,6 +162,16 @@ export function applyLoadedConversationState(id, response, { restoreScroll = fal
 export async function openConversation(id, options = {}) {
   const capturedVersion = ++openConversationVersion;
   setCurrentConv(id);
+  if (repoBrowserState.activeRoot === 'workspace') {
+    repoBrowserState.tree = null;
+    repoBrowserState.nodeMap = new Map();
+    repoBrowserState.currentPath = '';
+    repoBrowserState.truncated = false;
+    repoBrowserState.nodeCount = 0;
+    repoBrowserState.maxNodes = 0;
+    repoBrowserState.loadingPath = '';
+    repoBrowserState.error = '';
+  }
   closeSidebar();
   clearAttachments();
   document.getElementById('chat-title').textContent = conversations[id]?.title || id;
@@ -157,6 +179,9 @@ export async function openConversation(id, options = {}) {
   updateSessionPill(conversations[id], null);
   updateCompactButton();
   renderConvList();
+  if (repoBrowserState.open && repoBrowserState.activeRoot === 'workspace') {
+    void loadRepoBrowserTree();
+  }
 
   const savedScrollTop = loadConversationScrollTop(id);
   const restoreScroll = Number.isFinite(savedScrollTop);

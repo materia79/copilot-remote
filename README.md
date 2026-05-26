@@ -144,6 +144,18 @@ When the CLI extension connects, it also prints the relay info window (local/net
 Respawner scripts (`start:server:respawn*`) are legacy/manual troubleshooting tools only and are not part of the extension-managed startup path.
 Do not use them for manual restarts; use `POST /api/relay/shutdown` instead.
 
+Manual relay control details:
+
+- `POST /api/relay/shutdown` without `restart` queues a normal relay shutdown.
+- `POST /api/relay/shutdown` with `restart: true` queues an intentional self-restart.
+- Requests are localhost-only and still require relay auth.
+- The relay waits until the queue is idle before acting; this endpoint does not interrupt an in-flight turn.
+- `/api/status` exposes the queued relay exit state as `relayShutdown` so the UI/logs can distinguish idle, queued, and shutting-down restart/shutdown flows.
+- Self-restart stays owner-aware:
+  - extension-managed mode restarts under the extension-managed server lifecycle
+  - `npm start` restarts under `server/start.js`
+  - bare `node server/server.js` now follows the `playground/scripts/self_restart` pattern: `server.js` stays attached as the supervisor and respawns a worker child in the same terminal session
+
 ### Global npm command (Windows first)
 
 You can install the repo locally and get a global `copilot-remote` command without publishing:
@@ -177,7 +189,7 @@ Roadmap for later launcher modes:
 - Answer clarification prompts in relay question cards (from `ask_user`).
 - Use the usage button (`📊`) for live Copilot usage summary.
 - Use the **Context** button to read the latest token/context metrics in a modal from local session-state events, with a clearly labeled lower-bound fallback when newer sessions no longer emit the full legacy bucket breakdown.
-- Workspace browsing is locked to the Copilot CLI startup CWD (your active repo root) and does not retarget via chat `cd ...` commands.
+- Workspace browsing follows the selected CLI session's effective CWD. Running sessions keep their learned runtime CWD, menu changes update the next-launch CWD, and chat `cd ...` commands do not retarget the browser.
 
 ## Relay modes
 
@@ -283,6 +295,7 @@ If the same extension is available both project-local (`.github/extensions/web-r
 Common routes:
 
 - Browser/API: `/api/message`, `/api/conversations`, `/api/conversation/:id`, `/api/status`, `/api/models`, `/api/usage`
+- Relay control: `/api/relay/shutdown`, `/api/relay/pause`, `/api/relay/resume`
 - CLI bridge: `/api/pending`, `/api/response`, `/api/activity`, `/api/heartbeat`
 - Questions: `/api/relay-question`, `/api/relay-question/:id`, `/api/relay-question/:id/answer`
 - File access: `/api/files/*`, `/api/files-preview/*`, `/api/repo/tree`, `/api/drives/*`

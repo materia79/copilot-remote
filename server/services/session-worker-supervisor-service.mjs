@@ -77,7 +77,12 @@ export function createSessionWorkerSupervisor({
   const idleTimeoutMs = clampInt(idleEvictionMs, 0);
   const heartbeatStaleAfterMs = Math.max(1_000, clampInt(heartbeatTimeoutMs, 30_000));
   const recoveryGraceMs = Math.max(0, clampInt(degradedRecoveryGraceMs, 10_000));
-  const planReference = normalizeSessionId(diagnosticPlanReference);
+  function resolvePlanReference() {
+    const value = typeof diagnosticPlanReference === 'function'
+      ? diagnosticPlanReference()
+      : diagnosticPlanReference;
+    return normalizeSessionId(value);
+  }
 
   function emitMonitorLog(message) {
     if (typeof log === 'function') {
@@ -163,7 +168,7 @@ export function createSessionWorkerSupervisor({
       readyWithoutHeartbeatMs: lifecycle.awaitingHeartbeat && lifecycle.launchAtMs
         ? Math.max(0, nowMs() - lifecycle.launchAtMs)
         : 0,
-      diagnosticPlanReference: planReference || null,
+      diagnosticPlanReference: resolvePlanReference() || null,
     };
   }
 
@@ -208,8 +213,9 @@ export function createSessionWorkerSupervisor({
     const readyWithoutHeartbeatMs = lifecycle.launchAtMs
       ? Math.max(0, nowAtMs - lifecycle.launchAtMs)
       : 0;
+    const plan = resolvePlanReference();
     emitMonitorLog(
-      `[worker-monitor] session=${sessionId} reason=${String(reason || 'unknown')} mode=${String(lifecycle.launchMode || 'unknown')} pid=${pid || 'none'} readyWithoutHeartbeatMs=${readyWithoutHeartbeatMs}${planReference ? ` plan=${planReference}` : ''}`,
+      `[worker-monitor] session=${sessionId} reason=${String(reason || 'unknown')} mode=${String(lifecycle.launchMode || 'unknown')} pid=${pid || 'none'} readyWithoutHeartbeatMs=${readyWithoutHeartbeatMs}${plan ? ` plan=${plan}` : ''}`,
     );
     setLifecycle(sessionId, { monitorLoggedAtMs: nowAtMs });
   }
@@ -773,4 +779,3 @@ export function createSessionWorkerSupervisor({
     snapshot,
   };
 }
-

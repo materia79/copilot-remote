@@ -143,6 +143,41 @@ test('api relay shutdown accepts localhost request and queues shutdown', () => {
   assert.equal(res.payload?.status, 'queued');
   assert.equal(calls.length, 1);
   assert.equal(calls[0].reason, 'manual-restart');
+  assert.equal(calls[0].restart, false);
+});
+
+test('api relay shutdown accepts restart intent and forwards restart flag', () => {
+  const handlers = {};
+  const app = {
+    post(path, ...fns) { handlers[path] = fns[fns.length - 1]; },
+    get() {},
+  };
+  const calls = [];
+  registerMessagesRoutes(app, createBaseDeps({
+    requestRelayShutdown: (request) => {
+      calls.push(request);
+      return { accepted: true, status: 'queued', action: 'restart', restart: true, reason: request.reason };
+    },
+  }));
+
+  const handler = handlers['/api/relay/shutdown'];
+  assert.equal(typeof handler, 'function');
+
+  const res = createResponseRecorder();
+  handler({
+    ip: '::ffff:127.0.0.1',
+    socket: { remoteAddress: '::ffff:127.0.0.1' },
+    body: { reason: 'self-restart', restart: true },
+  }, res);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.payload?.ok, true);
+  assert.equal(res.payload?.status, 'queued');
+  assert.equal(res.payload?.action, 'restart');
+  assert.equal(res.payload?.restart, true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].reason, 'self-restart');
+  assert.equal(calls[0].restart, true);
 });
 
 test('api relay shutdown rejects non-localhost callers', () => {

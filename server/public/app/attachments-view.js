@@ -5,9 +5,12 @@ import {
   FILE_PREVIEW_MAX_BYTES,
   MAX_UPLOAD_ATTACHMENTS,
   REPO_IMAGE_EXTENSIONS,
+  currentConvId,
   selectedAttachments,
   filePreviewState,
   repoBrowserState,
+  workspaceRootPath,
+  getConversationCurrentWorkspaceRootPath,
 } from './store.js';
 import {
   uploadAttachment,
@@ -30,12 +33,37 @@ import {
   eventClosest,
 } from './router.js';
 
+function currentConversationId() {
+  return String(currentConvId || '').trim();
+}
+
+function currentWorkspaceRootPathForSelection() {
+  return String(getConversationCurrentWorkspaceRootPath(currentConversationId()) || workspaceRootPath || '').trim();
+}
+
+function currentWorkspaceScopeSuffix() {
+  const convId = currentConversationId();
+  return convId ? `?conversationId=${encodeURIComponent(convId)}` : '';
+}
+
 function setFilePreviewState(next) {
   Object.assign(filePreviewState, next);
 }
 
 function setRepoBrowserState(next) {
   Object.assign(repoBrowserState, next);
+}
+
+let repoBrowserReloadQueued = false;
+
+function flushQueuedRepoBrowserReload() {
+  if (!repoBrowserState.open) {
+    repoBrowserReloadQueued = false;
+    return;
+  }
+  if (!repoBrowserReloadQueued || repoBrowserState.loading) return;
+  repoBrowserReloadQueued = false;
+  void loadRepoBrowserTree();
 }
 
 export function renderAttachmentMarkup(attachments) {
@@ -478,7 +506,7 @@ export function renderFilePreview() {
     ? driveFileHrefFromPath(filePreviewState.path)
     : filePreviewState.source === 'upload'
       ? String(payload?.rawUrl || '')
-      : `${BASE}/api/files/${filePreviewState.path.split('/').map((s) => encodeURIComponent(s)).join('/')}`;
+      : `${BASE}/api/files/${filePreviewState.path.split('/').map((s) => encodeURIComponent(s)).join('/')}${currentWorkspaceScopeSuffix()}`;
   rawLink.href = rawHref || '#';
   const fallbackName = String(filePreviewState.path || '').split('/').filter(Boolean).pop() || 'download';
   rawLink.setAttribute('download', String(payload?.name || fallbackName));
@@ -574,7 +602,7 @@ export async function openWorkspaceFilePreview(rawPath) {
   modal.setAttribute('aria-hidden', 'false');
   renderFilePreview();
 
-  const payload = await loadWorkspaceFilePreview(normalized);
+  const payload = await loadWorkspaceFilePreview(normalized, currentConversationId());
   if (!payload || payload.error) {
     filePreviewState.loading = false;
     filePreviewState.error = payload?.error || 'Failed to load file preview';
@@ -641,6 +669,24 @@ export function normalizeRepoPath(pathValue) {
   return normalizeWorkspaceMentionPath(pathValue);
 }
 
+function joinWindowsPath(basePath, relativePath) {
+  const root = String(basePath || '').trim().replace(/[\\/]+$/, '');
+  const rel = String(relativePath || '').trim().replace(/^[\\/]+/, '').replace(/\//g, '\\');
+  if (!root) return rel;
+  if (!rel) return root;
+  return `${root}\\${rel}`;
+}
+
+export function getRepoBrowserLaunchCwdPath() {
+  const currentPath = String(repoBrowserState.currentPath || '').trim();
+  const activeWorkspaceRoot = currentWorkspaceRootPathForSelection();
+  if (!currentPath) return activeWorkspaceRoot;
+  if (repoBrowserState.activeRoot === 'workspace') {
+    return joinWindowsPath(activeWorkspaceRoot, currentPath);
+  }
+  return normalizeDriveBrowserPath(currentPath) || currentPath.replace(/\\/g, '/');
+}
+
 export function repoNodeMapFromTree(root) {
   const map = new Map();
   function walk(node) {
@@ -659,7 +705,7 @@ export function repoRawHref(pathValue) {
   if (repoBrowserState.activeRoot !== 'workspace') {
     return `${BASE}/api/drives/file?path=${encodeURIComponent(String(pathValue || ''))}`;
   }
-  return `${BASE}/api/files/${String(pathValue || '').split('/').map((segment) => encodeURIComponent(segment)).join('/')}`;
+  return `${BASE}/api/files/${String(pathValue || '').split('/').map((segment) => encodeURIComponent(segment)).join('/')}${currentWorkspaceScopeSuffix()}`;
 }
 
 export function repoIcon(node) {
@@ -930,7 +976,11 @@ export function renderRepoBrowser() {
 }
 
 export async function loadRepoBrowserTree() {
-  if (repoBrowserState.loading) return;
+  if (repoBrowserState.loading) {
+    repoBrowserReloadQueued = true;
+    return;
+  }
+  repoBrowserReloadQueued = false;
   repoBrowserState.loading = true;
   repoBrowserState.loadingPath = '';
   repoBrowserState.error = '';
@@ -938,16 +988,24 @@ export async function loadRepoBrowserTree() {
 
   const workspaceRoot = repoBrowserState.activeRoot === 'workspace';
   const sessionRoot = repoBrowserState.activeRoot === 'session';
+  const requestedConversationId = workspaceRoot ? currentConversationId() : '';
   const payload = workspaceRoot
-    ? await loadRepoTree(repoBrowserState.workspaceIncludeHidden, repoBrowserState.workspaceIncludeHeavy)
+    ? await loadRepoTree(repoBrowserState.workspaceIncludeHidden, repoBrowserState.workspaceIncludeHeavy, requestedConversationId)
     : (sessionRoot
       ? await loadDriveChildren(normalizeDriveBrowserPath(repoBrowserState.sessionRootPath), repoBrowserState.drivesIncludeHidden)
       : await loadDrivesRoots());
+  if (workspaceRoot && requestedConversationId !== currentConversationId()) {
+    repoBrowserState.loading = false;
+    repoBrowserReloadQueued = true;
+    flushQueuedRepoBrowserReload();
+    return;
+  }
   const rootNode = payload?.root || payload?.node || null;
   if (!payload || payload.error || !rootNode) {
     repoBrowserState.loading = false;
     repoBrowserState.error = payload?.error || (workspaceRoot ? 'Failed to load repository tree.' : (sessionRoot ? 'Failed to load session tree.' : 'Failed to load drives.'));
     renderRepoBrowser();
+    flushQueuedRepoBrowserReload();
     return;
   }
 
@@ -968,6 +1026,7 @@ export async function loadRepoBrowserTree() {
     repoBrowserState.currentPath = '';
   }
   renderRepoBrowser();
+  flushQueuedRepoBrowserReload();
 }
 
 export async function ensureDriveChildrenLoaded(pathValue) {
@@ -1071,7 +1130,9 @@ export function openRepoBrowser() {
   modal.classList.add('visible');
   modal.setAttribute('aria-hidden', 'false');
   repoBrowserState.open = true;
-  if (!repoBrowserState.tree) {
+  if (repoBrowserState.activeRoot === 'workspace') {
+    void loadRepoBrowserTree();
+  } else if (!repoBrowserState.tree) {
     void loadRepoBrowserTree();
   } else {
     renderRepoBrowser();

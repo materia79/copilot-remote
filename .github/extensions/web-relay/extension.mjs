@@ -34,8 +34,9 @@ import { createSessionIoHelpers } from "./runtime/session-io.mjs";
 import { resolveSessionBinding } from "./runtime/session-binding.mjs";
 import { createBannerStateStore } from "./runtime/banner-state.mjs";
 import { clearSession, registerSession } from "./runtime/session-registry.mjs";
-import { syncSessionToServer } from "./runtime/session-sync-bridge.mjs";
+import { syncSessionToServer, syncWorkspaceRootToServer } from "./runtime/session-sync-bridge.mjs";
 import { joinSessionWithRetry } from "./runtime/session-join-retry.mjs";
+import { resolveWorkspaceRootPath } from "./runtime/workspace-root.mjs";
 
 const SERVER_URL   = "http://localhost:3333";
 const POLL_MS      = 2000;
@@ -172,6 +173,14 @@ function getCurrentConversationId() {
   return conversationId || null;
 }
 
+function getCurrentWorkspaceRootPath() {
+  return resolveWorkspaceRootPath({
+    session,
+    env: process.env,
+    cwd: process.cwd(),
+  });
+}
+
 function normalizeRelayScopeValue(value) {
   const text = String(value || "").trim();
   return text || null;
@@ -268,9 +277,29 @@ async function syncActiveSession(reason, forceSync = false) {
   if (!activeSession?.sdkSessionId || !activeSession?.conversationId) return false;
 
   try {
-    return await syncSessionToServer(activeSession.sdkSessionId, activeSession.conversationId, api, forceSync);
+    return await syncSessionToServer(activeSession.sdkSessionId, activeSession.conversationId, api, forceSync, {
+      workspaceRootPath: getCurrentWorkspaceRootPath(),
+    });
   } catch (e) {
     dbg("session sync failed:", reason, e?.message || String(e));
+    return false;
+  }
+}
+
+async function syncStartupWorkspaceRoot(reason = "startup") {
+  const currentWorkspaceRootPath = resolveWorkspaceRootPath({
+    session,
+    env: process.env,
+    cwd: process.cwd(),
+    includeProcessCwd: false,
+  });
+  if (!currentWorkspaceRootPath) return false;
+  try {
+    return await syncWorkspaceRootToServer(currentWorkspaceRootPath, api, {
+      sdkSessionId: String(session?.sessionId || "").trim() || null,
+    });
+  } catch (e) {
+    dbg("workspace root sync failed:", reason, e?.message || String(e));
     return false;
   }
 }
@@ -320,7 +349,9 @@ async function ensureSessionForConversation(conversationId, reason = "dequeue") 
 
   if (binding?.canClaim === true && binding?.activeSessionId) {
     try {
-      await syncSessionToServer(binding.activeSessionId, convId, api, true);
+      await syncSessionToServer(binding.activeSessionId, convId, api, true, {
+        workspaceRootPath: getCurrentWorkspaceRootPath(),
+      });
       registerSession(binding.activeSessionId, convId);
       return {
         ok: true,
@@ -720,6 +751,7 @@ session = await joinSessionWithRetry({
   hooks: {
     onSessionStart: async () => {
       dbg("onSessionStart fired");
+      await syncStartupWorkspaceRoot("onSessionStart");
       try {
         await ensureRelayActive("onSessionStart");
       } catch (e) {

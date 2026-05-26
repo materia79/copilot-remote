@@ -141,6 +141,21 @@ test("spawns relay once when probe is unreachable and waits until ready", async 
   assert.equal(spawned.length, 1);
 });
 
+test("managed server marks spawned relay as supervised", async (t) => {
+  let calls = 0;
+  const { lifecycle, spawned } = createLifecycleHarness(t, {
+    api: async () => {
+      calls += 1;
+      if (calls <= 2) throw new Error("fetch failed");
+      return { ok: true };
+    },
+  });
+  const started = await lifecycle.ensureManagedServer();
+  assert.equal(started, true);
+  assert.equal(spawned.length, 1);
+  assert.equal(spawned[0].args[2].env.COPILOT_WEB_RELAY_SUPERVISED, "1");
+});
+
 test("concurrent startup calls share one spawn attempt", async (t) => {
   let calls = 0;
   const { lifecycle, spawned } = createLifecycleHarness(t, {

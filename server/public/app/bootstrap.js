@@ -9,6 +9,9 @@ import {
   relayQuestionDrafts,
   relayActivities,
   repoBrowserState,
+  workspaceRootPath,
+  getConversationWorkspaceState,
+  getConversationCurrentWorkspaceRootPath,
   pendingUserMessageIds,
   escHtml,
   setToken,
@@ -18,6 +21,7 @@ import {
   setCurrentConv,
   updateWorkspaceRootHints,
   updateCliStatus,
+  cliOnline,
   openSidebar,
   closeSidebar,
   updateCompactButton,
@@ -56,6 +60,9 @@ import {
   updateConversationTitle,
   updateConversationPreferences,
   killSessionWorker,
+  requestRelayRestart,
+  updateWorkspaceRoot,
+  launchSessionWorker,
   scheduleContextUsageRefresh,
 } from './api-client.js';
 import { loadConversations, refreshConversations, openConversation, renderConvList, applyLoadedConversationState } from './journal-view.js';
@@ -66,6 +73,7 @@ import { loadRelayBoards, renderRelayBoards, upsertRelayBoard, submitRelayBoardA
 import { showThinking, removeThinking, renderThinkingActivities, appendThinkingActivity, applyRelayStreamEvent, clearRelayStreamStateForMessage, restoreInFlightThinking, applyConversationTurnStatus, renderMessages, appendMessage, compactCurrentConversation, sendMessage, handleKey, getConversationLoadedMessageCount, loadOlderConversationMessages, syncComposerControlState, getRenderedConversationMessageFingerprints } from './conversation-view.js';
 import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { handleAttachmentInput, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
+import { getRepoBrowserLaunchCwdPath } from './attachments-view.js';
 import { initEmojiPicker, toggleEmojiPicker } from './emoji-view.js';
 import {
   resolveConversationComposerSelection,
@@ -73,6 +81,7 @@ import {
   normalizePreferredModelsByMode,
 } from './conversation-preferences.mjs';
 import { isLikelyLiveDuplicateMessage } from './live-message-dedupe.mjs';
+import { stripRelayPromptContext } from './relay-prompt-sanitizer.mjs';
 
 const MODEL_STORAGE_KEY = 'copilot_selected_model';
 const MODE_STORAGE_KEY = 'copilot_selected_mode';
@@ -81,6 +90,8 @@ const FALLBACK_MODEL = 'gpt-5.4-mini';
 const FALLBACK_MODE = 'agent';
 const THEME_COLOR_BASE = '#0d1117';
 const THEME_COLOR_IMMERSIVE = '#161b22';
+const KNOWN_CWD_HISTORY_KEY = 'copilot_known_cwds';
+const MAX_KNOWN_CWD_HISTORY = 12;
 const MODEL_LABELS = {
   'gpt-5.4': 'GPT-5.4',
   'gpt-5.4-mini': 'GPT-5.4 Mini',
@@ -107,6 +118,7 @@ let chatTitleEditingConversationId = null;
 const INSTALLED_DISPLAY_MODE_QUERIES = ['(display-mode: standalone)', '(display-mode: fullscreen)'];
 let pendingInstalledFullscreenGesture = false;
 let relayQuestionRenderHash = '';
+let changeCwdInFlight = false;
 let modelCatalogState = {
   models: [FALLBACK_MODEL],
   currentModel: FALLBACK_MODEL,
@@ -1037,6 +1049,220 @@ function lockChatActionsMenuShield(ms = 300) {
   }, Math.max(150, Number(ms) || 300));
 }
 
+function normalizeKnownCwdPath(value) {
+  return String(value || '').trim().replace(/[\\/]+$/, '');
+}
+
+function readKnownCwdHistory() {
+  const raw = String(localStorage.getItem(KNOWN_CWD_HISTORY_KEY) || '').trim();
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((value) => normalizeKnownCwdPath(value))
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function rememberKnownCwdPath(pathValue) {
+  const nextPath = normalizeKnownCwdPath(pathValue);
+  if (!nextPath) return [];
+  const existing = readKnownCwdHistory().filter((item) => item.toLowerCase() !== nextPath.toLowerCase());
+  existing.unshift(nextPath);
+  const trimmed = existing.slice(0, MAX_KNOWN_CWD_HISTORY);
+  localStorage.setItem(KNOWN_CWD_HISTORY_KEY, JSON.stringify(trimmed));
+  return trimmed;
+}
+
+function buildKnownCwdOptions() {
+  const options = [];
+  const seen = new Set();
+  const add = (label, value, note = '') => {
+    const pathValue = normalizeKnownCwdPath(value);
+    if (!pathValue) return;
+    const key = pathValue.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    options.push({ label, path: pathValue, note });
+  };
+
+  const selectedCurrentCwd = getSelectedConversationCurrentCwd();
+  add('Current session CWD', selectedCurrentCwd, 'Selected session');
+  add('Relay workspace', workspaceRootPath, 'Relay host cwd');
+  const browserCwd = normalizeKnownCwdPath(getRepoBrowserLaunchCwdPath());
+  if (browserCwd && browserCwd.toLowerCase() !== normalizeKnownCwdPath(selectedCurrentCwd).toLowerCase()) {
+    add('Current browser folder', browserCwd, 'From file explorer');
+  }
+  const history = readKnownCwdHistory();
+  history.forEach((pathValue, index) => {
+    add(`Recent CWD ${index + 1}`, pathValue, 'Previously selected');
+  });
+  return options;
+}
+
+function renderKnownCwdSelectOptions(options, selectedPath) {
+  return options.map((option) => {
+    const selected = normalizeKnownCwdPath(option.path).toLowerCase() === normalizeKnownCwdPath(selectedPath).toLowerCase();
+    const label = option.note ? `${option.label} — ${option.path}` : `${option.label} — ${option.path}`;
+    return `<option value="${escHtml(option.path)}"${selected ? ' selected' : ''}>${escHtml(label)}</option>`;
+  }).join('');
+}
+
+function getSelectedConversationWorkspaceState() {
+  return getConversationWorkspaceState(currentConvId) || null;
+}
+
+function getSelectedConversationCurrentCwd() {
+  return normalizeKnownCwdPath(getConversationCurrentWorkspaceRootPath(currentConvId) || '');
+}
+
+function syncChatHeaderWorkspaceLabel() {
+  const labelEl = document.getElementById('chat-title-cwd');
+  if (!labelEl) return;
+  const convId = String(currentConvId || '').trim();
+  const cwd = getSelectedConversationCurrentCwd();
+  if (!convId || !cwd) {
+    labelEl.hidden = true;
+    labelEl.textContent = '';
+    labelEl.removeAttribute('title');
+    return;
+  }
+  labelEl.hidden = false;
+  labelEl.textContent = cwd;
+  labelEl.title = cwd;
+}
+
+function getCurrentLaunchableSessionId() {
+  const conversation = conversations?.[currentConvId] || null;
+  return String(conversation?.sdkSessionId || conversation?.sdk_session_id || '').trim();
+}
+
+function isSelectedSessionRunning() {
+  const conversation = conversations?.[currentConvId] || null;
+  const status = String(conversation?.runtimeSessionStatus || conversation?.runtime_session_status || '').trim().toLowerCase();
+  return ['starting', 'ready', 'processing'].includes(status);
+}
+
+function openChangeCwdModal() {
+  const options = buildKnownCwdOptions();
+  const workspaceState = getSelectedConversationWorkspaceState();
+  const currentCwd = normalizeKnownCwdPath(workspaceState?.currentWorkspaceRootPath || '');
+  const nextLaunchCwd = normalizeKnownCwdPath(workspaceState?.configuredWorkspaceRootPath || '');
+  const defaultPath = nextLaunchCwd || normalizeKnownCwdPath(getRepoBrowserLaunchCwdPath()) || currentCwd || normalizeKnownCwdPath(workspaceRootPath) || options[0]?.path || '';
+  const optionsHtml = options.length
+    ? renderKnownCwdSelectOptions(options, defaultPath)
+    : '<option value="">No known CWDs available</option>';
+  const launchableSessionId = getCurrentLaunchableSessionId();
+  const launchDisabledReason = !launchableSessionId
+    ? 'Open a conversation with a bound session before launching.'
+    : (isSelectedSessionRunning() ? 'Selected CLI is already running.' : '');
+  openSummaryModal({
+    title: 'Change CWD',
+    subtitle: 'Select a known launch directory',
+    kind: 'change-cwd',
+    bodyHtml: `
+      <p style="margin-bottom:10px;color:var(--muted);line-height:1.45">
+        Pick the selected session's persisted next-launch directory. Running CLIs keep their current CWD until the next launch.
+      </p>
+      <div style="display:grid;gap:4px;margin-bottom:10px;font-size:0.78rem;color:var(--muted)">
+        <div><strong style="color:var(--text)">Current CWD:</strong> ${escHtml(currentCwd || 'Unknown')}</div>
+        <div><strong style="color:var(--text)">Next launch:</strong> ${escHtml(nextLaunchCwd || currentCwd || 'Unknown')}</div>
+      </div>
+      <label style="display:flex;flex-direction:column;gap:8px;font-size:0.84rem;color:var(--muted)">
+        <span>Known CWDs</span>
+        <select id="change-cwd-select" style="width:100%;min-width:0;height:38px;border:1px solid var(--border);border-radius:8px;background:var(--bg3);color:var(--text);padding:0 10px;font:inherit">
+          ${optionsHtml}
+        </select>
+      </label>
+      <div id="change-cwd-details" style="margin-top:10px;font-size:0.78rem;color:var(--muted);line-height:1.45;word-break:break-word"></div>
+      <div class="summary-modal-actions">
+        <button class="summary-btn" type="button" onclick="confirmChangeCwd()">🗂️ Save next-launch CWD</button>
+        <button class="summary-btn" type="button" ${launchableSessionId ? 'onclick="confirmChangeCwdAndLaunch()"' : 'disabled'} title="${escHtml(launchDisabledReason || 'Set the CWD and launch the current session worker')}">🚀 Set new CWD and launch</button>
+        <button class="summary-close" type="button" onclick="closeSummaryModal()">Cancel</button>
+      </div>
+    `,
+  });
+  window.setTimeout(() => {
+    const select = document.getElementById('change-cwd-select');
+    const details = document.getElementById('change-cwd-details');
+    if (select && details) {
+      const updateDetails = () => {
+        const option = select.options[select.selectedIndex];
+        details.textContent = option?.value
+          ? `Selected: ${option.value}`
+          : 'No known CWDs are available yet.';
+      };
+      select.addEventListener('change', updateDetails);
+      updateDetails();
+    }
+  }, 0);
+}
+
+async function confirmChangeCwd() {
+  await submitChangeCwd(false);
+}
+
+async function confirmChangeCwdAndLaunch() {
+  await submitChangeCwd(true);
+}
+
+async function submitChangeCwd(launchAfterChange = false) {
+  if (changeCwdInFlight) return;
+  const select = document.getElementById('change-cwd-select');
+  const selectedPath = normalizeKnownCwdPath(select?.value || '');
+  if (!selectedPath) {
+    alert('Select a known CWD first.');
+    return;
+  }
+  const launchableSessionId = launchAfterChange ? getCurrentLaunchableSessionId() : '';
+  if (launchAfterChange && !launchableSessionId) {
+    alert('Open a conversation with a bound session before launching.');
+    return;
+  }
+  if (launchAfterChange && isSelectedSessionRunning()) {
+    alert('Selected CLI is already running.');
+    return;
+  }
+  changeCwdInFlight = true;
+  setSummaryModalLoading(true);
+  try {
+  const result = await updateWorkspaceRoot(selectedPath, currentConvId);
+    if (!result) {
+      alert('Failed to update the launch CWD');
+      return;
+    }
+  applyConversationWorkspaceRootUpdate({
+    conversationId: currentConvId,
+    ...result,
+  });
+  const updatedPath = result.configuredWorkspaceRootPath || result.currentWorkspaceRootPath || result.workspaceRootPath || selectedPath;
+  rememberKnownCwdPath(updatedPath);
+  if (launchAfterChange) {
+    const launchResult = await launchSessionWorker(launchableSessionId);
+      if (!launchResult) {
+        alert('Launch CWD updated, but the CLI launch request failed.');
+        return;
+      }
+      closeSummaryModal();
+      showTransientRelayNotice(`Next launch CWD saved as ${updatedPath} and CLI launch requested.`);
+      await refreshSessionWorkerStatus().catch(() => {});
+      return;
+    }
+    closeSummaryModal();
+    showTransientRelayNotice(isSelectedSessionRunning()
+      ? `Next launch CWD saved as ${updatedPath}. The running CLI keeps its current CWD.`
+      : `Next launch CWD saved as ${updatedPath}.`);
+  } catch (error) {
+    alert(error?.message || 'Failed to update the launch CWD');
+  } finally {
+    changeCwdInFlight = false;
+    setSummaryModalLoading(false);
+  }
+}
+
 function bindTapAction(element, handler) {
   if (!element || element.dataset.tapBound === '1') return;
   element.dataset.tapBound = '1';
@@ -1118,6 +1344,7 @@ function syncChatTitleControls() {
   if (!editing && editor && !editor.hidden) {
     editor.hidden = true;
   }
+  syncChatHeaderWorkspaceLabel();
 }
 
 function openChatTitleEditor() {
@@ -1177,6 +1404,27 @@ function applyConversationTitleUpdate(conversationId, title, updatedAt) {
   renderConvList();
 }
 
+function applyConversationWorkspaceRootUpdate(payload = {}) {
+  const conversationId = String(payload.conversationId || '').trim();
+  if (!conversationId) return;
+  const existing = conversations[conversationId] || { id: conversationId, archived: false, messageCount: 0 };
+  conversations[conversationId] = {
+    ...existing,
+    configuredWorkspaceRootPath: String(payload.configuredWorkspaceRootPath || existing.configuredWorkspaceRootPath || '').trim() || null,
+    configuredWorkspaceRootName: String(payload.configuredWorkspaceRootName || existing.configuredWorkspaceRootName || '').trim() || null,
+    runtimeWorkspaceRootPath: String(payload.runtimeWorkspaceRootPath || existing.runtimeWorkspaceRootPath || '').trim() || null,
+    runtimeWorkspaceRootName: String(payload.runtimeWorkspaceRootName || existing.runtimeWorkspaceRootName || '').trim() || null,
+    currentWorkspaceRootPath: String(payload.currentWorkspaceRootPath || existing.currentWorkspaceRootPath || '').trim() || null,
+    currentWorkspaceRootName: String(payload.currentWorkspaceRootName || existing.currentWorkspaceRootName || '').trim() || null,
+  };
+  if (currentConvId === conversationId) {
+    syncChatHeaderWorkspaceLabel();
+    if (repoBrowserState.activeRoot === 'workspace' && repoBrowserState.open) {
+      void loadRepoBrowserTree();
+    }
+  }
+}
+
 function getCurrentConversationSessionInfo() {
   const convId = String(currentConvId || '').trim();
   if (!convId) return null;
@@ -1214,6 +1462,7 @@ function openKillSessionConfirmation() {
 }
 
 let killSessionInFlight = false;
+let restartRelayInFlight = false;
 
 async function confirmKillCurrentSession() {
   if (killSessionInFlight) return;
@@ -1242,6 +1491,57 @@ async function confirmKillCurrentSession() {
     await refreshSessionWorkerStatus().catch(() => {});
   } finally {
     killSessionInFlight = false;
+    setSummaryModalLoading(false);
+  }
+}
+
+function openRestartRelayConfirmation() {
+  openSummaryModal({
+    title: 'Restart web relay',
+    subtitle: 'Queues restart via /api/relay/shutdown',
+    kind: 'restart-relay',
+    bodyHtml: `
+      <p>Queue a manual relay restart now?</p>
+      <p>The restart waits until the current turn is idle, so it does not interrupt an in-flight turn immediately.</p>
+      <div class="summary-modal-actions">
+        <button class="chat-title-action-btn" type="button" onclick="confirmRestartWebRelay()">🌄 Restart web relay</button>
+        <button class="chat-title-action-btn" type="button" onclick="closeSummaryModal()">Cancel</button>
+      </div>
+    `,
+  });
+}
+
+async function confirmRestartWebRelay() {
+  if (restartRelayInFlight) return;
+  restartRelayInFlight = true;
+  setSummaryModalLoading(true);
+  try {
+    const result = await requestRelayRestart({
+      reason: 'manual-restart',
+      requestedBy: 'localhost-api',
+      restart: true,
+    });
+    closeSummaryModal();
+    // Restart can close the connection before the browser receives JSON.
+    if (!result) {
+      showTransientRelayNotice('Relay restart requested. Connection may briefly drop while it restarts.', 7000);
+      return;
+    }
+    if (!result.ok) {
+      alert('Failed to queue relay restart');
+      return;
+    }
+    if (result.accepted === false) {
+      showTransientRelayNotice('Relay is already shutting down/restarting.', 7000);
+      return;
+    }
+    const queue = result.queue || {};
+    showTransientRelayNotice(
+      `Relay restart queued (pending=${Number(queue.pendingCount || 0)}, processing=${Number(queue.processingCount || 0)}).`,
+      7000,
+    );
+  } finally {
+    restartRelayInFlight = false;
     setSummaryModalLoading(false);
   }
 }
@@ -1322,13 +1622,27 @@ async function connectSocket() {
   });
   socket.on('workspace_root_changed', (payload) => {
     updateWorkspaceRootHints(payload || {});
+    rememberKnownCwdPath(payload?.workspaceRootPath || workspaceRootPath);
     if (repoBrowserState.activeRoot !== 'workspace') return;
     repoBrowserState.currentPath = '';
     if (repoBrowserState.open) {
       void loadRepoBrowserTree();
     }
   });
+  socket.on('conversation_workspace_root_updated', (payload) => {
+    applyConversationWorkspaceRootUpdate(payload || {});
+    rememberKnownCwdPath(
+      payload?.currentWorkspaceRootPath
+      || payload?.configuredWorkspaceRootPath
+      || payload?.runtimeWorkspaceRootPath
+      || '',
+    );
+  });
   socket.on('user_message', ({ conversationId, messageId, senderClientId, message }) => {
+    const normalizedMessage = {
+      ...(message && typeof message === 'object' ? message : {}),
+      text: stripRelayPromptContext(message?.text, message?.mode),
+    };
     if (senderClientId && senderClientId === CLIENT_ID) {
       pendingUserMessageIds.delete(messageId);
       return;
@@ -1339,16 +1653,16 @@ async function connectSocket() {
     }
     if (conversationId === currentConvId) {
       const renderedMessages = getRenderedConversationMessageFingerprints(24);
-      const hasPendingTextMatch = hasPendingUserMessageDuplicate(conversationId, message?.text);
+      const hasPendingTextMatch = hasPendingUserMessageDuplicate(conversationId, normalizedMessage.text);
       if (isLikelyLiveDuplicateMessage({
         incomingMessageId: messageId,
-        incomingMessage: message,
+        incomingMessage: normalizedMessage,
         existingMessages: renderedMessages,
         hasPendingTextMatch,
       })) {
         return;
       }
-      appendMessage(message, true, messageId);
+      appendMessage(normalizedMessage, true, messageId);
     }
   });
   socket.on('assistant_message', ({ conversationId, message, messageId, sourceMessageId }) => {
@@ -1536,6 +1850,22 @@ async function initApp() {
       alert(error?.message || 'Failed to compact conversation');
     });
   });
+  const chatMenuChangeCwdBtn = document.getElementById('chat-menu-change-cwd');
+  bindMenuAction(chatMenuChangeCwdBtn, (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    lockChatActionsMenuShield(350);
+    closeChatActionsMenu();
+    openChangeCwdModal();
+  });
+  const chatMenuRestartRelayBtn = document.getElementById('chat-menu-restart-relay');
+  bindMenuAction(chatMenuRestartRelayBtn, (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    lockChatActionsMenuShield(350);
+    closeChatActionsMenu();
+    openRestartRelayConfirmation();
+  });
   const chatMenuKillBtn = document.getElementById('chat-menu-kill-session');
   bindMenuAction(chatMenuKillBtn, (event) => {
     event.preventDefault();
@@ -1595,6 +1925,7 @@ async function initApp() {
   initModeSelector();
   initModelSelector();
   const status = await refreshWorkspaceRootHints();
+  rememberKnownCwdPath(status?.workspaceRootPath || workspaceRootPath);
   setSessionWorkerStatesFromStatusPayload(status?.sessionWorker || null);
   await refreshModelCatalog(true);
   initFullscreenButton();
@@ -1631,7 +1962,7 @@ function registerPwaShell() {
   if (!('serviceWorker' in navigator)) return;
   const scopeBase = window.location.pathname.replace(/\/+$/, '');
   const scopeRoot = `${scopeBase}/`;
-  return navigator.serviceWorker.register(`${scopeBase}/sw.js?v=10`, { scope: scopeRoot, updateViaCache: 'none' }).catch(() => {});
+  return navigator.serviceWorker.register(`${scopeBase}/sw.js?v=14`, { scope: scopeRoot, updateViaCache: 'none' }).catch(() => {});
 }
 
 async function bootstrap() {
@@ -1663,6 +1994,9 @@ window.openSidebar = openSidebar;
 window.closeSidebar = closeSidebar;
 window.toggleSidebar = toggleSidebar;
 window.showUsage = showUsage;
+window.openChangeCwdModal = openChangeCwdModal;
+window.confirmChangeCwd = confirmChangeCwd;
+window.confirmChangeCwdAndLaunch = confirmChangeCwdAndLaunch;
 window.showContext = showContext;
 window.promptInstallApp = promptInstallApp;
 window.toggleFullscreen = toggleFullscreen;
@@ -1722,5 +2056,6 @@ window.openSummaryModal = openSummaryModal;
 window.syncChatTitleControls = syncChatTitleControls;
 window.closeChatActionsMenu = closeChatActionsMenu;
 window.confirmKillCurrentSession = confirmKillCurrentSession;
+window.confirmRestartWebRelay = confirmRestartWebRelay;
 
 bootstrap();

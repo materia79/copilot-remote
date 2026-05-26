@@ -1,10 +1,4 @@
-'use strict';
-
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
-
-const DEFAULT_RELAY_TOOL_GUIDANCE = [
+const RELAY_TOOL_GUIDANCE = [
   '# Relay Tool Guidance',
   'For any user-facing question or clarification, use the ask_user tool so the web relay can render question cards and buttons. Never ask questions in plain assistant text.',
   'In autopilot, still call ask_user when user input is truly blocking, because the relay bridge can surface the question even when the direct SDK question hook is bypassed.',
@@ -12,23 +6,6 @@ const DEFAULT_RELAY_TOOL_GUIDANCE = [
   'Note: shutdown is queued and only completes when the current turn finishes, so it is pointless to wait for it to interrupt an active turn.',
   'Use `restart: true` in the request body when the user wants a real relay restart rather than a plain shutdown. Example request body: `{ "reason": "manual-restart", "requestedBy": "localhost-api", "restart": true }`.',
 ].join(' ');
-
-function loadRelayToolGuidance() {
-  try {
-    const moduleDir = path.dirname(fileURLToPath(import.meta.url));
-    const guidancePath = path.resolve(moduleDir, '..', 'relay-tools.md');
-    const content = fs.readFileSync(guidancePath, 'utf8');
-    const parts = String(content || '')
-      .split(/\r?\n/)
-      .map((line) => String(line || '').trim())
-      .filter(Boolean);
-    return parts.length ? parts.join(' ') : DEFAULT_RELAY_TOOL_GUIDANCE;
-  } catch {
-    return DEFAULT_RELAY_TOOL_GUIDANCE;
-  }
-}
-
-const RELAY_TOOL_GUIDANCE = loadRelayToolGuidance();
 
 const MODE_MARKERS = {
   plan: '[Relay mode: plan]',
@@ -113,7 +90,7 @@ function buildPromptPrefixPatterns(mode) {
   });
 }
 
-export function stripRelayPromptContext(text, relayMode = '', attachments = []) {
+export function stripRelayPromptContext(text, relayMode = '') {
   const value = String(text || '').trim();
   if (!value) return '';
   const patterns = buildPromptPrefixPatterns(relayMode);

@@ -9,6 +9,8 @@ When changing anything related to the web relay (`server/` or `.github/extension
    - Never kill or restart the node process bound to port `3333` unless the user explicitly gives permission to restart the web relay.
 2. Before any restart, stop stale relay/watchdog processes from earlier runs (especially detached shells) so only one web relay remains bound to `:3333`.
    3. For extension-managed mode, only restart the web relay after explicit user permission. Manual restarts must use the authenticated localhost API (`POST /api/relay/shutdown`); do not use direct process kills or respawn scripts.
+      - Include `restart: true` in the request body for an intentional self-restart; omit it for a plain shutdown.
+      - Preferred restart request body: `{ "reason": "manual-restart", "requestedBy": "localhost-api", "restart": true }`.
       - `POST /api/relay/shutdown` is queued and only actually exits once the current turn is idle, so do not wait for it to "interrupt" an in-flight turn.
 4. Keep the main Copilot CLI session running so extension polling can continue.
 5. Verify relay health after changes:

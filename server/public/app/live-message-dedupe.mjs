@@ -1,3 +1,5 @@
+import { stripRelayPromptContext } from './relay-prompt-sanitizer.mjs';
+
 function normalizeText(value) {
   return String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
 }
@@ -17,10 +19,11 @@ function normalizeTimestampMs(value) {
 }
 
 export function buildLiveMessageFingerprint(message = {}) {
+  const sanitizedText = stripRelayPromptContext(message?.text, message?.mode);
   return {
     id: normalizeId(message?.id),
     role: normalizeRole(message?.role),
-    text: normalizeText(message?.text),
+    text: normalizeText(sanitizedText),
     timestampMs: normalizeTimestampMs(message?.timestamp),
     sourceMessageId: normalizeId(message?.sourceMessageId),
   };

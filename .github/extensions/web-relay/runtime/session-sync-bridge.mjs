@@ -17,8 +17,9 @@ export async function syncSessionToServer(
   if (!sessionId || !nextConversationId || typeof apiClient !== "function") {
     return false;
   }
+  const workspaceRootPath = normalizeId(options?.workspaceRootPath || options?.cwd);
 
-  const syncKey = `${sessionId}::${nextConversationId || ""}`;
+  const syncKey = `${sessionId}::${nextConversationId || ""}::${workspaceRootPath || ""}`;
   if (!forceSync && syncKey === lastSyncedKey) {
     return true;
   }
@@ -30,6 +31,7 @@ export async function syncSessionToServer(
     sdk_session_id: sessionId,
     conversation_id: nextConversationId,
   };
+  if (workspaceRootPath) payload.workspace_root_path = workspaceRootPath;
   if (orchestrator) {
     const correlationId = normalizeId(
       orchestrator.correlationId
@@ -50,5 +52,23 @@ export async function syncSessionToServer(
   await apiClient("POST", "/api/session-sync", payload);
 
   lastSyncedKey = syncKey;
+  return true;
+}
+
+export async function syncWorkspaceRootToServer(
+  workspaceRootPath,
+  apiClient,
+  options = {},
+) {
+  const nextWorkspaceRootPath = normalizeId(workspaceRootPath);
+  if (!nextWorkspaceRootPath || typeof apiClient !== "function") {
+    return false;
+  }
+
+  const payload = { workspace_root_path: nextWorkspaceRootPath };
+  const sessionId = normalizeId(options?.sdkSessionId || options?.sessionId);
+  if (sessionId) payload.sdk_session_id = sessionId;
+
+  await apiClient("POST", "/api/session-workspace-root", payload);
   return true;
 }

@@ -6,6 +6,8 @@ import path from 'path';
 import { randomUUID } from 'crypto';
 import { fileURLToPath } from 'url';
 import { resolveStartupWorkspaceRoot } from './workspace-root.mjs';
+import { RELAY_RESTART_EXIT_CODE } from './relay-exit-codes.mjs';
+import { RELAY_SUPERVISED_ENV } from './relay-self-restart.mjs';
 
 const projectDir = path.dirname(fileURLToPath(import.meta.url));
 const nodeBin = process.execPath;
@@ -20,6 +22,7 @@ const portArgIdx = rawArgs.indexOf('--port');
 const portFromArg = portArgIdx !== -1 ? rawArgs[portArgIdx + 1] : null;
 
 let shuttingDown = false;
+let restartingServer = false;
 let serverProc = null;
 let relayProc = null;
 
@@ -101,49 +104,70 @@ async function main() {
     console.log('[start] No token in args/config; generated a startup token.');
   }
 
-  console.log('[start] Launching web server...');
-  const serverArgs = [serverScript, ...rawArgs];
-  if (!tokenFromArg) {
-    serverArgs.push('--token', sharedToken);
-  }
+  while (!shuttingDown) {
+    restartingServer = false;
+    console.log('[start] Launching web server...');
+    const serverArgs = [serverScript, ...rawArgs];
+    if (!tokenFromArg) {
+      serverArgs.push('--token', sharedToken);
+    }
 
-  serverProc = spawn(nodeBin, serverArgs, {
-    cwd: launchWorkspaceRoot,
-    env: { ...process.env, COPILOT_WORKSPACE_ROOT: launchWorkspaceRoot },
-    stdio: 'inherit',
-    detached: process.platform !== 'win32',
-    windowsHide: false,
-  });
+    serverProc = spawn(nodeBin, serverArgs, {
+      cwd: launchWorkspaceRoot,
+      env: { ...process.env, COPILOT_WORKSPACE_ROOT: launchWorkspaceRoot, [RELAY_SUPERVISED_ENV]: '1' },
+      stdio: 'inherit',
+      detached: process.platform !== 'win32',
+      windowsHide: false,
+    });
 
-  serverProc.on('exit', (code, signal) => {
+    const serverExitPromise = new Promise((resolve) => {
+      serverProc.once('exit', (code, signal) => resolve({ code, signal }));
+    });
+
+    await waitForServerReady(sharedToken, port, 20_000);
+    if (shuttingDown) break;
+
+    console.log('[start] Launching relay...');
+    const relayArgs = [relayScript, '--token', sharedToken];
+    if (portFromArg) relayArgs.push('--port', portFromArg);
+    if (rawArgs.includes('--foreground')) relayArgs.push('--foreground');
+    if (rawArgs.includes('--quiet')) relayArgs.push('--quiet');
+    if (rawArgs.includes('--verbose')) relayArgs.push('--verbose');
+
+    relayProc = spawn(nodeBin, relayArgs, {
+      cwd: launchWorkspaceRoot,
+      env: { ...process.env, COPILOT_WORKSPACE_ROOT: launchWorkspaceRoot },
+      stdio: 'inherit',
+      detached: process.platform !== 'win32',
+      windowsHide: false,
+    });
+
+    relayProc.once('exit', (code, signal) => {
+      if (shuttingDown || restartingServer) return;
+      console.log(`[start] Relay exited (code=${code ?? 'null'}, signal=${signal ?? 'none'}). Stopping server...`);
+      killProcessTree(serverProc);
+      process.exit(code ?? 1);
+    });
+
+    const { code, signal } = await serverExitPromise;
+    if (shuttingDown) break;
+    const serverExitCode = Number.isInteger(Number(code)) ? Number(code) : null;
+    const restartRequested = serverExitCode === RELAY_RESTART_EXIT_CODE;
+
+    if (restartRequested) {
+      restartingServer = true;
+      console.log(`[start] Server exited (code=${serverExitCode}, signal=${signal ?? 'none'}). Restart requested, relaunching...`);
+      killProcessTree(relayProc);
+      relayProc = null;
+      serverProc = null;
+      await delay(150);
+      continue;
+    }
+
     console.log(`[start] Server exited (code=${code ?? 'null'}, signal=${signal ?? 'none'}). Stopping relay...`);
     killProcessTree(relayProc);
-    process.exit(code ?? 0);
-  });
-
-  await waitForServerReady(sharedToken, port, 20_000);
-
-  console.log('[start] Launching relay...');
-  const relayArgs = [relayScript, '--token', sharedToken];
-  if (portFromArg) relayArgs.push('--port', portFromArg);
-  if (rawArgs.includes('--foreground')) relayArgs.push('--foreground');
-  if (rawArgs.includes('--quiet')) relayArgs.push('--quiet');
-  if (rawArgs.includes('--verbose')) relayArgs.push('--verbose');
-
-  relayProc = spawn(nodeBin, relayArgs, {
-    cwd: launchWorkspaceRoot,
-    env: { ...process.env, COPILOT_WORKSPACE_ROOT: launchWorkspaceRoot },
-    stdio: 'inherit',
-    detached: process.platform !== 'win32',
-    windowsHide: false,
-  });
-
-  relayProc.on('exit', (code, signal) => {
-    if (shuttingDown) return;
-    console.log(`[start] Relay exited (code=${code ?? 'null'}, signal=${signal ?? 'none'}). Stopping server...`);
-    killProcessTree(serverProc);
-    process.exit(code ?? 1);
-  });
+    process.exit(serverExitCode ?? 0);
+  }
 }
 
 process.on('SIGINT', () => shutdown(0));

@@ -65,7 +65,7 @@ npm run start:server
 Mode summary:
 
 - `npm start`: server + standalone SDK relay (manual development / local end-to-end testing)
-- `npm run start:server`: server only (use with `.github/extensions/web-relay/extension.mjs` in CLI session)
+- `npm run start:server`: server only; `server.js` now acts like the `playground/scripts/self_restart` supervisor entry for manual terminal runs
 - `npm run start:server:respawn`: legacy/manual watchdog tool (`respawn.bat`, outside extension-managed flow)
 - `npm run start:server:respawn:posix`: legacy/manual watchdog tool (`respawn.sh`, outside extension-managed flow)
 
@@ -81,6 +81,7 @@ On Windows, the visible relay launcher path now targets a stable per-workspace W
 6. Follow relay restart policy from `.github/copilot-instructions.md`.
 7. In extension-managed mode, use `POST /api/relay/shutdown` for manual restart requests.
    - It is queued until the relay is idle, so it will not stop an in-flight turn immediately.
+   - Send `{ "restart": true }` when you want a self-restart instead of a plain shutdown.
 8. Do not run tests that spawn Copilot CLI clients unless the user explicitly permits it.
 
 Script necessity note:
@@ -134,9 +135,29 @@ http://localhost:3333/
 `localhostOnly` affects only the local relay listener. SSH reverse tunnel exposure is configured separately with `sshTunnel.remoteBind`.
 
 Sign in once with the token prompt; the browser stores the session in an HttpOnly cookie.
-The workspace browser is locked to the Copilot CLI startup CWD (or to
-`COPILOT_WORKSPACE_ROOT` when explicitly set), so the active repo root stays stable
-for the whole session. Plain `cd ...` chat commands do not retarget `Browse files`.
+Each CLI session now tracks its own workspace root:
+- the running CLI keeps its learned runtime CWD
+- the **🗂️ Change CWD** menu updates that session's persisted next-launch CWD
+- the workspace browser follows the selected session's effective CWD instead of one relay-global root
+
+Startup CWD learning prefers explicit session/launcher hints such as `COPILOT_WORKSPACE_ROOT`,
+then other runtime cwd hints (`INIT_CWD`, `PWD`, session metadata). The extension startup sync
+deliberately skips `process.cwd()` so the relay host directory never silently masquerades as a
+project root. Sessions without an explicit configured CWD launch in the relay's working directory.
+
+A plain `cd <path>` chat command persists to that conversation's configured CWD only — it does not
+affect other sessions or the global relay root.
+
+Use the chat header **⋯** menu and choose **🗂️ Change CWD** to switch the selected session's next
+launch directory from the list of known directories. The CWD picker always stays available; the
+launch action is only enabled for the selected CLI when it is not running.
+
+### Socket events for CWD changes
+
+| Event | Emitter | Meaning |
+|---|---|---|
+| `workspace_root_changed` | Admin CWD picker (`POST /api/workspace-root`) | Global relay root changed; affects all sessions that have no per-session root configured |
+| `conversation_workspace_root_updated` | Chat `/cd` command and conversation CWD API | Per-conversation configured root updated; only the referenced conversation is affected |
 
 ## Install as an app
 
@@ -251,7 +272,7 @@ This means the following startup sequence is expected:
 2. Send one message in the CLI
 3. Extension starts polling and queued web messages begin processing
 
-If a conversation is still unbound when the CLI first sees it, the extension now claims it through `/api/session-sync` before processing so the browser can send back to the same SDK session.
+If a conversation is still unbound when the CLI first sees it, the extension now claims it through `/api/session-sync` before processing so the browser can send back to the same SDK session. A separate startup sync to `/api/session-workspace-root` reports the CLI working directory for the already-bound session; it no longer creates a placeholder conversation on its own.
 
 | Symptom | Check |
 |---|---|
@@ -270,6 +291,7 @@ All authenticated routes accept an HttpOnly auth cookie or an `Authorization: Be
 
 `GET /api/status` now also includes `readyBanner`, a preformatted relay-info payload used by the CLI extension to print the access window directly in the Copilot CLI client when relay connectivity is established.
 It also includes `restartOrchestrator` with the current relay-side restart transaction state.
+It also includes `relayShutdown`, which reports queued manual relay shutdown/restart state separately from the worker restart orchestrator.
 Queue metrics include `parkedCount` for turns deferred behind restart/rebind gates.
 
 | Method | Path | Description |
@@ -293,6 +315,7 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | GET | `/api/sdk-session-delete/pending` | (CLI relay) Fetch next pending SDK session delete request |
 | POST | `/api/sdk-session-delete/result` | (CLI relay) Report SDK session delete result |
 | POST | `/api/session-sync` | (CLI relay) Sync conversation↔SDK binding and optionally confirm orchestrator rebind completion |
+| POST | `/api/session-workspace-root` | (CLI relay) Report the startup workspace CWD for a session once it is known |
 | GET | `/api/pending` | (CLI) Fetch next pending message |
 | POST | `/api/response` | (CLI) Submit response for a message |
 | GET | `/api/restart-orchestrator` | Read relay restart orchestrator state |
@@ -301,6 +324,7 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/stream` | (CLI) Push in-flight assistant text stream for current pending message |
 | POST | `/api/relay/pause` | Pause dequeueing and drop currently queued messages |
 | POST | `/api/relay/resume` | Resume dequeueing after pause |
+| POST | `/api/relay/shutdown` | Queue a localhost-only authenticated relay shutdown or self-restart |
 | GET | `/api/relay-questions` | (CLI/UI) List relay questions by `status` (for example `pending` or `answered`) |
 | GET | `/api/relay-question/:id` | (CLI) Fetch a single relay question |
 | POST | `/api/relay-question` | (CLI) Create a relay question for the browser |
@@ -313,6 +337,35 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | GET | `/api/context/:conversationId` | Parse and return context metrics from session-state events for a conversation, falling back to a labeled lower-bound completion-token estimate when full legacy buckets are missing |
 | GET | `/api/context` | Parse context metrics only when `conversationId` query is provided; otherwise returns a missing-selection response |
 | GET | `/api/usage` | Live Copilot usage snapshot |
+
+### Manual relay shutdown / self-restart
+
+- `POST /api/relay/shutdown` is localhost-only even when the relay is otherwise reachable on the network.
+- The request body accepts:
+  - `reason` (optional string)
+  - `requestedBy` (optional string)
+  - `restart` (optional boolean-ish flag; `true` queues self-restart instead of plain shutdown)
+- Example restart request:
+
+```json
+{
+  "reason": "manual-restart",
+  "requestedBy": "localhost-api",
+  "restart": true
+}
+```
+
+- Response payload includes:
+  - `status`: `queued` or `shutting_down`
+  - `action`: `shutdown` or `restart`
+  - `restart`: boolean mirror of the action
+  - `requestedAt`, `reason`, `requestedBy`
+  - `queue`: current `pendingCount` / `processingCount` / `parkedCount`
+- The relay waits until the queue is idle before acting; this API is not an interrupt or cancel mechanism.
+- Ownership after an intentional restart depends on the active runtime owner:
+  - extension-managed `server.js` relaunches under `.github/extensions/web-relay/server-lifecycle/managed-server.mjs`
+  - standalone `npm start` relaunches under `server/start.js`
+  - bare `node server.js` keeps `server.js` attached as the self-restart supervisor, respawns a worker-mode child, and keeps the same terminal session alive
 
 ### Upload storage model
 
@@ -459,6 +512,9 @@ are terminal and stop retrying.
 (or `rebind_state=completed`). Rebind mismatches return `409` with `retryable`/`terminal`.
 The extension dequeue/send path treats this restart-orchestrator flow as authoritative and
 does not attempt in-process runtime session switch calls.
+
+This worker restart-orchestrator flow is separate from the manual relay self-restart state
+reported as `relayShutdown`.
 
 
 

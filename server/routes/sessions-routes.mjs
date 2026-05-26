@@ -19,6 +19,112 @@ function toSafeNonNegativeInt(value, fallback = 0) {
   return Math.max(0, Math.trunc(numeric));
 }
 
+export function canUpdateWorkspaceRoot(runtimeState = {}) {
+  return true;
+}
+
+export async function launchWorkspaceRootSession(runtimeState = {}, sessionWorkerSupervisor = null, sdkSessionId = '') {
+  const sid = String(sdkSessionId || '').trim();
+  if (!sid) {
+    return { ok: false, statusCode: 400, error: 'Missing session id' };
+  }
+  const selectedWorkerState = typeof sessionWorkerSupervisor?.getWorkerState === 'function'
+    ? sessionWorkerSupervisor.getWorkerState(sid)
+    : null;
+  const selectedWorkerStatus = String(selectedWorkerState?.status || '').trim().toLowerCase();
+  if (['starting', 'ready', 'processing'].includes(selectedWorkerStatus)) {
+    return { ok: false, statusCode: 409, error: 'Selected CLI is already running' };
+  }
+  if (!sessionWorkerSupervisor || typeof sessionWorkerSupervisor.ensureWorker !== 'function') {
+    return { ok: false, statusCode: 500, error: 'Session worker launcher is unavailable' };
+  }
+
+  const result = await sessionWorkerSupervisor.ensureWorker(sid);
+  if (!result?.ok) {
+    return {
+      ok: false,
+      statusCode: 409,
+      error: result?.error || 'launch-failed',
+      worker: result?.worker || null,
+      lifecycle: result?.lifecycle || null,
+    };
+  }
+  return { ok: true, statusCode: 200, ...result };
+}
+
+export function learnWorkspaceRootFromSessionSync({
+  learnConversationWorkspaceRoot = null,
+  setWorkspaceRoot = null,
+  sdkSessionId = '',
+  conversationId = '',
+  workspaceRootPath = '',
+} = {}) {
+  const nextRootPath = String(workspaceRootPath || '').trim();
+  if (!nextRootPath) {
+    return { ok: false, learned: false, changed: false, error: 'Missing workspace root path' };
+  }
+  if (typeof learnConversationWorkspaceRoot !== 'function' && typeof setWorkspaceRoot !== 'function') {
+    return { ok: false, learned: false, changed: false, error: 'Workspace root updates are unavailable' };
+  }
+
+  if (typeof learnConversationWorkspaceRoot !== 'function') {
+    const legacyResult = setWorkspaceRoot(nextRootPath, { reason: 'session-sync-cwd' });
+    if (!legacyResult?.changed && legacyResult?.error) {
+      return {
+        ok: false,
+        learned: false,
+        changed: false,
+        error: legacyResult.error,
+      };
+    }
+    return {
+      ok: true,
+      learned: true,
+      changed: !!legacyResult?.changed,
+      rootPath: legacyResult?.rootPath || nextRootPath,
+      rootName: legacyResult?.rootName || null,
+      state: null,
+    };
+  }
+
+  const convId = String(conversationId || '').trim();
+  if (!convId) {
+    return {
+      ok: true,
+      learned: false,
+      changed: false,
+      rootPath: nextRootPath,
+      rootName: null,
+      state: null,
+    };
+  }
+
+  const result = learnConversationWorkspaceRoot({
+    sdkSessionId,
+    conversationId: convId,
+    rootPath: nextRootPath,
+    seedConfigured: true,
+  });
+  if (!result?.ok) {
+    return {
+      ok: false,
+      learned: false,
+      changed: false,
+      error: result?.error || 'Failed to learn workspace root',
+    };
+  }
+  const state = result?.state || null;
+
+  return {
+    ok: true,
+    learned: true,
+    changed: String(state?.runtimeWorkspaceRootPath || '').trim().toLowerCase() === nextRootPath.toLowerCase(),
+    rootPath: state?.runtimeWorkspaceRootPath || state?.currentWorkspaceRootPath || nextRootPath,
+    rootName: state?.runtimeWorkspaceRootName || state?.currentWorkspaceRootName || null,
+    state,
+  };
+}
+
 const MAX_CONVERSATION_TITLE_LENGTH = 120;
 const FALLBACK_RELAY_MODE = 'agent';
 
@@ -712,6 +818,10 @@ export function registerSessionsRoutes(app, deps) {
     updateModelCatalog,
     buildRelayReadyBannerData,
     workspaceRootPayload,
+    setWorkspaceRoot,
+    resolveConversationWorkspaceState,
+    updateConversationConfiguredWorkspaceRoot,
+    learnConversationWorkspaceRoot,
     processingTimeoutMs,
     localhostOnly,
     listenHost,
@@ -872,6 +982,9 @@ export function registerSessionsRoutes(app, deps) {
       const discoveredItem = sid ? discoveredBySdkSessionId.get(sid) : null;
       const discoveredUpdatedAt = String(discoveredItem?.updatedAt || '').trim();
       const discoveredTitle = String(discoveredItem?.title || '').trim();
+      const workspaceState = typeof resolveConversationWorkspaceState === 'function'
+        ? resolveConversationWorkspaceState({ conversationId: r.id, sdkSessionId: sid })
+        : null;
       const preferences = resolveConversationPreferences(r, {
         supportedRelayModes: SUPPORTED_RELAY_MODES,
         defaultRelayMode: DEFAULT_RELAY_MODE,
@@ -891,6 +1004,12 @@ export function registerSessionsRoutes(app, deps) {
         runtimeSessionStrategy: r.runtime_strategy || null,
         runtimeSessionStatus: r.runtime_status || null,
         runtimeSessionLastUsedAt: r.runtime_last_used_at || null,
+        configuredWorkspaceRootPath: workspaceState?.configuredWorkspaceRootPath || null,
+        configuredWorkspaceRootName: workspaceState?.configuredWorkspaceRootName || null,
+        runtimeWorkspaceRootPath: workspaceState?.runtimeWorkspaceRootPath || null,
+        runtimeWorkspaceRootName: workspaceState?.runtimeWorkspaceRootName || null,
+        currentWorkspaceRootPath: workspaceState?.currentWorkspaceRootPath || null,
+        currentWorkspaceRootName: workspaceState?.currentWorkspaceRootName || null,
         createdAt:    r.created_at,
         updatedAt:    discoveredUpdatedAt || r.updated_at,
         messageCount: resolveMessageCount(r.sdk_session_id, r.message_count),
@@ -915,6 +1034,9 @@ export function registerSessionsRoutes(app, deps) {
 
       const runtimeSession = stmts.getRuntimeSessionBySdkSessionId.get(sdkSessionId) || null;
       const updatedAt = String(item?.updatedAt || '').trim() || new Date().toISOString();
+      const workspaceState = typeof resolveConversationWorkspaceState === 'function'
+        ? resolveConversationWorkspaceState({ conversationId: sdkSessionId, sdkSessionId })
+        : null;
       const syntheticConversation = {
         id: sdkSessionId,
         sdkSessionId,
@@ -926,6 +1048,12 @@ export function registerSessionsRoutes(app, deps) {
         runtimeSessionStrategy: runtimeSession?.strategy || null,
         runtimeSessionStatus: runtimeSession?.status || null,
         runtimeSessionLastUsedAt: runtimeSession?.last_used_at || updatedAt,
+        configuredWorkspaceRootPath: workspaceState?.configuredWorkspaceRootPath || null,
+        configuredWorkspaceRootName: workspaceState?.configuredWorkspaceRootName || null,
+        runtimeWorkspaceRootPath: workspaceState?.runtimeWorkspaceRootPath || null,
+        runtimeWorkspaceRootName: workspaceState?.runtimeWorkspaceRootName || null,
+        currentWorkspaceRootPath: workspaceState?.currentWorkspaceRootPath || null,
+        currentWorkspaceRootName: workspaceState?.currentWorkspaceRootName || null,
         createdAt: updatedAt,
         updatedAt,
         messageCount: resolveMessageCount(sdkSessionId, 0),
@@ -1021,6 +1149,13 @@ export function registerSessionsRoutes(app, deps) {
     relayBridgeOwnerService?.observe?.(readBridgeIdentity(req));
     const sdkSessionId = String(body.sdk_session_id || '').trim();
     const conversationId = String(body.conversation_id || '').trim();
+    const workspaceRootPath = String(
+      body.workspace_root_path
+      || body.workspaceRootPath
+      || body.cwd
+      || body.current_working_directory
+      || '',
+    ).trim();
     const orchestratorCorrelationId = String(
       body.orchestrator_correlation_id
       || body.orchestrator_transaction_id
@@ -1051,6 +1186,12 @@ export function registerSessionsRoutes(app, deps) {
     }
 
     try {
+      const workspaceRootSync = learnWorkspaceRootFromSessionSync({
+        learnConversationWorkspaceRoot,
+        sdkSessionId,
+        conversationId,
+        workspaceRootPath,
+      });
       const sync = sdkSessionSyncService.syncSession({
         sdk_session_id: sdkSessionId,
         conversation_id: conversationId,
@@ -1090,6 +1231,18 @@ export function registerSessionsRoutes(app, deps) {
         sdkSessionId: sync?.sdkSessionId || sdkSessionId,
         runtimeSessionId: sync?.runtimeSessionId || null,
       });
+      if (workspaceRootSync.ok && workspaceRootSync.state?.conversationId) {
+        io.emit('conversation_workspace_root_updated', {
+          conversationId: workspaceRootSync.state.conversationId,
+          sdkSessionId: workspaceRootSync.state.sdkSessionId || sync?.sdkSessionId || sdkSessionId,
+          configuredWorkspaceRootPath: workspaceRootSync.state.configuredWorkspaceRootPath || null,
+          configuredWorkspaceRootName: workspaceRootSync.state.configuredWorkspaceRootName || null,
+          runtimeWorkspaceRootPath: workspaceRootSync.state.runtimeWorkspaceRootPath || null,
+          runtimeWorkspaceRootName: workspaceRootSync.state.runtimeWorkspaceRootName || null,
+          currentWorkspaceRootPath: workspaceRootSync.state.currentWorkspaceRootPath || null,
+          currentWorkspaceRootName: workspaceRootSync.state.currentWorkspaceRootName || null,
+        });
+      }
       return res.json({
         ok: true,
         session: {
@@ -1098,6 +1251,12 @@ export function registerSessionsRoutes(app, deps) {
           runtimeSessionId: sync?.runtimeSessionId || null,
           createdRuntimeSession: sync?.createdRuntimeSession === true,
         },
+        workspaceRoot: workspaceRootSync.ok ? {
+          learned: workspaceRootSync.learned === true,
+          changed: workspaceRootSync.changed === true,
+          rootPath: workspaceRootSync.rootPath || workspaceRootPath || null,
+          rootName: workspaceRootSync.rootName || null,
+        } : null,
         rebind: rebind ? {
           considered: rebind.considered === true,
           completed: rebind.completed === true,
@@ -1122,6 +1281,58 @@ export function registerSessionsRoutes(app, deps) {
       };
       return res.status(Number.isInteger(statusCode) ? statusCode : 500).json(payload);
     }
+  });
+
+  app.post('/api/session-workspace-root', auth, (req, res) => {
+    const sdkSessionId = String(req.body?.sdk_session_id || req.body?.sdkSessionId || '').trim();
+    const conversationId = String(req.body?.conversation_id || req.body?.conversationId || '').trim();
+    const workspaceRootPath = String(
+      req.body?.workspace_root_path
+      || req.body?.workspaceRootPath
+      || req.body?.cwd
+      || req.body?.current_working_directory
+      || '',
+    ).trim();
+    const result = learnWorkspaceRootFromSessionSync({
+      learnConversationWorkspaceRoot,
+      sdkSessionId,
+      conversationId,
+      workspaceRootPath,
+    });
+    if (!result.ok) {
+      return res.status(400).json({
+        ok: false,
+        error: result.error || 'Failed to learn workspace root',
+      });
+    }
+    if (result.state?.conversationId) {
+      io.emit('conversation_workspace_root_updated', {
+        conversationId: result.state.conversationId,
+        sdkSessionId: result.state.sdkSessionId || sdkSessionId || null,
+        configuredWorkspaceRootPath: result.state.configuredWorkspaceRootPath || null,
+        configuredWorkspaceRootName: result.state.configuredWorkspaceRootName || null,
+        runtimeWorkspaceRootPath: result.state.runtimeWorkspaceRootPath || null,
+        runtimeWorkspaceRootName: result.state.runtimeWorkspaceRootName || null,
+        currentWorkspaceRootPath: result.state.currentWorkspaceRootPath || null,
+        currentWorkspaceRootName: result.state.currentWorkspaceRootName || null,
+      });
+    }
+    return res.json({
+      ok: true,
+      learned: true,
+      changed: result.changed === true,
+      workspaceRootPath: result.rootPath || workspaceRootPath || null,
+      workspaceRootName: result.rootName || null,
+      conversationId: result.state?.conversationId || conversationId || null,
+      sdkSessionId: result.state?.sdkSessionId || sdkSessionId || null,
+      configuredWorkspaceRootPath: result.state?.configuredWorkspaceRootPath || null,
+      configuredWorkspaceRootName: result.state?.configuredWorkspaceRootName || null,
+      runtimeWorkspaceRootPath: result.state?.runtimeWorkspaceRootPath || null,
+      runtimeWorkspaceRootName: result.state?.runtimeWorkspaceRootName || null,
+      currentWorkspaceRootPath: result.state?.currentWorkspaceRootPath || null,
+      currentWorkspaceRootName: result.state?.currentWorkspaceRootName || null,
+      ...workspaceRootPayload(),
+    });
   });
 
   app.get('/api/context/:conversationId', auth, (req, res) => {
@@ -1224,12 +1435,21 @@ export function registerSessionsRoutes(app, deps) {
         title: discoveredTitle,
         resolveSessionStateRoot,
       });
+      const workspaceState = typeof resolveConversationWorkspaceState === 'function'
+        ? resolveConversationWorkspaceState({ conversationId: requestedId, sdkSessionId: requestedId })
+        : null;
       return res.json({
         id: requestedId,
         sdkSessionId: requestedId,
         title: discoveredTitle,
         sessionRootPath: sessionRoot?.sessionRootPath || null,
         sessionRootName: sessionRoot?.sessionRootName || discoveredTitle,
+        configuredWorkspaceRootPath: workspaceState?.configuredWorkspaceRootPath || null,
+        configuredWorkspaceRootName: workspaceState?.configuredWorkspaceRootName || null,
+        runtimeWorkspaceRootPath: workspaceState?.runtimeWorkspaceRootPath || null,
+        runtimeWorkspaceRootName: workspaceState?.runtimeWorkspaceRootName || null,
+        currentWorkspaceRootPath: workspaceState?.currentWorkspaceRootPath || null,
+        currentWorkspaceRootName: workspaceState?.currentWorkspaceRootName || null,
         archived: false,
         compactedInto: null,
         compactedFrom: null,
@@ -1280,6 +1500,9 @@ export function registerSessionsRoutes(app, deps) {
       title: resolvedTitle,
       resolveSessionStateRoot,
     });
+    const workspaceState = typeof resolveConversationWorkspaceState === 'function'
+      ? resolveConversationWorkspaceState({ conversationId: req.params.id, sdkSessionId: conv.sdk_session_id || req.params.id })
+      : null;
     const dbMessages = stmts.getMessages.all(req.params.id);
     const queueRows = db.prepare(`
       SELECT id, response_message_id, text, timestamp, retry_count
@@ -1318,6 +1541,12 @@ export function registerSessionsRoutes(app, deps) {
       title: resolvedTitle,
       sessionRootPath: sessionRoot?.sessionRootPath || null,
       sessionRootName: sessionRoot?.sessionRootName || resolvedTitle || 'Session',
+      configuredWorkspaceRootPath: workspaceState?.configuredWorkspaceRootPath || null,
+      configuredWorkspaceRootName: workspaceState?.configuredWorkspaceRootName || null,
+      runtimeWorkspaceRootPath: workspaceState?.runtimeWorkspaceRootPath || null,
+      runtimeWorkspaceRootName: workspaceState?.runtimeWorkspaceRootName || null,
+      currentWorkspaceRootPath: workspaceState?.currentWorkspaceRootPath || null,
+      currentWorkspaceRootName: workspaceState?.currentWorkspaceRootName || null,
       archived: Number(conv.archived || 0) === 1,
       compactedInto: conv.compacted_into || null,
       compactedFrom: conv.compacted_from || null,
@@ -1407,6 +1636,53 @@ export function registerSessionsRoutes(app, deps) {
       updatedAt: persisted.updatedAt,
       created: persisted.created,
       senderClientId,
+    });
+  });
+
+  app.post('/api/conversation/:id/workspace-root', auth, (req, res) => {
+    const conversationId = String(req.params.id || '').trim();
+    if (!conversationId) return res.status(400).json({ error: 'Missing conversation id' });
+    const nextRootPath = String(
+      req.body?.rootPath
+      || req.body?.workspaceRootPath
+      || req.body?.workspace_root_path
+      || req.body?.cwd
+      || '',
+    ).trim();
+    if (!nextRootPath) {
+      return res.status(400).json({ error: 'Missing rootPath' });
+    }
+    if (typeof updateConversationConfiguredWorkspaceRoot !== 'function') {
+      return res.status(500).json({ error: 'Conversation workspace updates are unavailable' });
+    }
+    const result = updateConversationConfiguredWorkspaceRoot({
+      conversationId,
+      rootPath: nextRootPath,
+    });
+    if (!result?.ok) {
+      return res.status(400).json({ error: result?.error || 'Failed to update conversation workspace root' });
+    }
+    const state = result.state || null;
+    io.emit('conversation_workspace_root_updated', {
+      conversationId,
+      sdkSessionId: state?.sdkSessionId || null,
+      configuredWorkspaceRootPath: state?.configuredWorkspaceRootPath || null,
+      configuredWorkspaceRootName: state?.configuredWorkspaceRootName || null,
+      runtimeWorkspaceRootPath: state?.runtimeWorkspaceRootPath || null,
+      runtimeWorkspaceRootName: state?.runtimeWorkspaceRootName || null,
+      currentWorkspaceRootPath: state?.currentWorkspaceRootPath || null,
+      currentWorkspaceRootName: state?.currentWorkspaceRootName || null,
+    });
+    return res.json({
+      ok: true,
+      conversationId,
+      sdkSessionId: state?.sdkSessionId || null,
+      configuredWorkspaceRootPath: state?.configuredWorkspaceRootPath || null,
+      configuredWorkspaceRootName: state?.configuredWorkspaceRootName || null,
+      runtimeWorkspaceRootPath: state?.runtimeWorkspaceRootPath || null,
+      runtimeWorkspaceRootName: state?.runtimeWorkspaceRootName || null,
+      currentWorkspaceRootPath: state?.currentWorkspaceRootPath || null,
+      currentWorkspaceRootName: state?.currentWorkspaceRootName || null,
     });
   });
 
@@ -1529,12 +1805,53 @@ export function registerSessionsRoutes(app, deps) {
       },
       activeBridgeOwner: runtimeState.activeBridgeOwner || null,
       restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
+      relayShutdown: runtimeState.relayShutdown || null,
       features: featureFlags || {},
       sessionWorker: buildSessionWorkerStatusPayload({
         featureFlags,
         supervisorSnapshot: sessionWorkerSupervisor?.snapshot?.({ pendingQuestionSessionIds }) || null,
         queueRows: listSessionWorkerQueueRows.all(...SESSION_WORKER_STATUS_QUEUE_STATES),
       }),
+    });
+  });
+
+  app.post('/api/workspace-root', auth, (req, res) => {
+    const nextRootPath = String(req.body?.rootPath || req.body?.workspaceRootPath || '').trim();
+    if (!nextRootPath) {
+      return res.status(400).json({ error: 'Missing rootPath' });
+    }
+    if (typeof setWorkspaceRoot !== 'function') {
+      return res.status(500).json({ error: 'Workspace root updates are unavailable' });
+    }
+
+    const result = setWorkspaceRoot(nextRootPath, { reason: 'manual-ui-change' });
+    if (!result?.changed && result?.error) {
+      return res.status(400).json({ error: result.error });
+    }
+
+    const payload = workspaceRootPayload();
+    io.emit('workspace_root_changed', payload);
+    return res.json({
+      ok: true,
+      changed: !!result?.changed,
+      ...payload,
+    });
+  });
+
+  app.post('/api/session-worker/:sdkSessionId/launch', auth, async (req, res) => {
+    const sdkSessionId = String(req.params.sdkSessionId || '').trim();
+    const result = await launchWorkspaceRootSession(runtimeState, sessionWorkerSupervisor, sdkSessionId);
+    if (!result?.ok) {
+      return res.status(result?.statusCode || 400).json({
+        ok: false,
+        error: result?.error || 'launch-failed',
+        worker: result?.worker || null,
+        lifecycle: result?.lifecycle || null,
+      });
+    }
+    return res.json({
+      ok: true,
+      ...result,
     });
   });
 

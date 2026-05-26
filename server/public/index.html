@@ -11,7 +11,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <script>
   const __APP_BASE = window.location.pathname.replace(/\/+$/, '');
-  const __PWA_VERSION = '25';
+  const __PWA_VERSION = '27.2';
   window.__COPILOT_PWA_VERSION = __PWA_VERSION;
   window.addEventListener('DOMContentLoaded', () => {
     const versionEntry = document.getElementById('chat-menu-pwa-version');
@@ -298,7 +298,7 @@
   }
   #chat-title-wrap {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: 8px;
     flex: 1;
     min-width: 0;
@@ -307,10 +307,23 @@
     flex: 1;
     min-width: 0;
     overflow: hidden;
+  }
+  #chat-title-primary {
+    overflow: hidden;
     white-space: nowrap;
     text-overflow: ellipsis;
   }
   #chat-title { font-weight: 600; font-size: 1rem; display: inline; }
+  #chat-title-cwd {
+    display: block;
+    margin-top: 2px;
+    font-size: 0.7rem;
+    color: var(--muted);
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  #chat-title-cwd[hidden] { display: none; }
   #chat-title[data-copilot-session-id] { cursor: copy; }
   #chat-title[data-copilot-session-id]:hover {
     text-decoration: underline;
@@ -601,7 +614,19 @@
   .msg-bubble p:last-child { margin-bottom: 0; }
   .msg-bubble h1, .msg-bubble h2, .msg-bubble h3 { margin: 0.5em 0 0.25em; }
   .msg-bubble ul, .msg-bubble ol { padding-left: 1.4em; margin-bottom: 0.5em; }
-  .msg-bubble pre { margin: 0.5em 0; border-radius: 8px; overflow: auto; }
+  .msg-bubble pre {
+    margin: 0.5em 0;
+    border-radius: 8px;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    white-space: pre;
+    -webkit-overflow-scrolling: touch;
+  }
+  .msg-bubble pre code {
+    display: block;
+    white-space: inherit;
+  }
   .msg-bubble code:not(pre code) {
     background: #30363d; padding: 2px 6px; border-radius: 4px; font-size: 0.875em;
   }
@@ -1617,13 +1642,30 @@
       width: auto;
       min-width: 0;
       flex-wrap: nowrap;
-      align-items: center;
+      align-items: flex-start;
       gap: 6px;
     }
     #chat-title-slot {
+      display: flex;
+      flex-direction: column;
       flex: 1 1 auto;
       width: auto;
       margin: 0;
+      min-width: 0;
+    }
+    #chat-title-primary {
+      display: block;
+      min-width: 0;
+    }
+    #chat-title-cwd {
+      display: block;
+      margin-top: 1px;
+      font-size: 0.64rem;
+      line-height: 1.2;
+      min-width: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     #chat-header-actions {
       margin-left: auto;
@@ -1830,7 +1872,7 @@
     <div id="chat-header">
       <button id="sidebar-toggle" class="header-icon-btn" type="button" title="Toggle conversations sidebar" aria-label="Toggle conversations sidebar">☰</button>
       <div id="chat-title-wrap">
-        <span id="chat-title-slot"><span id="chat-title">Select or start a conversation</span></span>
+        <span id="chat-title-slot"><span id="chat-title-primary"><span id="chat-title">Select or start a conversation</span></span><span id="chat-title-cwd" hidden></span></span>
         <form id="chat-title-editor" hidden>
           <input id="chat-title-input" type="text" maxlength="120" autocomplete="off" spellcheck="false">
           <button id="chat-title-save-btn" class="chat-title-action-btn" type="submit">Save</button>
@@ -1846,6 +1888,8 @@
             <button id="chat-menu-edit-title" class="chat-actions-menu-item" type="button" role="menuitem">✍️ Edit conversation title</button>
             <button id="chat-menu-usage" class="chat-actions-menu-item" type="button" role="menuitem">📊 Check Usage</button>
             <button id="chat-menu-compact" class="chat-actions-menu-item" type="button" role="menuitem">🗜️ Compact</button>
+            <button id="chat-menu-change-cwd" class="chat-actions-menu-item" type="button" role="menuitem">🗂️ Change CWD</button>
+            <button id="chat-menu-restart-relay" class="chat-actions-menu-item" type="button" role="menuitem">🌄 Restart web relay</button>
             <button id="chat-menu-kill-session" class="chat-actions-menu-item" type="button" role="menuitem">☠️ Kill session</button>
           </div>
         </div>

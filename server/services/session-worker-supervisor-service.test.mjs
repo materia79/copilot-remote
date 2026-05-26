@@ -217,6 +217,25 @@ test('ensureWorker reuses a live worker even when its heartbeat is stale', async
   assert.equal(spawnCalls, 0);
 });
 
+test('diagnostic plan reference can be resolved dynamically', async () => {
+  const registry = createSessionWorkerRegistry();
+  let planPath = 'C:\\plans\\one.md';
+  const supervisor = createSessionWorkerSupervisor({
+    registry,
+    diagnosticPlanReference: () => planPath,
+  });
+
+  await supervisor.ensureWorker('sdk-plan');
+  let snapshot = supervisor.snapshot();
+  let worker = snapshot.workers.find((row) => row.sdkSessionId === 'sdk-plan');
+  assert.equal(worker.diagnosticPlanReference, 'C:\\plans\\one.md');
+
+  planPath = 'C:\\plans\\two.md';
+  snapshot = supervisor.snapshot();
+  worker = snapshot.workers.find((row) => row.sdkSessionId === 'sdk-plan');
+  assert.equal(worker.diagnosticPlanReference, 'C:\\plans\\two.md');
+});
+
 test('ensureWorker respawns only after the worker pid is gone', async () => {
   const registry = createSessionWorkerRegistry();
   registry.upsertWorker({
@@ -477,4 +496,3 @@ test('startup timeout exposes monitoring diagnostics and plan reference', async 
   assert.equal(monitorLogs.length, 1);
   assert.match(monitorLogs[0], /startup-heartbeat-timeout/);
 });
-
