@@ -11,11 +11,11 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <script>
   const __APP_BASE = window.location.pathname.replace(/\/+$/, '');
-  const __PWA_VERSION = '27.2';
+  const __PWA_VERSION = '0';
   window.__COPILOT_PWA_VERSION = __PWA_VERSION;
   window.addEventListener('DOMContentLoaded', () => {
-    const versionEntry = document.getElementById('chat-menu-pwa-version');
-    if (versionEntry) versionEntry.textContent = `PWA shell version: v${__PWA_VERSION}`;
+    const versionValueEntry = document.getElementById('chat-menu-pwa-version-value');
+    if (versionValueEntry) versionValueEntry.textContent = `v${__PWA_VERSION}`;
   });
   const __PWA_BUST = `v=${__PWA_VERSION}`;
   document.write(`<link rel="manifest" href="${__APP_BASE}/manifest.webmanifest?${__PWA_BUST}">`);
@@ -57,6 +57,10 @@
     --danger:    #f85149;
     --success:   #3fb950;
     --warn:      #d29922;
+    --conversation-title-offline: #f0f6fc;
+    --conversation-title-ready: #3fb950;
+    --conversation-title-question: #f85149;
+    --conversation-title-error: #d29922;
     --viewport-top-offset: 0px;
     --header-safe-top: max(env(safe-area-inset-top, 0px), var(--viewport-top-offset, 0px));
     --chat-header-top-base-desktop: 14px;
@@ -69,6 +73,10 @@
     --sidebar-header-top-pad-mobile: calc(var(--sidebar-header-top-base-mobile) + var(--header-safe-top));
     --immersive-top-shift: 0px;
     --sidebar-width: 280px;
+    --messages-height: 100vh;
+    --messages-width: 100vw;
+    --msg-attachment-max-height: calc(var(--messages-height, 100vh) * 0.35);
+    --msg-attachment-max-width: min(360px, calc(var(--messages-width, 100vw) * 0.35));
   }
 
   html, body {
@@ -250,10 +258,14 @@
   .conv-item.active { background: var(--bg3); border-color: var(--border); }
   .conv-title { font-size: 0.9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-right: 24px; }
   .conv-meta  { font-size: 0.75rem; color: var(--muted); margin-top: 2px; padding-right: 24px; }
-  .conv-item.worker-ui-offline .conv-title { color: #f0f6fc; }
-  .conv-item.worker-ui-ready .conv-title { color: #3fb950; }
-  .conv-item.worker-ui-question .conv-title { color: #f85149; }
-  .conv-item.worker-ui-error .conv-title { color: #d29922; }
+  .conv-item.worker-ui-offline .conv-title,
+  #chat-title[data-ui-state="offline"] { color: var(--conversation-title-offline); }
+  .conv-item.worker-ui-ready .conv-title,
+  #chat-title[data-ui-state="ready"] { color: var(--conversation-title-ready); }
+  .conv-item.worker-ui-question .conv-title,
+  #chat-title[data-ui-state="question"] { color: var(--conversation-title-question); }
+  .conv-item.worker-ui-error .conv-title,
+  #chat-title[data-ui-state="error"] { color: var(--conversation-title-error); }
   .conv-processing-dots {
     display: inline-block;
     min-width: 1.8ch;
@@ -419,7 +431,7 @@
     background: transparent;
     color: var(--text);
     border-radius: 8px;
-    padding: 0 10px;
+    padding: 0 8px;
     font-size: 0.82rem;
     text-align: left;
     cursor: pointer;
@@ -446,10 +458,47 @@
     border: 1px solid transparent;
     color: var(--muted);
     border-radius: 8px;
-    padding: 0 10px;
+    padding: 0 8px;
     font-size: 0.76rem;
     cursor: default;
     user-select: text;
+  }
+  .chat-actions-menu-meta-stacked {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    justify-content: center;
+    min-height: 42px;
+    padding: 3px 8px;
+    gap: 1px;
+    line-height: 1.2;
+  }
+  .chat-actions-menu-meta-primary {
+    font-size: 0.72rem;
+    color: var(--muted);
+  }
+  .chat-actions-menu-meta-top {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+  }
+  .chat-actions-menu-meta-label {
+    border: none;
+    background: transparent;
+    color: var(--muted);
+    font-size: 0.72rem;
+    line-height: 1.2;
+    padding: 0;
+    cursor: pointer;
+    text-align: left;
+  }
+  .chat-actions-menu-meta-label:hover {
+    color: var(--text);
+  }
+  .chat-actions-menu-meta-secondary {
+    font-size: 0.78rem;
+    color: var(--text);
   }
   #pending-question-banner {
     display: none;
@@ -596,13 +645,23 @@
   .msg-attachment.msg-attachment-image {
     align-self: flex-start;
     display: inline-block;
-    max-width: min(100%, 360px);
+    max-width: min(100%, var(--msg-attachment-max-width));
   }
   .msg-attachment.msg-attachment-image img {
-    display: block; width: 100%; height: auto; cursor: pointer;
+    display: block;
+    width: auto;
+    max-width: 100%;
+    height: auto;
+    max-height: var(--msg-attachment-max-height);
+    cursor: pointer;
   }
   .msg-attachment img {
-    display: block; width: 100%; max-width: 360px; height: auto; cursor: pointer;
+    display: block;
+    width: auto;
+    max-width: min(100%, var(--msg-attachment-max-width));
+    height: auto;
+    max-height: var(--msg-attachment-max-height);
+    cursor: pointer;
   }
   .msg-attachment-meta {
     padding: 6px 10px; font-size: 0.75rem; color: var(--muted);
@@ -732,6 +791,20 @@
     pointer-events: none;
     transition: background 0.2s ease, box-shadow 0.2s ease, opacity 0.2s ease;
   }
+  #input-area.ctx-indicator-bar::before {
+    right: auto;
+    width: calc(var(--context-usage-ratio, 0) * 100%);
+    background: linear-gradient(90deg,
+      hsl(120, 88%, 49%) 0%,
+      hsl(90, 88%, 49%) 38%,
+      hsl(48, 92%, 52%) 68%,
+      hsl(0, 88%, 51%) 100%);
+    background-position: left center;
+    background-size: calc(100% / clamp(0.001, var(--context-usage-ratio, 0), 1)) 100%;
+    box-shadow: 0 0 6px 0 var(--context-usage-glow);
+    opacity: 1;
+    transition: width 0.2s ease, background-size 0.2s ease, box-shadow 0.2s ease;
+  }
   #attachment-preview {
     display: none; gap: 10px; flex-wrap: wrap; margin-bottom: 10px;
   }
@@ -826,7 +899,7 @@
   #msg-input {
     flex: 1; padding: 12px 16px; font-size: 0.95rem;
     background: var(--bg3); border: 1px solid var(--border); border-radius: 12px;
-    color: var(--text); resize: none; outline: none; min-height: 46px; max-height: 160px;
+    color: var(--text); resize: none; outline: none; min-height: 46px; max-height: 132px;
     line-height: 1.4; font-family: inherit;
   }
   #msg-input:focus { border-color: var(--accent); }
@@ -980,8 +1053,23 @@
     user-select: none;
     -webkit-user-drag: none;
   }
+  .file-preview-video-shell {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    width: 100%;
+    height: 100%;
+  }
+  .file-preview-video {
+    width: 100%;
+    max-width: 100%;
+    max-height: min(72vh, 100%);
+    background: #000;
+    border-radius: 10px;
+  }
   /* Image body: no scrollbar, fill remaining dialog space, dark letterbox bg */
-  .file-preview-body.image-zoom-mode {
+  .file-preview-body.image-zoom-mode,
+  .file-preview-body.video-preview-mode {
     flex: 1;
     min-height: 0;          /* critical: prevents flex child from overflowing max-height */
     overflow: hidden;
@@ -995,6 +1083,23 @@
     min-height: 0;          /* same reason — lets the img's max-height:100% resolve */
     background: #0b0f14;
   }
+  .file-preview-body.video-preview-mode .file-preview-video-shell {
+    flex: 1;
+    min-height: 0;
+    padding: 12px 14px;
+    background: #0b0f14;
+  }
+  .msg-attachment-video-chip {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 88px;
+    height: 88px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--bg3);
+    font-size: 2rem;
+  }
   .file-preview-note {
     font-size: 0.82rem;
     color: var(--muted);
@@ -1004,7 +1109,7 @@
   #summary-modal {
     position: fixed;
     inset: 0;
-    z-index: 11001;
+    z-index: 12050;
     display: none;
     align-items: center;
     justify-content: center;
@@ -1754,7 +1859,7 @@
       display: none !important;
     }
     #msg-input {
-      min-width: 0; min-height: 42px; max-height: 42vh; border-radius: 10px;
+      min-width: 0; min-height: 42px; max-height: 40vh; border-radius: 10px;
       padding: 10px 12px; font-size: clamp(1rem, 4.2vw, 1.12rem);
     }
     #send-btn {
@@ -1830,6 +1935,26 @@
     .repo-entry-actions {
       justify-content: flex-start;
     }
+
+    #summary-modal {
+      padding: 8px;
+      align-items: stretch;
+      justify-content: center;
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+    .summary-dialog {
+      width: 100%;
+      height: calc(var(--app-height) - 16px);
+      max-height: calc(var(--app-height) - 16px);
+      border-radius: 10px;
+    }
+    .summary-modal-actions {
+      justify-content: stretch;
+    }
+    .summary-modal-actions > * {
+      flex: 1 1 calc(50% - 5px);
+    }
   }
 
   ::-webkit-scrollbar { width: 6px; }
@@ -1884,12 +2009,14 @@
         <div id="chat-actions-menu-wrap">
           <button id="chat-actions-menu-btn" class="header-icon-btn" type="button" title="Conversation actions" aria-label="Conversation actions" aria-haspopup="menu" aria-expanded="false">⋯</button>
           <div id="chat-actions-menu" role="menu" hidden>
-            <div id="chat-menu-pwa-version" class="chat-actions-menu-meta" aria-hidden="true">PWA shell version: v?</div>
+            <div id="chat-menu-pwa-version" class="chat-actions-menu-meta chat-actions-menu-meta-stacked" aria-hidden="true"><span class="chat-actions-menu-meta-primary">PWA shell version</span><span class="chat-actions-menu-meta-secondary" id="chat-menu-pwa-version-value">v?</span></div>
+            <div id="chat-menu-queue-status" class="chat-actions-menu-meta chat-actions-menu-meta-stacked" aria-hidden="true"><div class="chat-actions-menu-meta-top"><span class="chat-actions-menu-meta-primary">Queue</span><button id="chat-menu-empty-queue" class="chat-actions-menu-meta-label" type="button">🚮 Empty queue</button></div><span class="chat-actions-menu-meta-secondary" id="chat-menu-queue-status-value">pending=?, processing=?, parked=?</span></div>
             <button id="chat-menu-edit-title" class="chat-actions-menu-item" type="button" role="menuitem">✍️ Edit conversation title</button>
             <button id="chat-menu-usage" class="chat-actions-menu-item" type="button" role="menuitem">📊 Check Usage</button>
             <button id="chat-menu-compact" class="chat-actions-menu-item" type="button" role="menuitem">🗜️ Compact</button>
             <button id="chat-menu-change-cwd" class="chat-actions-menu-item" type="button" role="menuitem">🗂️ Change CWD</button>
             <button id="chat-menu-restart-relay" class="chat-actions-menu-item" type="button" role="menuitem">🌄 Restart web relay</button>
+            <button id="chat-menu-suspend-host" class="chat-actions-menu-item" type="button" role="menuitem" onclick="openSuspendHostConfirmation()">💤 Suspend host</button>
             <button id="chat-menu-kill-session" class="chat-actions-menu-item" type="button" role="menuitem">☠️ Kill session</button>
           </div>
         </div>

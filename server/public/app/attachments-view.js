@@ -37,6 +37,20 @@ function currentConversationId() {
   return String(currentConvId || '').trim();
 }
 
+function isVideoMimeType(mimeType) {
+  return String(mimeType || '').toLowerCase().startsWith('video/');
+}
+
+function normalizeVideoPreviewOptions(options = {}) {
+  const startSeconds = Math.max(0, Number(options?.startSeconds ?? options?.startAtSeconds ?? 0) || 0);
+  const preload = String(options?.preload || 'metadata').toLowerCase();
+  return {
+    startSeconds,
+    preload: preload === 'auto' ? 'auto' : 'metadata',
+    autoplay: options?.autoplay === true,
+  };
+}
+
 function currentWorkspaceRootPathForSelection() {
   return String(getConversationCurrentWorkspaceRootPath(currentConversationId()) || workspaceRootPath || '').trim();
 }
@@ -77,15 +91,18 @@ export function renderAttachmentMarkup(attachments) {
           ? (att.contentUrl.startsWith('/') ? `${BASE}${att.contentUrl}` : att.contentUrl)
           : '';
       const isImage = String(att?.type || '').startsWith('image/');
+      const isVideo = isVideoMimeType(att?.type);
       const sizeText = Number(att?.size || 0) > 0 ? ` · ${formatBytes(Number(att.size || 0))}` : '';
-      if (isImage && rawUrl) {
+      if ((isImage || isVideo) && rawUrl) {
         const jsName = escHtml(JSON.stringify(att?.name || 'attachment'));
         const jsUrl = escHtml(JSON.stringify(rawUrl));
         const jsType = escHtml(JSON.stringify(att?.type || 'image/jpeg'));
         const openHandler = `openUploadedAttachmentViewer(${jsName},${jsUrl},${jsType})`;
         return `
-          <div class="msg-attachment msg-attachment-image">
-            <img src="${escHtml(rawUrl)}" alt="${name}" loading="lazy" onclick="${openHandler}" onload="(function(i){var c=i.closest('.msg-attachment');if(c&&i.naturalWidth>0){c.style.width=i.naturalWidth+'px';}})(this)">
+          <div class="msg-attachment msg-attachment-${isVideo ? 'video' : 'image'}">
+            ${isVideo
+              ? `<div class="msg-attachment-video-chip">🎞️</div>`
+              : `<img src="${escHtml(rawUrl)}" alt="${name}" loading="lazy" onclick="${openHandler}">`}
             <div class="msg-attachment-meta"><a href="#" onclick="${openHandler};return false;">${name}</a> · ${type}${sizeText} · <a href="#" onclick="${openHandler};return false;">open</a></div>
           </div>`;
       }
@@ -214,6 +231,27 @@ function teardownImageZoom() {
   if (bodyEl) bodyEl.classList.remove('image-zoom-mode');
 }
 
+function teardownVideoPreview() {
+  const video = videoPreview.videoEl;
+  const onLoadedMetadata = videoPreview.onLoadedMetadata;
+  const onError = videoPreview.onError;
+  const onCanPlay = videoPreview.onCanPlay;
+  if (video) {
+    if (onLoadedMetadata) video.removeEventListener('loadedmetadata', onLoadedMetadata);
+    if (onError) video.removeEventListener('error', onError);
+    if (onCanPlay) video.removeEventListener('canplay', onCanPlay);
+    try {
+      video.pause();
+    } catch {}
+  }
+  videoPreview.videoEl = null;
+  videoPreview.onLoadedMetadata = null;
+  videoPreview.onError = null;
+  videoPreview.onCanPlay = null;
+  const bodyEl = document.getElementById('file-preview-body');
+  if (bodyEl) bodyEl.classList.remove('video-preview-mode');
+}
+
 function setupImageZoom(container) {
   imgZoom.container = container;
   imgZoom.imgEl = container.querySelector('img');
@@ -257,6 +295,12 @@ let imgZoom = {
   container: null,
   imgEl: null,
   onImgLoad: null,
+};
+let videoPreview = {
+  videoEl: null,
+  onLoadedMetadata: null,
+  onError: null,
+  onCanPlay: null,
 };
 const IMG_ZOOM_MIN_FLOOR = 0.05;
 const IMG_ZOOM_MAX = 8;
@@ -459,8 +503,10 @@ function _imgZoomOnResize() {
   _recomputeImgZoomMinScale({ resetToMin: _isAtImgZoomMin() });
 }
 
-export function openUploadedAttachmentViewer(name, contentUrl, mimeType) {
+export function openUploadedAttachmentViewer(name, contentUrl, mimeType, options = {}) {
   const isImage = String(mimeType || '').startsWith('image/');
+  const isVideo = isVideoMimeType(mimeType);
+  const viewerOptions = normalizeVideoPreviewOptions(options);
   setFilePreviewState({
     path: String(name || 'attachment'),
     source: 'upload',
@@ -468,11 +514,13 @@ export function openUploadedAttachmentViewer(name, contentUrl, mimeType) {
     allowHtml: false,
     loading: false,
     error: '',
+    viewerOptions,
     payload: {
-      kind: isImage ? 'image' : 'binary',
+      kind: isImage ? 'image' : (isVideo ? 'video' : 'binary'),
       name: String(name || 'attachment'),
       rawUrl: String(contentUrl || ''),
       size: 0,
+      contentType: String(mimeType || '').toLowerCase(),
     },
   });
   const modal = document.getElementById('file-preview-modal');
@@ -496,6 +544,7 @@ export function toggleFilePreviewHtml() {
 
 export function renderFilePreview() {
   teardownImageZoom();
+  teardownVideoPreview();
   const titleEl = document.getElementById('file-preview-title');
   const metaEl = document.getElementById('file-preview-meta');
   const bodyEl = document.getElementById('file-preview-body');
@@ -567,11 +616,71 @@ export function renderFilePreview() {
     return;
   }
 
-  const rawText = String(payload.content || '');
   if (filePreviewState.mode === 'raw') {
-    bodyEl.innerHTML = `<div class="file-preview-code"><pre><code>${escHtml(rawText)}</code></pre></div>`;
+    bodyEl.innerHTML = payload.kind === 'video'
+      ? '<div class="file-preview-note">Video files are binary. Use <b>Download</b> to save the file.</div>'
+      : `<div class="file-preview-code"><pre><code>${escHtml(String(payload.content || ''))}</code></pre></div>`;
     return;
   }
+
+  if (payload.kind === 'video') {
+    const videoHref = String(rawHref || payload.rawUrl || '');
+    const viewerOptions = filePreviewState.viewerOptions || {};
+    const startSeconds = Math.max(0, Number(viewerOptions.startSeconds || 0) || 0);
+    const preload = String(viewerOptions.preload || 'metadata').toLowerCase() === 'auto' ? 'auto' : 'metadata';
+    const autoplay = viewerOptions.autoplay === true;
+    if (videoHref) {
+      bodyEl.innerHTML = `
+        <div class="file-preview-video-shell" data-start-seconds="${escHtml(String(startSeconds))}" data-preload="${escHtml(preload)}">
+          <video class="file-preview-video" controls playsinline preload="${escHtml(preload)}" src="${escHtml(videoHref)}"></video>
+          <div class="file-preview-note">${startSeconds > 0 ? `Will start at ${startSeconds.toFixed(2)}s.` : 'Video preview ready.'} ${preload === 'auto' ? 'Preloading enabled.' : 'Metadata preload enabled.'}</div>
+        </div>`;
+      bodyEl.classList.add('video-preview-mode');
+      const shell = bodyEl.querySelector('.file-preview-video-shell');
+      const video = shell?.querySelector('video');
+      if (video) {
+        videoPreview.videoEl = video;
+        videoPreview.onLoadedMetadata = () => {
+          if (startSeconds > 0 && Number.isFinite(video.duration) && video.duration > startSeconds) {
+            try {
+              video.currentTime = startSeconds;
+            } catch {}
+          }
+          if (autoplay) {
+            const playPromise = video.play?.();
+            if (playPromise && typeof playPromise.catch === 'function') {
+              playPromise.catch(() => {});
+            }
+          }
+        };
+        videoPreview.onCanPlay = () => {
+          if (autoplay && video.paused) {
+            const playPromise = video.play?.();
+            if (playPromise && typeof playPromise.catch === 'function') {
+              playPromise.catch(() => {});
+            }
+          }
+        };
+        videoPreview.onError = () => {
+          let errorNote = bodyEl.querySelector('.file-preview-video-error');
+          if (!errorNote) {
+            errorNote = document.createElement('div');
+            errorNote.className = 'file-preview-note file-preview-video-error';
+            bodyEl.appendChild(errorNote);
+          }
+          errorNote.innerHTML = 'Video preview unavailable. Use <b>Download</b> to save the file.';
+        };
+        video.addEventListener('loadedmetadata', videoPreview.onLoadedMetadata, { once: true });
+        video.addEventListener('canplay', videoPreview.onCanPlay);
+        video.addEventListener('error', videoPreview.onError, { once: true });
+      }
+    } else {
+      bodyEl.innerHTML = '<div class="file-preview-note">Video preview unavailable.</div>';
+    }
+    return;
+  }
+ 
+  const rawText = String(payload.content || '');
 
   if (payload.kind === 'markdown') {
     const html = renderMarkdownPreview(rawText, filePreviewState.allowHtml);
@@ -585,9 +694,10 @@ export function renderFilePreview() {
   bodyEl.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
 }
 
-export async function openWorkspaceFilePreview(rawPath) {
+export async function openWorkspaceFilePreview(rawPath, options = {}) {
   const normalized = normalizeWorkspaceMentionPath(rawPath);
   if (!normalized) return;
+  const viewerOptions = normalizeVideoPreviewOptions(options);
   setFilePreviewState({
     path: normalized,
     source: 'workspace',
@@ -596,6 +706,7 @@ export async function openWorkspaceFilePreview(rawPath) {
     loading: true,
     error: '',
     payload: null,
+    viewerOptions,
   });
   const modal = document.getElementById('file-preview-modal');
   modal.classList.add('visible');
@@ -612,12 +723,14 @@ export async function openWorkspaceFilePreview(rawPath) {
   filePreviewState.loading = false;
   filePreviewState.payload = payload;
   filePreviewState.path = String(payload.path || normalized);
+  filePreviewState.viewerOptions = viewerOptions;
   renderFilePreview();
 }
 
-export async function openDriveFilePreview(rawPath) {
+export async function openDriveFilePreview(rawPath, options = {}) {
   const normalized = normalizeDriveBrowserPath(rawPath);
   if (!normalized) return;
+  const viewerOptions = normalizeVideoPreviewOptions(options);
   setFilePreviewState({
     path: normalized,
     source: 'drives',
@@ -626,6 +739,7 @@ export async function openDriveFilePreview(rawPath) {
     loading: true,
     error: '',
     payload: null,
+    viewerOptions,
   });
   const modal = document.getElementById('file-preview-modal');
   modal.classList.add('visible');
@@ -643,19 +757,21 @@ export async function openDriveFilePreview(rawPath) {
   filePreviewState.payload = payload;
   filePreviewState.path = String(payload.path || normalized);
   filePreviewState.source = 'drives';
+  filePreviewState.viewerOptions = viewerOptions;
   renderFilePreview();
 }
 
-export async function openWorkspaceFilePreviewFromRepo(rawPath) {
+export async function openWorkspaceFilePreviewFromRepo(rawPath, options = {}) {
   if (repoBrowserState.activeRoot !== 'workspace') {
-    await openDriveFilePreview(rawPath);
+    await openDriveFilePreview(rawPath, options);
     return;
   }
-  await openWorkspaceFilePreview(rawPath);
+  await openWorkspaceFilePreview(rawPath, options);
 }
 
 export function closeFilePreview() {
   teardownImageZoom();
+  teardownVideoPreview();
   const modal = document.getElementById('file-preview-modal');
   modal.classList.remove('visible');
   modal.setAttribute('aria-hidden', 'true');
@@ -717,6 +833,7 @@ export function repoIcon(node) {
   }
   const kind = String(node.previewKind || '').toLowerCase();
   if (kind === 'image') return '🖼️';
+  if (kind === 'video') return '🎞️';
   if (kind === 'markdown') return '📝';
   if (kind === 'code') return '💻';
   if (kind === 'binary') return '📦';

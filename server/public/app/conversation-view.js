@@ -740,11 +740,17 @@ export async function sendMessage() {
   const mobileSend = isMobileComposerViewport();
   const activeTurn = getActiveTurnForConversation(currentConvId);
   const hasDraft = hasComposerDraft({ text, attachmentCount: selectedAttachments.length });
+  // #region agent log
+  fetch('http://127.0.0.1:7611/ingest/41e205ad-83bf-40b2-b2ab-5040e785036c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0e20dd'},body:JSON.stringify({sessionId:'0e20dd',id:`log_${Date.now()}_${Math.random().toString(36).slice(2,10)}`,runId:'ui-regressions-baseline',hypothesisId:'H10-send-gating',location:'server/public/app/conversation-view.js:sendMessage.entry',message:'send message invocation snapshot',data:{conversationId:String(currentConvId||'').trim()||null,sendInFlight,activeTurnMessageId:String(activeTurn?.messageId||'').trim()||null,activeTurnStatus:String(activeTurn?.status||'').trim()||null,hasDraft,cliOnline,textChars:String(text||'').length},timestamp:Date.now()})}).catch(()=>{});
+  // #endregion
   if (sendInFlight) {
     showTransientRelayNotice('Please wait for the current message to finish sending.');
     return;
   }
   if (activeTurn?.messageId && !hasDraft) {
+    // #region agent log
+    fetch('http://127.0.0.1:7611/ingest/41e205ad-83bf-40b2-b2ab-5040e785036c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0e20dd'},body:JSON.stringify({sessionId:'0e20dd',id:`log_${Date.now()}_${Math.random().toString(36).slice(2,10)}`,runId:'ui-regressions-baseline',hypothesisId:'H10-send-gating',location:'server/public/app/conversation-view.js:sendMessage.stop-branch',message:'send button routed to stop active turn',data:{conversationId:String(currentConvId||'').trim()||null,activeTurnMessageId:String(activeTurn?.messageId||'').trim()||null},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
     await stopCurrentConversationTurn(currentConvId);
     return;
   }
@@ -786,6 +792,9 @@ export async function sendMessage() {
     releaseComposerFocusAfterSend(input);
     pendingUserMessageIds.add(clientMessageId);
     appendMessage({ role: 'user', text, model: selectedModel, mode: selectedMode, timestamp: msgTimestamp, attachments }, true, clientMessageId, true);
+    // #region agent log
+    fetch('http://127.0.0.1:7611/ingest/41e205ad-83bf-40b2-b2ab-5040e785036c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0e20dd'},body:JSON.stringify({sessionId:'0e20dd',id:`log_${Date.now()}_${Math.random().toString(36).slice(2,10)}`,runId:'ui-regressions-baseline',hypothesisId:'H11-pending-row',location:'server/public/app/conversation-view.js:sendMessage.optimistic-user-row',message:'optimistic pending user row appended',data:{clientMessageId,conversationId:targetConversationId||null,selectedMode,selectedModel,textChars:String(text||'').length},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
     scrollBottomAfterSend();
 
     const body = {
@@ -901,11 +910,20 @@ async function validateSelectedConversationBeforeSend() {
 
   const conversationSessionId = String(current.sdkSessionId || current.sdk_session_id || '').trim();
   const runtimeSessionSessionId = String(current.runtimeSession?.sdkSessionId || current.runtimeSession?.sdk_session_id || '').trim();
+  // #region agent log
+  fetch('http://127.0.0.1:7611/ingest/41e205ad-83bf-40b2-b2ab-5040e785036c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0e20dd'},body:JSON.stringify({sessionId:'0e20dd',id:`log_${Date.now()}_${Math.random().toString(36).slice(2,10)}`,runId:'baseline-binding',hypothesisId:'H1-client-precheck',location:'server/public/app/conversation-view.js:validateSelectedConversationBeforeSend',message:'pre-send binding snapshot',data:{conversationId:convId,conversationSessionId:conversationSessionId||null,runtimeSessionSessionId:runtimeSessionSessionId||null,runtimeSessionId:String(current.runtimeSession?.id||'').trim()||null},timestamp:Date.now()})}).catch(()=>{});
+  // #endregion
   if (!conversationSessionId) {
+    // #region agent log
+    fetch('http://127.0.0.1:7611/ingest/41e205ad-83bf-40b2-b2ab-5040e785036c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0e20dd'},body:JSON.stringify({sessionId:'0e20dd',id:`log_${Date.now()}_${Math.random().toString(36).slice(2,10)}`,runId:'baseline-binding',hypothesisId:'H1-client-precheck',location:'server/public/app/conversation-view.js:validateSelectedConversationBeforeSend',message:'blocked send: conversation unbound',data:{conversationId:convId,conversationSessionId:null,runtimeSessionSessionId:runtimeSessionSessionId||null},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
     setModelBanner('⚠️ This conversation is waiting to be claimed by the relay. Please wait, or open another conversation.');
     return false;
   }
   if (!runtimeSessionSessionId || conversationSessionId !== runtimeSessionSessionId) {
+    // #region agent log
+    fetch('http://127.0.0.1:7611/ingest/41e205ad-83bf-40b2-b2ab-5040e785036c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0e20dd'},body:JSON.stringify({sessionId:'0e20dd',id:`log_${Date.now()}_${Math.random().toString(36).slice(2,10)}`,runId:'baseline-binding',hypothesisId:'H2-client-mismatch-branch',location:'server/public/app/conversation-view.js:validateSelectedConversationBeforeSend',message:'blocked send: runtime mismatch or missing',data:{conversationId:convId,conversationSessionId:conversationSessionId||null,runtimeSessionSessionId:runtimeSessionSessionId||null,runtimeSessionId:String(current.runtimeSession?.id||'').trim()||null},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
     setModelBanner('⚠️ This conversation is bound to a different relay session. Wait for the matching session to claim it, or open another conversation.');
     return false;
   }

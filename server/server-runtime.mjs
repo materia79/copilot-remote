@@ -41,6 +41,9 @@ import { RELAY_RESTART_EXIT_CODE } from './relay-exit-codes.mjs';
 import { DEFAULT_QUESTION_TIMEOUT_MS } from '../shared/question-timeout.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PUBLIC_DIR = path.join(__dirname, 'public');
+const INDEX_HTML_PATH = path.join(PUBLIC_DIR, 'index.html');
+const PWA_VERSION_PLACEHOLDER = /const __PWA_VERSION = '[^']*';/;
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 const CONFIG_PATH    = process.env.COPILOT_WEB_RELAY_CONFIG
@@ -122,6 +125,14 @@ const WORKSPACE_CONTENT_TYPES = Object.freeze({
   '.gif': 'image/gif',
   '.webp': 'image/webp',
   '.ico': 'image/x-icon',
+  '.mp4': 'video/mp4',
+  '.m4v': 'video/mp4',
+  '.mov': 'video/quicktime',
+  '.webm': 'video/webm',
+  '.mkv': 'video/x-matroska',
+  '.avi': 'video/x-msvideo',
+  '.ogv': 'video/ogg',
+  '.wmv': 'video/x-ms-wmv',
   '.pdf': 'application/pdf',
 });
 const WORKSPACE_MARKDOWN_EXTENSIONS = new Set(['.md', '.mdx', '.markdown']);
@@ -165,6 +176,7 @@ const WORKSPACE_PREVIEW_LANGUAGE_BY_EXTENSION = Object.freeze({
 const WORKSPACE_CODE_EXTENSIONS = new Set(Object.keys(WORKSPACE_PREVIEW_LANGUAGE_BY_EXTENSION)
   .filter((ext) => !WORKSPACE_MARKDOWN_EXTENSIONS.has(ext)));
 const WORKSPACE_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.ico', '.bmp', '.avif']);
+const WORKSPACE_VIDEO_EXTENSIONS = new Set(['.mp4', '.m4v', '.mov', '.webm', '.mkv', '.avi', '.ogv', '.wmv']);
 const REPO_HEAVY_DIR_NAMES = new Set(['.git', 'node_modules']);
 const MAX_REPO_TREE_NODES = 20_000;
 const MAX_REPO_TREE_DEPTH = 64;
@@ -325,6 +337,39 @@ function normalizeConversationWorkspaceRootPath(candidatePath) {
   return normalized || null;
 }
 
+// Per-session pending CWD registry. Stores the CLI working directory reported on
+// startup before the session has been bound to any conversation. Consumed when the
+// session eventually binds (via /api/session-sync) and persisted to the DB.
+const pendingSessionCwds = new Map();
+const MAX_PENDING_SESSION_CWDS = 64;
+
+function setPendingSessionCwd(sdkSessionId, cwdPath) {
+  const sid = String(sdkSessionId || '').trim();
+  if (!sid) return false;
+  const normalized = normalizeConversationWorkspaceRootPath(cwdPath);
+  if (!normalized) return false;
+  if (pendingSessionCwds.size >= MAX_PENDING_SESSION_CWDS) {
+    const oldest = pendingSessionCwds.keys().next().value;
+    if (oldest) pendingSessionCwds.delete(oldest);
+  }
+  pendingSessionCwds.set(sid, normalized);
+  return true;
+}
+
+function getPendingSessionCwd(sdkSessionId) {
+  const sid = String(sdkSessionId || '').trim();
+  if (!sid) return null;
+  return pendingSessionCwds.get(sid) || null;
+}
+
+function consumePendingSessionCwd(sdkSessionId) {
+  const sid = String(sdkSessionId || '').trim();
+  if (!sid) return null;
+  const value = pendingSessionCwds.get(sid) || null;
+  if (value) pendingSessionCwds.delete(sid);
+  return value;
+}
+
 function listRecentWorkspaceRoots(limit = MAX_RECENT_WORKSPACE_ROOTS) {
   const maxItems = Math.max(1, Math.min(MAX_RECENT_WORKSPACE_ROOTS, Number(limit) || MAX_RECENT_WORKSPACE_ROOTS));
   if (!stmts?.listRecentWorkspaceRoots?.all) return [];
@@ -364,20 +409,31 @@ function isConversationSessionRunning(sdkSessionId) {
   return ACTIVE_SESSION_CWD_STATUSES.has(status);
 }
 
-function buildConversationWorkspaceRootState(row = null) {
+function buildConversationWorkspaceRootState(row = null, {
+  conversationId: fallbackConversationId = '',
+  sdkSessionId: fallbackSdkSessionId = '',
+  discoveredWorkspaceRootPath = '',
+} = {}) {
   const conversation = row && typeof row === 'object' ? row : null;
-  const conversationId = String(conversation?.id || '').trim() || null;
-  const sdkSessionId = String(conversation?.sdk_session_id || conversationId || '').trim() || null;
+  const conversationId = String(conversation?.id || fallbackConversationId || '').trim() || null;
+  const sdkSessionId = String(conversation?.sdk_session_id || fallbackSdkSessionId || conversationId || '').trim() || null;
+  // pendingCwd: CWD reported by the CLI at startup before the session was bound to any
+  // conversation. Used as a fallback so the correct directory is shown as soon as the
+  // session starts, even before the first message is processed.
+  const pendingCwd = sdkSessionId ? getPendingSessionCwd(sdkSessionId) : null;
   const configuredWorkspaceRootPath =
     normalizeConversationWorkspaceRootPath(conversation?.configured_workspace_root_path)
-    || currentWorkspaceRootPath();
+    || null;
   const runtimeWorkspaceRootPath =
     normalizeConversationWorkspaceRootPath(conversation?.runtime_workspace_root_path)
     || null;
+  const discoveredCurrentWorkspaceRootPath =
+    normalizeConversationWorkspaceRootPath(discoveredWorkspaceRootPath)
+    || null;
   const running = sdkSessionId ? isConversationSessionRunning(sdkSessionId) : false;
   const effectiveWorkspaceRootPath = running
-    ? (runtimeWorkspaceRootPath || configuredWorkspaceRootPath || currentWorkspaceRootPath())
-    : (configuredWorkspaceRootPath || runtimeWorkspaceRootPath || currentWorkspaceRootPath());
+    ? (runtimeWorkspaceRootPath || pendingCwd || configuredWorkspaceRootPath || discoveredCurrentWorkspaceRootPath || currentWorkspaceRootPath())
+    : (pendingCwd || configuredWorkspaceRootPath || runtimeWorkspaceRootPath || discoveredCurrentWorkspaceRootPath || currentWorkspaceRootPath());
   const currentWorkspaceRootPathValue = effectiveWorkspaceRootPath || currentWorkspaceRootPath();
   return {
     conversationId,
@@ -394,8 +450,15 @@ function buildConversationWorkspaceRootState(row = null) {
   };
 }
 
-function resolveConversationWorkspaceState({ conversationId = '', sdkSessionId = '' } = {}) {
-  return buildConversationWorkspaceRootState(resolveConversationRecord({ conversationId, sdkSessionId }));
+function resolveConversationWorkspaceState({
+  conversationId = '',
+  sdkSessionId = '',
+  discoveredWorkspaceRootPath = '',
+} = {}) {
+  return buildConversationWorkspaceRootState(
+    resolveConversationRecord({ conversationId, sdkSessionId }),
+    { conversationId, sdkSessionId, discoveredWorkspaceRootPath },
+  );
 }
 
 function updateConversationConfiguredWorkspaceRoot({ conversationId = '', sdkSessionId = '', rootPath = '' } = {}) {
@@ -2010,6 +2073,7 @@ function workspacePreviewKindForMeta(ext, contentType) {
   const normalizedType = String(contentType || '').toLowerCase();
   if (WORKSPACE_MARKDOWN_EXTENSIONS.has(normalizedExt)) return 'markdown';
   if (WORKSPACE_IMAGE_EXTENSIONS.has(normalizedExt) || normalizedType.startsWith('image/')) return 'image';
+  if (WORKSPACE_VIDEO_EXTENSIONS.has(normalizedExt) || normalizedType.startsWith('video/')) return 'video';
   if (WORKSPACE_CODE_EXTENSIONS.has(normalizedExt)) return 'code';
   if (isLikelyTextContentType(normalizedType)) return 'text';
   return 'binary';
@@ -2638,6 +2702,71 @@ function fetchUsageSummary(cb) {
   });
 }
 
+function shouldIncludeInPwaVersion(relativePath) {
+  if (!relativePath) return false;
+  const normalized = String(relativePath).replace(/\\/g, '/').replace(/^\/+/, '');
+  if (!normalized || normalized.startsWith('.')) return false;
+  if (normalized === 'index.html' || normalized === 'sw.js' || normalized === 'manifest.webmanifest') return true;
+  if (/^app-icon(?:-\d+)?\.png$/i.test(normalized)) return true;
+  if (/^app-icon\.svg$/i.test(normalized)) return true;
+  if (/^favicon\.ico$/i.test(normalized)) return true;
+  if (normalized.startsWith('app/')) {
+    const ext = path.extname(normalized).toLowerCase();
+    return ext === '.js' || ext === '.mjs' || ext === '.css' || ext === '.html';
+  }
+  return false;
+}
+
+function formatPwaVersionTimestamp(valueMs) {
+  const date = new Date(valueMs);
+  if (!Number.isFinite(date.getTime())) return '0';
+  const yyyy = String(date.getUTCFullYear());
+  const mm = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(date.getUTCDate()).padStart(2, '0');
+  const hh = String(date.getUTCHours()).padStart(2, '0');
+  const min = String(date.getUTCMinutes()).padStart(2, '0');
+  const ss = String(date.getUTCSeconds()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}-${hh}-${min}-${ss}Z`;
+}
+
+function computePwaShellVersion() {
+  let maxMtimeMs = 0;
+  const stack = [PUBLIC_DIR];
+  while (stack.length) {
+    const dirPath = stack.pop();
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dirPath, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const absolutePath = path.join(dirPath, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(absolutePath);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const relativePath = path.relative(PUBLIC_DIR, absolutePath);
+      if (!shouldIncludeInPwaVersion(relativePath)) continue;
+      try {
+        const stats = fs.statSync(absolutePath);
+        if (Number.isFinite(stats.mtimeMs) && stats.mtimeMs > maxMtimeMs) {
+          maxMtimeMs = stats.mtimeMs;
+        }
+      } catch {}
+    }
+  }
+  const sourceMs = Number.isFinite(maxMtimeMs) && maxMtimeMs > 0 ? maxMtimeMs : Date.now();
+  return formatPwaVersionTimestamp(sourceMs);
+}
+
+function renderIndexHtmlWithPwaVersion() {
+  const version = computePwaShellVersion();
+  const source = fs.readFileSync(INDEX_HTML_PATH, 'utf8');
+  return source.replace(PWA_VERSION_PLACEHOLDER, `const __PWA_VERSION = '${version}';`);
+}
+
 const sessionDiscoveryService = createSessionDiscoveryService({
   fs,
   path,
@@ -2663,7 +2792,16 @@ const httpServer = http.createServer(app);
 const io         = new Server(httpServer, { cors: { origin: '*' } });
 
 app.use(express.json({ limit: '20mb' }));
-app.use(express.static(path.join(__dirname, 'public'), { etag: false, setHeaders: (res) => res.setHeader('Cache-Control', 'no-store') }));
+app.get(['/', '/index.html'], (req, res, next) => {
+  try {
+    const html = renderIndexHtmlWithPwaVersion();
+    res.setHeader('Cache-Control', 'no-store');
+    res.type('html').send(html);
+  } catch (error) {
+    next(error);
+  }
+});
+app.use(express.static(PUBLIC_DIR, { etag: false, setHeaders: (res) => res.setHeader('Cache-Control', 'no-store') }));
 
 // ─── CLI Status Tracking ──────────────────────────────────────────────────────
 let cliLastSeen = null;
@@ -2763,6 +2901,8 @@ const sharedRouteDeps = {
   resolveConversationWorkspaceState,
   updateConversationConfiguredWorkspaceRoot,
   learnConversationWorkspaceRoot,
+  setPendingSessionCwd,
+  consumePendingSessionCwd,
   featureFlags,
   sessionWorkerSupervisor,
   sessionWorkerRegistry,

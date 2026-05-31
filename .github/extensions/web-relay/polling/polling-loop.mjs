@@ -1,5 +1,9 @@
 import fs from "fs";
-import { buildTerminalFailureText, isTerminalSendAndWaitError } from "../runtime/send-and-wait-errors.mjs";
+import {
+  buildTerminalFailureText,
+  isTerminalSendAndWaitError,
+  normalizeTerminalSendAndWaitError,
+} from "../runtime/send-and-wait-errors.mjs";
 import { getActiveSession } from "../runtime/session-registry.mjs";
 import { DEFAULT_QUESTION_TIMEOUT_MS } from "../../../../shared/question-timeout.mjs";
 import { QUESTION_TIMEOUT_CONTINUATION_TEXT } from "../../../../shared/question-timeout.mjs";
@@ -12,6 +16,38 @@ import {
 function isImageAttachment(att) {
   const type = String(att?.type || "").toLowerCase();
   return type.startsWith("image/");
+}
+
+export function classifySwitchingFailure(input = {}) {
+  const explicitRetryable = input?.retryable;
+  const reason = String(input?.reason || "switch-call-failed").trim() || "switch-call-failed";
+  if (typeof explicitRetryable === "boolean") {
+    return { reason, retryable: explicitRetryable };
+  }
+  const nonRetryable = new Set([
+    "switch-api-missing",
+    "target-session-invalid",
+  ]);
+  return { reason, retryable: !nonRetryable.has(reason) };
+}
+
+export function evaluateSwitchRetry({
+  retryable = false,
+  attempts = 0,
+  maxRetries = 2,
+} = {}) {
+  const safeAttempts = Math.max(0, Math.trunc(Number(attempts) || 0));
+  const safeMaxRetries = Math.max(0, Math.trunc(Number(maxRetries) || 0));
+  if (!retryable || safeAttempts >= safeMaxRetries) {
+    return {
+      shouldRetry: false,
+      attempts: Math.min(safeAttempts, safeMaxRetries),
+    };
+  }
+  return {
+    shouldRetry: true,
+    attempts: safeAttempts + 1,
+  };
 }
 
 function readImageBlobFromDataUrl(att) {
@@ -637,6 +673,21 @@ export function createPollingLoop({
           const label = message.isNewConversation ? "new conv" : "existing conv";
           await session.log(`📨 [${label}] Web message (${message.model || "default"} / ${message.relayMode || "agent"}): "${String(message.text || "").slice(0, 80)}"`);
           dbg("session.send: queuing for msgId", message.id);
+          let lastStreamedSent = "";
+          const pushRelayStream = async (text, done = false) => {
+            const value = String(text || "");
+            if (!value && !done) return;
+            if (!done && value === lastStreamedSent) return;
+            const publish = await publishRelayStreamEvent({
+              api,
+              message,
+              text: value,
+              done,
+              dbg,
+            });
+            if (!done && publish.ok) lastStreamedSent = value;
+          };
+          let sendAndWaitStartedAtMs = 0;
 
           try {
             if (message.model) {
@@ -672,21 +723,7 @@ export function createPollingLoop({
             }
 
             let finalEvent;
-            let lastStreamedSent = "";
             let lastWorkerStatusCheckAt = 0;
-            const pushRelayStream = async (text, done = false) => {
-              const value = String(text || "");
-              if (!value && !done) return;
-              if (!done && value === lastStreamedSent) return;
-              const publish = await publishRelayStreamEvent({
-                api,
-                message,
-                text: value,
-                done,
-                dbg,
-              });
-              if (!done && publish.ok) lastStreamedSent = value;
-            };
             const onStreamingEvent = async (event) => {
               await checkActiveAbortControl(message);
               const streamedText = extractStreamTextFromEvent(event);
@@ -755,6 +792,10 @@ export function createPollingLoop({
               // The extension SDK's session.send() can resolve to an opaque request id before
               // onUserInputRequest fires. For relay turns that would finalize the queue row too
               // early, so keep using the stable sendAndWait path here.
+              sendAndWaitStartedAtMs = Date.now();
+              // #region agent log
+              if (typeof fetch === "function") fetch('http://127.0.0.1:7611/ingest/41e205ad-83bf-40b2-b2ab-5040e785036c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0e20dd'},body:JSON.stringify({sessionId:'0e20dd',id:`log_${Date.now()}_${Math.random().toString(36).slice(2,10)}`,runId:'slow-turn-baseline',hypothesisId:'H8-sdk-sendandwait',location:'.github/extensions/web-relay/polling/polling-loop.mjs:sendWithoutStreaming.start',message:'sendAndWait started',data:{queueMessageId:String(message?.id||''),conversationId:String(message?.conversationId||''),ownerSessionId:String(message?.ownerSessionId||''),relayMode:String(message?.relayMode||''),model:String(message?.model||''),promptChars:String(prompt||'').length,attachmentCount:Array.isArray(sdkAttachments)?sdkAttachments.length:0},timestamp:Date.now()})}).catch(()=>{});
+              // #endregion
               finalEvent = await sendWithoutStreaming(payload);
             } catch (attachmentError) {
               if (!sdkAttachments.length) throw attachmentError;
@@ -767,6 +808,10 @@ export function createPollingLoop({
               }).catch(() => {});
               finalEvent = await sendWithoutStreaming({ prompt });
             }
+            const sendAndWaitDurationMs = sendAndWaitStartedAtMs > 0 ? Math.max(0, Date.now() - sendAndWaitStartedAtMs) : null;
+            // #region agent log
+            if (typeof fetch === "function") fetch('http://127.0.0.1:7611/ingest/41e205ad-83bf-40b2-b2ab-5040e785036c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0e20dd'},body:JSON.stringify({sessionId:'0e20dd',id:`log_${Date.now()}_${Math.random().toString(36).slice(2,10)}`,runId:'slow-turn-baseline',hypothesisId:'H8-sdk-sendandwait',location:'.github/extensions/web-relay/polling/polling-loop.mjs:sendWithoutStreaming.done',message:'sendAndWait completed',data:{queueMessageId:String(message?.id||''),conversationId:String(message?.conversationId||''),ownerSessionId:String(message?.ownerSessionId||''),durationMs:sendAndWaitDurationMs,finalTextChars:String(extractFinalText(finalEvent)||'').length},timestamp:Date.now()})}).catch(()=>{});
+            // #endregion
             dbg("session.sendAndWait: completed for msgId", message.id);
 
             const text = stripPromptContextPrefix(extractFinalText(finalEvent), message, "", prompt);
@@ -891,23 +936,42 @@ export function createPollingLoop({
               await session.log(`✅ Sent response to web (${text.length} chars)`, { ephemeral: true });
             }
           } catch (e) {
-              dbg("sendAndWait ERROR for msgId", message.id, ":", e.message);
+              if (sendAndWaitStartedAtMs > 0) {
+                // #region agent log
+                if (typeof fetch === "function") fetch('http://127.0.0.1:7611/ingest/41e205ad-83bf-40b2-b2ab-5040e785036c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0e20dd'},body:JSON.stringify({sessionId:'0e20dd',id:`log_${Date.now()}_${Math.random().toString(36).slice(2,10)}`,runId:'slow-turn-baseline',hypothesisId:'H8-sdk-sendandwait',location:'.github/extensions/web-relay/polling/polling-loop.mjs:sendWithoutStreaming.error',message:'sendAndWait failed',data:{queueMessageId:String(message?.id||''),conversationId:String(message?.conversationId||''),ownerSessionId:String(message?.ownerSessionId||''),durationMs:Math.max(0,Date.now()-sendAndWaitStartedAtMs),error:String(e?.message||e||'unknown')},timestamp:Date.now()})}).catch(()=>{});
+                // #endregion
+              }
+              const terminalFailure = normalizeTerminalSendAndWaitError(e);
+              dbg(
+                "sendAndWait ERROR for msgId",
+                message.id,
+                ":",
+                e.message,
+                `terminal=${terminalFailure ? "yes" : "no"}`,
+                `stableCode=${terminalFailure?.stableCode || "none"}`,
+              );
               if (String(e?.code || "").trim() === "RELAY_TURN_ABORTED") {
                 await pushRelayStream(lastStreamedSent, true);
               } else if (isTerminalSendAndWaitError(e)) {
                 const failureText = buildTerminalFailureText(e);
-                await session.log("❌ Terminal SDK/tool-output error — marking turn failed", { level: "error" });
+                await session.log("❌ Terminal SDK/tool-output error — marking turn failed", { level: "error" }).catch((logError) => {
+                  dbg("session.log failed while reporting terminal error", message.id, logError?.message || String(logError));
+                });
                 await pushRelayStream(lastStreamedSent, true);
                 await api("POST", "/api/response", {
                   messageId: message.id,
                   conversationId: message.conversationId,
                   text: failureText,
+                  terminalError: terminalFailure || undefined,
                   model: await getCurrentModelId() || message.model || null,
-              }).catch(async () => {
-                await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
-              });
+                }).catch(async (responseError) => {
+                  dbg("terminal response publish failed for msgId", message.id, responseError?.message || String(responseError));
+                  await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
+                });
             } else if (e?.code === "RELAY_WORKER_UNAVAILABLE" && e?.terminalFailure) {
-              await session.log("⚠️ Session worker became unavailable during the turn — marking it failed", { level: "warn" });
+              await session.log("⚠️ Session worker became unavailable during the turn — marking it failed", { level: "warn" }).catch((logError) => {
+                dbg("session.log failed while reporting worker-unavailable", message.id, logError?.message || String(logError));
+              });
               await pushRelayStream(lastStreamedSent, true);
               await api("POST", "/api/response", {
                 messageId: message.id,
@@ -918,7 +982,9 @@ export function createPollingLoop({
                 await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
               });
             } else {
-              await session.log(`❌ Response failed: ${e.message}; re-queuing`, { level: "error" });
+              await session.log(`❌ Response failed: ${e.message}; re-queuing`, { level: "error" }).catch((logError) => {
+                dbg("session.log failed while reporting generic send error", message.id, logError?.message || String(logError));
+              });
               api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
             }
           } finally {

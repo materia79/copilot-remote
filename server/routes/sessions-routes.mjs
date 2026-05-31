@@ -2,10 +2,14 @@
 
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
+import { spawn } from 'child_process';
 import { createSdkSessionSyncService } from '../services/sdk-session-sync-service.mjs';
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 import { persistConversationPreferences } from '../services/conversation-preferences-service.mjs';
+import { postRelayDebugLog } from '../../debugging/relay-debug-log.mjs';
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SESSION_WORKER_STATUS_QUEUE_STATES = Object.freeze(['pending', 'processing', 'parked']);
 
 function normalizeWorkerStatusText(value, fallback = null) {
@@ -17,6 +21,29 @@ function toSafeNonNegativeInt(value, fallback = 0) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return fallback;
   return Math.max(0, Math.trunc(numeric));
+}
+
+const HOST_SLEEP_SCRIPT_PATH = path.resolve(__dirname, '..', '..', 'bin', 'sleep.bat');
+
+function runHostSleepScript() {
+  if (process.platform !== 'win32') {
+    return { ok: false, statusCode: 501, error: 'Host suspend is only supported on Windows' };
+  }
+  if (!fs.existsSync(HOST_SLEEP_SCRIPT_PATH)) {
+    return { ok: false, statusCode: 500, error: `Missing suspend script: ${HOST_SLEEP_SCRIPT_PATH}` };
+  }
+  try {
+    const child = spawn('cmd.exe', ['/c', HOST_SLEEP_SCRIPT_PATH], {
+      cwd: path.dirname(HOST_SLEEP_SCRIPT_PATH),
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    child.unref?.();
+    return { ok: true, scriptPath: HOST_SLEEP_SCRIPT_PATH };
+  } catch (error) {
+    return { ok: false, statusCode: 500, error: error?.message || 'Failed to launch host suspend script' };
+  }
 }
 
 export function canUpdateWorkspaceRoot(runtimeState = {}) {
@@ -89,6 +116,29 @@ export function learnWorkspaceRootFromSessionSync({
 
   const convId = String(conversationId || '').trim();
   if (!convId) {
+    // No conversation id — try to update an existing conversation already bound to this
+    // sdk session (e.g. a rebind or a session that is reconnecting).
+    const sid = String(sdkSessionId || '').trim();
+    if (sid && typeof learnConversationWorkspaceRoot === 'function') {
+      const sdkResult = learnConversationWorkspaceRoot({
+        sdkSessionId: sid,
+        conversationId: '',
+        rootPath: nextRootPath,
+        seedConfigured: true,
+      });
+      if (sdkResult?.ok && sdkResult.state?.conversationId) {
+        const state = sdkResult.state;
+        return {
+          ok: true,
+          learned: true,
+          changed: String(state?.runtimeWorkspaceRootPath || '').trim().toLowerCase() === nextRootPath.toLowerCase(),
+          rootPath: state?.runtimeWorkspaceRootPath || state?.currentWorkspaceRootPath || nextRootPath,
+          rootName: state?.runtimeWorkspaceRootName || state?.currentWorkspaceRootName || null,
+          state,
+        };
+      }
+    }
+    // No conversation found — caller should store as a pending session CWD.
     return {
       ok: true,
       learned: false,
@@ -236,52 +286,8 @@ function buildWorkspaceYamlTitleContent(existingContent, { sessionId = '', title
   ).replace(/\s*$/, '\n');
 }
 
-function updateConversationWorkspaceTitle({
-  resolveSessionStateRoot = null,
-  conversationId = '',
-  sdkSessionId = '',
-  title = '',
-  updatedAt = '',
-} = {}) {
-  if (typeof resolveSessionStateRoot !== 'function') {
-    return { ok: true, updated: false, reason: 'missing-session-root-resolver' };
-  }
-
-  const sid = String(sdkSessionId || conversationId || '').trim();
-  if (!sid) {
-    return { ok: true, updated: false, reason: 'missing-session-id' };
-  }
-
-  const root = String(resolveSessionStateRoot() || '').trim();
-  if (!root) {
-    return { ok: true, updated: false, reason: 'missing-session-root' };
-  }
-
-  const sessionRootPath = path.join(root, sid);
-  if (!fs.existsSync(sessionRootPath)) {
-    return { ok: true, updated: false, reason: 'missing-session-directory', sessionRootPath };
-  }
-
-  const stat = fs.statSync(sessionRootPath);
-  if (!stat.isDirectory()) {
-    return { ok: true, updated: false, reason: 'session-root-not-directory', sessionRootPath };
-  }
-
-  const workspaceYamlPath = path.join(sessionRootPath, 'workspace.yaml');
-  const existingContent = fs.existsSync(workspaceYamlPath)
-    ? fs.readFileSync(workspaceYamlPath, 'utf8')
-    : '';
-  const nextContent = buildWorkspaceYamlTitleContent(existingContent, {
-    sessionId: sid,
-    title,
-    updatedAt,
-  });
-  fs.writeFileSync(workspaceYamlPath, nextContent, 'utf8');
-  return {
-    ok: true,
-    updated: true,
-    workspaceYamlPath,
-  };
+function updateConversationWorkspaceTitle() {
+  return { ok: true, updated: false, reason: 'workspace-yaml-title-sync-disabled' };
 }
 
 export function resolveConversationTitle({ title = '', titleSource = '', discoveredTitle = '' } = {}) {
@@ -472,7 +478,7 @@ export function buildConversationSessionRootPayload({
   return {
     sdkSessionId: sid,
     sessionRootPath: rootPath,
-    sessionRootName: String(title || '').trim() || 'Session',
+    sessionRootName: 'Session',
   };
 }
 
@@ -822,6 +828,8 @@ export function registerSessionsRoutes(app, deps) {
     resolveConversationWorkspaceState,
     updateConversationConfiguredWorkspaceRoot,
     learnConversationWorkspaceRoot,
+    setPendingSessionCwd,
+    consumePendingSessionCwd,
     processingTimeoutMs,
     localhostOnly,
     listenHost,
@@ -983,7 +991,11 @@ export function registerSessionsRoutes(app, deps) {
       const discoveredUpdatedAt = String(discoveredItem?.updatedAt || '').trim();
       const discoveredTitle = String(discoveredItem?.title || '').trim();
       const workspaceState = typeof resolveConversationWorkspaceState === 'function'
-        ? resolveConversationWorkspaceState({ conversationId: r.id, sdkSessionId: sid })
+        ? resolveConversationWorkspaceState({
+          conversationId: r.id,
+          sdkSessionId: sid,
+          discoveredWorkspaceRootPath: discoveredItem?.workspaceRootPath || '',
+        })
         : null;
       const preferences = resolveConversationPreferences(r, {
         supportedRelayModes: SUPPORTED_RELAY_MODES,
@@ -1035,7 +1047,11 @@ export function registerSessionsRoutes(app, deps) {
       const runtimeSession = stmts.getRuntimeSessionBySdkSessionId.get(sdkSessionId) || null;
       const updatedAt = String(item?.updatedAt || '').trim() || new Date().toISOString();
       const workspaceState = typeof resolveConversationWorkspaceState === 'function'
-        ? resolveConversationWorkspaceState({ conversationId: sdkSessionId, sdkSessionId })
+        ? resolveConversationWorkspaceState({
+          conversationId: sdkSessionId,
+          sdkSessionId,
+          discoveredWorkspaceRootPath: item?.workspaceRootPath || '',
+        })
         : null;
       const syntheticConversation = {
         id: sdkSessionId,
@@ -1182,6 +1198,19 @@ export function registerSessionsRoutes(app, deps) {
     }
 
     if (!sdkSessionId || !conversationId) {
+      // #region agent log
+      postRelayDebugLog({
+        runId: 'baseline-1',
+        hypothesisId: 'H3',
+        location: 'server/routes/sessions-routes.mjs:api.session-sync.missing-fields',
+        message: 'session sync rejected due to missing ids',
+        data: {
+          sdkSessionId: String(sdkSessionId || ''),
+          conversationId: String(conversationId || ''),
+          hasWorkspaceRootPath: workspaceRootPath.length > 0,
+        },
+      });
+      // #endregion
       return res.status(400).json({ error: 'Missing sdk_session_id or conversation_id' });
     }
 
@@ -1208,6 +1237,23 @@ export function registerSessionsRoutes(app, deps) {
         console.log(
           `[session-sync] rebind outcome sid=${shortId(sdkSessionId)} tx=${shortId(orchestratorCorrelationId)} code=${String(rebind?.code || 'none')} completed=${rebind?.completed === true ? 'yes' : 'no'} state=${String(rebind?.state?.state || 'unknown')}`,
         );
+        // #region agent log
+        postRelayDebugLog({
+          runId: 'baseline-1',
+          hypothesisId: 'H3',
+          location: 'server/routes/sessions-routes.mjs:api.session-sync.rebind',
+          message: 'session sync rebind completion observed',
+          data: {
+            sdkSessionId,
+            conversationId,
+            correlationId: orchestratorCorrelationId,
+            targetSessionId: orchestratorTargetSessionId,
+            rebindCode: String(rebind?.code || ''),
+            completed: rebind?.completed === true,
+            state: String(rebind?.state?.state || ''),
+          },
+        });
+        // #endregion
       }
       if (rebindCompleted && rebind?.ok === false && rebind?.conflict) {
         const statusCode = rebind.retryable ? 409 : 409;
@@ -1221,6 +1267,12 @@ export function registerSessionsRoutes(app, deps) {
         });
       }
       stmts.clearDeletedSdkSession.run(sdkSessionId);
+      // If the session reported its CWD before the conversation was bound,
+      // the pending entry is no longer needed — the workspace root has been
+      // persisted to the conversation by workspaceRootSync above.
+      if (workspaceRootSync.learned === true && typeof consumePendingSessionCwd === 'function') {
+        consumePendingSessionCwd(sdkSessionId);
+      }
       markWorkerSessionSeen({
         sdkSessionId: sync?.sdkSessionId || sdkSessionId,
         conversationId: sync?.conversationId || conversationId,
@@ -1277,6 +1329,21 @@ export function registerSessionsRoutes(app, deps) {
     } catch (error) {
       const statusCode = Number(error?.statusCode || 500);
       const retryable = statusCode >= 500;
+      // #region agent log
+      postRelayDebugLog({
+        runId: 'baseline-1',
+        hypothesisId: 'H3',
+        location: 'server/routes/sessions-routes.mjs:api.session-sync.catch',
+        message: 'session sync failed',
+        data: {
+          sdkSessionId,
+          conversationId,
+          statusCode,
+          retryable,
+          error: String(error?.message || error || 'session-sync-failed'),
+        },
+      });
+      // #endregion
       const payload = {
         error: error?.message || 'Failed to sync session',
         code: statusCode === 409 ? 'binding-conflict' : 'session-sync-failed',
@@ -1308,6 +1375,12 @@ export function registerSessionsRoutes(app, deps) {
         ok: false,
         error: result.error || 'Failed to learn workspace root',
       });
+    }
+    // When no conversation was found to update (new session before any message),
+    // store the CWD in the per-session pending map so it can be used as a display
+    // fallback and consumed when the session later binds to a conversation.
+    if (!result.learned && sdkSessionId && workspaceRootPath) {
+      setPendingSessionCwd(sdkSessionId, workspaceRootPath);
     }
     if (result.state?.conversationId) {
       const workspaceHints = workspaceRootPayload();
@@ -1442,7 +1515,11 @@ export function registerSessionsRoutes(app, deps) {
         resolveSessionStateRoot,
       });
       const workspaceState = typeof resolveConversationWorkspaceState === 'function'
-        ? resolveConversationWorkspaceState({ conversationId: requestedId, sdkSessionId: requestedId })
+        ? resolveConversationWorkspaceState({
+          conversationId: requestedId,
+          sdkSessionId: requestedId,
+          discoveredWorkspaceRootPath: match?.workspaceRootPath || '',
+        })
         : null;
       return res.json({
         id: requestedId,
@@ -1481,14 +1558,13 @@ export function registerSessionsRoutes(app, deps) {
       });
     }
     const runtimeSession = stmts.getRuntimeSessionByConversation.get(req.params.id) || null;
-    const discoveredTitle = (() => {
+    const discoveredSessionState = (() => {
       const sdkSessionId = String(conv.sdk_session_id || '').trim();
       if (!sdkSessionId) return null;
       const discovered = discoverSessionStateConversations(400);
-      const match = discovered.find((item) => String(item?.sdkSessionId || '').trim() === sdkSessionId) || null;
-      const title = String(match?.title || '').trim();
-      return title || null;
+      return discovered.find((item) => String(item?.sdkSessionId || '').trim() === sdkSessionId) || null;
     })();
+    const discoveredTitle = String(discoveredSessionState?.title || '').trim() || null;
     const resolvedTitle = resolveConversationTitle({
       title: conv.title,
       titleSource: conv.title_source,
@@ -1507,7 +1583,11 @@ export function registerSessionsRoutes(app, deps) {
       resolveSessionStateRoot,
     });
     const workspaceState = typeof resolveConversationWorkspaceState === 'function'
-      ? resolveConversationWorkspaceState({ conversationId: req.params.id, sdkSessionId: conv.sdk_session_id || req.params.id })
+      ? resolveConversationWorkspaceState({
+        conversationId: req.params.id,
+        sdkSessionId: conv.sdk_session_id || req.params.id,
+        discoveredWorkspaceRootPath: discoveredSessionState?.workspaceRootPath || '',
+      })
       : null;
     const dbMessages = stmts.getMessages.all(req.params.id);
     const queueRows = db.prepare(`
@@ -1731,6 +1811,9 @@ export function registerSessionsRoutes(app, deps) {
     try {
       const sdkSessionId = String(existing.sdk_session_id || '').trim() || null;
       if (!sdkSessionId) {
+        // Tombstone the conversation id as a synthetic session id to prevent
+        // discoverSessionStateConversations() from resurrecting it via GET /api/conversation/:id.
+        stmts.markDeletedSdkSession.run(id, new Date().toISOString());
         const orphanedUploads = collectOrphanedUploadsFromConversation(id);
         hardDeleteConversationRows(id);
         deleteOrphanedUploads(orphanedUploads);
@@ -1740,6 +1823,10 @@ export function registerSessionsRoutes(app, deps) {
 
       markConversationDeleted.run(id);
       stmts.markDeletedSdkSession.run(sdkSessionId, new Date().toISOString());
+      if (sdkSessionId !== id) {
+        // Also tombstone the conversation id itself for legacy/synthetic sdk id fallback paths.
+        stmts.markDeletedSdkSession.run(id, new Date().toISOString());
+      }
       enqueueSdkDeleteRequest(sdkSessionId, id);
       const awaited = await waitForSdkDeleteCompletion(sdkSessionId);
       if (awaited.completed) return res.json({ ok: true });
@@ -1776,6 +1863,8 @@ export function registerSessionsRoutes(app, deps) {
     const { pendingCount, processingCount, parkedCount } = queueCounts();
     const modelState = getModelCatalogState();
     const activeRuntimeSessionCount = Number(stmts.countRuntimeSessions.get()?.cnt || 0);
+    const configuredContextIndicatorMode = String(config?.contextIndicatorMode || '').trim().toLowerCase();
+    const contextIndicatorMode = configuredContextIndicatorMode === 'bar' ? 'bar' : 'default';
     const readyBanner = buildRelayReadyBannerData();
     const pendingQuestionSessionIds = listPendingQuestionSessionRows.all()
       .map((row) => normalizeWorkerStatusText(row?.sdk_session_id))
@@ -1797,6 +1886,7 @@ export function registerSessionsRoutes(app, deps) {
       defaultRelayMode: DEFAULT_RELAY_MODE,
       supportedConversationSessionModes: SUPPORTED_CONVERSATION_SESSION_MODES,
       conversationSessionMode: configuredConversationSessionMode,
+      contextIndicatorMode,
       ...workspaceRootPayload(),
       processingTimeoutMs,
       localhostOnly,
@@ -1861,6 +1951,21 @@ export function registerSessionsRoutes(app, deps) {
     return res.json({
       ok: true,
       ...result,
+    });
+  });
+
+  app.post('/api/host/suspend', auth, (req, res) => {
+    const result = runHostSleepScript();
+    if (!result?.ok) {
+      return res.status(result?.statusCode || 500).json({
+        ok: false,
+        error: result?.error || 'Failed to suspend host',
+      });
+    }
+    return res.status(202).json({
+      ok: true,
+      queued: true,
+      scriptPath: result.scriptPath,
     });
   });
 

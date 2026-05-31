@@ -100,9 +100,21 @@ export async function openPendingQuestionFromBanner() {
   const pending = getPendingRelayQuestions();
   const fallbackConversationId = String(pending[pending.length - 1]?.conversationId || '').trim();
   const nextConversationId = targetConversationId || fallbackConversationId;
+  // #region agent log
+  fetch('http://127.0.0.1:7611/ingest/41e205ad-83bf-40b2-b2ab-5040e785036c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0e20dd'},body:JSON.stringify({sessionId:'0e20dd',id:`log_${Date.now()}_${Math.random().toString(36).slice(2,10)}`,runId:'pending-question-banner-fix',hypothesisId:'H20-banner-noop-missing-conv',location:'server/public/app/ask-user-view.js:openPendingQuestionFromBanner.entry',message:'pending question banner clicked',data:{targetConversationId:targetConversationId||null,fallbackConversationId:fallbackConversationId||null,nextConversationId:nextConversationId||null,currentConversationId:String(currentConvId||'').trim()||null,knownConversation:Boolean(conversations[nextConversationId])},timestamp:Date.now()})}).catch(()=>{});
+  // #endregion
   if (!nextConversationId) return;
-  if (nextConversationId !== currentConvId && conversations[nextConversationId]) {
+  if (nextConversationId !== currentConvId) {
+    if (!conversations[nextConversationId]) {
+      await window.refreshConversations?.();
+    }
     await window.openConversation?.(nextConversationId);
+    // #region agent log
+    fetch('http://127.0.0.1:7611/ingest/41e205ad-83bf-40b2-b2ab-5040e785036c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0e20dd'},body:JSON.stringify({sessionId:'0e20dd',id:`log_${Date.now()}_${Math.random().toString(36).slice(2,10)}`,runId:'pending-question-banner-fix',hypothesisId:'H20-banner-noop-missing-conv',location:'server/public/app/ask-user-view.js:openPendingQuestionFromBanner.opened',message:'pending question banner navigation requested',data:{nextConversationId:nextConversationId||null,openedConversationId:String(currentConvId||'').trim()||null},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
+    if (String(currentConvId || '').trim() !== nextConversationId) {
+      window.showTransientRelayNotice?.('Could not open the latest question conversation yet. Try again in a moment.');
+    }
     return;
   }
   renderRelayQuestions();

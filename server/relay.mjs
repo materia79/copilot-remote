@@ -139,7 +139,17 @@ const NODE_PATH = process.env.COPILOT_WEB_RELAY_NODE || process.execPath;
 const CLI_PORT  = config.cliPort || 4445;
 const foregroundWindowName = buildWindowsTerminalWindowName(launchWorkspaceRoot);
 
-function ts() { return new Date().toISOString().slice(11, 23); }
+function ts() {
+  const now = new Date();
+  return [
+    now.getUTCFullYear(),
+    String(now.getUTCMonth() + 1).padStart(2, '0'),
+    String(now.getUTCDate()).padStart(2, '0'),
+    String(now.getUTCHours()).padStart(2, '0'),
+    String(now.getUTCMinutes()).padStart(2, '0'),
+    String(now.getUTCSeconds()).padStart(2, '0'),
+  ].join('-');
+}
 function log(...a) { console.log(`[relay ${ts()}]`, ...a); }
 function err(...a) { console.error(`[relay ${ts()}] ERROR`, ...a); }
 function vlog(...a) { if (VERBOSE) log(...a); }

@@ -300,7 +300,7 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/upload` | Upload binary file content (deduped by SHA-256) |
 | GET | `/api/upload/:sha256/content` | Stream stored upload content by hash |
 | GET | `/api/files/*` | Stream a workspace file by repo-relative path (token required) |
-| GET | `/api/files-preview/*` | Return structured preview JSON for markdown/code/text/image files |
+| GET | `/api/files-preview/*` | Return structured preview JSON for markdown/code/text/image/video files |
 | GET | `/api/repo/tree` | Return repository tree snapshot (supports `includeHidden` and `includeHeavy`) |
 | GET | `/api/drives/roots` | Return browsable drive roots (local fixed + removable) for explorer drive mode |
 | GET | `/api/drives/list` | Lazy-load entries for a drive directory (`path`, optional `includeHidden`) |
@@ -426,6 +426,7 @@ call `/api/usage` directly.
   "pollIntervalMs": 3000,
   "processingTimeoutMs": 600000,
   "conversationSessionMode": "isolated",
+  "contextIndicatorMode": "default",
   "sshTunnel": {
     "enabled": false,
     "remoteBind": "loopback",
@@ -445,6 +446,7 @@ call `/api/usage` directly.
 | `pollIntervalMs` | `3000` | CLI poll interval (ms) |
 | `processingTimeoutMs` | `600000` | Max response wait time (ms) |
 | `conversationSessionMode` | `isolated` | SDK session strategy (`isolated` or `shared`) |
+| `contextIndicatorMode` | `default` | Input context indicator style (`default` shimmer line or `bar` fill indicator) |
 | `restartGracefulTimeoutMs` | `8000` | Graceful shutdown wait before force fallback |
 | `restartShutdownTimeoutMs` | `45000` | Drain timeout while waiting for active queue jobs |
 | `restartSpawnTimeoutMs` | `18000` | Max wait for resume process to leave online state |
@@ -489,6 +491,7 @@ relay.example.com {
 **`/api/status`** now includes:
 
 ```json
+"contextIndicatorMode": "default",
 "sshTunnel": {
   "enabled": true,
   "connected": true,

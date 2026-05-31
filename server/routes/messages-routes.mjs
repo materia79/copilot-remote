@@ -11,6 +11,7 @@ import {
 import {
   persistConversationModeModelPreference as persistConversationModeModelPreferenceTx,
 } from '../services/conversation-preferences-service.mjs';
+import { postRelayDebugLog } from '../../debugging/relay-debug-log.mjs';
 
 export const SESSION_WORKER_OWNER_LEASE_MS = 120_000;
 export const SESSION_WORKER_TRANSIENT_DEQUEUE_RETRIES = 2;
@@ -20,6 +21,8 @@ const DUPLICATE_USER_MESSAGE_WINDOW_MS = 10 * 60 * 1000;
 const OPAQUE_RESPONSE_TEXT_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const OPAQUE_RESPONSE_RECOVERY_WAIT_MS = 600_000;
 const OPAQUE_RESPONSE_RECOVERY_POLL_MS = 250;
+const STRANDED_SESSION_PRIME_COOLDOWN_MS = 10_000;
+const STRANDED_SESSION_HEARTBEAT_FRESH_MS = 15_000;
 // Hold finalization after a relay question is answered so the SDK has time to fire the next
 // onUserInputRequest (multi-step ask_user). Without this, the transcript is used prematurely and
 // the queue row is marked done while additional questions are still pending.
@@ -590,6 +593,33 @@ export function dequeuePendingMessage({
   return dequeue();
 }
 
+export function shouldFailRecoveredProcessingRow({
+  reason = null,
+  relayActivityCount = 0,
+  relayStreamCount = 0,
+} = {}) {
+  const normalizedReason = String(reason || '').trim().toLowerCase();
+  if (normalizedReason !== 'owner-heartbeat-idle') return false;
+  return Math.max(0, Number(relayActivityCount || 0)) > 0
+    || Math.max(0, Number(relayStreamCount || 0)) > 0;
+}
+
+export function buildHeartbeatIdleReplayFailure({
+  requesterSessionId = null,
+} = {}) {
+  const normalizedSessionId = normalizeSessionWorkerId(requesterSessionId);
+  return {
+    kind: 'turn-aborted',
+    error: 'turn-replay-blocked',
+    code: 'turn-replay-blocked',
+    stableCode: 'relay.turn-replay-blocked',
+    message: 'System note: This turn had already started before the relay lost its active worker state, so it was ended instead of being replayed.',
+    guidance: 'Send the message again if you still want that work to run.',
+    failedAt: new Date().toISOString(),
+    requesterSessionId: normalizedSessionId,
+  };
+}
+
 export async function dequeuePendingMessageForWorkerLoop({
   db,
   stmts,
@@ -633,6 +663,21 @@ export async function dequeuePendingMessageForWorkerLoop({
         blockedReason: String(ensureResult?.error || 'worker-unavailable').trim() || 'worker-unavailable',
         queue: null,
       });
+      // #region agent log
+      postRelayDebugLog({
+        runId: 'baseline-1',
+        hypothesisId: 'H1',
+        location: 'server/routes/messages-routes.mjs:worker.ensure.blocked',
+        message: 'dequeue blocked by ensureWorker',
+        data: {
+          requesterSessionId: requesterSid,
+          blockedReason: String(ensureResult?.error || 'worker-unavailable').trim() || 'worker-unavailable',
+          retryCount: Number(ensureResult?.lifecycle?.retryCount || 0),
+          workerStatus: String(ensureResult?.worker?.status || ''),
+          workerPid: Number(ensureResult?.worker?.pid || 0) || null,
+        },
+      });
+      // #endregion
       return {
         message: null,
         blockedReason: String(ensureResult?.error || 'worker-unavailable').trim() || 'worker-unavailable',
@@ -668,6 +713,32 @@ export async function dequeuePendingMessageForWorkerLoop({
         pid: routingWithWorker ? (supervisor?.getWorkerState?.(requesterSid)?.pid || null) : null,
         queue: null,
       });
+      if (message) {
+        const dequeuedAtMs = Date.parse(currentIso);
+        const queuedAtMs = Date.parse(String(message?.timestamp || '').trim());
+        const queueWaitMs = Number.isFinite(dequeuedAtMs) && Number.isFinite(queuedAtMs)
+          ? Math.max(0, dequeuedAtMs - queuedAtMs)
+          : null;
+        // #region agent log
+        postRelayDebugLog({
+          runId: 'slow-turn-baseline',
+          hypothesisId: 'H6-queue-wait',
+          location: 'server/routes/messages-routes.mjs:queue.dequeue.success',
+          message: 'message dequeued for worker loop',
+          data: {
+            requesterSessionId: requesterSid,
+            queueMessageId: String(message?.id || ''),
+            queueConversationId: String(message?.conversation_id || ''),
+            ownerSessionId: String(message?.owner_sdk_session_id || ''),
+            status: String(message?.status || ''),
+            attempt,
+            queueWaitMs,
+            queuedAt: String(message?.timestamp || ''),
+            dequeuedAt: currentIso,
+          },
+        });
+        // #endregion
+      }
       return {
         message,
         blockedReason: null,
@@ -690,6 +761,20 @@ export async function dequeuePendingMessageForWorkerLoop({
         queue: null,
         error: String(error?.message || error || 'dequeue-failed'),
       });
+      // #region agent log
+      postRelayDebugLog({
+        runId: 'baseline-1',
+        hypothesisId: 'H1',
+        location: 'server/routes/messages-routes.mjs:queue.dequeue.catch',
+        message: transient && attempt < retryLimit ? 'transient dequeue retry' : 'dequeue error',
+        data: {
+          requesterSessionId: requesterSid,
+          attempt: attempt + 1,
+          transient,
+          error: String(error?.message || error || 'dequeue-failed'),
+        },
+      });
+      // #endregion
       if (!routingWithWorker || !transient || attempt >= retryLimit) {
         if (routingWithWorker && typeof supervisor?.markError === 'function') {
           supervisor.markError(requesterSid, error);
@@ -709,6 +794,56 @@ export async function dequeuePendingMessageForWorkerLoop({
     lifecycle: routingWithWorker ? (supervisor?.getLifecycleState?.(requesterSid) || null) : null,
     attempts: retryLimit + 1,
   };
+}
+
+function serveFileWithRangeSupport(req, res, filePath, meta, { safeName, cacheDelete = null } = {}) {
+  const fileSize = meta.size;
+  const name = safeName || path.basename(filePath).replace(/"/g, '');
+  const rangeHeader = req.headers['range'];
+
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Content-Type', meta.contentType);
+  res.setHeader('Content-Disposition', `inline; filename="${name}"`);
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+
+  const onStreamError = (error) => {
+    if (cacheDelete) cacheDelete(filePath);
+    if (res.headersSent) { res.destroy(error); return; }
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') {
+      res.status(404).json({ error: 'File not found' });
+      return;
+    }
+    res.status(500).json({ error: 'Failed to read file' });
+  };
+
+  if (rangeHeader) {
+    const match = /bytes=(\d+)-(\d*)/.exec(rangeHeader);
+    if (!match) {
+      res.setHeader('Content-Range', `bytes */${fileSize}`);
+      res.status(416).end();
+      return;
+    }
+    const start = parseInt(match[1], 10);
+    const end = match[2] ? parseInt(match[2], 10) : fileSize - 1;
+    if (start > end || start >= fileSize || end >= fileSize) {
+      res.setHeader('Content-Range', `bytes */${fileSize}`);
+      res.status(416).end();
+      return;
+    }
+    const chunkSize = end - start + 1;
+    res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`);
+    res.setHeader('Content-Length', String(chunkSize));
+    res.status(206);
+    const stream = fs.createReadStream(filePath, { start, end });
+    stream.on('error', onStreamError);
+    stream.pipe(res);
+  } else {
+    res.setHeader('Content-Length', String(fileSize));
+    const stream = fs.createReadStream(filePath);
+    stream.on('error', onStreamError);
+    stream.pipe(res);
+  }
 }
 
 export function registerMessagesRoutes(app, deps) {
@@ -930,12 +1065,16 @@ export function registerMessagesRoutes(app, deps) {
       return { ok: false, status: 404, error: 'Conversation not found' };
     }
     const runtimeSession = stmts.getRuntimeSessionByConversation.get(normalizedConversationId) || null;
+    const runtimeSessionBySdkSessionId = conversation?.sdk_session_id && stmts.getRuntimeSessionBySdkSessionId
+      ? (stmts.getRuntimeSessionBySdkSessionId.get(String(conversation.sdk_session_id).trim()) || null)
+      : null;
     const conversationSdkSessionId = normalizeBindingValue(conversation.sdk_session_id);
     const runtimeSessionSdkSessionId = normalizeBindingValue(runtimeSession?.sdk_session_id);
     return {
       ok: true,
       conversation,
       runtimeSession,
+      runtimeSessionBySdkSessionId,
       conversationSdkSessionId,
       runtimeSessionSdkSessionId,
     };
@@ -1044,6 +1183,8 @@ export function registerMessagesRoutes(app, deps) {
     }
     return { responseId, now };
   }
+
+  const strandedPrimeCooldownBySession = new Map();
 
   const findPendingOwnedByOtherSession = db.prepare(`
     SELECT id, conversation_id, owner_sdk_session_id, retry_count
@@ -1293,22 +1434,68 @@ export function registerMessagesRoutes(app, deps) {
       cutoffIso,
     ) || [];
     if (!rows.length) return [];
+    const rowsToFail = [];
+    const rowsToRecover = [];
+    for (const row of rows) {
+      const relayActivityRows = stmts.listActivityByQueueMessage?.all?.(row.id);
+      const relayStreamRows = stmts.listStreamEventsByQueueMessage?.all?.(row.id);
+      const fallbackRelayActivities = Array.isArray(relayActivityRows)
+        ? relayActivityRows
+        : relayActivityForQueueMessage?.(row.id);
+      const relayActivityCount = Array.isArray(fallbackRelayActivities) ? fallbackRelayActivities.length : 0;
+      const relayStreamCount = Array.isArray(relayStreamRows) ? relayStreamRows.length : 0;
+      if (shouldFailRecoveredProcessingRow({
+        reason,
+        relayActivityCount,
+        relayStreamCount,
+      })) {
+        rowsToFail.push(row);
+        continue;
+      }
+      rowsToRecover.push(row);
+    }
     const requeueAt = addMsIso(2_000);
     const tx = db.transaction((recoverRows) => {
       for (const row of recoverRows) {
         recoverOwnedProcessingMessage.run(requeueAt, row.id, normalizedSessionId);
       }
     });
-    tx(rows);
-    for (const row of rows) {
+    tx(rowsToRecover);
+    for (const row of rowsToRecover) {
       settleRelayAbortControlsForQueueMessage(row.id, {
         ok: false,
         error: reason,
       });
       io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'pending' });
     }
-    if (rows.length) {
-      io.emit('queue_updated', { recovered: rows.length, ownerSessionId: normalizedSessionId });
+    for (const row of rowsToFail) {
+      const failureRecord = buildHeartbeatIdleReplayFailure({
+        requesterSessionId: normalizedSessionId,
+      });
+      const failureText = buildTerminalFailureTextForChat(failureRecord);
+      const failed = failQueueMessage({
+        queueRow: row,
+        messageId: row.id,
+        conversationId: row.conversation_id,
+        relayMode: normalizeRelayMode(row.relay_mode) || DEFAULT_RELAY_MODE,
+        model: row.model || null,
+        responseText: failureText,
+        failureRecord,
+        markWorkerError: false,
+      });
+      if (failed) {
+        settleRelayAbortControlsForQueueMessage(row.id, {
+          ok: false,
+          error: failureRecord.code,
+        });
+      }
+    }
+    if (rowsToRecover.length || rowsToFail.length) {
+      io.emit('queue_updated', {
+        recovered: rowsToRecover.length,
+        replayBlocked: rowsToFail.length,
+        ownerSessionId: normalizedSessionId,
+      });
     }
     return rows;
   }
@@ -1636,27 +1823,10 @@ export function registerMessagesRoutes(app, deps) {
     if (!meta || meta.kind === 'missing') return res.status(404).json({ error: 'File not found' });
     if (meta.kind !== 'file') return res.status(400).json({ error: 'Path must reference a file' });
 
-    const safeName = path.basename(filePath).replace(/"/g, '');
-    res.setHeader('Content-Type', meta.contentType);
-    res.setHeader('Content-Length', String(meta.size));
-    res.setHeader('Content-Disposition', `inline; filename="${safeName}"`);
-    res.setHeader('Cache-Control', 'no-store');
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-
-    const stream = fs.createReadStream(filePath);
-    stream.on('error', (error) => {
-      workspaceFileMetaCache.delete(filePath);
-      if (res.headersSent) {
-        res.destroy(error);
-        return;
-      }
-      if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') {
-        res.status(404).json({ error: 'File not found' });
-        return;
-      }
-      res.status(500).json({ error: 'Failed to read file' });
+    serveFileWithRangeSupport(req, res, filePath, meta, {
+      safeName: path.basename(filePath).replace(/"/g, ''),
+      cacheDelete: (p) => workspaceFileMetaCache.delete(p),
     });
-    stream.pipe(res);
   });
 
   app.get('/api/files-preview/*', auth, (req, res) => {
@@ -1724,7 +1894,7 @@ export function registerMessagesRoutes(app, deps) {
       rawUrl: `${remotePath}/api/files/${normalizedWebPath.split('/').map((part) => encodeURIComponent(part)).join('/')}${scopeSuffix}`,
     };
 
-    if (kind !== 'binary' && kind !== 'image') {
+    if (kind !== 'binary' && kind !== 'image' && kind !== 'video') {
       payload.content = contentBuffer.toString('utf8');
     }
 
@@ -1858,27 +2028,10 @@ export function registerMessagesRoutes(app, deps) {
       if (!meta || meta.kind === 'missing') return res.status(404).json({ error: 'File not found' });
       if (meta.kind !== 'file') return res.status(400).json({ error: 'Path must reference a file' });
 
-      const safeName = path.win32.basename(filePath).replace(/"/g, '');
-      res.setHeader('Content-Type', meta.contentType);
-      res.setHeader('Content-Length', String(meta.size));
-      res.setHeader('Content-Disposition', `inline; filename="${safeName}"`);
-      res.setHeader('Cache-Control', 'no-store');
-      res.setHeader('X-Content-Type-Options', 'nosniff');
-
-      const stream = fs.createReadStream(filePath);
-      stream.on('error', (error) => {
-        workspaceFileMetaCache.delete(filePath);
-        if (res.headersSent) {
-          res.destroy(error);
-          return;
-        }
-        if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') {
-          res.status(404).json({ error: 'File not found' });
-          return;
-        }
-        res.status(500).json({ error: 'Failed to read file' });
+      serveFileWithRangeSupport(req, res, filePath, meta, {
+        safeName: path.win32.basename(filePath).replace(/"/g, ''),
+        cacheDelete: (p) => workspaceFileMetaCache.delete(p),
       });
-      stream.pipe(res);
     });
   });
 
@@ -1950,7 +2103,7 @@ export function registerMessagesRoutes(app, deps) {
         rawUrl: `${remotePath}/api/drives/file?path=${encodeURIComponent(normalizedWebPath)}`,
       };
 
-      if (kind !== 'binary' && kind !== 'image') {
+      if (kind !== 'binary' && kind !== 'image' && kind !== 'video') {
         payload.content = contentBuffer.toString('utf8');
       }
 
@@ -2009,14 +2162,65 @@ export function registerMessagesRoutes(app, deps) {
 
     if (!shouldCreateConversation) {
       const sessionState = getConversationSessionState(conversationId);
+      // #region agent log
+      postRelayDebugLog({
+        runId: 'baseline-binding',
+        hypothesisId: 'H3-server-guard',
+        location: 'server/routes/messages-routes.mjs:api.message.session-state',
+        message: 'api/message existing conversation session state',
+        data: {
+          conversationId,
+          requesterSessionId: requesterSessionId || null,
+          conversationSdkSessionId: sessionState?.conversationSdkSessionId || null,
+          runtimeSessionSdkSessionId: sessionState?.runtimeSessionSdkSessionId || null,
+          runtimeSessionId: sessionState?.runtimeSession?.id || null,
+          runtimeSessionBySdkSessionId: sessionState?.runtimeSessionBySdkSessionId?.id || null,
+          runtimeSessionBySdkSdkSessionId: sessionState?.runtimeSessionBySdkSessionId?.sdk_session_id || null,
+        },
+      });
+      // #endregion
       if (!sessionState.ok) {
         return rejectSessionBinding(res, sessionState.status, sessionState.error);
       }
       conversationSdkSessionId = sessionState.conversationSdkSessionId || null;
       if (!sessionState.conversationSdkSessionId || !sessionState.runtimeSessionSdkSessionId) {
+        // #region agent log
+        postRelayDebugLog({
+          runId: 'baseline-binding',
+          hypothesisId: 'H4-server-missing-runtime',
+          location: 'server/routes/messages-routes.mjs:api.message.reject.not-bound',
+          message: 'api/message rejected because session binding is incomplete',
+          data: {
+            conversationId,
+            requesterSessionId: requesterSessionId || null,
+            conversationSdkSessionId: sessionState.conversationSdkSessionId || null,
+            runtimeSessionSdkSessionId: sessionState.runtimeSessionSdkSessionId || null,
+            runtimeSessionId: sessionState.runtimeSession?.id || null,
+            runtimeSessionBySdkSessionId: sessionState.runtimeSessionBySdkSessionId?.id || null,
+            runtimeSessionBySdkSdkSessionId: sessionState.runtimeSessionBySdkSessionId?.sdk_session_id || null,
+          },
+        });
+        // #endregion
         return rejectSessionBinding(res, 409, 'Conversation is not session-bound yet');
       }
       if (sessionState.conversationSdkSessionId !== sessionState.runtimeSessionSdkSessionId) {
+        // #region agent log
+        postRelayDebugLog({
+          runId: 'baseline-binding',
+          hypothesisId: 'H5-server-mismatch',
+          location: 'server/routes/messages-routes.mjs:api.message.reject.mismatch',
+          message: 'api/message rejected because bound and runtime sdk sessions differ',
+          data: {
+            conversationId,
+            requesterSessionId: requesterSessionId || null,
+            conversationSdkSessionId: sessionState.conversationSdkSessionId || null,
+            runtimeSessionSdkSessionId: sessionState.runtimeSessionSdkSessionId || null,
+            runtimeSessionId: sessionState.runtimeSession?.id || null,
+            runtimeSessionBySdkSessionId: sessionState.runtimeSessionBySdkSessionId?.id || null,
+            runtimeSessionBySdkSdkSessionId: sessionState.runtimeSessionBySdkSessionId?.sdk_session_id || null,
+          },
+        });
+        // #endregion
         return rejectSessionBinding(res, 409, 'Conversation session binding mismatch');
       }
     }
@@ -2130,6 +2334,25 @@ export function registerMessagesRoutes(app, deps) {
       null,
       null,
     );
+    // #region agent log
+    postRelayDebugLog({
+      runId: 'slow-turn-baseline',
+      hypothesisId: 'H6-queue-wait',
+      location: 'server/routes/messages-routes.mjs:api.message.enqueued',
+      message: 'message enqueued for relay processing',
+      data: {
+        queueMessageId: msgId,
+        conversationId: convId,
+        requesterSessionId: requesterSessionId || null,
+        ownerSessionId: ownerSessionId || null,
+        runtimeSessionId: runtimeSession?.id || null,
+        relayMode: requestedRelayMode,
+        model: requestedModel,
+        seededCarryOver: shouldApplySeed,
+        queuedTextChars: String(queueText || '').length,
+      },
+    });
+    // #endregion
     if (ownerSessionId) {
       const existingWorker = sessionWorkerRegistry?.getWorker?.(ownerSessionId) || null;
       sessionWorkerRegistry?.upsertWorker?.({
@@ -2436,13 +2659,31 @@ export function registerMessagesRoutes(app, deps) {
     if (!msg && sessionWorkerRoutingEnabled && requesterSessionId && !dequeueBlockedReason) {
       const strandedOwner = findPendingOwnedByOtherSession.get(requesterSessionId, now);
       const strandedSessionId = normalizeSessionWorkerId(strandedOwner?.owner_sdk_session_id);
+      const strandedWorker = strandedSessionId
+        ? (sessionWorkerRegistry?.getWorker?.(strandedSessionId) || sessionWorkerSupervisor?.getWorkerState?.(strandedSessionId) || null)
+        : null;
+      const strandedLifecycle = strandedSessionId
+        ? (sessionWorkerSupervisor?.getLifecycleState?.(strandedSessionId) || null)
+        : null;
+      const strandedStatus = String(strandedWorker?.status || '').trim().toLowerCase();
+      const lastPrimeAtMs = strandedSessionId ? Number(strandedPrimeCooldownBySession.get(strandedSessionId) || 0) : 0;
+      const nowMs = Date.now();
+      const cooldownActive = lastPrimeAtMs > 0 && (nowMs - lastPrimeAtMs) < STRANDED_SESSION_PRIME_COOLDOWN_MS;
+      const heartbeatMs = Date.parse(String(strandedLifecycle?.lastHeartbeatAt || '').trim());
+      const heartbeatFresh = Number.isFinite(heartbeatMs) && (nowMs - heartbeatMs) < STRANDED_SESSION_HEARTBEAT_FRESH_MS;
+      const shouldSkipPrime = cooldownActive
+        || strandedStatus === 'processing'
+        || strandedStatus === 'starting'
+        || (strandedStatus === 'ready' && heartbeatFresh);
       if (
         shouldAutoPrimeStrandedSession({
           strandedRow: strandedOwner,
           requesterSessionId,
         })
+        && !shouldSkipPrime
         && typeof sessionWorkerSupervisor?.ensureWorker === 'function'
       ) {
+        strandedPrimeCooldownBySession.set(strandedSessionId, nowMs);
         try {
           const primeResult = await sessionWorkerSupervisor.ensureWorker(strandedSessionId);
           const primedTerminalFailure = resolvePrimedWorkerTerminalFailure({
@@ -2500,6 +2741,23 @@ export function registerMessagesRoutes(app, deps) {
             extra: { error: String(error?.message || error || 'worker-prime-failed') },
           });
         }
+      } else if (strandedSessionId && shouldSkipPrime) {
+        // #region agent log
+        postRelayDebugLog({
+          runId: 'baseline-1',
+          hypothesisId: 'H4',
+          location: 'server/routes/messages-routes.mjs:worker.prime.skipped',
+          message: 'stranded owner prime skipped by cooldown/health gate',
+          data: {
+            requesterSessionId,
+            strandedSessionId,
+            strandedStatus,
+            cooldownActive,
+            heartbeatFresh,
+            heartbeatAt: String(strandedLifecycle?.lastHeartbeatAt || ''),
+          },
+        });
+        // #endregion
       }
     }
     if (msg) {
@@ -2643,6 +2901,36 @@ export function registerMessagesRoutes(app, deps) {
     return res.json({ ok: true, recovered: rows.length, maxAgeMs });
   });
 
+  app.post('/api/queue/empty', auth, (req, res) => {
+    if (!isLoopbackRequest(req)) {
+      return res.status(403).json({ error: 'Queue empty endpoint is localhost-only' });
+    }
+    const rows = stmts.listQueueForPauseDrop.all();
+    const droppedCount = rows.length;
+    if (!droppedCount) {
+      return res.json({ ok: true, droppedCount: 0, queue: queueCounts() });
+    }
+    const beforeQueue = queueCounts();
+    const dropQueue = db.transaction(() => {
+      for (const row of rows) {
+        stmts.deleteQueueById.run(row.id);
+      }
+    });
+    dropQueue();
+    for (const row of rows) {
+      io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'dropped' });
+    }
+    const afterQueue = queueCounts();
+    io.emit('queue_updated', { droppedCount, reason: 'manual-empty-queue' });
+    console.log(`[${ts()}] RELAY     queue emptied dropped=${droppedCount}`);
+    return res.json({
+      ok: true,
+      droppedCount,
+      queueBefore: beforeQueue,
+      queue: afterQueue,
+    });
+  });
+
   app.post('/api/relay/shutdown', auth, (req, res) => {
     if (!isLoopbackRequest(req)) {
       return res.status(403).json({ error: 'Relay shutdown endpoint is localhost-only' });
@@ -2665,13 +2953,32 @@ export function registerMessagesRoutes(app, deps) {
   app.post('/api/response', auth, async (req, res) => {
     touchCli();
     const { messageId, conversationId, text, model, mode } = req.body;
+    const trimmedText = String(text || '').trim();
+    const terminalFailure = resolveTerminalFailurePayload(req.body, { fallbackText: trimmedText });
 
-    if (!text?.trim()) return res.status(400).json({ error: 'Empty response' });
+    if (!trimmedText && !terminalFailure) return res.status(400).json({ error: 'Empty response' });
     if (!messageId) return res.status(400).json({ error: 'Missing messageId' });
 
     const q = stmts.findQById.get(messageId);
     const targetConversationId = q?.conversation_id || conversationId;
     if (!targetConversationId) return res.status(400).json({ error: 'Missing conversationId' });
+    const responseBridgeIdentity = readBridgeIdentity(req);
+    // #region agent log
+    postRelayDebugLog({
+      runId: 'baseline-1',
+      hypothesisId: 'H2',
+      location: 'server/routes/messages-routes.mjs:api.response.entry',
+      message: 'response received for queue message',
+      data: {
+        queueMessageId: String(messageId || ''),
+        queueStatus: String(q?.status || ''),
+        ownerSessionId: String(q?.owner_sdk_session_id || ''),
+        requesterSessionId: String(responseBridgeIdentity?.sessionId || ''),
+        requesterPid: Number(responseBridgeIdentity?.pid || 0) || null,
+        conversationId: String(targetConversationId || ''),
+      },
+    });
+    // #endregion
 
     if (q && q.status === 'done') {
       console.log(`[${ts()}] RESPONSE  ${messageId?.slice(0,8)} ignored=already_done`);
@@ -2683,9 +2990,8 @@ export function registerMessagesRoutes(app, deps) {
     }
 
     const relayMode = normalizeRelayMode(mode || q?.relay_mode) || DEFAULT_RELAY_MODE;
-    const terminalFailure = resolveTerminalFailurePayload(req.body, { fallbackText: text });
     if (terminalFailure) {
-      const failureText = buildTerminalFailureTextForChat(terminalFailure, text);
+      const failureText = buildTerminalFailureTextForChat(terminalFailure, trimmedText);
       const failed = failQueueMessage({
         queueRow: q,
         messageId,
@@ -2723,7 +3029,7 @@ export function registerMessagesRoutes(app, deps) {
 
     const conversation = stmts.getConvAnyStatus?.get?.(targetConversationId) || null;
     const resolvedText = await resolveRelayResponseText({
-      text,
+      text: trimmedText,
       conversation,
       queueTimestamp: q?.timestamp || null,
       readSessionTranscriptMessages,
@@ -2757,9 +3063,56 @@ export function registerMessagesRoutes(app, deps) {
 
     const finalized = finalize();
     if (!finalized) {
+      // #region agent log
+      postRelayDebugLog({
+        runId: 'baseline-1',
+        hypothesisId: 'H2',
+        location: 'server/routes/messages-routes.mjs:api.response.finalize.false',
+        message: 'response ignored because queue row not pending/processing',
+        data: {
+          queueMessageId: String(messageId || ''),
+          queueStatus: String(q?.status || ''),
+          ownerSessionId: String(q?.owner_sdk_session_id || ''),
+          requesterSessionId: String(responseBridgeIdentity?.sessionId || ''),
+        },
+      });
+      // #endregion
       console.log(`[${ts()}] RESPONSE  ${messageId?.slice(0,8)} ignored=not_pending_or_processing`);
       return res.json({ ok: true, ignored: 'not_pending_or_processing' });
     }
+    // #region agent log
+    const queuedAtMs = Date.parse(String(q?.timestamp || '').trim());
+    const processingAtMs = Date.parse(String(q?.processing_at || '').trim());
+    const finalizedAtMs = Date.parse(now);
+    const queueToDoneMs = Number.isFinite(queuedAtMs) && Number.isFinite(finalizedAtMs)
+      ? Math.max(0, finalizedAtMs - queuedAtMs)
+      : null;
+    const processingToDoneMs = Number.isFinite(processingAtMs) && Number.isFinite(finalizedAtMs)
+      ? Math.max(0, finalizedAtMs - processingAtMs)
+      : null;
+    const queueToProcessingMs = Number.isFinite(queuedAtMs) && Number.isFinite(processingAtMs)
+      ? Math.max(0, processingAtMs - queuedAtMs)
+      : null;
+    postRelayDebugLog({
+      runId: 'slow-turn-baseline',
+      hypothesisId: 'H7-turn-duration',
+      location: 'server/routes/messages-routes.mjs:api.response.finalize.true',
+      message: 'response finalized queue message',
+      data: {
+        queueMessageId: String(messageId || ''),
+        priorQueueStatus: String(q?.status || ''),
+        ownerSessionId: String(q?.owner_sdk_session_id || ''),
+        requesterSessionId: String(responseBridgeIdentity?.sessionId || ''),
+        requesterPid: Number(responseBridgeIdentity?.pid || 0) || null,
+        queueToDoneMs,
+        processingToDoneMs,
+        queueToProcessingMs,
+        queuedAt: String(q?.timestamp || ''),
+        processingAt: String(q?.processing_at || ''),
+        finalizedAt: now,
+      },
+    });
+    // #endregion
     settleRelayAbortControlsForQueueMessage(messageId, {
       ok: true,
       note: 'queue message completed before stop control was applied',
@@ -2911,6 +3264,21 @@ export function registerMessagesRoutes(app, deps) {
             return res.status(409).json({ error: error.message });
           }
           const shouldRetry = isStreamSeqConstraintError(error) && attempt < maxRetries;
+          if (shouldRetry) {
+            // #region agent log
+            postRelayDebugLog({
+              runId: 'baseline-1',
+              hypothesisId: 'H5',
+              location: 'server/routes/messages-routes.mjs:api.stream.retry',
+              message: 'stream sequence constraint retry',
+              data: {
+                queueMessageId: String(messageId || ''),
+                attempt,
+                error: String(error?.message || error || 'stream-seq-insert-failed'),
+              },
+            });
+            // #endregion
+          }
           if (!shouldRetry) throw error;
         }
       }

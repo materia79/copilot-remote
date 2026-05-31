@@ -31,6 +31,7 @@ import { shouldApplyConversationLoad } from './activity-replay-state.mjs';
 
 const PROCESSING_DOT_FRAMES = ['   ', '.  ', '.. ', '...'];
 const PROCESSING_DOT_INTERVAL_MS = 1000;
+const LOCAL_PROCESSING_STALE_MS = 5 * 60 * 1000;
 let processingDotFrame = 0;
 let processingDotTimer = null;
 let openConversationVersion = 0;
@@ -38,6 +39,13 @@ let openConversationVersion = 0;
 function isConversationProcessing(conversation, workerState) {
   const workerStatus = String(workerState?.status || '').trim().toLowerCase();
   if (workerStatus === 'processing') return true;
+  const localTurnStatus = String(conversation?.localTurnStatus || '').trim().toLowerCase();
+  if (localTurnStatus === 'processing') {
+    const updatedAtMs = Number(conversation?.localTurnStatusUpdatedAt || 0);
+    if (!Number.isFinite(updatedAtMs) || updatedAtMs <= 0 || (Date.now() - updatedAtMs) < LOCAL_PROCESSING_STALE_MS) {
+      return true;
+    }
+  }
   const runtimeStatus = String(
     conversation?.runtimeSessionStatus
     || conversation?.runtime_session_status
@@ -112,6 +120,7 @@ export function renderConvList() {
     </div>`;
   }).join('');
   ensureProcessingDotTimer(hasProcessingConversation);
+  window.syncChatTitleControls?.();
 }
 
 export function applyLoadedConversationState(id, response, { restoreScroll = false, savedScrollTop = null } = {}) {
@@ -150,9 +159,15 @@ export function applyLoadedConversationState(id, response, { restoreScroll = fal
   if (!restoreScroll) return;
   const el = document.getElementById('messages');
   if (!el) return;
+  // #region agent log
+  fetch('http://127.0.0.1:7611/ingest/41e205ad-83bf-40b2-b2ab-5040e785036c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0e20dd'},body:JSON.stringify({sessionId:'0e20dd',id:`log_${Date.now()}_${Math.random().toString(36).slice(2,10)}`,runId:'ui-regressions-baseline',hypothesisId:'H12-scroll-restore',location:'server/public/app/journal-view.js:applyLoadedConversationState.before-restore',message:'attempting to restore conversation scroll position',data:{conversationId:String(id||'').trim()||null,restoreScroll,savedScrollTop:Number.isFinite(savedScrollTop)?savedScrollTop:null,currentScrollTop:el.scrollTop,scrollHeight:el.scrollHeight,clientHeight:el.clientHeight},timestamp:Date.now()})}).catch(()=>{});
+  // #endregion
   if (Number.isFinite(savedScrollTop)) {
     el.scrollTop = savedScrollTop;
     saveConversationScrollTop(id, el.scrollTop);
+    // #region agent log
+    fetch('http://127.0.0.1:7611/ingest/41e205ad-83bf-40b2-b2ab-5040e785036c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0e20dd'},body:JSON.stringify({sessionId:'0e20dd',id:`log_${Date.now()}_${Math.random().toString(36).slice(2,10)}`,runId:'ui-regressions-baseline',hypothesisId:'H13-scroll-overwrite',location:'server/public/app/journal-view.js:applyLoadedConversationState.after-restore',message:'restored conversation scroll position from saved value',data:{conversationId:String(id||'').trim()||null,restoredScrollTop:el.scrollTop,scrollHeight:el.scrollHeight,clientHeight:el.clientHeight},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
     return;
   }
   el.scrollTop = el.scrollHeight;
@@ -186,6 +201,9 @@ export async function openConversation(id, options = {}) {
   const savedScrollTop = loadConversationScrollTop(id);
   const restoreScroll = Number.isFinite(savedScrollTop);
   const savedLoadedCount = loadConversationLoadedMessageCount(id);
+  // #region agent log
+  fetch('http://127.0.0.1:7611/ingest/41e205ad-83bf-40b2-b2ab-5040e785036c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0e20dd'},body:JSON.stringify({sessionId:'0e20dd',id:`log_${Date.now()}_${Math.random().toString(36).slice(2,10)}`,runId:'ui-regressions-baseline',hypothesisId:'H12-scroll-restore',location:'server/public/app/journal-view.js:openConversation.saved-scroll',message:'open conversation loaded saved view state',data:{conversationId:String(id||'').trim()||null,savedScrollTop:Number.isFinite(savedScrollTop)?savedScrollTop:null,savedLoadedCount:Number.isFinite(savedLoadedCount)?savedLoadedCount:null},timestamp:Date.now()})}).catch(()=>{});
+  // #endregion
   const requestLimit = Number.isFinite(savedLoadedCount)
     ? Math.max(20, savedLoadedCount)
     : 20;

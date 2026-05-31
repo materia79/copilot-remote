@@ -53,6 +53,11 @@ export let filePreviewState = {
   loading: false,
   error: '',
   payload: null,
+  viewerOptions: {
+    startSeconds: 0,
+    preload: 'metadata',
+    autoplay: false,
+  },
 };
 export let repoBrowserState = {
   open: false,
@@ -76,6 +81,7 @@ export let repoBrowserState = {
 };
 export let contextUsageRefreshTimer = null;
 export let contextUsageRefreshSeq = 0;
+export let contextIndicatorMode = 'bar';
 export let compactInFlight = false;
 export let deferredInstallPrompt = null;
 export let viewportBaseHeight = window.innerHeight || document.documentElement.clientHeight || 0;
@@ -165,6 +171,17 @@ function writeConversationViewState(conversationId, nextState = {}) {
 export function saveConversationScrollTop(conversationId, scrollTop) {
   const value = Number(scrollTop);
   if (!Number.isFinite(value) || value < 0) return false;
+  try {
+    window.__scrollSaveDebug = {
+      conversationId: String(conversationId || '').trim() || null,
+      scrollTop: Math.trunc(value),
+      at: Date.now(),
+      stack: String(new Error().stack || '')
+        .split('\n')
+        .slice(1, 4)
+        .map((line) => line.trim()),
+    };
+  } catch {}
   return writeConversationViewState(conversationId, { scrollTop: value });
 }
 
@@ -371,6 +388,17 @@ export function readContextUsageRatio(payload) {
   return null;
 }
 
+export function normalizeContextIndicatorMode(value) {
+  return String(value || '').trim().toLowerCase() === 'bar' ? 'bar' : 'default';
+}
+
+export function setContextIndicatorMode(mode) {
+  contextIndicatorMode = normalizeContextIndicatorMode(mode);
+  const inputArea = document.getElementById('input-area');
+  if (!inputArea) return;
+  inputArea.classList.toggle('ctx-indicator-bar', contextIndicatorMode === 'bar');
+}
+
 export function applyContextUsageBar(ratio) {
   const inputArea = document.getElementById('input-area');
   if (!inputArea) return;
@@ -380,6 +408,8 @@ export function applyContextUsageBar(ratio) {
     inputArea.style.setProperty('--context-usage-bar', 'linear-gradient(90deg, rgba(139,148,158,0.65) 0%, rgba(139,148,158,0.95) 50%, rgba(139,148,158,0.65) 100%)');
     inputArea.style.setProperty('--context-usage-glow', 'rgba(139,148,158,0.35)');
     inputArea.style.setProperty('--context-usage-opacity', '0.62');
+    inputArea.style.setProperty('--context-usage-ratio', '0');
+    inputArea.style.setProperty('--context-usage-hue', '120');
     delete inputArea.dataset.contextUsageRatio;
     return;
   }
@@ -395,6 +425,8 @@ export function applyContextUsageBar(ratio) {
   );
   inputArea.style.setProperty('--context-usage-glow', `hsla(${hue}, 88%, 52%, ${glowAlpha})`);
   inputArea.style.setProperty('--context-usage-opacity', '0.98');
+  inputArea.style.setProperty('--context-usage-ratio', normalized.toFixed(4));
+  inputArea.style.setProperty('--context-usage-hue', String(hue));
   inputArea.dataset.contextUsageRatio = normalized.toFixed(4);
 }
 
@@ -428,7 +460,9 @@ export function releaseComposerFocusAfterSend(input) {
 
 export function autoResize(el) {
   el.style.height = 'auto';
-  el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+  const maxHeight = Number.parseFloat(globalThis.getComputedStyle?.(el)?.maxHeight || '');
+  const cap = Number.isFinite(maxHeight) && maxHeight > 0 ? maxHeight : 160;
+  el.style.height = `${Math.min(el.scrollHeight, cap)}px`;
   syncViewportMetrics();
 }
 
@@ -875,6 +909,7 @@ export function showTransientRelayNotice(message, ms = 4000) {
 
 export function syncViewportMetrics() {
   const layoutHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+  const layoutWidth = window.innerWidth || document.documentElement.clientWidth || 0;
   const vv = window.visualViewport;
   let appHeight = layoutHeight;
   let viewportTopOffset = 0;
@@ -892,6 +927,11 @@ export function syncViewportMetrics() {
 
   document.documentElement.style.setProperty('--viewport-top-offset', `${Math.max(0, Math.round(viewportTopOffset))}px`);
   document.documentElement.style.setProperty('--app-height', `${Math.max(0, Math.round(appHeight))}px`);
+  const messagesEl = document.getElementById('messages');
+  const messagesHeight = messagesEl ? Math.max(0, messagesEl.clientHeight || 0) : appHeight;
+  const messagesWidth = messagesEl ? Math.max(0, messagesEl.clientWidth || 0) : layoutWidth;
+  document.documentElement.style.setProperty('--messages-height', `${Math.max(0, Math.round(messagesHeight))}px`);
+  document.documentElement.style.setProperty('--messages-width', `${Math.max(0, Math.round(messagesWidth))}px`);
 }
 
 export function setPullRefreshIndicator(distance, label, ready = false) {

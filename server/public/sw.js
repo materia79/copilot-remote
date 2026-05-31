@@ -1,4 +1,6 @@
-const CACHE_NAME = 'copilot-remote-shell-v27.2';
+const SW_URL = new URL(self.location.href);
+const SW_VERSION = String(SW_URL.searchParams.get('v') || '').trim() || '0';
+const CACHE_NAME = `copilot-remote-shell-v${SW_VERSION}`;
 const STATIC_ASSETS = [
   './',
   'index.html',

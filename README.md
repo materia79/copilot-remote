@@ -44,6 +44,13 @@ Copilot Remote is split into two pieces:
 1. **Web relay server** (`server/`): queueing, persistence, auth, browser UI, file browser, uploads.
 2. **Copilot CLI extension** (`.github/extensions/web-relay/`): polls the relay, executes turns, streams activity, bridges `ask_user` questions into web question cards.
 
+
+
+## Project Status
+
+Copilot Remote is still under active development, so expect occasional rough edges and some Copilot SDK features to be missing or incomplete for now.
+
+
 ## Highlights
 
 - Remote chat UI for a local Copilot CLI session
@@ -62,12 +69,14 @@ Copilot Remote is split into two pieces:
 
 ## Prerequisites
 
-| Requirement | Notes |
-|---|---|
-| Node.js 18+ | Runs the relay server |
-| GitHub CLI (`gh`) | Must be available in PATH |
+
+| Requirement                  | Notes                                    |
+| ---------------------------- | ---------------------------------------- |
+| Node.js 18+                  | Runs the relay server                    |
+| GitHub CLI (`gh`)            | Must be available in PATH                |
 | GitHub Copilot CLI extension | `gh extension install github/gh-copilot` |
-| Copilot subscription | Individual, Business, or Enterprise |
+| Copilot subscription         | Individual, Business, or Enterprise      |
+
 
 ## Quick start
 
@@ -118,12 +127,14 @@ Sign in once with your token. The relay then uses an HttpOnly auth cookie.
 
 ## Runtime modes and startup commands
 
-| Command | Purpose |
-|---|---|
-| `copilot-remote` | Global npm command (after `npm link` or `npm install -g .`) that starts the web relay if needed, then runs `gh copilot` in the same shell |
-| `npm run copilot:relay` | Starts Copilot CLI with an initial prompt so the extension loads and polling begins |
-| `npm run start:server` | Server only (use with an active Copilot CLI session that loads the extension) |
-| `npm start` | Standalone development mode (`server.js` + `relay.mjs`) |
+
+| Command                 | Purpose                                                                                                                                   |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `copilot-remote`        | Global npm command (after `npm link` or `npm install -g .`) that starts the web relay if needed, then runs `gh copilot` in the same shell |
+| `npm run copilot:relay` | Starts Copilot CLI with an initial prompt so the extension loads and polling begins                                                       |
+| `npm run start:server`  | Server only (use with an active Copilot CLI session that loads the extension)                                                             |
+| `npm start`             | Standalone development mode (`server.js` + `relay.mjs`)                                                                                   |
+
 
 ### Single runtime owner rule
 
@@ -141,7 +152,7 @@ In extension-managed mode, polling begins after the CLI session becomes active (
 The extension now supervises managed `server.js` restarts (bounded backoff) while the CLI session is alive, and stops restart attempts on session shutdown.
 When the CLI extension connects, it also prints the relay info window (local/network/remote/auth/polling URLs) directly in the Copilot CLI client.
 
-Respawner scripts (`start:server:respawn*`) are legacy/manual troubleshooting tools only and are not part of the extension-managed startup path.
+Respawner scripts (`start:server:respawn`*) are legacy/manual troubleshooting tools only and are not part of the extension-managed startup path.
 Do not use them for manual restarts; use `POST /api/relay/shutdown` instead.
 
 Manual relay control details:
@@ -185,7 +196,7 @@ Roadmap for later launcher modes:
 - Choose **mode** and **model** per message in the composer.
 - Use **Compact** to branch to a fresh conversation seeded with summary context.
 - Use **Browse files** to inspect workspace/drives and open previews.
-- Click file/folder copy controls to insert ``@file:...`` / ``@folder:...`` tokens.
+- Click file/folder copy controls to insert `@file:...` / `@folder:...` tokens.
 - Answer clarification prompts in relay question cards (from `ask_user`).
 - Use the usage button (`📊`) for live Copilot usage summary.
 - Use the **Context** button to read the latest token/context metrics in a modal from local session-state events, with a clearly labeled lower-bound fallback when newer sessions no longer emit the full legacy bucket breakdown.
@@ -193,12 +204,14 @@ Roadmap for later launcher modes:
 
 ## Relay modes
 
-| Mode | Behavior |
-|---|---|
-| `ask` | Clarification-first behavior before implementation |
-| `plan` | Planning response style (no implementation unless requested) |
-| `agent` | Interactive coding agent behavior |
-| `autopilot` | Action-first behavior; asks only when truly blocking |
+
+| Mode        | Behavior                                                     |
+| ----------- | ------------------------------------------------------------ |
+| `ask`       | Clarification-first behavior before implementation           |
+| `plan`      | Planning response style (no implementation unless requested) |
+| `agent`     | Interactive coding agent behavior                            |
+| `autopilot` | Action-first behavior; asks only when truly blocking         |
+
 
 ## Models
 
@@ -214,29 +227,31 @@ Selection is persisted in browser storage and attached per message.
 
 ## Configuration reference (`server/config.json`)
 
-| Key | Default | Description |
-|---|---|---|
-| `authToken` | generated if missing | Required for API/UI auth; set explicitly for stable access |
-| `port` | `3333` | HTTP + WebSocket port |
-| `localhostOnly` | `true` | Bind only to loopback (`127.0.0.1`) and disable LAN/WAN access |
-| `pollIntervalMs` | `3000` | CLI heartbeat/poll cadence |
-| `processingTimeoutMs` | `600000` | Max turn processing wait |
-| `ask_user` timeout | `900000` | `ask_user` question wait; edit `shared/question-timeout.mjs` to change it |
-| `conversationSessionMode` | `isolated` | Configured strategy (`isolated` / `shared`) exposed in status |
-| `restartGracefulTimeoutMs` | `8000` | Graceful restart wait before force fallback |
-| `restartShutdownTimeoutMs` | `45000` | Drain timeout while waiting for active queue job completion |
-| `restartSpawnTimeoutMs` | `18000` | Max wait for resume/restart phase per attempt |
-| `restartRebindTimeoutMs` | `20000` | Max wait for rebind/session-sync completion per attempt |
-| `restartMaxAttempts` | `3` | Bounded restart attempts before terminal exhaustion |
-| `restartRetryBackoffMs` | `[1000,3000,7000]` | Deterministic retry backoff schedule in milliseconds |
-| `maxRequeueRetries` | `5` | Queue retry limit for failed processing |
-| `remotePath` | `""` | URL base path when reverse-proxied under a subpath |
-| `sshTunnel.enabled` | `false` | Enable reverse SSH tunnel |
-| `sshTunnel.remoteBind` | `loopback` | Remote bind mode for SSH `-R` (`loopback` or `public`) |
-| `sshTunnel.user` | — | SSH user |
-| `sshTunnel.host` | — | SSH host |
-| `sshTunnel.remotePort` | — | Remote forwarded port |
-| `sshTunnel.identityFile` | optional | SSH key path (falls back to default agent/key) |
+
+| Key                        | Default              | Description                                                               |
+| -------------------------- | -------------------- | ------------------------------------------------------------------------- |
+| `authToken`                | generated if missing | Required for API/UI auth; set explicitly for stable access                |
+| `port`                     | `3333`               | HTTP + WebSocket port                                                     |
+| `localhostOnly`            | `true`               | Bind only to loopback (`127.0.0.1`) and disable LAN/WAN access            |
+| `pollIntervalMs`           | `3000`               | CLI heartbeat/poll cadence                                                |
+| `processingTimeoutMs`      | `600000`             | Max turn processing wait                                                  |
+| `ask_user` timeout         | `900000`             | `ask_user` question wait; edit `shared/question-timeout.mjs` to change it |
+| `conversationSessionMode`  | `isolated`           | Configured strategy (`isolated` / `shared`) exposed in status             |
+| `restartGracefulTimeoutMs` | `8000`               | Graceful restart wait before force fallback                               |
+| `restartShutdownTimeoutMs` | `45000`              | Drain timeout while waiting for active queue job completion               |
+| `restartSpawnTimeoutMs`    | `18000`              | Max wait for resume/restart phase per attempt                             |
+| `restartRebindTimeoutMs`   | `20000`              | Max wait for rebind/session-sync completion per attempt                   |
+| `restartMaxAttempts`       | `3`                  | Bounded restart attempts before terminal exhaustion                       |
+| `restartRetryBackoffMs`    | `[1000,3000,7000]`   | Deterministic retry backoff schedule in milliseconds                      |
+| `maxRequeueRetries`        | `5`                  | Queue retry limit for failed processing                                   |
+| `remotePath`               | `""`                 | URL base path when reverse-proxied under a subpath                        |
+| `sshTunnel.enabled`        | `false`              | Enable reverse SSH tunnel                                                 |
+| `sshTunnel.remoteBind`     | `loopback`           | Remote bind mode for SSH `-R` (`loopback` or `public`)                    |
+| `sshTunnel.user`           | —                    | SSH user                                                                  |
+| `sshTunnel.host`           | —                    | SSH host                                                                  |
+| `sshTunnel.remotePort`     | —                    | Remote forwarded port                                                     |
+| `sshTunnel.identityFile`   | optional             | SSH key path (falls back to default agent/key)                            |
+
 
 > Session mismatch recovery is restart-driven: the relay restart orchestrator parks queue work, restarts/rebinds the CLI runtime, and resumes dequeueing after rebind confirmation. The extension no longer attempts in-process session switch APIs from the dequeue/send path.
 
@@ -306,17 +321,19 @@ All authenticated routes accept either:
 - `Authorization: Bearer <token>`
 - auth cookie from prior login
 
-For deeper implementation/API details, see [`server/README.md`](server/README.md).
+For deeper implementation/API details, see `[server/README.md](server/README.md)`.
 
 ## Troubleshooting
 
-| Symptom | What to check |
-|---|---|
-| UI says CLI offline | Send one CLI prompt to trigger extension session start, then check `/api/status` |
-| Messages stuck pending | Ensure only one relay owner is running and only one process owns port `3333` |
-| Wrong/old model shown | Check `/api/models` and extension logs for model snapshot updates |
-| Clarification card not progressing | Answer via the web card; relay resumes after question status becomes `answered` |
-| File links fail | Verify auth token/cookie and that paths are inside allowed workspace/drive roots |
+
+| Symptom                            | What to check                                                                    |
+| ---------------------------------- | -------------------------------------------------------------------------------- |
+| UI says CLI offline                | Send one CLI prompt to trigger extension session start, then check `/api/status` |
+| Messages stuck pending             | Ensure only one relay owner is running and only one process owns port `3333`     |
+| Wrong/old model shown              | Check `/api/models` and extension logs for model snapshot updates                |
+| Clarification card not progressing | Answer via the web card; relay resumes after question status becomes `answered`  |
+| File links fail                    | Verify auth token/cookie and that paths are inside allowed workspace/drive roots |
+
 
 ## Security notes
 

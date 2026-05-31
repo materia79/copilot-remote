@@ -49,6 +49,8 @@ import {
   loadConversationLoadedMessageCount,
   saveConversationScrollTop,
   getRecentWorkspaceRoots,
+  getSessionWorkerState,
+  resolveConversationUiState,
 } from './store.js';
 import {
   verifyExistingSession,
@@ -62,13 +64,21 @@ import {
   updateConversationPreferences,
   killSessionWorker,
   requestRelayRestart,
+  requestHostSuspend,
+  requestQueueEmpty,
   updateWorkspaceRoot,
   launchSessionWorker,
   scheduleContextUsageRefresh,
 } from './api-client.js';
 import { loadConversations, refreshConversations, openConversation, renderConvList, applyLoadedConversationState } from './journal-view.js';
 import { newConversation, deleteConv } from './journal-view.js';
-import { loadRelayQuestions, renderRelayQuestions, upsertRelayQuestion, updatePendingQuestionBanner } from './ask-user-view.js';
+import {
+  loadRelayQuestions,
+  renderRelayQuestions,
+  upsertRelayQuestion,
+  updatePendingQuestionBanner,
+  getPendingQuestionCountsByConversation,
+} from './ask-user-view.js';
 import { openPendingQuestionFromBanner, submitRelayQuestionChoice, submitRelayQuestionAnswer, onRelayQuestionDraftInput, handleRelayQuestionKey } from './ask-user-view.js';
 import { loadRelayBoards, renderRelayBoards, upsertRelayBoard, submitRelayBoardAction } from './relay-board-view.js';
 import { showThinking, removeThinking, renderThinkingActivities, appendThinkingActivity, applyRelayStreamEvent, clearRelayStreamStateForMessage, restoreInFlightThinking, applyConversationTurnStatus, renderMessages, appendMessage, compactCurrentConversation, sendMessage, handleKey, getConversationLoadedMessageCount, loadOlderConversationMessages, syncComposerControlState, getRenderedConversationMessageFingerprints } from './conversation-view.js';
@@ -136,6 +146,11 @@ let pullRefreshState = {
   startY: 0,
   refreshing: false,
 };
+let latestQueueStatus = {
+  pendingCount: 0,
+  processingCount: 0,
+  parkedCount: 0,
+};
 
 function getTokenFromUrl() {
   return new URLSearchParams(window.location.search).get('token');
@@ -165,9 +180,41 @@ function showAuthError(msg) {
 
 function syncPwaVersionMenuEntry() {
   const chip = document.getElementById('chat-menu-pwa-version');
+  const value = document.getElementById('chat-menu-pwa-version-value');
   if (!chip) return;
   const version = String(window.__COPILOT_PWA_VERSION || '').trim();
+  if (value) {
+    value.textContent = version ? `v${version}` : 'v?';
+    return;
+  }
   chip.textContent = version ? `PWA shell version: v${version}` : 'PWA shell version: v?';
+}
+
+function normalizeQueueCount(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.trunc(parsed) : 0;
+}
+
+function updateQueueStatusFromPayload(payload = null) {
+  if (!payload || typeof payload !== 'object') return;
+  latestQueueStatus = {
+    pendingCount: normalizeQueueCount(payload.pendingCount ?? payload.queue?.pendingCount),
+    processingCount: normalizeQueueCount(payload.processingCount ?? payload.queue?.processingCount),
+    parkedCount: normalizeQueueCount(payload.parkedCount ?? payload.queue?.parkedCount),
+  };
+}
+
+function syncQueueStatusMenuEntry(payload = null) {
+  if (payload) updateQueueStatusFromPayload(payload);
+  const chip = document.getElementById('chat-menu-queue-status');
+  const value = document.getElementById('chat-menu-queue-status-value');
+  if (!chip) return;
+  const statusText = `pending=${latestQueueStatus.pendingCount}, processing=${latestQueueStatus.processingCount}, parked=${latestQueueStatus.parkedCount}`;
+  if (value) {
+    value.textContent = statusText;
+    return;
+  }
+  chip.textContent = `Queue: ${statusText}`;
 }
 
 function updateModelCatalogState(payload) {
@@ -799,6 +846,7 @@ function startRelayBoardPolling() {
 async function refreshSessionWorkerStatus() {
   const status = await refreshWorkspaceRootHints();
   if (!status) return;
+  syncQueueStatusMenuEntry(status);
   if (setSessionWorkerStatesFromStatusPayload(status.sessionWorker)) {
     renderConvList();
   }
@@ -1273,7 +1321,7 @@ function bindMenuAction(element, handler) {
   const markSuppressed = (ms = 450) => {
     suppressClickUntil = Date.now() + Math.max(200, Number(ms) || 450);
   };
-  element.addEventListener('pointerdown', (event) => {
+  element.addEventListener('pointerup', (event) => {
     if (event.pointerType === 'mouse' && event.button !== 0) return;
     event.preventDefault();
     event.stopPropagation();
@@ -1296,7 +1344,23 @@ function syncChatTitleControls() {
   const { title, editBtn, editor, input } = getChatTitleElements();
   const convId = String(currentConvId || '').trim();
   const killBtn = document.getElementById('chat-menu-kill-session');
-  const sdkSessionId = String(conversations[convId]?.sdkSessionId || '').trim();
+  const conversation = convId ? (conversations[convId] || null) : null;
+  const sdkSessionId = String(conversation?.sdkSessionId || '').trim();
+  if (title) {
+    if (!convId || !conversation) {
+      delete title.dataset.uiState;
+    } else {
+      const pendingByConversation = getPendingQuestionCountsByConversation();
+      const pendingCount = Number(pendingByConversation[convId] || 0);
+      const workerState = sdkSessionId ? getSessionWorkerState(sdkSessionId) : null;
+      const uiState = resolveConversationUiState({
+        conversation,
+        workerState,
+        hasPendingQuestion: pendingCount > 0,
+      });
+      title.dataset.uiState = uiState;
+    }
+  }
   if (chatTitleEditingConversationId && chatTitleEditingConversationId !== convId) {
     chatTitleEditingConversationId = null;
   }
@@ -1442,6 +1506,8 @@ function openKillSessionConfirmation() {
 
 let killSessionInFlight = false;
 let restartRelayInFlight = false;
+let suspendHostInFlight = false;
+let emptyQueueInFlight = false;
 
 async function confirmKillCurrentSession() {
   if (killSessionInFlight) return;
@@ -1488,6 +1554,100 @@ function openRestartRelayConfirmation() {
       </div>
     `,
   });
+}
+
+function openEmptyQueueConfirmation() {
+  lockChatActionsMenuShield(350);
+  closeChatActionsMenu();
+  openSummaryModal({
+    title: 'Empty queue',
+    subtitle: 'Calls localhost /api/queue/empty',
+    kind: 'empty-queue',
+    bodyHtml: `
+      <p>Drop all queue rows in pending, processing, and parked states?</p>
+      <p>This is a local maintenance action and cannot be undone.</p>
+      <div class="summary-modal-actions">
+        <button class="chat-title-action-btn danger-btn" type="button" onclick="confirmEmptyQueue()">🚮 Empty queue</button>
+        <button class="chat-title-action-btn" type="button" onclick="closeSummaryModal()">Cancel</button>
+      </div>
+    `,
+  });
+}
+
+function openSuspendHostConfirmation() {
+  lockChatActionsMenuShield(350);
+  closeChatActionsMenu();
+  openSummaryModal({
+    title: 'Suspend host',
+    subtitle: 'Runs bin/sleep.bat',
+    kind: 'suspend-host',
+    bodyHtml: `
+      <p>Put this PC to sleep now?</p>
+      <p>This launches <code>bin/sleep.bat</code> and may suspend the host immediately.</p>
+      <div class="summary-modal-actions">
+        <button class="chat-title-action-btn" type="button" onclick="confirmSuspendHost()">💤 Suspend host</button>
+        <button class="chat-title-action-btn" type="button" onclick="closeSummaryModal()">Cancel</button>
+      </div>
+    `,
+  });
+  window.setTimeout(() => {
+    const modal = document.getElementById('summary-modal');
+    const classVisible = !!modal?.classList?.contains('visible');
+    const ariaVisible = String(modal?.getAttribute('aria-hidden') || 'true') === 'false';
+    const displayVisible = modal ? window.getComputedStyle(modal).display !== 'none' : false;
+    if (classVisible && ariaVisible && displayVisible) return;
+    const confirmed = window.confirm('Put this PC to sleep now?\n\nThis runs bin/sleep.bat.');
+    if (!confirmed) return;
+    confirmSuspendHost().catch(() => {});
+  }, 90);
+}
+
+async function confirmSuspendHost() {
+  if (suspendHostInFlight) return;
+  suspendHostInFlight = true;
+  setSummaryModalLoading(true);
+  try {
+    const result = await requestHostSuspend({
+      reason: 'manual-suspend',
+      requestedBy: 'localhost-api',
+    });
+    closeSummaryModal();
+    if (!result?.ok) {
+      alert('Failed to suspend host');
+      return;
+    }
+  } finally {
+    suspendHostInFlight = false;
+    setSummaryModalLoading(false);
+  }
+}
+
+async function confirmEmptyQueue() {
+  if (emptyQueueInFlight) return;
+  emptyQueueInFlight = true;
+  setSummaryModalLoading(true);
+  try {
+    const result = await requestQueueEmpty({
+      reason: 'manual-empty-queue',
+      requestedBy: 'localhost-api',
+    });
+    closeSummaryModal();
+    if (!result?.ok) {
+      alert('Failed to empty queue');
+      return;
+    }
+    const droppedCount = Number(result.droppedCount || 0);
+    if (droppedCount <= 0) {
+      showTransientRelayNotice('Queue is already empty.');
+    } else {
+      showTransientRelayNotice(`Queue emptied: dropped ${droppedCount} row${droppedCount === 1 ? '' : 's'}.`, 6000);
+    }
+    const status = await refreshWorkspaceRootHints();
+    syncQueueStatusMenuEntry(status);
+  } finally {
+    emptyQueueInFlight = false;
+    setSummaryModalLoading(false);
+  }
 }
 
 async function confirmRestartWebRelay() {
@@ -1555,8 +1715,6 @@ function initFullscreenButton() {
   const syncFullscreenUi = () => {
     updateInstallButton();
     updateFullscreenButton();
-    queueInstalledFullscreenGesture();
-    ensureInstalledAppFullscreen().catch(() => {});
   };
   document.addEventListener('fullscreenchange', syncFullscreenUi);
   window.addEventListener('resize', syncFullscreenUi);
@@ -1567,7 +1725,6 @@ function initFullscreenButton() {
     }
   }
   updateFullscreenButton();
-  ensureInstalledAppFullscreen().catch(() => {});
 }
 
 async function connectSocket() {
@@ -1725,23 +1882,34 @@ async function connectSocket() {
     }
   });
   socket.on('message_status', ({ messageId, conversationId, status }) => {
+    const normalizedStatus = String(status || '').trim().toLowerCase();
+    const clearsProcessingStatus = ['done', 'failed', 'dropped', 'pending', 'parked', 'cancelled'].includes(normalizedStatus);
     applyConversationTurnStatus({ conversationId, messageId, status });
     if (conversationId && conversations[conversationId]) {
-      if (status === 'processing') {
-        conversations[conversationId].runtimeSessionStatus = 'processing';
-      } else if (status === 'done' || status === 'failed' || status === 'dropped') {
-        delete conversations[conversationId].runtimeSessionStatus;
+      const conversation = conversations[conversationId];
+      if (normalizedStatus === 'processing') {
+        conversation.localTurnStatus = 'processing';
+        conversation.localTurnStatusUpdatedAt = Date.now();
+        conversation.localTurnMessageId = String(messageId || '').trim() || null;
+      } else if (clearsProcessingStatus) {
+        const trackedMessageId = String(conversation.localTurnMessageId || '').trim();
+        const incomingMessageId = String(messageId || '').trim();
+        if (!trackedMessageId || !incomingMessageId || trackedMessageId === incomingMessageId) {
+          delete conversation.localTurnStatus;
+          delete conversation.localTurnStatusUpdatedAt;
+          delete conversation.localTurnMessageId;
+        }
       }
     }
-    if (conversationId === currentConvId && status === 'processing') {
+    if (conversationId === currentConvId && normalizedStatus === 'processing') {
       showThinking(messageId || null);
       renderThinkingActivities();
     }
-    if (status === 'done' || status === 'failed' || status === 'dropped') {
+    if (clearsProcessingStatus) {
       clearPendingUserMessage(messageId);
       if (messageId) clearRelayStreamStateForMessage(messageId);
     }
-    if (conversationId === currentConvId && (status === 'done' || status === 'failed' || status === 'dropped')) {
+    if (conversationId === currentConvId && clearsProcessingStatus) {
       removeThinking();
       void refreshCurrentView().catch(() => {});
       scheduleContextUsageRefresh(conversationId, 220);
@@ -1786,6 +1954,7 @@ function showAuthGate() {
 async function initApp() {
   clearLegacyKnownCwdHistoryStorage();
   syncPwaVersionMenuEntry();
+  syncQueueStatusMenuEntry();
   setupViewportTracking();
   document.getElementById('auth-gate').style.display = 'none';
   document.getElementById('app').classList.add('visible');
@@ -1839,6 +2008,12 @@ async function initApp() {
     lockChatActionsMenuShield(350);
     closeChatActionsMenu();
     openRestartRelayConfirmation();
+  });
+  const chatMenuEmptyQueueBtn = document.getElementById('chat-menu-empty-queue');
+  bindMenuAction(chatMenuEmptyQueueBtn, (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    openEmptyQueueConfirmation();
   });
   const chatMenuKillBtn = document.getElementById('chat-menu-kill-session');
   bindMenuAction(chatMenuKillBtn, (event) => {
@@ -1899,6 +2074,7 @@ async function initApp() {
   initModeSelector();
   initModelSelector();
   const status = await refreshWorkspaceRootHints();
+  syncQueueStatusMenuEntry(status);
   setSessionWorkerStatesFromStatusPayload(status?.sessionWorker || null);
   await refreshModelCatalog(true);
   initFullscreenButton();
@@ -1935,7 +2111,8 @@ function registerPwaShell() {
   if (!('serviceWorker' in navigator)) return;
   const scopeBase = window.location.pathname.replace(/\/+$/, '');
   const scopeRoot = `${scopeBase}/`;
-  return navigator.serviceWorker.register(`${scopeBase}/sw.js?v=14`, { scope: scopeRoot, updateViaCache: 'none' }).catch(() => {});
+  const pwaVersion = String(window.__COPILOT_PWA_VERSION || '0').trim() || '0';
+  return navigator.serviceWorker.register(`${scopeBase}/sw.js?v=${encodeURIComponent(pwaVersion)}`, { scope: scopeRoot, updateViaCache: 'none' }).catch(() => {});
 }
 
 async function bootstrap() {
@@ -2028,7 +2205,10 @@ window.setSummaryModalLoading = setSummaryModalLoading;
 window.openSummaryModal = openSummaryModal;
 window.syncChatTitleControls = syncChatTitleControls;
 window.closeChatActionsMenu = closeChatActionsMenu;
+window.openSuspendHostConfirmation = openSuspendHostConfirmation;
 window.confirmKillCurrentSession = confirmKillCurrentSession;
 window.confirmRestartWebRelay = confirmRestartWebRelay;
+window.confirmSuspendHost = confirmSuspendHost;
+window.confirmEmptyQueue = confirmEmptyQueue;
 
 bootstrap();

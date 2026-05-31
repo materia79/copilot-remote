@@ -1,4 +1,4 @@
-import { BASE, TOKEN, authHeaders, updateWorkspaceRootHints, applyContextUsageBar, readContextUsageRatio, currentConvId, conversations, setCliOnline, setActiveRuntimeSessionCount } from './store.js';
+import { BASE, TOKEN, authHeaders, updateWorkspaceRootHints, applyContextUsageBar, readContextUsageRatio, currentConvId, conversations, setCliOnline, setActiveRuntimeSessionCount, setContextIndicatorMode } from './store.js';
 
 export async function apiFetch(url, opts = {}) {
   try {
@@ -27,6 +27,7 @@ export async function verifyExistingSession() {
     if (!response.ok) return false;
     const payload = await response.json().catch(() => null);
     if (payload) updateWorkspaceRootHints(payload);
+    setContextIndicatorMode(payload?.contextIndicatorMode);
     setCliOnline(!!payload?.cliOnline);
     setActiveRuntimeSessionCount(payload?.activeRuntimeSessionCount);
     return true;
@@ -43,6 +44,7 @@ export async function verifyToken(token) {
     if (!response.ok) return false;
     const payload = await response.json().catch(() => null);
     if (payload) updateWorkspaceRootHints(payload);
+    setContextIndicatorMode(payload?.contextIndicatorMode);
     setCliOnline(!!payload?.cliOnline);
     setActiveRuntimeSessionCount(payload?.activeRuntimeSessionCount);
     return true;
@@ -55,6 +57,7 @@ export async function refreshWorkspaceRootHints() {
   const status = await apiFetch('/api/status');
   if (status) {
     updateWorkspaceRootHints(status);
+    setContextIndicatorMode(status?.contextIndicatorMode);
     setCliOnline(!!status?.cliOnline);
     setActiveRuntimeSessionCount(status?.activeRuntimeSessionCount);
   }
@@ -171,6 +174,28 @@ export async function requestRelayRestart(body = {}) {
       reason: 'manual-restart',
       requestedBy: 'localhost-api',
       restart: true,
+      ...(body || {}),
+    }),
+  });
+}
+
+export async function requestHostSuspend(body = {}) {
+  return apiFetch('/api/host/suspend', {
+    method: 'POST',
+    body: JSON.stringify({
+      reason: 'manual-suspend',
+      requestedBy: 'localhost-api',
+      ...(body || {}),
+    }),
+  });
+}
+
+export async function requestQueueEmpty(body = {}) {
+  return apiFetch('/api/queue/empty', {
+    method: 'POST',
+    body: JSON.stringify({
+      reason: 'manual-empty-queue',
+      requestedBy: 'localhost-api',
       ...(body || {}),
     }),
   });

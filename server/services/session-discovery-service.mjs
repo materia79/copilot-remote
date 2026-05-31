@@ -35,17 +35,20 @@ export function createSessionDiscoveryService({ fs, path, resolveSessionStateRoo
     try {
       content = String(fs.readFileSync(workspaceYamlPath, 'utf8') || '');
     } catch {
-      return { title: null, updatedAt: null };
+      return { title: null, updatedAt: null, workspaceRootPath: null };
     }
-    if (!content) return { title: null, updatedAt: null };
+    if (!content) return { title: null, updatedAt: null, workspaceRootPath: null };
 
     const summaryMatch = content.match(/^\s*summary\s*:\s*(.+)\s*$/im);
     const nameMatch = content.match(/^\s*name\s*:\s*(.+)\s*$/im);
     const modifiedMatch = content.match(/^\s*modified\s*:\s*(.+)\s*$/im);
     const updatedAtMatch = content.match(/^\s*updated_at\s*:\s*(.+)\s*$/im);
     const updatedAtCamelMatch = content.match(/^\s*updatedAt\s*:\s*(.+)\s*$/im);
+    const cwdMatch = content.match(/^\s*cwd\s*:\s*(.+)\s*$/im);
+    const gitRootMatch = content.match(/^\s*git_root\s*:\s*(.+)\s*$/im);
     const raw = String(summaryMatch?.[1] || nameMatch?.[1] || '').trim();
     const rawUpdatedAt = String(modifiedMatch?.[1] || updatedAtMatch?.[1] || updatedAtCamelMatch?.[1] || '').trim();
+    const rawWorkspaceRootPath = String(cwdMatch?.[1] || gitRootMatch?.[1] || '').trim();
 
     const unquoted = raw
       .replace(/^['"]+|['"]+$/g, '')
@@ -59,6 +62,9 @@ export function createSessionDiscoveryService({ fs, path, resolveSessionStateRoo
     return {
       title: unquoted || null,
       updatedAt: parsedUpdatedAt,
+      workspaceRootPath: rawWorkspaceRootPath
+        .replace(/^['"]+|['"]+$/g, '')
+        .trim() || null,
     };
   }
 
@@ -89,7 +95,7 @@ export function createSessionDiscoveryService({ fs, path, resolveSessionStateRoo
       const statTarget = fs.existsSync(eventsPath) ? eventsPath : sessionDir;
       const workspaceMeta = fs.existsSync(workspaceYamlPath)
         ? parseWorkspaceYamlMeta(workspaceYamlPath)
-        : { title: null, updatedAt: null };
+        : { title: null, updatedAt: null, workspaceRootPath: null };
 
       let updatedAtIso = null;
       try {
@@ -103,6 +109,7 @@ export function createSessionDiscoveryService({ fs, path, resolveSessionStateRoo
         sdkSessionId: sessionId,
         updatedAt: pickLatestIso(workspaceMeta.updatedAt, updatedAtIso) || new Date().toISOString(),
         title: workspaceMeta.title || 'Session',
+        workspaceRootPath: String(workspaceMeta.workspaceRootPath || '').trim() || null,
       });
     }
 

@@ -291,7 +291,7 @@ async function syncStartupWorkspaceRoot(reason = "startup") {
     session,
     env: process.env,
     cwd: process.cwd(),
-    includeProcessCwd: false,
+    includeProcessCwd: true,
   });
   if (!currentWorkspaceRootPath) return false;
   try {

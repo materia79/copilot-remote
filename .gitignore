@@ -9,3 +9,4 @@ server/uploads/*
 !server/uploads/image_input.md
 test-results/
 tests/
+tests/agents/

@@ -14,7 +14,7 @@
     "start:server:respawn:posix": "bash server/respawn.sh",
     "copilot:relay": "gh copilot -- --allow-all -i \"launch the server\"",
     "test:e2e": "node tests/run-e2e.mjs",
-    "test:e2e:raw": "playwright test --config tests/playwright.config.mjs"
+    "test:e2e:raw": "node ./node_modules/@playwright/test/cli.js test --config tests/playwright.config.mjs"
   },
   "dependencies": {
     "better-sqlite3": "^12.10.0",
