@@ -36,6 +36,7 @@ import { createRelayCliLauncherService } from './services/relay-cli-launcher-ser
 import { createSessionWorkerRegistry } from './services/session-worker-registry-service.mjs';
 import { createSessionWorkerSupervisor } from './services/session-worker-supervisor-service.mjs';
 import { createSessionWorkerProcessInspector } from './services/session-worker-process-service.mjs';
+import { launchSessionCli } from './services/session-worker-launch-service.mjs';
 import { FEATURES, normalizeFeatureFlags } from './features.mjs';
 import { RELAY_RESTART_EXIT_CODE } from './relay-exit-codes.mjs';
 import { DEFAULT_QUESTION_TIMEOUT_MS } from '../shared/question-timeout.mjs';
@@ -1116,29 +1117,31 @@ const relayCliLauncherService = createRelayCliLauncherService({
   env: process.env,
   log: (message) => console.log(`[${ts()}] ${message}`),
 });
-function spawnSessionWorkerCli(targetSessionId) {
+async function spawnSessionWorkerCli(targetSessionId) {
   const normalizedTargetSessionId = String(targetSessionId || '').trim();
   if (!normalizedTargetSessionId) {
     throw new Error('missing-target-session-id');
   }
-  const liveWorker = sessionWorkerProcessInspector.findWindowsProcessForSession(normalizedTargetSessionId);
+  const liveWorker = sessionWorkerProcessInspector.findProcessForSession(normalizedTargetSessionId);
   if (liveWorker?.processId) {
     const workerId = `worker-${normalizedTargetSessionId.slice(0, 8)}`;
     console.log(`[${ts()}] worker launcher: reused ${workerId} session=${normalizedTargetSessionId.slice(0, 8)} pid=${liveWorker.processId}`);
     return { workerId, pid: liveWorker.processId };
   }
-  const child = spawn('gh', ['copilot', '--', '--allow-all', '--session-id', normalizedTargetSessionId], {
+  const launched = await launchSessionCli({
+    targetSessionId: normalizedTargetSessionId,
     cwd: resolveLaunchWorkspaceRootForSession(normalizedTargetSessionId),
     env: process.env,
-    detached: true,
-    stdio: 'ignore',
-    shell: process.platform === 'win32',
-    windowsHide: process.platform === 'win32',
+    platform: process.platform,
+    spawnImpl: spawn,
+    execFileSyncImpl: execFileSync,
+    processInspector: sessionWorkerProcessInspector,
   });
-  child.unref?.();
-  const workerPid = Number.isInteger(Number(child?.pid)) ? Number(child.pid) : null;
+  const workerPid = Number.isInteger(Number(launched?.pid)) ? Number(launched.pid) : null;
   const workerId = `worker-${normalizedTargetSessionId.slice(0, 8)}`;
-  console.log(`[${ts()}] worker launcher: spawned ${workerId} session=${normalizedTargetSessionId.slice(0, 8)} pid=${workerPid || 'none'}`);
+  const launchMode = String(launched?.launchMode || 'detached').trim();
+  const tmuxSessionName = String(launched?.tmuxSessionName || '').trim();
+  console.log(`[${ts()}] worker launcher: spawned ${workerId} session=${normalizedTargetSessionId.slice(0, 8)} pid=${workerPid || 'none'} mode=${launchMode}${tmuxSessionName ? ` tmux=${tmuxSessionName}` : ''}`);
   return { workerId, pid: workerPid };
 }
 const sessionWorkerSupervisor = createSessionWorkerSupervisor({
@@ -3054,19 +3057,47 @@ function ensureRuntimeSessionBinding(conversationId, model, nowIso = new Date().
     return stmts.getRuntimeSessionById.get(existing.id);
   }
 
+  if (normalizedSdkSessionId) {
+    const existingBySdkSessionId = stmts.getRuntimeSessionBySdkSessionId.get(normalizedSdkSessionId);
+    if (existingBySdkSessionId?.id) {
+      stmts.touchRuntimeSession.run(normalizedModel, nowIso, existingBySdkSessionId.id);
+      return stmts.getRuntimeSessionById.get(existingBySdkSessionId.id);
+    }
+  }
+
   const runtimeSessionId = uuidv4();
   const strategy = configuredConversationSessionMode;
   const runtimeKey = runtimeSessionId;
-  stmts.insertRuntimeSession.run(
-    runtimeSessionId,
-    normalizedConversationId,
-    strategy,
-    runtimeKey,
-    normalizedModel,
-    nowIso,
-    nowIso,
-    normalizedSdkSessionId,
-  );
+  try {
+    stmts.insertRuntimeSession.run(
+      runtimeSessionId,
+      normalizedConversationId,
+      strategy,
+      runtimeKey,
+      normalizedModel,
+      nowIso,
+      nowIso,
+      normalizedSdkSessionId,
+    );
+  } catch (error) {
+    if (String(error?.code || '') !== 'SQLITE_CONSTRAINT_UNIQUE') throw error;
+    const byConversation = stmts.getRuntimeSessionByConversation.get(normalizedConversationId);
+    if (byConversation?.id) {
+      stmts.touchRuntimeSession.run(normalizedModel, nowIso, byConversation.id);
+      if (normalizedSdkSessionId) {
+        stmts.setRuntimeSessionSdkSessionIdIfMissing.run(normalizedSdkSessionId, nowIso, byConversation.id);
+      }
+      return stmts.getRuntimeSessionById.get(byConversation.id);
+    }
+    if (normalizedSdkSessionId) {
+      const bySdkSessionId = stmts.getRuntimeSessionBySdkSessionId.get(normalizedSdkSessionId);
+      if (bySdkSessionId?.id) {
+        stmts.touchRuntimeSession.run(normalizedModel, nowIso, bySdkSessionId.id);
+        return stmts.getRuntimeSessionById.get(bySdkSessionId.id);
+      }
+    }
+    throw error;
+  }
   return stmts.getRuntimeSessionById.get(runtimeSessionId);
 }
 
@@ -3104,20 +3135,32 @@ function bootstrapRuntimeSessionBindings() {
         const latestModel = stmts.getLatestConversationModel.get(conversationId)?.model || null;
         const runtimeSession = ensureRuntimeSessionBinding(conversationId, latestModel, discoveredUpdatedAt, item?.sdkSessionId || null);
         if (runtimeSession?.id) {
-          db.prepare(`
+          const updated = db.prepare(`
             UPDATE runtime_sessions
             SET sdk_session_id = ?, last_used_at = ?, status = 'active'
             WHERE id = ?
-          `).run(conversationId, discoveredUpdatedAt, runtimeSession.id);
-          bootstrapped += 1;
+              AND NOT EXISTS (
+                SELECT 1
+                FROM runtime_sessions conflicts
+                WHERE conflicts.sdk_session_id = ?
+                  AND conflicts.id != runtime_sessions.id
+              )
+          `).run(conversationId, discoveredUpdatedAt, runtimeSession.id, conversationId);
+          if (updated.changes > 0) bootstrapped += 1;
         }
       } else if (String(existingRuntimeSession.sdk_session_id || '').trim() !== conversationId) {
-        db.prepare(`
+        const updated = db.prepare(`
           UPDATE runtime_sessions
           SET sdk_session_id = ?, last_used_at = ?, status = 'active'
           WHERE id = ?
-        `).run(conversationId, discoveredUpdatedAt, existingRuntimeSession.id);
-        bootstrapped += 1;
+            AND NOT EXISTS (
+              SELECT 1
+              FROM runtime_sessions conflicts
+              WHERE conflicts.sdk_session_id = ?
+                AND conflicts.id != runtime_sessions.id
+            )
+        `).run(conversationId, discoveredUpdatedAt, existingRuntimeSession.id, conversationId);
+        if (updated.changes > 0) bootstrapped += 1;
       }
     }
 

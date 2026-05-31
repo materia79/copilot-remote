@@ -12,6 +12,7 @@ import {
   persistConversationModeModelPreference as persistConversationModeModelPreferenceTx,
 } from '../services/conversation-preferences-service.mjs';
 import { postRelayDebugLog } from '../../debugging/relay-debug-log.mjs';
+import { killTmuxSession } from '../services/session-worker-launch-service.mjs';
 
 export const SESSION_WORKER_OWNER_LEASE_MS = 120_000;
 export const SESSION_WORKER_TRANSIENT_DEQUEUE_RETRIES = 2;
@@ -562,14 +563,22 @@ export function dequeuePendingMessage({
   routingEnabled = false,
   requesterSessionId = null,
   ownerLeaseMs = SESSION_WORKER_OWNER_LEASE_MS,
+  affinityOnly = false,
 } = {}) {
   const currentIso = String(nowIso || '').trim() || new Date().toISOString();
   const requesterSid = normalizeSessionWorkerId(requesterSessionId);
   const leaseExpiresAt = requesterSid ? addMsToIso(currentIso, ownerLeaseMs) : null;
   const dequeue = db.transaction(() => {
-    const next = routingEnabled && requesterSid && stmts.findPendingForWorker
-      ? stmts.findPendingForWorker.get(currentIso, requesterSid, requesterSid)
-      : stmts.findPending.get(currentIso);
+    let next = null;
+    if (routingEnabled && requesterSid && stmts.findPendingForWorker) {
+      next = stmts.findPendingForWorker.get(currentIso, requesterSid, requesterSid);
+    } else if (!routingEnabled && requesterSid && stmts.findPendingForSessionAffinity) {
+      next = stmts.findPendingForSessionAffinity.get(currentIso, requesterSid);
+    }
+    if (!next && affinityOnly) return null;
+    if (!next) {
+      next = stmts.findPending.get(currentIso);
+    }
     if (!next) return null;
     if (routingEnabled && requesterSid && stmts.setProcessingWithWorkerLease) {
       stmts.setProcessingWithWorkerLease.run(currentIso, requesterSid, currentIso, leaseExpiresAt, currentIso, next.id);
@@ -627,6 +636,7 @@ export async function dequeuePendingMessageForWorkerLoop({
   routingEnabled = false,
   requesterSessionId = null,
   ownerLeaseMs = SESSION_WORKER_OWNER_LEASE_MS,
+  affinityOnly = false,
   sessionWorkerSupervisor = null,
   transientRetryLimit = SESSION_WORKER_TRANSIENT_DEQUEUE_RETRIES,
   transientRetryBackoffMs = SESSION_WORKER_TRANSIENT_DEQUEUE_BACKOFF_MS,
@@ -700,6 +710,7 @@ export async function dequeuePendingMessageForWorkerLoop({
         routingEnabled,
         requesterSessionId: requesterSid,
         ownerLeaseMs,
+        affinityOnly,
       });
       emitWorkerLoopTelemetry(telemetry, {
         event: message ? 'queue.dequeue.success' : 'queue.dequeue.empty',
@@ -1500,14 +1511,16 @@ export function registerMessagesRoutes(app, deps) {
     return rows;
   }
 
-  app.post('/api/session-worker/:sdkSessionId/kill', auth, (req, res) => {
+  app.post('/api/session-worker/:sdkSessionId/kill', auth, async (req, res) => {
     const sdkSessionId = normalizeSessionWorkerId(req.params.sdkSessionId);
     if (!sdkSessionId) return res.status(400).json({ error: 'Missing session worker id' });
 
     const currentWorker = sessionWorkerRegistry?.getWorker?.(sdkSessionId) || null;
 
     // Collect ALL matching PIDs (not just first)
-    const discoveredProcesses = sessionWorkerProcessInspector?.findWindowsProcessesForSession?.(sdkSessionId) || [];
+    const discoveredProcesses = sessionWorkerProcessInspector?.findProcessesForSession?.(sdkSessionId)
+      || sessionWorkerProcessInspector?.findWindowsProcessesForSession?.(sdkSessionId)
+      || [];
     const allPids = [...new Set([
       ...discoveredProcesses.map((p) => (p.processId ? Number(p.processId) : null)).filter(Boolean),
       currentWorker?.pid ? Number(currentWorker.pid) : null,
@@ -1518,8 +1531,29 @@ export function registerMessagesRoutes(app, deps) {
 
     if (allPids.length) {
       try {
-        // Use PowerShell Stop-Process -Force instead of process.kill()
-        killedPids = sessionWorkerProcessInspector.stopWindowsPids(allPids);
+        if (process.platform === 'win32') {
+          // On Windows, kill through PowerShell to avoid process-group edge-cases.
+          killedPids = sessionWorkerProcessInspector.stopWindowsPids(allPids);
+        } else {
+          killTmuxSession(sdkSessionId);
+          for (const pid of allPids) {
+            try {
+              process.kill(pid, 'SIGTERM');
+              killedPids.push(pid);
+            } catch {
+              // Ignore missing/already-dead processes.
+            }
+          }
+          await delay(150);
+          for (const pid of allPids) {
+            try {
+              process.kill(pid, 0);
+              process.kill(pid, 'SIGKILL');
+            } catch {
+              // Already exited or inaccessible.
+            }
+          }
+        }
         processStatus = 'killed';
       } catch (error) {
         return res.status(500).json({ error: error?.message || 'Failed to kill session worker', pids: allPids });
@@ -1531,7 +1565,9 @@ export function registerMessagesRoutes(app, deps) {
 
     // Post-kill verification — synchronous re-scan to confirm processes are gone
     const remainingPids = allPids.length
-      ? (sessionWorkerProcessInspector?.findWindowsProcessesForSession?.(sdkSessionId) || []).map((p) => p.processId).filter(Boolean)
+      ? (process.platform === 'win32'
+          ? (sessionWorkerProcessInspector?.findWindowsProcessesForSession?.(sdkSessionId) || []).map((p) => p.processId).filter(Boolean)
+          : ((sessionWorkerProcessInspector?.findProcessesForSession?.(sdkSessionId) || []).map((p) => p.processId).filter(Boolean)))
       : [];
 
     sessionWorkerRegistry?.removeWorker?.(sdkSessionId);
@@ -2459,6 +2495,29 @@ export function registerMessagesRoutes(app, deps) {
     const requesterSessionId = normalizeSessionWorkerId(requester?.sessionId);
     const activeQueueMessageId = String(req.body?.activeQueueMessageId || '').trim();
     if (requesterSessionId) {
+      const existingRequesterWorker = sessionWorkerRegistry?.getWorker?.(requesterSessionId) || null;
+      const requesterPid = Number(requester?.pid);
+      const normalizedRequesterPid = Number.isInteger(requesterPid) && requesterPid > 0 ? requesterPid : null;
+      const requesterConversationId = String(requester?.conversationId || '').trim() || null;
+      const shouldPromoteReady = !existingRequesterWorker
+        || existingRequesterWorker.status === 'new'
+        || (!existingRequesterWorker.workerId && !existingRequesterWorker.pid);
+      if (shouldPromoteReady) {
+        sessionWorkerRegistry?.upsertWorker?.({
+          ...(existingRequesterWorker || {}),
+          sdkSessionId: requesterSessionId,
+          status: 'ready',
+          conversationId: requesterConversationId || existingRequesterWorker?.conversationId || null,
+          pid: normalizedRequesterPid || existingRequesterWorker?.pid || null,
+          queueDepth: Math.max(0, Number(queueCounts?.().pendingCount || 0)),
+        });
+      } else if (normalizedRequesterPid && existingRequesterWorker?.pid !== normalizedRequesterPid) {
+        sessionWorkerRegistry?.upsertWorker?.({
+          ...existingRequesterWorker,
+          sdkSessionId: requesterSessionId,
+          pid: normalizedRequesterPid,
+        });
+      }
       sessionWorkerSupervisor?.noteSessionHeartbeat?.(requesterSessionId);
       if (activeQueueMessageId) {
         const now = new Date().toISOString();
@@ -2486,7 +2545,17 @@ export function registerMessagesRoutes(app, deps) {
     const requesterSessionId = normalizeSessionWorkerId(requester?.sessionId);
     const sessionWorkerRoutingEnabled = isSessionWorkerRoutingEnabled(featureFlags);
     const ownerObservation = relayBridgeOwnerService?.observe?.(requester) || null;
-    if (requester && ownerObservation?.accepted === false && !sessionWorkerRoutingEnabled) {
+    const now = new Date().toISOString();
+    let affinityOnlyDequeue = !sessionWorkerRoutingEnabled && Boolean(requesterSessionId);
+    let enforceOwnerMismatch = requester && ownerObservation?.accepted === false && !sessionWorkerRoutingEnabled;
+    if (enforceOwnerMismatch && requesterSessionId && stmts.countQueueWorkForSessionAffinity) {
+      const scopedWork = stmts.countQueueWorkForSessionAffinity.get(now, requesterSessionId);
+      if (Number(scopedWork?.cnt || 0) > 0) {
+        enforceOwnerMismatch = false;
+        affinityOnlyDequeue = true;
+      }
+    }
+    if (enforceOwnerMismatch) {
       return res.json({
         message: null,
         ownerMismatch: true,
@@ -2539,7 +2608,6 @@ export function registerMessagesRoutes(app, deps) {
       });
     }
 
-    const now = new Date().toISOString();
     let dequeueResult = null;
     try {
       dequeueResult = await dequeuePendingMessageForWorkerLoop({
@@ -2549,6 +2617,7 @@ export function registerMessagesRoutes(app, deps) {
         routingEnabled: sessionWorkerRoutingEnabled,
         requesterSessionId,
         ownerLeaseMs: SESSION_WORKER_OWNER_LEASE_MS,
+        affinityOnly: affinityOnlyDequeue,
         sessionWorkerSupervisor,
         relayRestartOrchestrator,
         inFlightProcessingCount: Number(counts.processingCount || 0),

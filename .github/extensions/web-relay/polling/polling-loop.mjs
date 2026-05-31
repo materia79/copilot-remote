@@ -651,6 +651,17 @@ export function createPollingLoop({
             );
             if (retryable) {
               await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
+            } else {
+              await api("POST", "/api/response", {
+                messageId: message.id,
+                conversationId: message.conversationId,
+                text: detail
+                  ? `System note: I could not process this turn because the bound SDK session is unavailable (${detail}).`
+                  : "System note: I could not process this turn because the bound SDK session is unavailable.",
+                model: await getCurrentModelId() || message.model || null,
+              }).catch(async () => {
+                await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
+              });
             }
             setActiveMsg(null);
             continue;

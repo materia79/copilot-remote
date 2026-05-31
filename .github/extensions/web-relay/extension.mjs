@@ -30,10 +30,11 @@ import { createHeartbeatController } from "./polling/heartbeat.mjs";
 import { createPollingLoop } from "./polling/polling-loop.mjs";
 import { createManagedServerLifecycle } from "./server-lifecycle/managed-server.mjs";
 import { createModelSwitchingService } from "./model-api/model-switching.mjs";
+import { createSessionRuntimeManager } from "./runtime/session-runtime-manager.mjs";
 import { createSessionIoHelpers } from "./runtime/session-io.mjs";
 import { resolveSessionBinding } from "./runtime/session-binding.mjs";
 import { createBannerStateStore } from "./runtime/banner-state.mjs";
-import { clearSession, registerSession } from "./runtime/session-registry.mjs";
+import { clearSession, getActiveSession, registerSession } from "./runtime/session-registry.mjs";
 import { syncSessionToServer, syncWorkspaceRootToServer } from "./runtime/session-sync-bridge.mjs";
 import { joinSessionWithRetry } from "./runtime/session-join-retry.mjs";
 import { resolveWorkspaceRootPath } from "./runtime/workspace-root.mjs";
@@ -170,7 +171,9 @@ let deferredSessionEnd = false;
 
 function getCurrentConversationId() {
   const conversationId = String(activeMsg?.conversationId || "").trim();
-  return conversationId || null;
+  if (conversationId) return conversationId;
+  const persistedConversationId = String(getActiveSession()?.conversationId || "").trim();
+  return persistedConversationId || null;
 }
 
 function getCurrentWorkspaceRootPath() {
@@ -269,7 +272,9 @@ function refreshSessionRegistry() {
     return null;
   }
 
-  return registerSession(sdkSessionId, getCurrentConversationId());
+  const currentConversationId = getCurrentConversationId();
+  const existingConversationId = String(getActiveSession()?.conversationId || "").trim() || null;
+  return registerSession(sdkSessionId, currentConversationId || existingConversationId);
 }
 
 async function syncActiveSession(reason, forceSync = false) {
@@ -372,6 +377,46 @@ async function ensureSessionForConversation(conversationId, reason = "dequeue") 
     }
   }
 
+  const targetSessionId = String(binding?.targetSessionId || "").trim();
+  if (targetSessionId) {
+    const switched = await sessionRuntimeManager.activateSession(targetSessionId, reason);
+    if (!switched?.ok) {
+      return {
+        ok: false,
+        reason: switched?.reason || binding?.reason || "session-switch-failed",
+        retryable: switched?.retryable === true || binding?.retryable === true,
+        message: switched?.error
+          ? `Failed to activate bound SDK session: ${switched.error}`
+          : (binding?.message || "Failed to activate bound SDK session"),
+        activeSessionId: String(session?.sessionId || "").trim() || null,
+        targetSessionId,
+      };
+    }
+    const switchedSessionId = String(switched?.activeSessionId || targetSessionId).trim();
+    try {
+      await syncSessionToServer(switchedSessionId, convId, api, true, {
+        workspaceRootPath: getCurrentWorkspaceRootPath(),
+      });
+      registerSession(switchedSessionId, convId);
+      return {
+        ok: true,
+        switched: true,
+        via: switched?.source || "runtime-switch",
+        activeSessionId: switchedSessionId,
+        targetSessionId,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        reason: "session-sync-after-switch-failed",
+        retryable: true,
+        message: `Switched to SDK session ${targetSessionId} but failed to sync binding: ${error?.message || String(error)}`,
+        activeSessionId: switchedSessionId || null,
+        targetSessionId,
+      };
+    }
+  }
+
   return binding;
 }
 
@@ -386,6 +431,16 @@ const modelSwitchingService = createModelSwitchingService({
   dbg,
   getSession: () => session,
   modelSnapshotMinIntervalMs: MODEL_SNAPSHOT_MIN_INTERVAL_MS,
+});
+
+const sessionRuntimeManager = createSessionRuntimeManager({
+  dbg,
+  getSession: () => session,
+  setSession: (nextSession) => {
+    if (nextSession && typeof nextSession === "object") {
+      session = nextSession;
+    }
+  },
 });
 
 const getCurrentModelId = modelSwitchingService.getCurrentModelId;

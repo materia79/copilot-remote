@@ -125,16 +125,17 @@ When `localhostOnly` is `true`, use `http://localhost:3333/` from the same machi
 
 Sign in once with your token. The relay then uses an HttpOnly auth cookie.
 
-## Runtime modes and startup commands
+For day-to-day development workflows, relay restart steps, and worker debugging notes, see [`DEVELOPING.md`](./DEVELOPING.md).
 
+## Runtime modes and startup commands
 
 | Command                 | Purpose                                                                                                                                   |
 | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | `copilot-remote`        | Global npm command (after `npm link` or `npm install -g .`) that starts the web relay if needed, then runs `gh copilot` in the same shell |
+| `copilot-remote --install-extension` | Installs/updates a user-global `web-relay` wrapper entrypoint and exits                                                                |
 | `npm run copilot:relay` | Starts Copilot CLI with an initial prompt so the extension loads and polling begins                                                       |
 | `npm run start:server`  | Server only (use with an active Copilot CLI session that loads the extension)                                                             |
 | `npm start`             | Standalone development mode (`server.js` + `relay.mjs`)                                                                                   |
-
 
 ### Single runtime owner rule
 
@@ -285,12 +286,20 @@ The relay auto-reconnects tunnel drops with exponential backoff.
 
 ## Global extension install (optional)
 
-Install extension files for use across repositories:
+Install a user-global extension entrypoint for use across repositories:
 
 ```text
 %USERPROFILE%\.copilot\extensions\web-relay\   (Windows)
 ~/.copilot/extensions/web-relay/               (Linux/macOS)
 ```
+
+Recommended command:
+
+```bash
+copilot-remote --install-extension
+```
+
+This writes/updates `extension.mjs` in the user-global extension directory as a wrapper that imports the repository extension entrypoint directly.
 
 Useful environment variables:
 
