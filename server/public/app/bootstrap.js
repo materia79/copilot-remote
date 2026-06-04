@@ -1131,12 +1131,111 @@ function buildKnownCwdOptions() {
   return options;
 }
 
-function renderKnownCwdSelectOptions(options, selectedPath) {
+function renderKnownCwdMenuItems(options, selectedPath) {
+  if (!options.length) {
+    return '<div class="change-cwd-menu-empty">No known CWDs available</div>';
+  }
+  const selectedKey = normalizeKnownCwdPath(selectedPath).toLowerCase();
   return options.map((option) => {
-    const selected = normalizeKnownCwdPath(option.path).toLowerCase() === normalizeKnownCwdPath(selectedPath).toLowerCase();
-    const label = option.note ? `${option.label} — ${option.path}` : `${option.label} — ${option.path}`;
-    return `<option value="${escHtml(option.path)}"${selected ? ' selected' : ''}>${escHtml(label)}</option>`;
+    const optionPath = normalizeKnownCwdPath(option.path);
+    const selected = optionPath.toLowerCase() === selectedKey;
+    return `
+      <button class="change-cwd-menu-item${selected ? ' selected' : ''}" type="button" role="menuitemradio" aria-checked="${selected ? 'true' : 'false'}" data-path="${escHtml(optionPath)}" data-label="${escHtml(option.label || '')}" data-note="${escHtml(option.note || '')}" title="${escHtml(optionPath)}">
+        <span class="change-cwd-menu-item-primary">${escHtml(option.label || 'Known CWD')}</span>
+        <span class="change-cwd-menu-item-secondary">${escHtml(optionPath)}</span>
+      </button>
+    `;
   }).join('');
+}
+
+function getSelectedChangeCwdPath() {
+  const input = document.getElementById('change-cwd-selected-path');
+  return normalizeKnownCwdPath(input?.value || '');
+}
+
+function closeChangeCwdMenu() {
+  const menu = document.getElementById('change-cwd-menu');
+  const trigger = document.getElementById('change-cwd-menu-trigger');
+  if (menu) menu.hidden = true;
+  if (trigger) trigger.setAttribute('aria-expanded', 'false');
+}
+
+function syncChangeCwdPickerView() {
+  const trigger = document.getElementById('change-cwd-menu-trigger');
+  const details = document.getElementById('change-cwd-details');
+  const menu = document.getElementById('change-cwd-menu');
+  const selectedPath = getSelectedChangeCwdPath();
+  const itemNodes = Array.from(menu?.querySelectorAll('.change-cwd-menu-item[data-path]') || []);
+  let selectedItem = null;
+  for (const item of itemNodes) {
+    const itemPath = normalizeKnownCwdPath(item.getAttribute('data-path') || '');
+    const selected = itemPath && itemPath.toLowerCase() === selectedPath.toLowerCase();
+    item.classList.toggle('selected', selected);
+    item.setAttribute('aria-checked', selected ? 'true' : 'false');
+    if (selected) selectedItem = item;
+  }
+  if (trigger) {
+    if (selectedPath) {
+      trigger.textContent = selectedPath;
+      trigger.title = selectedPath;
+    } else {
+      trigger.textContent = 'Select a known CWD';
+      trigger.title = 'Select a known CWD';
+    }
+  }
+  if (details) {
+    const label = String(selectedItem?.getAttribute('data-label') || '').trim();
+    const note = String(selectedItem?.getAttribute('data-note') || '').trim();
+    if (!selectedPath) {
+      details.textContent = 'No known CWDs are available yet.';
+      return;
+    }
+    const labelPrefix = label ? `${label}: ` : '';
+    const noteSuffix = note ? ` (${note})` : '';
+    details.textContent = `${labelPrefix}${selectedPath}${noteSuffix}`;
+  }
+}
+
+function bindChangeCwdPicker() {
+  const modalBody = document.getElementById('summary-modal-body');
+  const trigger = document.getElementById('change-cwd-menu-trigger');
+  const menu = document.getElementById('change-cwd-menu');
+  const selectionInput = document.getElementById('change-cwd-selected-path');
+  if (!modalBody || !trigger || !menu || !selectionInput) return;
+  if (modalBody.dataset.changeCwdPickerModalBound !== '1') {
+    modalBody.dataset.changeCwdPickerModalBound = '1';
+    modalBody.addEventListener('click', (event) => {
+      const picker = document.getElementById('change-cwd-picker');
+      if (!picker || picker.contains(event.target)) return;
+      closeChangeCwdMenu();
+    });
+    modalBody.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape') return;
+      const activeMenu = document.getElementById('change-cwd-menu');
+      if (!activeMenu || activeMenu.hidden) return;
+      event.preventDefault();
+      event.stopPropagation();
+      closeChangeCwdMenu();
+    });
+  }
+  bindTapAction(trigger, (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const willOpen = !!menu.hidden;
+    menu.hidden = !willOpen;
+    trigger.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+  });
+  for (const item of menu.querySelectorAll('.change-cwd-menu-item[data-path]')) {
+    bindMenuAction(item, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const pathValue = normalizeKnownCwdPath(item.getAttribute('data-path') || '');
+      selectionInput.value = pathValue;
+      syncChangeCwdPickerView();
+      closeChangeCwdMenu();
+    });
+  }
+  syncChangeCwdPickerView();
 }
 
 function getSelectedConversationWorkspaceState() {
@@ -1180,9 +1279,7 @@ function openChangeCwdModal() {
   const currentCwd = normalizeKnownCwdPath(workspaceState?.currentWorkspaceRootPath || '');
   const nextLaunchCwd = normalizeKnownCwdPath(workspaceState?.configuredWorkspaceRootPath || '');
   const defaultPath = nextLaunchCwd || normalizeKnownCwdPath(getRepoBrowserLaunchCwdPath()) || currentCwd || normalizeKnownCwdPath(workspaceRootPath) || options[0]?.path || '';
-  const optionsHtml = options.length
-    ? renderKnownCwdSelectOptions(options, defaultPath)
-    : '<option value="">No known CWDs available</option>';
+  const menuItemsHtml = renderKnownCwdMenuItems(options, defaultPath);
   const launchableSessionId = getCurrentLaunchableSessionId();
   const launchDisabledReason = !launchableSessionId
     ? 'Open a conversation with a bound session before launching.'
@@ -1199,11 +1296,13 @@ function openChangeCwdModal() {
         <div><strong style="color:var(--text)">Current CWD:</strong> ${escHtml(currentCwd || 'Unknown')}</div>
         <div><strong style="color:var(--text)">Next launch:</strong> ${escHtml(nextLaunchCwd || currentCwd || 'Unknown')}</div>
       </div>
-      <label style="display:flex;flex-direction:column;gap:8px;font-size:0.84rem;color:var(--muted)">
+      <label id="change-cwd-picker" class="change-cwd-picker" style="font-size:0.84rem;color:var(--muted)">
         <span>Known CWDs</span>
-        <select id="change-cwd-select" style="width:100%;min-width:0;height:38px;border:1px solid var(--border);border-radius:8px;background:var(--bg3);color:var(--text);padding:0 10px;font:inherit">
-          ${optionsHtml}
-        </select>
+        <input id="change-cwd-selected-path" type="hidden" value="${escHtml(defaultPath)}">
+        <button id="change-cwd-menu-trigger" class="change-cwd-menu-trigger" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="change-cwd-menu">Select a known CWD</button>
+        <div id="change-cwd-menu" class="change-cwd-menu-panel" role="menu" hidden>
+          ${menuItemsHtml}
+        </div>
       </label>
       <div id="change-cwd-details" style="margin-top:10px;font-size:0.78rem;color:var(--muted);line-height:1.45;word-break:break-word"></div>
       <div class="summary-modal-actions">
@@ -1214,18 +1313,7 @@ function openChangeCwdModal() {
     `,
   });
   window.setTimeout(() => {
-    const select = document.getElementById('change-cwd-select');
-    const details = document.getElementById('change-cwd-details');
-    if (select && details) {
-      const updateDetails = () => {
-        const option = select.options[select.selectedIndex];
-        details.textContent = option?.value
-          ? `Selected: ${option.value}`
-          : 'No known CWDs are available yet.';
-      };
-      select.addEventListener('change', updateDetails);
-      updateDetails();
-    }
+    bindChangeCwdPicker();
   }, 0);
 }
 
@@ -1239,8 +1327,7 @@ async function confirmChangeCwdAndLaunch() {
 
 async function submitChangeCwd(launchAfterChange = false) {
   if (changeCwdInFlight) return;
-  const select = document.getElementById('change-cwd-select');
-  const selectedPath = normalizeKnownCwdPath(select?.value || '');
+  const selectedPath = getSelectedChangeCwdPath();
   if (!selectedPath) {
     alert('Select a known CWD first.');
     return;

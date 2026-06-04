@@ -572,6 +572,10 @@ export function dequeuePendingMessage({
     let next = null;
     if (routingEnabled && requesterSid && stmts.findPendingForWorker) {
       next = stmts.findPendingForWorker.get(currentIso, requesterSid, requesterSid);
+      // In routed worker mode, never fall back to the global queue. If this
+      // worker has no matching owned/unowned work, another worker session must
+      // pick up the turn instead of letting the wrong session steal it.
+      if (!next) return null;
     } else if (!routingEnabled && requesterSid && stmts.findPendingForSessionAffinity) {
       next = stmts.findPendingForSessionAffinity.get(currentIso, requesterSid);
     }
