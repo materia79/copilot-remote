@@ -70,7 +70,7 @@ import {
   launchSessionWorker,
   scheduleContextUsageRefresh,
 } from './api-client.js';
-import { loadConversations, refreshConversations, openConversation, renderConvList, applyLoadedConversationState } from './journal-view.js';
+import { loadConversations, refreshConversations, openConversation, renderConvList, applyLoadedConversationState, initConversationListLazyLoading } from './journal-view.js';
 import { newConversation, deleteConv } from './journal-view.js';
 import {
   loadRelayQuestions,
@@ -81,7 +81,8 @@ import {
 } from './ask-user-view.js';
 import { openPendingQuestionFromBanner, submitRelayQuestionChoice, submitRelayQuestionAnswer, onRelayQuestionDraftInput, handleRelayQuestionKey } from './ask-user-view.js';
 import { loadRelayBoards, renderRelayBoards, upsertRelayBoard, submitRelayBoardAction } from './relay-board-view.js';
-import { showThinking, removeThinking, renderThinkingActivities, appendThinkingActivity, applyRelayStreamEvent, clearRelayStreamStateForMessage, restoreInFlightThinking, applyConversationTurnStatus, renderMessages, appendMessage, compactCurrentConversation, sendMessage, handleKey, getConversationLoadedMessageCount, loadOlderConversationMessages, syncComposerControlState, getRenderedConversationMessageFingerprints } from './conversation-view.js';
+import { showThinking, removeThinking, renderThinkingActivities, appendThinkingActivity, applyRelayStreamEvent, clearRelayStreamStateForMessage, restoreInFlightThinking, applyConversationTurnStatus, renderMessages, appendMessage, compactCurrentConversation, sendMessage, handleKey, getConversationLoadedMessageCount, loadOlderConversationMessages, syncComposerControlState, getRenderedConversationMessageFingerprints, initConversationHistoryLazyLoading,
+} from './conversation-view.js';
 import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { handleAttachmentInput, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
 import { getRepoBrowserLaunchCwdPath } from './attachments-view.js';
@@ -2169,6 +2170,8 @@ async function initApp() {
   initPullToRefresh();
   initChatTitleCopy();
   initEmojiPicker();
+  initConversationListLazyLoading();
+  initConversationHistoryLazyLoading();
   initMessageScrollPersistence();
   syncChatTitleControls();
   connectSocket();

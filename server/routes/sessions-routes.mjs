@@ -660,6 +660,87 @@ export function selectConversationHistoryPage(messages = [], {
   };
 }
 
+const DEFAULT_CONVERSATION_LIST_LIMIT = 40;
+const MAX_CONVERSATION_LIST_LIMIT = 100;
+
+export function normalizeConversationListLimit(value, fallback = DEFAULT_CONVERSATION_LIST_LIMIT) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return Math.min(MAX_CONVERSATION_LIST_LIMIT, Math.max(1, Number(fallback) || DEFAULT_CONVERSATION_LIST_LIMIT));
+  }
+  return Math.min(MAX_CONVERSATION_LIST_LIMIT, Math.max(1, Math.trunc(parsed)));
+}
+
+function compareConversationListOrder(a, b) {
+  const aUpdatedAtMs = normalizeConversationTimestampMs(a?.updated_at || a?.updatedAt);
+  const bUpdatedAtMs = normalizeConversationTimestampMs(b?.updated_at || b?.updatedAt);
+  if (aUpdatedAtMs !== bUpdatedAtMs) return bUpdatedAtMs - aUpdatedAtMs;
+  return String(b?.id || '').trim().localeCompare(String(a?.id || '').trim());
+}
+
+function resolveConversationListCursor(rows = [], {
+  beforeConversationId = '',
+  beforeUpdatedAt = '',
+} = {}) {
+  const cursorConversationId = String(beforeConversationId || '').trim();
+  const cursorUpdatedAt = String(beforeUpdatedAt || '').trim();
+  const list = Array.isArray(rows) ? rows : [];
+
+  if (cursorConversationId) {
+    const cursorRow = list.find((row) => String(row?.id || '').trim() === cursorConversationId) || null;
+    if (cursorRow) {
+      return {
+        beforeConversationId: cursorConversationId,
+        beforeUpdatedAt: String(cursorRow.updated_at || cursorRow.updatedAt || '').trim() || null,
+        timestampMs: normalizeConversationTimestampMs(cursorRow.updated_at || cursorRow.updatedAt),
+      };
+    }
+  }
+
+  if (cursorUpdatedAt) {
+    return {
+      beforeConversationId: cursorConversationId || null,
+      beforeUpdatedAt: cursorUpdatedAt,
+      timestampMs: normalizeConversationTimestampMs(cursorUpdatedAt),
+    };
+  }
+
+  return null;
+}
+
+export function selectConversationListPage(rows = [], {
+  limit = DEFAULT_CONVERSATION_LIST_LIMIT,
+  beforeConversationId = '',
+  beforeUpdatedAt = '',
+} = {}) {
+  const pageLimit = normalizeConversationListLimit(limit);
+  const ordered = Array.isArray(rows)
+    ? rows.filter((row) => !!row).slice().sort(compareConversationListOrder)
+    : [];
+  const cursor = resolveConversationListCursor(ordered, { beforeConversationId, beforeUpdatedAt });
+  const olderRows = cursor
+    ? ordered.filter((row) => {
+        const rowUpdatedAtMs = normalizeConversationTimestampMs(row?.updated_at || row?.updatedAt);
+        if (rowUpdatedAtMs < cursor.timestampMs) return true;
+        if (rowUpdatedAtMs > cursor.timestampMs) return false;
+        if (!cursor.beforeConversationId) return false;
+        return String(row?.id || '').trim().localeCompare(cursor.beforeConversationId) < 0;
+      })
+    : ordered;
+  const pageRows = olderRows.slice(0, pageLimit);
+  const oldestRow = pageRows[pageRows.length - 1] || null;
+  return {
+    rows: pageRows,
+    pageInfo: {
+      hasMore: olderRows.length > pageRows.length,
+      nextCursor: oldestRow ? {
+        beforeConversationId: String(oldestRow.id || '').trim(),
+        beforeUpdatedAt: String(oldestRow.updated_at || oldestRow.updatedAt || '').trim() || null,
+      } : null,
+    },
+  };
+}
+
 export function buildConversationMessages({
   dbMessages = [],
   transcriptMessages = [],
@@ -997,17 +1078,25 @@ export function registerSessionsRoutes(app, deps) {
     };
 
     const includeArchived = String(req.query.archived || '').trim().toLowerCase() === 'true';
+    const limit = normalizeConversationListLimit(req.query.limit, DEFAULT_CONVERSATION_LIST_LIMIT);
+    const beforeConversationId = String(req.query.beforeConversationId || '').trim();
+    const beforeUpdatedAt = String(req.query.beforeUpdatedAt || '').trim();
     const rows = stmts.listConvs.all(includeArchived ? 1 : 0);
+    const page = selectConversationListPage(rows, {
+      limit,
+      beforeConversationId,
+      beforeUpdatedAt,
+    });
+    const includeDiscoveryOverlay = !beforeConversationId && !beforeUpdatedAt;
     const discovered = discoverSessionStateConversations(200);
     const discoveredBySdkSessionId = new Map(
       discovered
         .map((item) => [String(item?.sdkSessionId || '').trim(), item])
         .filter(([sid]) => !!sid),
     );
-    const conversations = rows.map((r) => {
+    const conversations = page.rows.map((r) => {
       const sid = String(r.sdk_session_id || '').trim();
       const discoveredItem = sid ? discoveredBySdkSessionId.get(sid) : null;
-      const discoveredUpdatedAt = String(discoveredItem?.updatedAt || '').trim();
       const discoveredTitle = String(discoveredItem?.title || '').trim();
       const workspaceState = typeof resolveConversationWorkspaceState === 'function'
         ? resolveConversationWorkspaceState({
@@ -1042,7 +1131,7 @@ export function registerSessionsRoutes(app, deps) {
         currentWorkspaceRootPath: workspaceState?.currentWorkspaceRootPath || null,
         currentWorkspaceRootName: workspaceState?.currentWorkspaceRootName || null,
         createdAt:    r.created_at,
-        updatedAt:    discoveredUpdatedAt || r.updated_at,
+        updatedAt:    r.updated_at,
         messageCount: resolveMessageCount(r.sdk_session_id, r.message_count),
         preferredRelayMode: preferences.preferredRelayMode,
         preferredModelsByMode: preferences.preferredModelsByMode,
@@ -1057,54 +1146,70 @@ export function registerSessionsRoutes(app, deps) {
         .map((row) => String(row?.sdk_session_id || '').trim())
         .filter(Boolean),
     );
-    for (const item of discovered) {
-      const sdkSessionId = String(item?.sdkSessionId || '').trim();
-      if (!sdkSessionId) continue;
-      if (deletedSdkSessions.has(sdkSessionId)) continue;
-      if (knownBySdkSessionId.has(sdkSessionId) || knownById.has(sdkSessionId)) continue;
+    const knownConversationIds = new Set(
+      rows
+        .map((row) => String(row?.id || '').trim())
+        .filter(Boolean),
+    );
 
-      const runtimeSession = stmts.getRuntimeSessionBySdkSessionId.get(sdkSessionId) || null;
-      const updatedAt = String(item?.updatedAt || '').trim() || new Date().toISOString();
-      const workspaceState = typeof resolveConversationWorkspaceState === 'function'
-        ? resolveConversationWorkspaceState({
-          conversationId: sdkSessionId,
+    if (includeDiscoveryOverlay) {
+      for (const item of discovered) {
+        const sdkSessionId = String(item?.sdkSessionId || '').trim();
+        if (!sdkSessionId) continue;
+        if (deletedSdkSessions.has(sdkSessionId)) continue;
+        if (knownBySdkSessionId.has(sdkSessionId) || knownById.has(sdkSessionId)) continue;
+
+        const runtimeSession = stmts.getRuntimeSessionBySdkSessionId.get(sdkSessionId) || null;
+        const updatedAt = String(item?.updatedAt || '').trim() || new Date().toISOString();
+        const workspaceState = typeof resolveConversationWorkspaceState === 'function'
+          ? resolveConversationWorkspaceState({
+            conversationId: sdkSessionId,
+            sdkSessionId,
+            discoveredWorkspaceRootPath: item?.workspaceRootPath || '',
+          })
+          : null;
+        const syntheticConversation = {
+          id: sdkSessionId,
           sdkSessionId,
-          discoveredWorkspaceRootPath: item?.workspaceRootPath || '',
-        })
-        : null;
-      const syntheticConversation = {
-        id: sdkSessionId,
-        sdkSessionId,
-        title: String(item?.title || '').trim() || 'Session',
-        archived: false,
-        compactedInto: null,
-        compactedFrom: null,
-        runtimeSessionId: runtimeSession?.id || null,
-        runtimeSessionStrategy: runtimeSession?.strategy || null,
-        runtimeSessionStatus: runtimeSession?.status || null,
-        runtimeSessionLastUsedAt: runtimeSession?.last_used_at || updatedAt,
-        configuredWorkspaceRootPath: workspaceState?.configuredWorkspaceRootPath || null,
-        configuredWorkspaceRootName: workspaceState?.configuredWorkspaceRootName || null,
-        runtimeWorkspaceRootPath: workspaceState?.runtimeWorkspaceRootPath || null,
-        runtimeWorkspaceRootName: workspaceState?.runtimeWorkspaceRootName || null,
-        currentWorkspaceRootPath: workspaceState?.currentWorkspaceRootPath || null,
-        currentWorkspaceRootName: workspaceState?.currentWorkspaceRootName || null,
-        createdAt: updatedAt,
-        updatedAt,
-        messageCount: resolveMessageCount(sdkSessionId, 0),
-        preferredRelayMode: normalizeRelayModePreference(null, {
-          supportedRelayModes: SUPPORTED_RELAY_MODES,
-          fallbackMode: DEFAULT_RELAY_MODE,
-        }),
-        preferredModelsByMode: {},
-      };
-      conversations.push(syntheticConversation);
-      knownById.add(sdkSessionId);
-      knownBySdkSessionId.add(sdkSessionId);
+          title: String(item?.title || '').trim() || 'Session',
+          archived: false,
+          compactedInto: null,
+          compactedFrom: null,
+          runtimeSessionId: runtimeSession?.id || null,
+          runtimeSessionStrategy: runtimeSession?.strategy || null,
+          runtimeSessionStatus: runtimeSession?.status || null,
+          runtimeSessionLastUsedAt: runtimeSession?.last_used_at || updatedAt,
+          configuredWorkspaceRootPath: workspaceState?.configuredWorkspaceRootPath || null,
+          configuredWorkspaceRootName: workspaceState?.configuredWorkspaceRootName || null,
+          runtimeWorkspaceRootPath: workspaceState?.runtimeWorkspaceRootPath || null,
+          runtimeWorkspaceRootName: workspaceState?.runtimeWorkspaceRootName || null,
+          currentWorkspaceRootPath: workspaceState?.currentWorkspaceRootPath || null,
+          currentWorkspaceRootName: workspaceState?.currentWorkspaceRootName || null,
+          createdAt: updatedAt,
+          updatedAt,
+          messageCount: resolveMessageCount(sdkSessionId, 0),
+          preferredRelayMode: normalizeRelayModePreference(null, {
+            supportedRelayModes: SUPPORTED_RELAY_MODES,
+            fallbackMode: DEFAULT_RELAY_MODE,
+          }),
+          preferredModelsByMode: {},
+        };
+        conversations.push(syntheticConversation);
+        knownConversationIds.add(sdkSessionId);
+        knownById.add(sdkSessionId);
+        knownBySdkSessionId.add(sdkSessionId);
+      }
     }
 
     conversations.sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
-    res.json({ conversations });
+    const payload = {
+      conversations,
+      pageInfo: page.pageInfo,
+    };
+    if (includeDiscoveryOverlay) {
+      payload.knownConversationIds = Array.from(knownConversationIds);
+    }
+    res.json(payload);
   });
 
   app.get('/api/sessions', auth, (req, res) => {

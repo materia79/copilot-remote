@@ -28,13 +28,115 @@ import { loadRelayQuestions, getPendingQuestionCountsByConversation } from './as
 import { loadRelayBoards } from './relay-board-view.js';
 import { clearAttachments, setRepoBrowserSessionInfo, loadRepoBrowserTree } from './attachments-view.js';
 import { shouldApplyConversationLoad } from './activity-replay-state.mjs';
+import { createInfiniteLoader } from './infinite-loader.js';
 
 const PROCESSING_DOT_FRAMES = ['   ', '.  ', '.. ', '...'];
 const PROCESSING_DOT_INTERVAL_MS = 1000;
 const LOCAL_PROCESSING_STALE_MS = 5 * 60 * 1000;
+const CONVERSATION_LIST_PAGE_SIZE = 40;
 let processingDotFrame = 0;
 let processingDotTimer = null;
 let openConversationVersion = 0;
+let conversationListBoundaryCheckFrame = 0;
+let conversationListAutoLoadBlockedUntil = 0;
+let conversationListPaginationState = {
+  hasMore: false,
+  nextCursor: null,
+  hasPrefetchedPage: false,
+  isLoading: false,
+  isPrefetching: false,
+  hasLoadedOlderPages: false,
+};
+
+function mergeConversationRecord(current, next) {
+  return {
+    ...(current && typeof current === 'object' ? current : {}),
+    ...(next && typeof next === 'object' ? next : {}),
+  };
+}
+
+function upsertConversationRecord(record) {
+  const id = String(record?.id || '').trim();
+  if (!id) return false;
+  const hadExistingRecord = !!conversations[id];
+  conversations[id] = mergeConversationRecord(conversations[id], record);
+  return !hadExistingRecord;
+}
+
+function getConversationListElement() {
+  return document.getElementById('conv-list');
+}
+
+function getConversationListBoundaryDistance() {
+  const el = getConversationListElement();
+  if (!el) return Number.POSITIVE_INFINITY;
+  return Math.max(0, el.scrollHeight - el.clientHeight - el.scrollTop);
+}
+
+function scheduleConversationListBoundaryCheck() {
+  if (conversationListBoundaryCheckFrame) return;
+  conversationListBoundaryCheckFrame = requestAnimationFrame(() => {
+    conversationListBoundaryCheckFrame = 0;
+    if (Date.now() < conversationListAutoLoadBlockedUntil) return;
+    void conversationListLoader.handleBoundaryDistance(getConversationListBoundaryDistance());
+  });
+}
+
+function applyConversationPage(items = []) {
+  for (const conversation of Array.isArray(items) ? items : []) {
+    upsertConversationRecord(conversation);
+  }
+  renderConvList();
+  updateCompactButton();
+  scheduleConversationListBoundaryCheck();
+}
+
+const conversationListLoader = createInfiniteLoader({
+  fetchPage: async (cursor) => {
+    const response = await loadConversationsApi({
+      limit: CONVERSATION_LIST_PAGE_SIZE,
+      beforeConversationId: String(cursor?.beforeConversationId || '').trim(),
+      beforeUpdatedAt: String(cursor?.beforeUpdatedAt || '').trim(),
+    });
+    if (!response) throw new Error('Could not load conversations');
+    return {
+      items: response.conversations || [],
+      hasMore: !!response.pageInfo?.hasMore,
+      nextCursor: response.pageInfo?.nextCursor || null,
+    };
+  },
+  applyPage: async (page) => {
+    applyConversationPage(page.items);
+    conversationListPaginationState.hasLoadedOlderPages = true;
+  },
+  onError: (error) => {
+    conversationListAutoLoadBlockedUntil = Date.now() + 2000;
+    console.error('Conversation list paging failed:', error);
+  },
+  onStateChange: (state) => {
+    conversationListPaginationState = {
+      ...conversationListPaginationState,
+      ...state,
+    };
+    renderConvList();
+  },
+});
+
+function resetConversationListPageState(pageInfo = null, { preserveProgress = false } = {}) {
+  const currentState = conversationListLoader.getState();
+  const nextState = preserveProgress && conversationListPaginationState.hasLoadedOlderPages
+    ? currentState
+    : {
+        hasMore: !!pageInfo?.hasMore,
+        nextCursor: pageInfo?.nextCursor || null,
+      };
+  if (!preserveProgress) {
+    conversationListPaginationState.hasLoadedOlderPages = false;
+  }
+  conversationListAutoLoadBlockedUntil = 0;
+  conversationListLoader.reset(nextState);
+  scheduleConversationListBoundaryCheck();
+}
 
 function isConversationProcessing(conversation, workerState) {
   const workerStatus = String(workerState?.status || '').trim().toLowerCase();
@@ -72,25 +174,51 @@ function ensureProcessingDotTimer(enabled) {
 }
 
 export async function loadConversations() {
-  await refreshConversations();
+  await refreshConversations({ preservePagination: false });
   const lastId = localStorage.getItem('copilot_last_conv');
-  if (lastId && conversations[lastId]) await openConversation(lastId, { restoreScroll: true });
+  if (lastId) await openConversation(lastId, { restoreScroll: true });
 }
 
-export async function refreshConversations() {
-  const r = await loadConversationsApi();
+export async function refreshConversations(options = {}) {
+  const preservePagination = options?.preservePagination !== false;
+  const r = await loadConversationsApi({ limit: CONVERSATION_LIST_PAGE_SIZE });
   if (!r) return;
-  for (const key of Object.keys(conversations)) delete conversations[key];
-  for (const c of r.conversations) conversations[c.id] = c;
+  if (Array.isArray(r.knownConversationIds)) {
+    const knownConversationIds = new Set(
+      r.knownConversationIds
+        .map((id) => String(id || '').trim())
+        .filter(Boolean),
+    );
+    for (const id of Object.keys(conversations)) {
+      if (!knownConversationIds.has(id)) delete conversations[id];
+    }
+  }
+  applyConversationPage(r.conversations || []);
+  resetConversationListPageState(r.pageInfo || null, {
+    preserveProgress: preservePagination,
+  });
   renderConvList();
   updateCompactButton();
 }
 
 export function renderConvList() {
   const list = document.getElementById('conv-list');
-  const sorted = Object.values(conversations).sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+  const sorted = Object.values(conversations).sort((a, b) => {
+    const updatedAtDelta = new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0);
+    if (updatedAtDelta !== 0) return updatedAtDelta;
+    return String(b?.id || '').trim().localeCompare(String(a?.id || '').trim());
+  });
   const pendingByConversation = getPendingQuestionCountsByConversation();
   let hasProcessingConversation = false;
+  const footerHtml = (() => {
+    if (conversationListPaginationState.isLoading) {
+      return '<div class="conv-list-footer">Loading older conversations…</div>';
+    }
+    if (conversationListPaginationState.hasMore || conversationListPaginationState.isPrefetching) {
+      return '<div class="conv-list-footer">Scroll for older conversations</div>';
+    }
+    return '';
+  })();
   if (sorted.length === 0) {
     ensureProcessingDotTimer(false);
     list.innerHTML = '<div style="padding:12px;color:var(--muted);font-size:0.85rem;text-align:center">No conversations yet</div>';
@@ -109,7 +237,7 @@ export function renderConvList() {
     if (processing) hasProcessingConversation = true;
     return { visualState, processing };
   };
-  list.innerHTML = sorted.map((c) => {
+  list.innerHTML = `${sorted.map((c) => {
     const view = conversationView(c);
     const processingDots = view.processing ? PROCESSING_DOT_FRAMES[processingDotFrame] : '';
     return `
@@ -118,9 +246,10 @@ export function renderConvList() {
       <div class="conv-meta">${fmtDate(c.updatedAt)} · ${c.messageCount} msg${c.messageCount !== 1 ? 's' : ''}</div>
       <button class="conv-delete" onclick="deleteConv(event,'${c.id}')" title="Delete">🗑</button>
     </div>`;
-  }).join('');
+  }).join('')}${footerHtml}`;
   ensureProcessingDotTimer(hasProcessingConversation);
   window.syncChatTitleControls?.();
+  scheduleConversationListBoundaryCheck();
 }
 
 export function applyLoadedConversationState(id, response, { restoreScroll = false, savedScrollTop = null } = {}) {
@@ -131,19 +260,29 @@ export function applyLoadedConversationState(id, response, { restoreScroll = fal
     window.syncChatTitleControls?.();
     return;
   }
-  if (conversations[id]) {
-    conversations[id] = {
-      ...conversations[id],
-      preferredRelayMode: response.preferredRelayMode ?? conversations[id].preferredRelayMode,
-      preferredModelsByMode: response.preferredModelsByMode ?? conversations[id].preferredModelsByMode,
-      configuredWorkspaceRootPath: response.configuredWorkspaceRootPath ?? conversations[id].configuredWorkspaceRootPath ?? null,
-      configuredWorkspaceRootName: response.configuredWorkspaceRootName ?? conversations[id].configuredWorkspaceRootName ?? null,
-      runtimeWorkspaceRootPath: response.runtimeWorkspaceRootPath ?? conversations[id].runtimeWorkspaceRootPath ?? null,
-      runtimeWorkspaceRootName: response.runtimeWorkspaceRootName ?? conversations[id].runtimeWorkspaceRootName ?? null,
-      currentWorkspaceRootPath: response.currentWorkspaceRootPath ?? conversations[id].currentWorkspaceRootPath ?? null,
-      currentWorkspaceRootName: response.currentWorkspaceRootName ?? conversations[id].currentWorkspaceRootName ?? null,
-    };
-  }
+  const existingConversation = conversations[id] || {};
+  upsertConversationRecord({
+    ...existingConversation,
+    id: id,
+    sdkSessionId: response.sdkSessionId ?? existingConversation.sdkSessionId ?? null,
+    title: response.title ?? existingConversation.title ?? id,
+    archived: response.archived ?? existingConversation.archived ?? false,
+    compactedInto: response.compactedInto ?? existingConversation.compactedInto ?? null,
+    compactedFrom: response.compactedFrom ?? existingConversation.compactedFrom ?? null,
+    updatedAt: response.updatedAt ?? existingConversation.updatedAt ?? new Date().toISOString(),
+    preferredRelayMode: response.preferredRelayMode ?? existingConversation.preferredRelayMode,
+    preferredModelsByMode: response.preferredModelsByMode ?? existingConversation.preferredModelsByMode,
+    configuredWorkspaceRootPath: response.configuredWorkspaceRootPath ?? existingConversation.configuredWorkspaceRootPath ?? null,
+    configuredWorkspaceRootName: response.configuredWorkspaceRootName ?? existingConversation.configuredWorkspaceRootName ?? null,
+    runtimeWorkspaceRootPath: response.runtimeWorkspaceRootPath ?? existingConversation.runtimeWorkspaceRootPath ?? null,
+    runtimeWorkspaceRootName: response.runtimeWorkspaceRootName ?? existingConversation.runtimeWorkspaceRootName ?? null,
+    currentWorkspaceRootPath: response.currentWorkspaceRootPath ?? existingConversation.currentWorkspaceRootPath ?? null,
+    currentWorkspaceRootName: response.currentWorkspaceRootName ?? existingConversation.currentWorkspaceRootName ?? null,
+    messageCount: Array.isArray(response.messages)
+      ? Math.max(existingConversation.messageCount || 0, response.messages.length)
+      : (existingConversation.messageCount || 0),
+  });
+  renderConvList();
   window.applyConversationPreferences?.(id, {
     preferredRelayMode: response.preferredRelayMode,
     preferredModelsByMode: response.preferredModelsByMode,
@@ -258,6 +397,17 @@ export async function newConversation() {
   scheduleContextUsageRefresh(null);
   window.applyConversationPreferences?.(null, null);
   document.getElementById('msg-input').focus();
+}
+
+export function initConversationListLazyLoading() {
+  const el = getConversationListElement();
+  if (!el || el.dataset.lazyLoadBound === '1') return;
+  el.dataset.lazyLoadBound = '1';
+  el.addEventListener('scroll', () => {
+    conversationListAutoLoadBlockedUntil = 0;
+    void conversationListLoader.handleBoundaryDistance(getConversationListBoundaryDistance());
+  }, { passive: true });
+  scheduleConversationListBoundaryCheck();
 }
 
 export async function deleteConv(e, id) {

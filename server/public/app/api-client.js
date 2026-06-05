@@ -110,8 +110,18 @@ export async function loadModelCatalog() {
   return apiFetch('/api/models');
 }
 
-export async function loadConversations() {
-  return apiFetch('/api/conversations');
+export async function loadConversations(options = {}) {
+  const params = new URLSearchParams();
+  const limit = Math.max(1, Math.trunc(Number(options.limit) || 0));
+  if (limit) params.set('limit', String(limit));
+  const beforeConversationId = String(options.beforeConversationId || options.beforeId || '').trim();
+  if (beforeConversationId) params.set('beforeConversationId', beforeConversationId);
+  const beforeUpdatedAt = String(options.beforeUpdatedAt || '').trim();
+  if (beforeUpdatedAt) params.set('beforeUpdatedAt', beforeUpdatedAt);
+  const includeArchived = String(options.archived || '').trim().toLowerCase();
+  if (includeArchived === 'true') params.set('archived', 'true');
+  const query = params.toString();
+  return apiFetch(`/api/conversations${query ? `?${query}` : ''}`);
 }
 
 export async function loadConversation(id, options = {}) {

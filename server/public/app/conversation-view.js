@@ -40,6 +40,7 @@ import { normalizeStreamSeq, deriveLatestInFlightStreamEvent, computeNextRelaySt
 import { mergeRelayActivityTexts } from './activity-replay-state.mjs';
 import { deriveComposerControlState, hasComposerDraft } from './composer-control-state.mjs';
 import { buildLiveMessageFingerprint } from './live-message-dedupe.mjs';
+import { createInfiniteLoader } from './infinite-loader.js';
 
 const CONVERSATION_HISTORY_PAGE_SIZE = 20;
 const HISTORY_LOAD_MORE_ID = 'history-load-more';
@@ -55,10 +56,74 @@ let conversationHistoryState = {
   conversationId: '',
   hasMoreHistory: false,
   oldestMessageId: '',
+  oldestMessageTimestamp: '',
   newestMessageId: '',
   loadedMessageCount: 0,
   loadingOlder: false,
 };
+
+const conversationHistoryLoader = createInfiniteLoader({
+  fetchPage: async (cursor) => {
+    const conversationId = String(currentConvId || '').trim();
+    if (!conversationId) {
+      return {
+        items: [],
+        hasMore: false,
+        nextCursor: null,
+      };
+    }
+    const response = await loadConversationApi(conversationId, {
+      limit: CONVERSATION_HISTORY_PAGE_SIZE,
+      beforeMessageId: String(cursor?.beforeMessageId || '').trim(),
+      beforeTimestamp: String(cursor?.beforeTimestamp || '').trim(),
+    });
+    if (String(currentConvId || '').trim() !== conversationId) return null;
+    if (!response) throw new Error('Could not load older messages. Please try again.');
+    return {
+      items: response.messages || [],
+      hasMore: !!response.pageInfo?.hasMore,
+      nextCursor: response.pageInfo?.nextCursor || null,
+    };
+  },
+  applyPage: async (page) => {
+    const currentId = String(currentConvId || '').trim();
+    const el = getMessagesElement();
+    if (!currentId || !el) return;
+    const previousScrollTop = el.scrollTop;
+    const previousScrollHeight = el.scrollHeight;
+    const inserted = prependMessageNodes(page.items || []);
+    setConversationHistoryState({
+      conversationId: currentId,
+      hasMoreHistory: page.hasMore,
+      oldestMessageId: String(page.nextCursor?.beforeMessageId || conversationHistoryState.oldestMessageId || '').trim(),
+      oldestMessageTimestamp: String(page.nextCursor?.beforeTimestamp || conversationHistoryState.oldestMessageTimestamp || '').trim(),
+      newestMessageId: String(conversationHistoryState.newestMessageId || '').trim(),
+      loadedMessageCount: getConversationLoadedMessageCount() + inserted.inserted,
+      loadingOlder: false,
+    });
+    renderRelayQuestions();
+    renderRelayBoards();
+    requestAnimationFrame(() => {
+      if (!el || String(currentConvId || '').trim() !== currentId) return;
+      const nextScrollHeight = el.scrollHeight;
+      el.scrollTop = previousScrollTop + (nextScrollHeight - previousScrollHeight);
+      void conversationHistoryLoader.handleBoundaryDistance(el.scrollTop);
+    });
+  },
+  onError: (error, { mode }) => {
+    if (mode === 'load') {
+      showTransientRelayNotice(error?.message || 'Could not load older messages. Please try again.');
+    }
+  },
+  onStateChange: (state) => {
+    conversationHistoryState = {
+      ...conversationHistoryState,
+      hasMoreHistory: state.hasMore,
+      loadingOlder: state.isLoading,
+    };
+    syncHistoryLoadMoreControl();
+  },
+});
 
 function isOpaqueRelayText(value) {
   const text = String(value || '').trim();
@@ -128,10 +193,12 @@ function resetConversationHistoryState() {
     conversationId,
     hasMoreHistory: false,
     oldestMessageId: '',
+    oldestMessageTimestamp: '',
     newestMessageId: '',
     loadedMessageCount: 0,
     loadingOlder: false,
   };
+  conversationHistoryLoader.reset({ hasMore: false, nextCursor: null });
   saveConversationLoadedMessageCount(conversationId, 0);
   syncHistoryLoadMoreControl();
 }
@@ -141,6 +208,7 @@ function setConversationHistoryState(next = {}) {
     conversationId: String(next.conversationId || currentConvId || '').trim(),
     hasMoreHistory: !!next.hasMoreHistory,
     oldestMessageId: String(next.oldestMessageId || '').trim(),
+    oldestMessageTimestamp: String(next.oldestMessageTimestamp || '').trim(),
     newestMessageId: String(next.newestMessageId || '').trim(),
     loadedMessageCount: Math.max(0, Number(next.loadedMessageCount) || 0),
     loadingOlder: !!next.loadingOlder,
@@ -158,6 +226,15 @@ function getConversationHistoryCursor() {
 
 export function getConversationLoadedMessageCount() {
   return Math.max(0, Number(conversationHistoryState.loadedMessageCount) || 0);
+}
+
+export function initConversationHistoryLazyLoading() {
+  const el = getMessagesElement();
+  if (!el || el.dataset.historyLazyLoadBound === '1') return;
+  el.dataset.historyLazyLoadBound = '1';
+  el.addEventListener('scroll', () => {
+    void conversationHistoryLoader.handleBoundaryDistance(el.scrollTop);
+  }, { passive: true });
 }
 
 function buildHistoryLoadMoreMarkup(loading = false) {
@@ -647,65 +724,31 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
     conversationId,
     hasMoreHistory,
     oldestMessageId,
+    oldestMessageTimestamp: String(pageInfo?.nextCursor?.beforeTimestamp || '').trim(),
     newestMessageId,
     loadedMessageCount: ordered.length,
     loadingOlder: false,
+  });
+  conversationHistoryLoader.reset({
+    hasMore: hasMoreHistory,
+    nextCursor: hasMoreHistory ? (pageInfo?.nextCursor || {
+      beforeMessageId: oldestMessageId || null,
+      beforeTimestamp: null,
+    }) : null,
   });
   for (const m of ordered) appendMessage(m, false, m.id || null, true, getMessageThreadAnchor(m, messageById), false);
   renderRelayQuestions();
   renderRelayBoards();
   if (scroll) scrollBottom();
+  requestAnimationFrame(() => {
+    const box = getMessagesElement();
+    if (!box) return;
+    void conversationHistoryLoader.handleBoundaryDistance(box.scrollTop);
+  });
 }
 
 export async function loadOlderConversationMessages() {
-  const currentId = String(currentConvId || '').trim();
-  if (!currentId) return;
-  if (conversationHistoryState.loadingOlder || !conversationHistoryState.hasMoreHistory) return;
-  if (conversationHistoryState.conversationId && conversationHistoryState.conversationId !== currentId) return;
-
-  const beforeMessageId = getConversationHistoryCursor();
-  if (!beforeMessageId) return;
-
-  const el = getMessagesElement();
-  if (!el) return;
-
-  const previousScrollTop = el.scrollTop;
-  const previousScrollHeight = el.scrollHeight;
-  setConversationHistoryState({
-    ...conversationHistoryState,
-    loadingOlder: true,
-  });
-
-  const r = await loadConversationApi(currentId, {
-    limit: CONVERSATION_HISTORY_PAGE_SIZE,
-    beforeMessageId,
-  });
-  if (String(currentConvId || '').trim() !== currentId) return;
-  if (!r) {
-    setConversationHistoryState({
-      ...conversationHistoryState,
-      loadingOlder: false,
-    });
-    showTransientRelayNotice('Could not load older messages. Please try again.');
-    return;
-  }
-
-  const inserted = prependMessageNodes(r.messages || []);
-  setConversationHistoryState({
-    conversationId: currentId,
-    hasMoreHistory: !!r.pageInfo?.hasMore,
-    oldestMessageId: String(r.pageInfo?.nextCursor?.beforeMessageId || r.historyCursor || conversationHistoryState.oldestMessageId || '').trim(),
-    newestMessageId: String(r.historyNewestMessageId || conversationHistoryState.newestMessageId || '').trim(),
-    loadedMessageCount: getConversationLoadedMessageCount() + inserted.inserted,
-    loadingOlder: false,
-  });
-  renderRelayQuestions();
-  renderRelayBoards();
-  requestAnimationFrame(() => {
-    if (!el || String(currentConvId || '').trim() !== currentId) return;
-    const nextScrollHeight = el.scrollHeight;
-    el.scrollTop = previousScrollTop + (nextScrollHeight - previousScrollHeight);
-  });
+  await conversationHistoryLoader.loadMore();
 }
 
 export function compactCurrentConversation() {
