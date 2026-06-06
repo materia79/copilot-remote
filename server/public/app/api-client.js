@@ -134,8 +134,26 @@ export async function loadConversation(id, options = {}) {
   if (beforeMessageId) params.set('beforeMessageId', beforeMessageId);
   const beforeTimestamp = String(options.beforeTimestamp || '').trim();
   if (beforeTimestamp) params.set('beforeTimestamp', beforeTimestamp);
+  const afterMessageId = String(options.afterMessageId || options.after || '').trim();
+  if (afterMessageId) params.set('afterMessageId', afterMessageId);
+  const afterTimestamp = String(options.afterTimestamp || '').trim();
+  if (afterTimestamp) params.set('afterTimestamp', afterTimestamp);
+  const aroundMessageId = String(options.aroundMessageId || '').trim();
+  if (aroundMessageId) params.set('aroundMessageId', aroundMessageId);
   const query = params.toString();
   return apiFetch(`/api/conversation/${convId}${query ? `?${query}` : ''}`);
+}
+
+export async function searchMessages(options = {}) {
+  const query = String(options.query || options.q || '').trim();
+  if (!query) return null;
+  const params = new URLSearchParams();
+  params.set('q', query);
+  const limit = Math.max(1, Math.trunc(Number(options.limit) || 0));
+  if (limit) params.set('limit', String(limit));
+  const offset = Math.max(0, Math.trunc(Number(options.offset) || 0));
+  if (offset) params.set('offset', String(offset));
+  return apiFetch(`/api/search/messages?${params.toString()}`);
 }
 
 export async function deleteConversation(id) {

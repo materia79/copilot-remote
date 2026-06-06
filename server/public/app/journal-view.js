@@ -2,6 +2,7 @@ import {
   conversations,
   currentConvId,
   fmtDate,
+  parseTimestampMs,
   escHtml,
   repoBrowserState,
   getSessionWorkerState,
@@ -23,7 +24,7 @@ import {
   deleteConversation as deleteConversationApi,
   scheduleContextUsageRefresh,
 } from './api-client.js';
-import { renderMessages, restoreInFlightThinking } from './conversation-view.js';
+import { renderMessages, restoreInFlightThinking, focusConversationMessageById } from './conversation-view.js';
 import { loadRelayQuestions, getPendingQuestionCountsByConversation } from './ask-user-view.js';
 import { loadRelayBoards } from './relay-board-view.js';
 import { clearAttachments, setRepoBrowserSessionInfo, loadRepoBrowserTree } from './attachments-view.js';
@@ -204,7 +205,7 @@ export async function refreshConversations(options = {}) {
 export function renderConvList() {
   const list = document.getElementById('conv-list');
   const sorted = Object.values(conversations).sort((a, b) => {
-    const updatedAtDelta = new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0);
+    const updatedAtDelta = parseTimestampMs(b.updatedAt) - parseTimestampMs(a.updatedAt);
     if (updatedAtDelta !== 0) return updatedAtDelta;
     return String(b?.id || '').trim().localeCompare(String(a?.id || '').trim());
   });
@@ -337,16 +338,24 @@ export async function openConversation(id, options = {}) {
     void loadRepoBrowserTree();
   }
 
+  const focusMessageId = String(options.focusMessageId || '').trim();
+  const aroundMessageId = String(options.aroundMessageId || focusMessageId || '').trim();
+  const forceFreshWindow = !!aroundMessageId;
   const savedScrollTop = loadConversationScrollTop(id);
-  const restoreScroll = Number.isFinite(savedScrollTop);
+  const restoreScroll = !forceFreshWindow && Number.isFinite(savedScrollTop);
   const savedLoadedCount = loadConversationLoadedMessageCount(id);
   // #region agent log
   fetch('http://127.0.0.1:7611/ingest/41e205ad-83bf-40b2-b2ab-5040e785036c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0e20dd'},body:JSON.stringify({sessionId:'0e20dd',id:`log_${Date.now()}_${Math.random().toString(36).slice(2,10)}`,runId:'ui-regressions-baseline',hypothesisId:'H12-scroll-restore',location:'server/public/app/journal-view.js:openConversation.saved-scroll',message:'open conversation loaded saved view state',data:{conversationId:String(id||'').trim()||null,savedScrollTop:Number.isFinite(savedScrollTop)?savedScrollTop:null,savedLoadedCount:Number.isFinite(savedLoadedCount)?savedLoadedCount:null},timestamp:Date.now()})}).catch(()=>{});
   // #endregion
-  const requestLimit = Number.isFinite(savedLoadedCount)
-    ? Math.max(20, savedLoadedCount)
-    : 20;
-  const r = await loadConversation(id, { limit: requestLimit });
+  const requestLimit = forceFreshWindow
+    ? 40
+    : (Number.isFinite(savedLoadedCount)
+      ? Math.max(20, savedLoadedCount)
+      : 20);
+  const r = await loadConversation(id, {
+    limit: requestLimit,
+    aroundMessageId: aroundMessageId || undefined,
+  });
   if (!shouldApplyConversationLoad({
     requestedConversationId: id,
     activeConversationId: currentConvId,
@@ -357,6 +366,11 @@ export async function openConversation(id, options = {}) {
   }
   if (r) {
     applyLoadedConversationState(id, r, { restoreScroll, savedScrollTop });
+    if (focusMessageId) {
+      requestAnimationFrame(() => {
+        focusConversationMessageById(focusMessageId, { behavior: 'smooth', block: 'center' });
+      });
+    }
   } else {
     setRepoBrowserSessionInfo('', '');
     restoreInFlightThinking(null);

@@ -97,7 +97,7 @@ export function createCacheRebuildService({
   function archiveConversation(conversationId) {
     const sid = normalizeId(conversationId);
     if (!sid) return false;
-    const result = db.prepare(`UPDATE conversations SET archived = 1, updated_at = datetime('now') WHERE id = ? AND status != 'deleted'`).run(sid);
+    const result = db.prepare(`UPDATE conversations SET archived = 1, updated_at = ? WHERE id = ? AND status != 'deleted'`).run(new Date().toISOString(), sid);
     return Number(result?.changes || 0) > 0;
   }
 
@@ -192,11 +192,12 @@ export function createCacheRebuildService({
       if (!conversationId) continue;
 
       if (discoveredSessionIds.has(conversationId) && !tombstonedSessionIds.has(conversationId)) {
+        const now = new Date().toISOString();
         const updateResult = db.prepare(`
           UPDATE conversations
-          SET sdk_session_id = ?, updated_at = datetime('now')
+          SET sdk_session_id = ?, updated_at = ?
           WHERE id = ? AND (sdk_session_id IS NULL OR sdk_session_id = '')
-        `).run(conversationId, conversationId);
+        `).run(conversationId, now, conversationId);
         if (Number(updateResult?.changes || 0) > 0) {
           summary.backfilledConversationIds.push(conversationId);
           stmts.clearDeletedSdkSession.run(conversationId);

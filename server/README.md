@@ -316,7 +316,8 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | GET | `/api/drives/files-preview` | Return structured preview JSON for a drive file (`path`) |
 | GET | `/api/conversations` | List all conversations |
 | GET | `/api/sessions` | List runtime sessions bound 1:1 to conversations |
-| GET | `/api/conversation/:id` | Get full conversation with messages and session-root path metadata |
+| GET | `/api/conversation/:id` | Get conversation message windows (`before*`, `after*`, or `aroundMessageId`) plus session-root metadata |
+| GET | `/api/search/messages` | Search message text across all conversations (`q`, `limit`, `offset`) |
 | PATCH | `/api/conversation/:id` | Update a conversation title |
 | POST | `/api/conversation/:id/compact` | Compact a conversation into a new one with carry-over summary seed |
 | DELETE | `/api/conversation/:id` | Delete a conversation |

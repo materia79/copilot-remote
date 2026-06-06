@@ -32,6 +32,7 @@ import { createManagedServerLifecycle } from "./server-lifecycle/managed-server.
 import { createModelSwitchingService } from "./model-api/model-switching.mjs";
 import { createSessionRuntimeManager } from "./runtime/session-runtime-manager.mjs";
 import { createSessionIoHelpers } from "./runtime/session-io.mjs";
+import { createWorkerWebSocketLink } from "./runtime/worker-websocket-link.mjs";
 import { resolveSessionBinding } from "./runtime/session-binding.mjs";
 import { createBannerStateStore } from "./runtime/banner-state.mjs";
 import { clearSession, getActiveSession, registerSession } from "./runtime/session-registry.mjs";
@@ -40,7 +41,8 @@ import { joinSessionWithRetry } from "./runtime/session-join-retry.mjs";
 import { resolveWorkspaceRootPath } from "./runtime/workspace-root.mjs";
 
 const SERVER_URL   = "http://localhost:3333";
-const POLL_MS      = 2000;
+const POLL_MS      = 10_000;
+const HEARTBEAT_MS = 10_000;
 
 const TOKEN_FALLBACK = generateHighEntropyToken();
 
@@ -129,6 +131,7 @@ process.on("exit", () => {
   clearSession();
   pollingLoopController?.stopPolling?.();
   stopHeartbeat();
+  workerWebSocketLink?.stop?.();
   managedServerLifecycle.killManagedProcessTree();
 });
 process.on("SIGINT", () => {
@@ -168,6 +171,7 @@ let restartControlPromise = null;
 let startupVerificationTimer = null;
 let restartControlGraceUntilMs = 0;
 let deferredSessionEnd = false;
+let workerWebSocketLink = null;
 
 function getCurrentConversationId() {
   const conversationId = String(activeMsg?.conversationId || "").trim();
@@ -463,7 +467,7 @@ function startHeartbeat() {
   if (!heartbeatController) {
     heartbeatController = createHeartbeatController({
       api,
-      pollMs: POLL_MS,
+      pollMs: HEARTBEAT_MS,
       getSessionReady: () => sessionReady,
       getHeartbeatTimer: () => heartbeatTimer,
       setHeartbeatTimer: (timer) => { heartbeatTimer = timer; },
@@ -557,6 +561,21 @@ async function startPolling() {
   await pollingLoopController.startPolling();
 }
 
+function startWorkerWebSocketLink() {
+  if (!pollingLoopController || workerWebSocketLink) return;
+  workerWebSocketLink = createWorkerWebSocketLink({
+    serverUrl: SERVER_URL,
+    token: TOKEN,
+    dbg,
+    getSessionReady: () => sessionReady,
+    getSessionId: () => session?.sessionId || null,
+    pollNow: async () => {
+      await pollingLoopController?.kick?.();
+    },
+  });
+  workerWebSocketLink.start();
+}
+
 async function forwardRelayQuestion(request) {
   return questionBridge.forwardRelayQuestion(request);
 }
@@ -612,6 +631,8 @@ async function gracefulShutdown(reason) {
   }
   pollingLoopController?.stopPolling?.();
   stopHeartbeat();
+  workerWebSocketLink?.stop?.();
+  workerWebSocketLink = null;
   sessionReady = false;
   clearSession();
   await Promise.race([
@@ -821,7 +842,7 @@ session = await joinSessionWithRetry({
             : "🔐 Token source: server/config.json",
           { ephemeral: true }
         );
-        await session.log("🌐 Web relay loaded — polling http://localhost:3333 every 2 s", { ephemeral: true });
+        await session.log("🌐 Web relay loaded — worker websocket enabled with fallback polling every 10 s", { ephemeral: true });
       } catch (e) { dbg("session.log error:", e.message); }
     },
     onPreToolUse: async (request) => {
@@ -882,6 +903,7 @@ async function ensureRelayActive(reason) {
     startPolling().catch((error) => {
       dbg("startPolling failed", reason, error?.message || String(error));
     });
+    startWorkerWebSocketLink();
     scheduleStartupVerification(reason);
     dbg("relay active", reason);
   })().finally(() => {

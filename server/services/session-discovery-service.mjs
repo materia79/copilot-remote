@@ -7,8 +7,20 @@ export function createSessionDiscoveryService({ fs, path, resolveSessionStateRoo
     sessions: [],
   };
 
-  function toIsoOrNull(value) {
+  function normalizeTimestampInput(value) {
     const text = String(value || '').trim();
+    if (!text) return '';
+    const sqliteUtcLike = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?)$/;
+    const hasExplicitTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(text);
+    if (!hasExplicitTimezone && sqliteUtcLike.test(text)) {
+      const [, day, time] = text.match(sqliteUtcLike) || [];
+      return `${day}T${time}Z`;
+    }
+    return text;
+  }
+
+  function toIsoOrNull(value) {
+    const text = normalizeTimestampInput(value);
     if (!text) return null;
     const parsed = new Date(text);
     return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
@@ -113,7 +125,11 @@ export function createSessionDiscoveryService({ fs, path, resolveSessionStateRoo
       });
     }
 
-    sessions.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+    sessions.sort((a, b) => {
+      const bMs = Date.parse(normalizeTimestampInput(b.updatedAt));
+      const aMs = Date.parse(normalizeTimestampInput(a.updatedAt));
+      return (Number.isFinite(bMs) ? bMs : 0) - (Number.isFinite(aMs) ? aMs : 0);
+    });
     discoveryCache = {
       at: now,
       sessions,

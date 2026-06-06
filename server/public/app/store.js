@@ -280,12 +280,28 @@ export function formatBytes(bytes) {
 
 export function fmtDate(iso) {
   if (!iso) return '';
-  const d = new Date(iso);
+  const timestampMs = parseTimestampMs(iso);
+  if (!timestampMs) return '';
+  const d = new Date(timestampMs);
   const now = new Date();
   if (d.toDateString() === now.toDateString()) {
     return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
   return `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+}
+
+export function parseTimestampMs(value) {
+  const text = String(value || '').trim();
+  if (!text) return 0;
+  const sqliteUtcLike = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?)$/;
+  const hasExplicitTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(text);
+  let normalized = text;
+  if (!hasExplicitTimezone && sqliteUtcLike.test(text)) {
+    const [, day, time] = text.match(sqliteUtcLike) || [];
+    normalized = `${day}T${time}Z`;
+  }
+  const parsed = Date.parse(normalized);
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 export function updateWorkspaceRootHints(payload) {

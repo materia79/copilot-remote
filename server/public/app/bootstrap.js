@@ -94,6 +94,12 @@ import {
 } from './conversation-preferences.mjs';
 import { isLikelyLiveDuplicateMessage } from './live-message-dedupe.mjs';
 import { stripRelayPromptContext } from './relay-prompt-sanitizer.mjs';
+import {
+  initMessageSearchView,
+  openMessageSearchModal,
+  closeMessageSearchModal,
+  clearMessageSearchRuntimeState,
+} from './message-search-view.js';
 
 const MODEL_STORAGE_KEY = 'copilot_selected_model';
 const MODE_STORAGE_KEY = 'copilot_selected_mode';
@@ -1306,16 +1312,23 @@ function openChangeCwdModal() {
         </div>
       </label>
       <div id="change-cwd-details" style="margin-top:10px;font-size:0.78rem;color:var(--muted);line-height:1.45;word-break:break-word"></div>
-      <div class="summary-modal-actions">
+      <div class="summary-modal-actions" id="change-cwd-actions">
         <button class="summary-btn" type="button" onclick="confirmChangeCwd()">🗂️ Save next-launch CWD</button>
         <button class="summary-btn" type="button" ${launchableSessionId ? 'onclick="confirmChangeCwdAndLaunch()"' : 'disabled'} title="${escHtml(launchDisabledReason || 'Set the CWD and launch the current session worker')}">🚀 Set new CWD and launch</button>
         <button class="summary-close" type="button" onclick="closeSummaryModal()">Cancel</button>
       </div>
     `,
   });
+  // Shield the action buttons from stray click events that arrive just after the
+  // modal opens (e.g. click fires after pointerup-triggered modal in some browsers,
+  // or the 300ms synthetic touch-click lands on a button at the same coordinates).
+  const cwdActionsEl = document.getElementById('change-cwd-actions');
+  if (cwdActionsEl) cwdActionsEl.style.pointerEvents = 'none';
   window.setTimeout(() => {
     bindChangeCwdPicker();
-  }, 0);
+    const el = document.getElementById('change-cwd-actions');
+    if (el) el.style.pointerEvents = '';
+  }, 350);
 }
 
 async function confirmChangeCwd() {
@@ -1667,11 +1680,11 @@ function openSuspendHostConfirmation() {
   closeChatActionsMenu();
   openSummaryModal({
     title: 'Suspend host',
-    subtitle: 'Runs bin/sleep.bat',
+    subtitle: 'Requests suspend-to-RAM',
     kind: 'suspend-host',
     bodyHtml: `
       <p>Put this PC to sleep now?</p>
-      <p>This launches <code>bin/sleep.bat</code> and may suspend the host immediately.</p>
+      <p>This requests suspend-to-RAM immediately.</p>
       <div class="summary-modal-actions">
         <button class="chat-title-action-btn" type="button" onclick="confirmSuspendHost()">💤 Suspend host</button>
         <button class="chat-title-action-btn" type="button" onclick="closeSummaryModal()">Cancel</button>
@@ -1684,7 +1697,7 @@ function openSuspendHostConfirmation() {
     const ariaVisible = String(modal?.getAttribute('aria-hidden') || 'true') === 'false';
     const displayVisible = modal ? window.getComputedStyle(modal).display !== 'none' : false;
     if (classVisible && ariaVisible && displayVisible) return;
-    const confirmed = window.confirm('Put this PC to sleep now?\n\nThis runs bin/sleep.bat.');
+    const confirmed = window.confirm('Put this PC to sleep now?\n\nThis requests suspend-to-RAM.');
     if (!confirmed) return;
     confirmSuspendHost().catch(() => {});
   }, 90);
@@ -1820,6 +1833,7 @@ async function connectSocket() {
 
   socket.on('connect', () => {
     console.log('Socket connected');
+    clearMessageSearchRuntimeState();
     setRelayOnline(true);
     setCliOnline(true);
     renderConvList();
@@ -2173,6 +2187,7 @@ async function initApp() {
   initConversationListLazyLoading();
   initConversationHistoryLazyLoading();
   initMessageScrollPersistence();
+  initMessageSearchView({ openConversation });
   syncChatTitleControls();
   connectSocket();
   startRelayQuestionPolling();
@@ -2300,5 +2315,7 @@ window.confirmKillCurrentSession = confirmKillCurrentSession;
 window.confirmRestartWebRelay = confirmRestartWebRelay;
 window.confirmSuspendHost = confirmSuspendHost;
 window.confirmEmptyQueue = confirmEmptyQueue;
+window.openMessageSearchModal = openMessageSearchModal;
+window.closeMessageSearchModal = closeMessageSearchModal;
 
 bootstrap();

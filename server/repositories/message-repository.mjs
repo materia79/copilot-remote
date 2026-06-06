@@ -7,6 +7,36 @@ export function createMessageRepository(db) {
         getLatestConversationModel: db.prepare(`SELECT model FROM messages WHERE conversation_id = ? AND model IS NOT NULL AND model != '' ORDER BY timestamp DESC LIMIT 1`),
         getRecentMessagesDesc: db.prepare(`SELECT role, text, timestamp FROM messages WHERE conversation_id = ? ORDER BY timestamp DESC LIMIT ?`),
         insertMsg:      db.prepare(`INSERT INTO messages (id, conversation_id, role, text, model, mode, attachments, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`),
+        searchMessagesCount: db.prepare(`
+          SELECT COUNT(*) AS cnt
+          FROM messages_fts fts
+          INNER JOIN messages m
+            ON m.rowid = fts.rowid
+          INNER JOIN conversations c
+            ON c.id = m.conversation_id
+          WHERE fts.text MATCH ?
+            AND c.status != 'deleted'
+        `),
+        searchMessagesPage: db.prepare(`
+          SELECT
+            m.id AS message_id,
+            m.conversation_id AS conversation_id,
+            c.title AS conversation_title,
+            m.role AS role,
+            m.timestamp AS timestamp,
+            m.text AS raw_text,
+            snippet(messages_fts, 0, '<mark>', '</mark>', '…', 18) AS snippet,
+            bm25(messages_fts) AS score
+          FROM messages_fts fts
+          INNER JOIN messages m
+            ON m.rowid = fts.rowid
+          INNER JOIN conversations c
+            ON c.id = m.conversation_id
+          WHERE fts.text MATCH ?
+            AND c.status != 'deleted'
+          ORDER BY score ASC, m.timestamp DESC, m.id DESC
+          LIMIT ? OFFSET ?
+        `),
 
         // queue
         insertQ:        db.prepare(`INSERT INTO queue (id, conversation_id, runtime_session_id, is_new_conversation, model, relay_mode, text, attachments, status, timestamp, retry_count, next_attempt_at, owner_sdk_session_id, owner_assigned_at, owner_lease_expires_at, owner_last_claimed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, NULL, ?, ?, ?, ?)`),

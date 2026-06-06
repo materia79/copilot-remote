@@ -44,7 +44,7 @@ export function createSdkSessionSyncService(db) {
 
   const updateConversationSdkSession = db.prepare(`
     UPDATE conversations
-    SET sdk_session_id = ?, updated_at = datetime('now')
+    SET sdk_session_id = ?, updated_at = ?
     WHERE id = ?
   `);
 
@@ -52,7 +52,7 @@ export function createSdkSessionSyncService(db) {
     UPDATE runtime_sessions
     SET conversation_id = ?,
         sdk_session_id = ?,
-        last_used_at = datetime('now'),
+        last_used_at = ?,
         status = COALESCE(status, 'active')
     WHERE id = ?
   `);
@@ -60,12 +60,13 @@ export function createSdkSessionSyncService(db) {
   const insertRuntimeSession = db.prepare(`
     INSERT INTO runtime_sessions (
       id, conversation_id, strategy, runtime_key, model, status, created_at, last_used_at, sdk_session_id
-    ) VALUES (?, ?, ?, ?, ?, 'active', datetime('now'), datetime('now'), ?)
+    ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)
   `);
 
   const syncSessionTx = db.transaction((sdkSessionIdRaw, conversationIdRaw) => {
     const sdkSessionId = normalizeId(sdkSessionIdRaw);
     const conversationId = normalizeId(conversationIdRaw);
+    const nowIso = new Date().toISOString();
 
     if (!sdkSessionId || !conversationId) {
       throw makeError('Missing sdk_session_id or conversation_id', 400);
@@ -123,7 +124,7 @@ export function createSdkSessionSyncService(db) {
       );
     }
 
-    updateConversationSdkSession.run(sdkSessionId, conversationId);
+    updateConversationSdkSession.run(sdkSessionId, nowIso, conversationId);
 
     let runtimeSessionId = null;
     let createdRuntimeSession = false;
@@ -137,7 +138,7 @@ export function createSdkSessionSyncService(db) {
         );
       }
 
-      updateRuntimeSessionSdkSession.run(conversationId, sdkSessionId, runtimeSessionByConversation.id);
+      updateRuntimeSessionSdkSession.run(conversationId, sdkSessionId, nowIso, runtimeSessionByConversation.id);
       runtimeSessionId = runtimeSessionByConversation.id;
     } else if (runtimeSessionBySdkSessionId) {
       const currentConversationId = normalizeId(runtimeSessionBySdkSessionId.conversation_id);
@@ -148,7 +149,7 @@ export function createSdkSessionSyncService(db) {
         );
       }
 
-      updateRuntimeSessionSdkSession.run(conversationId, sdkSessionId, runtimeSessionBySdkSessionId.id);
+      updateRuntimeSessionSdkSession.run(conversationId, sdkSessionId, nowIso, runtimeSessionBySdkSessionId.id);
       runtimeSessionId = runtimeSessionBySdkSessionId.id;
     } else {
       runtimeSessionId = uuidv4();
@@ -159,6 +160,8 @@ export function createSdkSessionSyncService(db) {
         'isolated',
         runtimeSessionId,
         null,
+        nowIso,
+        nowIso,
         sdkSessionId,
       );
     }

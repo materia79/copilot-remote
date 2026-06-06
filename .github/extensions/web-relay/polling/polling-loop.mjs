@@ -379,6 +379,7 @@ export function createPollingLoop({
   let stopRequested = false;
   let lastAbortControlCheckAt = 0;
   let activeTurnMessageId = "";
+  let iterationPromise = null;
 
   async function waitForRelayQuestionAnswer(questionId, timeoutMs = DEFAULT_QUESTION_TIMEOUT_MS, pollIntervalMs = 1500) {
     const started = Date.now();
@@ -582,33 +583,23 @@ export function createPollingLoop({
     throw abortError;
   }
 
-  async function startPolling() {
-    if (getPollingLoopStarted()) return;
-    setPollingLoopStarted(true);
-    stopRequested = false;
-    dbg("startPolling: entered");
-    await session.log("🔄 Polling started", { ephemeral: true });
-
-    while (!stopRequested) {
-      await sleep(pollMs);
-
-      if (!getSessionReady()) continue;
-
-      try {
+  async function runPollingIteration() {
+    if (!getSessionReady()) return;
+    try {
         await api("POST", "/api/heartbeat", {
           activeQueueMessageId: getWaitingForAI() ? activeTurnMessageId || undefined : undefined,
         });
         await publishModelSnapshot("poll");
 
-        if (getWaitingForAI()) continue;
+        if (getWaitingForAI()) return;
         const processedDelete = await processPendingSdkSessionDeletes();
-        if (processedDelete) continue;
+        if (processedDelete) return;
 
         const pending = await api("GET", "/api/pending");
         const control = pending?.control || null;
         if (control && typeof handleControl === "function") {
           const handled = await handleControl(control, pending);
-          if (handled) continue;
+          if (handled) return;
         }
         const { message } = pending || {};
 
@@ -627,7 +618,7 @@ export function createPollingLoop({
               await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
             });
             setActiveMsg(null);
-            continue;
+            return;
           }
 
           const sessionResolution = await ensureSessionForConversation(message.conversationId, "dequeue");
@@ -664,7 +655,7 @@ export function createPollingLoop({
               });
             }
             setActiveMsg(null);
-            continue;
+            return;
           }
 
           const synced = await syncActiveSession?.("dequeue", true);
@@ -673,7 +664,7 @@ export function createPollingLoop({
             await session.log("⚠️ Session sync failed before processing; re-queuing turn", { level: "warn" });
             await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
             setActiveMsg(null);
-            continue;
+            return;
           }
           setWaitingForAI(true);
           setRelayTurnActive(true, message);
@@ -867,7 +858,7 @@ export function createPollingLoop({
                     model,
                   });
                   await session.log("✅ ask_user safety-net bridge: relay question card shown, answer received, turn resumed", { ephemeral: true });
-                  continue;
+                  return;
                 }
               } catch (bridgeErr) {
                 dbg("ask_user safety-net bridge failed", `msgId=${message.id}`, bridgeErr?.message || String(bridgeErr));
@@ -912,7 +903,7 @@ export function createPollingLoop({
                     model,
                   });
                   await session.log("✅ Converted plain-text question into relay bridge card and resumed the turn", { ephemeral: true });
-                  continue;
+                  return;
                 }
               } catch (bridgeErr) {
                 dbg("fallback question bridge failed", `msgId=${message.id}`, bridgeErr?.message || String(bridgeErr));
@@ -1008,13 +999,42 @@ export function createPollingLoop({
             activeTurnMessageId = "";
           }
         }
-      } catch {
-        // Server may be down — keep retrying silently
-      }
+    } catch {
+      // Server may be down — keep retrying silently
+    }
+  }
+
+  async function runPollingIterationSerialized() {
+    if (iterationPromise) return iterationPromise;
+    iterationPromise = Promise.resolve()
+      .then(() => runPollingIteration())
+      .finally(() => {
+        iterationPromise = null;
+      });
+    return iterationPromise;
+  }
+
+  async function startPolling() {
+    if (getPollingLoopStarted()) return;
+    setPollingLoopStarted(true);
+    stopRequested = false;
+    dbg("startPolling: entered");
+    await session.log("🔄 Polling started", { ephemeral: true });
+
+    while (!stopRequested) {
+      await sleep(pollMs);
+      if (stopRequested) break;
+      await runPollingIterationSerialized();
     }
 
     setPollingLoopStarted(false);
     dbg("startPolling: exited");
+  }
+
+  async function kick() {
+    if (stopRequested || !getPollingLoopStarted()) return false;
+    await runPollingIterationSerialized();
+    return true;
   }
 
   function stopPolling() {
@@ -1023,6 +1043,7 @@ export function createPollingLoop({
 
   return {
     startPolling,
+    kick,
     stopPolling,
   };
 }

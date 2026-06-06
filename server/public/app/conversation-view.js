@@ -54,12 +54,15 @@ let sendInFlight = false;
 const activeTurnsByConversation = new Map();
 let conversationHistoryState = {
   conversationId: '',
-  hasMoreHistory: false,
+  hasMoreOlder: false,
+  hasMoreNewer: false,
   oldestMessageId: '',
   oldestMessageTimestamp: '',
   newestMessageId: '',
+  newestMessageTimestamp: '',
   loadedMessageCount: 0,
   loadingOlder: false,
+  loadingNewer: false,
 };
 
 const conversationHistoryLoader = createInfiniteLoader({
@@ -94,12 +97,15 @@ const conversationHistoryLoader = createInfiniteLoader({
     const inserted = prependMessageNodes(page.items || []);
     setConversationHistoryState({
       conversationId: currentId,
-      hasMoreHistory: page.hasMore,
+      hasMoreOlder: page.hasMore,
+      hasMoreNewer: conversationHistoryState.hasMoreNewer,
       oldestMessageId: String(page.nextCursor?.beforeMessageId || conversationHistoryState.oldestMessageId || '').trim(),
       oldestMessageTimestamp: String(page.nextCursor?.beforeTimestamp || conversationHistoryState.oldestMessageTimestamp || '').trim(),
       newestMessageId: String(conversationHistoryState.newestMessageId || '').trim(),
+      newestMessageTimestamp: String(conversationHistoryState.newestMessageTimestamp || '').trim(),
       loadedMessageCount: getConversationLoadedMessageCount() + inserted.inserted,
       loadingOlder: false,
+      loadingNewer: conversationHistoryState.loadingNewer,
     });
     renderRelayQuestions();
     renderRelayBoards();
@@ -118,10 +124,69 @@ const conversationHistoryLoader = createInfiniteLoader({
   onStateChange: (state) => {
     conversationHistoryState = {
       ...conversationHistoryState,
-      hasMoreHistory: state.hasMore,
+      hasMoreOlder: state.hasMore,
       loadingOlder: state.isLoading,
     };
     syncHistoryLoadMoreControl();
+  },
+});
+
+const conversationFutureLoader = createInfiniteLoader({
+  fetchPage: async (cursor) => {
+    const conversationId = String(currentConvId || '').trim();
+    if (!conversationId) {
+      return {
+        items: [],
+        hasMore: false,
+        nextCursor: null,
+      };
+    }
+    const response = await loadConversationApi(conversationId, {
+      limit: CONVERSATION_HISTORY_PAGE_SIZE,
+      afterMessageId: String(cursor?.afterMessageId || '').trim(),
+      afterTimestamp: String(cursor?.afterTimestamp || '').trim(),
+    });
+    if (String(currentConvId || '').trim() !== conversationId) return null;
+    if (!response) throw new Error('Could not load newer messages. Please try again.');
+    return {
+      items: response.messages || [],
+      hasMore: !!response.pageInfo?.hasMoreNewer,
+      nextCursor: response.pageInfo?.newerCursor || null,
+    };
+  },
+  applyPage: async (page) => {
+    const currentId = String(currentConvId || '').trim();
+    const ordered = sortConversationMessages(page.items || []);
+    let inserted = 0;
+    for (const m of ordered) {
+      const msgId = String(m?.id || '').trim() || null;
+      const node = appendMessage(m, false, msgId, true, null, false);
+      if (node) inserted += 1;
+    }
+    setConversationHistoryState({
+      conversationId: currentId,
+      hasMoreOlder: conversationHistoryState.hasMoreOlder,
+      hasMoreNewer: page.hasMore,
+      oldestMessageId: String(conversationHistoryState.oldestMessageId || '').trim(),
+      oldestMessageTimestamp: String(conversationHistoryState.oldestMessageTimestamp || '').trim(),
+      newestMessageId: String(page.nextCursor?.afterMessageId || conversationHistoryState.newestMessageId || '').trim(),
+      newestMessageTimestamp: String(page.nextCursor?.afterTimestamp || conversationHistoryState.newestMessageTimestamp || '').trim(),
+      loadedMessageCount: getConversationLoadedMessageCount() + inserted,
+      loadingOlder: conversationHistoryState.loadingOlder,
+      loadingNewer: false,
+    });
+  },
+  onError: (error, { mode }) => {
+    if (mode === 'load') {
+      showTransientRelayNotice(error?.message || 'Could not load newer messages. Please try again.');
+    }
+  },
+  onStateChange: (state) => {
+    conversationHistoryState = {
+      ...conversationHistoryState,
+      hasMoreNewer: state.hasMore,
+      loadingNewer: state.isLoading,
+    };
   },
 });
 
@@ -191,14 +256,18 @@ function resetConversationHistoryState() {
   const conversationId = String(currentConvId || '').trim();
   conversationHistoryState = {
     conversationId,
-    hasMoreHistory: false,
+    hasMoreOlder: false,
+    hasMoreNewer: false,
     oldestMessageId: '',
     oldestMessageTimestamp: '',
     newestMessageId: '',
+    newestMessageTimestamp: '',
     loadedMessageCount: 0,
     loadingOlder: false,
+    loadingNewer: false,
   };
   conversationHistoryLoader.reset({ hasMore: false, nextCursor: null });
+  conversationFutureLoader.reset({ hasMore: false, nextCursor: null });
   saveConversationLoadedMessageCount(conversationId, 0);
   syncHistoryLoadMoreControl();
 }
@@ -206,12 +275,15 @@ function resetConversationHistoryState() {
 function setConversationHistoryState(next = {}) {
   conversationHistoryState = {
     conversationId: String(next.conversationId || currentConvId || '').trim(),
-    hasMoreHistory: !!next.hasMoreHistory,
+    hasMoreOlder: !!next.hasMoreOlder,
+    hasMoreNewer: !!next.hasMoreNewer,
     oldestMessageId: String(next.oldestMessageId || '').trim(),
     oldestMessageTimestamp: String(next.oldestMessageTimestamp || '').trim(),
     newestMessageId: String(next.newestMessageId || '').trim(),
+    newestMessageTimestamp: String(next.newestMessageTimestamp || '').trim(),
     loadedMessageCount: Math.max(0, Number(next.loadedMessageCount) || 0),
     loadingOlder: !!next.loadingOlder,
+    loadingNewer: !!next.loadingNewer,
   };
   saveConversationLoadedMessageCount(
     conversationHistoryState.conversationId,
@@ -224,6 +296,10 @@ function getConversationHistoryCursor() {
   return String(conversationHistoryState.oldestMessageId || '').trim();
 }
 
+function getConversationFutureCursor() {
+  return String(conversationHistoryState.newestMessageId || '').trim();
+}
+
 export function getConversationLoadedMessageCount() {
   return Math.max(0, Number(conversationHistoryState.loadedMessageCount) || 0);
 }
@@ -234,6 +310,8 @@ export function initConversationHistoryLazyLoading() {
   el.dataset.historyLazyLoadBound = '1';
   el.addEventListener('scroll', () => {
     void conversationHistoryLoader.handleBoundaryDistance(el.scrollTop);
+    const forwardDistance = Math.max(0, el.scrollHeight - el.clientHeight - el.scrollTop);
+    void conversationFutureLoader.handleBoundaryDistance(forwardDistance);
   }, { passive: true });
 }
 
@@ -249,7 +327,7 @@ function syncHistoryLoadMoreControl() {
   const el = getMessagesElement();
   if (!el) return;
   let box = document.getElementById(HISTORY_LOAD_MORE_ID);
-  if (!conversationHistoryState.hasMoreHistory) {
+  if (!conversationHistoryState.hasMoreOlder) {
     box?.remove();
     return;
   }
@@ -664,10 +742,23 @@ export function appendMessage(msg, scroll = true, msgId = null, force = false, i
   const isNewNode = !!node && !node.parentNode;
   const insertedNode = insertMessageNode(node, scroll, insertAfterId);
   if (trackHistory && isNewNode && insertedNode) {
+    const messageId = String(msgId || msg?.id || '').trim();
+    const messageTimestamp = String(msg?.timestamp || '').trim();
     setConversationHistoryState({
       ...conversationHistoryState,
+      newestMessageId: messageId || conversationHistoryState.newestMessageId,
+      newestMessageTimestamp: messageTimestamp || conversationHistoryState.newestMessageTimestamp,
       loadedMessageCount: getConversationLoadedMessageCount() + 1,
     });
+    if (conversationHistoryState.hasMoreNewer) {
+      conversationFutureLoader.reset({
+        hasMore: conversationHistoryState.hasMoreNewer,
+        nextCursor: {
+          afterMessageId: messageId || getConversationFutureCursor() || null,
+          afterTimestamp: messageTimestamp || conversationHistoryState.newestMessageTimestamp || null,
+        },
+      });
+    }
   }
   return insertedNode;
 }
@@ -709,31 +800,56 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
   }
   const conversationId = String(meta.conversationId || currentConvId || '').trim();
   const pageInfo = meta.pageInfo && typeof meta.pageInfo === 'object' ? meta.pageInfo : null;
-  const hasMoreHistory = typeof meta.hasMoreHistory === 'boolean'
-    ? meta.hasMoreHistory
-    : !!pageInfo?.hasMore;
+  const hasMoreOlder = typeof meta.hasMoreOlder === 'boolean'
+    ? meta.hasMoreOlder
+    : (typeof meta.hasMoreHistory === 'boolean' ? meta.hasMoreHistory : !!pageInfo?.hasMoreOlder || !!pageInfo?.hasMore);
+  const hasMoreNewer = typeof meta.hasMoreNewer === 'boolean'
+    ? meta.hasMoreNewer
+    : !!pageInfo?.hasMoreNewer;
   const oldestMessageId = String(
     meta.historyCursor
+    || pageInfo?.olderCursor?.beforeMessageId
     || pageInfo?.nextCursor?.beforeMessageId
     || ordered[0]?.id
     || '',
   ).trim();
+  const oldestMessageTimestamp = String(
+    pageInfo?.olderCursor?.beforeTimestamp
+    || pageInfo?.nextCursor?.beforeTimestamp
+    || ordered[0]?.timestamp
+    || '',
+  ).trim();
   const newestMessageId = String(meta.historyNewestMessageId || ordered[ordered.length - 1]?.id || '').trim();
-  el.innerHTML = `<div id="pull-refresh-indicator" aria-hidden="true"><span>↻ Pull down to refresh</span></div>${hasMoreHistory ? buildHistoryLoadMoreMarkup(false) : ''}`;
+  const newestMessageTimestamp = String(
+    pageInfo?.newerCursor?.afterTimestamp
+    || ordered[ordered.length - 1]?.timestamp
+    || '',
+  ).trim();
+  el.innerHTML = `<div id="pull-refresh-indicator" aria-hidden="true"><span>↻ Pull down to refresh</span></div>${hasMoreOlder ? buildHistoryLoadMoreMarkup(false) : ''}`;
   setConversationHistoryState({
     conversationId,
-    hasMoreHistory,
+    hasMoreOlder,
+    hasMoreNewer,
     oldestMessageId,
-    oldestMessageTimestamp: String(pageInfo?.nextCursor?.beforeTimestamp || '').trim(),
+    oldestMessageTimestamp,
     newestMessageId,
+    newestMessageTimestamp,
     loadedMessageCount: ordered.length,
     loadingOlder: false,
+    loadingNewer: false,
   });
   conversationHistoryLoader.reset({
-    hasMore: hasMoreHistory,
-    nextCursor: hasMoreHistory ? (pageInfo?.nextCursor || {
+    hasMore: hasMoreOlder,
+    nextCursor: hasMoreOlder ? (pageInfo?.olderCursor || pageInfo?.nextCursor || {
       beforeMessageId: oldestMessageId || null,
       beforeTimestamp: null,
+    }) : null,
+  });
+  conversationFutureLoader.reset({
+    hasMore: hasMoreNewer,
+    nextCursor: hasMoreNewer ? (pageInfo?.newerCursor || {
+      afterMessageId: newestMessageId || null,
+      afterTimestamp: newestMessageTimestamp || null,
     }) : null,
   });
   for (const m of ordered) appendMessage(m, false, m.id || null, true, getMessageThreadAnchor(m, messageById), false);
@@ -744,11 +860,32 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
     const box = getMessagesElement();
     if (!box) return;
     void conversationHistoryLoader.handleBoundaryDistance(box.scrollTop);
+    const forwardDistance = Math.max(0, box.scrollHeight - box.clientHeight - box.scrollTop);
+    void conversationFutureLoader.handleBoundaryDistance(forwardDistance);
   });
 }
 
 export async function loadOlderConversationMessages() {
   await conversationHistoryLoader.loadMore();
+}
+
+export async function loadNewerConversationMessages() {
+  await conversationFutureLoader.loadMore();
+}
+
+export function focusConversationMessageById(messageId, { behavior = 'smooth', block = 'center' } = {}) {
+  const id = String(messageId || '').trim();
+  if (!id) return false;
+  const el = getMessagesElement();
+  if (!el) return false;
+  const target = el.querySelector(`[data-message-id="${id}"]`);
+  if (!target) return false;
+  target.scrollIntoView({ behavior, block, inline: 'nearest' });
+  target.classList.add('msg-search-target');
+  window.setTimeout(() => {
+    target.classList.remove('msg-search-target');
+  }, 2200);
+  return true;
 }
 
 export function compactCurrentConversation() {

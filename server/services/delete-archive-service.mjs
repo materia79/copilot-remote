@@ -33,8 +33,8 @@ export function createDeleteArchiveService(db, sdkClient) {
       WHERE c.id = ?
       LIMIT 1
     `),
-    markDeleted: db.prepare(`UPDATE conversations SET status = 'deleted', updated_at = datetime('now') WHERE id = ?`),
-    markArchived: db.prepare(`UPDATE conversations SET archived = 1, updated_at = datetime('now') WHERE id = ?`),
+    markDeleted: db.prepare(`UPDATE conversations SET status = 'deleted', updated_at = ? WHERE id = ?`),
+    markArchived: db.prepare(`UPDATE conversations SET archived = 1, updated_at = ? WHERE id = ?`),
     listDeletedWithSdkSession: db.prepare(`
       SELECT c.id, c.sdk_session_id
       FROM conversations c
@@ -83,7 +83,7 @@ export function createDeleteArchiveService(db, sdkClient) {
     if (!row) return { ok: true, alreadyDeleted: true };
     if (row.status === 'deleted') return { ok: true, alreadyDeleted: true, tombstoned: true };
 
-    stmts.markDeleted.run(id);
+    stmts.markDeleted.run(new Date().toISOString(), id);
 
     const sdkSessionId = String(row.sdk_session_id || '').trim();
 
@@ -110,7 +110,7 @@ export function createDeleteArchiveService(db, sdkClient) {
     if (!row) return { ok: true, alreadyDeleted: true };
     if (row.status === 'deleted') return { ok: true, alreadyDeleted: true, tombstoned: true };
 
-    stmts.markArchived.run(id);
+    stmts.markArchived.run(new Date().toISOString(), id);
     return { ok: true, archived: true };
   }
 

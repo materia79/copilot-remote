@@ -23,26 +23,23 @@ function toSafeNonNegativeInt(value, fallback = 0) {
   return Math.max(0, Math.trunc(numeric));
 }
 
-const HOST_SLEEP_SCRIPT_PATH = path.resolve(__dirname, '..', '..', 'bin', 'sleep.bat');
-
-function runHostSleepScript() {
+function runHostSuspendToRam() {
   if (process.platform !== 'win32') {
     return { ok: false, statusCode: 501, error: 'Host suspend is only supported on Windows' };
   }
-  if (!fs.existsSync(HOST_SLEEP_SCRIPT_PATH)) {
-    return { ok: false, statusCode: 500, error: `Missing suspend script: ${HOST_SLEEP_SCRIPT_PATH}` };
-  }
   try {
-    const child = spawn('cmd.exe', ['/c', HOST_SLEEP_SCRIPT_PATH], {
-      cwd: path.dirname(HOST_SLEEP_SCRIPT_PATH),
+    const child = spawn('rundll32.exe', ['powrprof.dll,SetSuspendState', '0,0,0'], {
       detached: true,
       stdio: 'ignore',
       windowsHide: true,
     });
     child.unref?.();
-    return { ok: true, scriptPath: HOST_SLEEP_SCRIPT_PATH };
+    return {
+      ok: true,
+      command: 'rundll32.exe powrprof.dll,SetSuspendState 0,0,0',
+    };
   } catch (error) {
-    return { ok: false, statusCode: 500, error: error?.message || 'Failed to launch host suspend script' };
+    return { ok: false, statusCode: 500, error: error?.message || 'Failed to launch host suspend command' };
   }
 }
 
@@ -548,8 +545,23 @@ function isLikelyCanonicalDuplicateMessage(a, b, timestampWindowMs = 30_000) {
 }
 
 function normalizeConversationTimestampMs(value) {
-  const parsed = Date.parse(String(value || '').trim());
+  const text = String(value || '').trim();
+  if (!text) return 0;
+  const sqliteUtcLike = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?)$/;
+  const hasExplicitTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(text);
+  let normalized = text;
+  if (!hasExplicitTimezone && sqliteUtcLike.test(text)) {
+    const [, day, time] = text.match(sqliteUtcLike) || [];
+    normalized = `${day}T${time}Z`;
+  }
+  const parsed = Date.parse(normalized);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function normalizeConversationTimestampIso(value, fallback = null) {
+  const ms = normalizeConversationTimestampMs(value);
+  if (!ms) return fallback;
+  return new Date(ms).toISOString();
 }
 
 function isTranscriptUserEchoOfQueuedMessage({
@@ -598,11 +610,11 @@ export function normalizeConversationHistoryLimit(value, fallback = 20) {
 }
 
 function resolveConversationHistoryCursor(messages = [], {
-  beforeMessageId = '',
-  beforeTimestamp = '',
+  messageId = '',
+  timestamp = '',
 } = {}) {
-  const cursorMessageId = String(beforeMessageId || '').trim();
-  const cursorTimestampText = String(beforeTimestamp || '').trim();
+  const cursorMessageId = String(messageId || '').trim();
+  const cursorTimestampText = String(timestamp || '').trim();
   const list = Array.isArray(messages) ? messages : [];
 
   if (cursorMessageId) {
@@ -631,33 +643,120 @@ export function selectConversationHistoryPage(messages = [], {
   limit = 20,
   beforeMessageId = '',
   beforeTimestamp = '',
+  afterMessageId = '',
+  afterTimestamp = '',
+  aroundMessageId = '',
 } = {}) {
   const pageLimit = normalizeConversationHistoryLimit(limit);
   const ordered = Array.isArray(messages)
     ? messages.filter((message) => !!message).slice().sort(compareConversationMessageOrder)
     : [];
-  const cursor = resolveConversationHistoryCursor(ordered, { beforeMessageId, beforeTimestamp });
-  const olderMessages = cursor
-    ? ordered.filter((message) => {
-        const messageTimestampMs = normalizeConversationTimestampMs(message?.timestamp);
-        if (messageTimestampMs < cursor.timestampMs) return true;
-        if (messageTimestampMs > cursor.timestampMs) return false;
-        if (!cursor.beforeMessageId) return false;
-        return String(message?.id || '').trim().localeCompare(cursor.beforeMessageId) < 0;
-      })
-    : ordered;
-  const pageMessages = olderMessages.slice(-pageLimit);
+  const aroundId = String(aroundMessageId || '').trim();
+  const requestedAroundWindow = !!aroundId;
+  const beforeCursor = resolveConversationHistoryCursor(ordered, { messageId: beforeMessageId, timestamp: beforeTimestamp });
+  const afterCursor = resolveConversationHistoryCursor(ordered, { messageId: afterMessageId, timestamp: afterTimestamp });
+
+  let pageMessages = [];
+  if (aroundId) {
+    const aroundIndex = ordered.findIndex((message) => String(message?.id || '').trim() === aroundId);
+    if (aroundIndex >= 0) {
+      const halfWindow = Math.floor((pageLimit - 1) / 2);
+      let start = Math.max(0, aroundIndex - halfWindow);
+      let end = Math.min(ordered.length, start + pageLimit);
+      if ((end - start) < pageLimit) {
+        start = Math.max(0, end - pageLimit);
+      }
+      pageMessages = ordered.slice(start, end);
+    }
+  }
+  // Treat any non-empty afterMessageId as an intentional "after" request even when the
+  // cursor message is not found in the current list (e.g. transcript-only session where
+  // the ID is absent).  Without this guard the fallback branch would silently return a
+  // stale tail page instead of an empty result.
+  const requestedAfterWindow = !!String(afterMessageId || '').trim();
+  if (!pageMessages.length && !requestedAroundWindow && afterCursor) {
+    const newerMessages = ordered.filter((message) => {
+      const messageTimestampMs = normalizeConversationTimestampMs(message?.timestamp);
+      if (messageTimestampMs > afterCursor.timestampMs) return true;
+      if (messageTimestampMs < afterCursor.timestampMs) return false;
+      if (!afterCursor.beforeMessageId) return false;
+      return String(message?.id || '').trim().localeCompare(afterCursor.beforeMessageId) > 0;
+    });
+    pageMessages = newerMessages.slice(0, pageLimit);
+  }
+  if (!pageMessages.length && !requestedAfterWindow && !requestedAroundWindow) {
+    const olderMessages = beforeCursor
+      ? ordered.filter((message) => {
+          const messageTimestampMs = normalizeConversationTimestampMs(message?.timestamp);
+          if (messageTimestampMs < beforeCursor.timestampMs) return true;
+          if (messageTimestampMs > beforeCursor.timestampMs) return false;
+          if (!beforeCursor.beforeMessageId) return false;
+          return String(message?.id || '').trim().localeCompare(beforeCursor.beforeMessageId) < 0;
+        })
+      : ordered;
+    pageMessages = olderMessages.slice(-pageLimit);
+  }
+
+  const firstMessage = pageMessages[0] || null;
+  const lastMessage = pageMessages[pageMessages.length - 1] || null;
+  let firstIdx = -1;
+  let lastIdx = -1;
+  if (firstMessage && lastMessage) {
+    firstIdx = ordered.findIndex((message) => String(message?.id || '').trim() === String(firstMessage.id || '').trim());
+    for (let idx = ordered.length - 1; idx >= 0; idx -= 1) {
+      if (String(ordered[idx]?.id || '').trim() === String(lastMessage.id || '').trim()) {
+        lastIdx = idx;
+        break;
+      }
+    }
+  }
+  const hasMoreOlder = firstIdx > 0;
+  const hasMoreNewer = lastIdx >= 0 && lastIdx < (ordered.length - 1);
   const oldestMessage = pageMessages[0] || null;
   return {
     messages: pageMessages,
     pageInfo: {
-      hasMore: olderMessages.length > pageMessages.length,
+      hasMore: hasMoreOlder,
+      hasMoreOlder,
+      hasMoreNewer,
       nextCursor: oldestMessage ? {
         beforeMessageId: String(oldestMessage.id || '').trim(),
         beforeTimestamp: String(oldestMessage.timestamp || '').trim() || null,
       } : null,
+      olderCursor: oldestMessage ? {
+        beforeMessageId: String(oldestMessage.id || '').trim(),
+        beforeTimestamp: String(oldestMessage.timestamp || '').trim() || null,
+      } : null,
+      newerCursor: lastMessage ? {
+        afterMessageId: String(lastMessage.id || '').trim(),
+        afterTimestamp: String(lastMessage.timestamp || '').trim() || null,
+      } : null,
     },
   };
+}
+
+export function normalizeMessageSearchLimit(value, fallback = 30) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return Math.min(100, Math.max(1, Math.trunc(Number(fallback) || 30)));
+  return Math.min(100, Math.max(1, Math.trunc(numeric)));
+}
+
+export function normalizeMessageSearchOffset(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return 0;
+  return Math.max(0, Math.trunc(numeric));
+}
+
+export function buildMessageSearchMatchQuery(rawQuery = '') {
+  const query = String(rawQuery || '').trim();
+  if (!query) return '';
+  const tokens = query
+    .split(/\s+/)
+    .map((part) => part.replace(/"/g, ' ').trim())
+    .filter(Boolean)
+    .slice(0, 12);
+  if (!tokens.length) return '';
+  return tokens.map((part) => `"${part}"*`).join(' AND ');
 }
 
 const DEFAULT_CONVERSATION_LIST_LIMIT = 40;
@@ -691,7 +790,10 @@ function resolveConversationListCursor(rows = [], {
     if (cursorRow) {
       return {
         beforeConversationId: cursorConversationId,
-        beforeUpdatedAt: String(cursorRow.updated_at || cursorRow.updatedAt || '').trim() || null,
+        beforeUpdatedAt: normalizeConversationTimestampIso(
+          cursorRow.updated_at || cursorRow.updatedAt,
+          String(cursorRow.updated_at || cursorRow.updatedAt || '').trim() || null,
+        ),
         timestampMs: normalizeConversationTimestampMs(cursorRow.updated_at || cursorRow.updatedAt),
       };
     }
@@ -735,7 +837,10 @@ export function selectConversationListPage(rows = [], {
       hasMore: olderRows.length > pageRows.length,
       nextCursor: oldestRow ? {
         beforeConversationId: String(oldestRow.id || '').trim(),
-        beforeUpdatedAt: String(oldestRow.updated_at || oldestRow.updatedAt || '').trim() || null,
+        beforeUpdatedAt: normalizeConversationTimestampIso(
+          oldestRow.updated_at || oldestRow.updatedAt,
+          String(oldestRow.updated_at || oldestRow.updatedAt || '').trim() || null,
+        ),
       } : null,
     },
   };
@@ -960,7 +1065,7 @@ export function registerSessionsRoutes(app, deps) {
   const SDK_DELETE_WAIT_TIMEOUT_MS = 12_000;
   const SDK_DELETE_POLL_MS = 200;
   const SDK_DELETE_STALE_PROCESSING_MS = 60_000;
-  const markConversationDeleted = db.prepare(`UPDATE conversations SET status = 'deleted', updated_at = datetime('now') WHERE id = ?`);
+  const markConversationDeleted = db.prepare(`UPDATE conversations SET status = 'deleted', updated_at = ? WHERE id = ?`);
   const listSessionWorkerQueueRows = db.prepare(`
     SELECT id, conversation_id, runtime_session_id, owner_sdk_session_id, status
     FROM queue
@@ -1130,8 +1235,8 @@ export function registerSessionsRoutes(app, deps) {
         runtimeWorkspaceRootName: workspaceState?.runtimeWorkspaceRootName || null,
         currentWorkspaceRootPath: workspaceState?.currentWorkspaceRootPath || null,
         currentWorkspaceRootName: workspaceState?.currentWorkspaceRootName || null,
-        createdAt:    r.created_at,
-        updatedAt:    r.updated_at,
+        createdAt:    normalizeConversationTimestampIso(r.created_at, r.created_at),
+        updatedAt:    normalizeConversationTimestampIso(r.updated_at, r.updated_at),
         messageCount: resolveMessageCount(r.sdk_session_id, r.message_count),
         preferredRelayMode: preferences.preferredRelayMode,
         preferredModelsByMode: preferences.preferredModelsByMode,
@@ -1160,7 +1265,7 @@ export function registerSessionsRoutes(app, deps) {
         if (knownBySdkSessionId.has(sdkSessionId) || knownById.has(sdkSessionId)) continue;
 
         const runtimeSession = stmts.getRuntimeSessionBySdkSessionId.get(sdkSessionId) || null;
-        const updatedAt = String(item?.updatedAt || '').trim() || new Date().toISOString();
+        const updatedAt = normalizeConversationTimestampIso(item?.updatedAt, null) || new Date().toISOString();
         const workspaceState = typeof resolveConversationWorkspaceState === 'function'
           ? resolveConversationWorkspaceState({
             conversationId: sdkSessionId,
@@ -1201,7 +1306,7 @@ export function registerSessionsRoutes(app, deps) {
       }
     }
 
-    conversations.sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
+    conversations.sort(compareConversationListOrder);
     const payload = {
       conversations,
       pageInfo: page.pageInfo,
@@ -1607,12 +1712,52 @@ export function registerSessionsRoutes(app, deps) {
     });
   });
 
+  // GET /api/search/messages — search text across all conversation messages
+  app.get('/api/search/messages', auth, (req, res) => {
+    const rawQuery = String(req.query.q || '').trim();
+    const limit = normalizeMessageSearchLimit(req.query.limit, 30);
+    const offset = normalizeMessageSearchOffset(req.query.offset);
+    if (!rawQuery || rawQuery.length < 2) {
+      return res.status(400).json({ error: 'Search query must be at least 2 characters' });
+    }
+    const matchQuery = buildMessageSearchMatchQuery(rawQuery);
+    if (!matchQuery) {
+      return res.status(400).json({ error: 'Search query is empty' });
+    }
+    const total = Number(stmts.searchMessagesCount.get(matchQuery)?.cnt || 0);
+    const rows = stmts.searchMessagesPage.all(matchQuery, limit, offset);
+    const results = rows.map((row) => ({
+      conversationId: String(row?.conversation_id || '').trim(),
+      conversationTitle: String(row?.conversation_title || '').trim() || 'Conversation',
+      messageId: String(row?.message_id || '').trim(),
+      role: String(row?.role || '').trim(),
+      timestamp: String(row?.timestamp || '').trim() || null,
+      score: Number.isFinite(Number(row?.score)) ? Number(row.score) : null,
+      snippet: String(row?.snippet || '').trim() || String(row?.raw_text || '').trim().slice(0, 240),
+    })).filter((item) => item.conversationId && item.messageId);
+    const hasMore = (offset + results.length) < total;
+    return res.json({
+      query: rawQuery,
+      results,
+      pageInfo: {
+        limit,
+        offset,
+        total,
+        hasMore,
+        nextOffset: hasMore ? (offset + results.length) : null,
+      },
+    });
+  });
+
   // GET /api/conversation/:id — get paginated conversation history
   app.get('/api/conversation/:id', auth, (req, res) => {
     const requestedId = String(req.params.id || '').trim();
     const limit = normalizeConversationHistoryLimit(req.query.limit, 20);
     const beforeMessageId = String(req.query.beforeMessageId || '').trim();
     const beforeTimestamp = String(req.query.beforeTimestamp || '').trim();
+    const afterMessageId = String(req.query.afterMessageId || '').trim();
+    const afterTimestamp = String(req.query.afterTimestamp || '').trim();
+    const aroundMessageId = String(req.query.aroundMessageId || '').trim();
     if (stmts.getDeletedSdkSession.get(requestedId)) {
       return res.status(404).json({ error: 'Conversation not found' });
     }
@@ -1630,7 +1775,7 @@ export function registerSessionsRoutes(app, deps) {
           dbMessages: [],
           transcriptMessages,
         }),
-        { limit, beforeMessageId, beforeTimestamp },
+        { limit, beforeMessageId, beforeTimestamp, afterMessageId, afterTimestamp, aroundMessageId },
       );
       const sessionRoot = buildConversationSessionRootPayload({
         conversationId: requestedId,
@@ -1744,7 +1889,14 @@ export function registerSessionsRoutes(app, deps) {
       const sourceMessageId = responseMessageToSourceId.get(String(message.id || '').trim()) || message.sourceMessageId || undefined;
       return sourceMessageId ? { ...message, sourceMessageId } : message;
     });
-    const history = selectConversationHistoryPage(messages, { limit, beforeMessageId, beforeTimestamp });
+    const history = selectConversationHistoryPage(messages, {
+      limit,
+      beforeMessageId,
+      beforeTimestamp,
+      afterMessageId,
+      afterTimestamp,
+      aroundMessageId,
+    });
     res.json({
       id: conv.id,
       sdkSessionId: conv.sdk_session_id || null,
@@ -1945,7 +2097,7 @@ export function registerSessionsRoutes(app, deps) {
         return res.json({ ok: true });
       }
 
-      markConversationDeleted.run(id);
+      markConversationDeleted.run(new Date().toISOString(), id);
       stmts.markDeletedSdkSession.run(sdkSessionId, new Date().toISOString());
       if (sdkSessionId !== id) {
         // Also tombstone the conversation id itself for legacy/synthetic sdk id fallback paths.
@@ -1972,7 +2124,7 @@ export function registerSessionsRoutes(app, deps) {
       if (!existing || String(existing.status || '').trim() === 'deleted') {
         return res.json({ ok: true, alreadyDeleted: true });
       }
-      db.prepare(`UPDATE conversations SET archived = 1, updated_at = datetime('now') WHERE id = ?`).run(id);
+      db.prepare(`UPDATE conversations SET archived = 1, updated_at = ? WHERE id = ?`).run(new Date().toISOString(), id);
       io.emit('conversation_archived', { conversationId: id });
       return res.json({ ok: true });
     } catch (error) {
@@ -2026,6 +2178,7 @@ export function registerSessionsRoutes(app, deps) {
         reconnectAttempts: runtimeState.tunnelState?.reconnectAttempts ?? 0,
         connectedSince: runtimeState.tunnelState?.connectedSince ?? null,
       },
+      workerWebSocket: runtimeState.workerWebSocketStatus || null,
       activeBridgeOwner: runtimeState.activeBridgeOwner || null,
       restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
       relayShutdown: runtimeState.relayShutdown || null,
@@ -2079,7 +2232,7 @@ export function registerSessionsRoutes(app, deps) {
   });
 
   app.post('/api/host/suspend', auth, (req, res) => {
-    const result = runHostSleepScript();
+    const result = runHostSuspendToRam();
     if (!result?.ok) {
       return res.status(result?.statusCode || 500).json({
         ok: false,
@@ -2089,7 +2242,7 @@ export function registerSessionsRoutes(app, deps) {
     return res.status(202).json({
       ok: true,
       queued: true,
-      scriptPath: result.scriptPath,
+      command: result.command,
     });
   });
 

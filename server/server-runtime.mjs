@@ -3,6 +3,7 @@
 import express from 'express';
 import http from 'http';
 import { Server } from 'socket.io';
+import { WebSocketServer } from 'ws';
 import { v4 as uuidv4 } from 'uuid';
 import fs from 'fs';
 import path from 'path';
@@ -37,6 +38,7 @@ import { createSessionWorkerRegistry } from './services/session-worker-registry-
 import { createSessionWorkerSupervisor } from './services/session-worker-supervisor-service.mjs';
 import { createSessionWorkerProcessInspector } from './services/session-worker-process-service.mjs';
 import { launchSessionCli } from './services/session-worker-launch-service.mjs';
+import { createSessionWorkerWebSocketService } from './services/session-worker-websocket-service.mjs';
 import { FEATURES, normalizeFeatureFlags } from './features.mjs';
 import { RELAY_RESTART_EXIT_CODE } from './relay-exit-codes.mjs';
 import { DEFAULT_QUESTION_TIMEOUT_MS } from '../shared/question-timeout.mjs';
@@ -939,6 +941,43 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_upload_refs_sha ON upload_refs(file_sha256);
 `);
 
+db.exec(`
+  CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
+  USING fts5(text, content='messages', content_rowid='rowid');
+
+  CREATE TRIGGER IF NOT EXISTS messages_fts_after_insert
+  AFTER INSERT ON messages
+  BEGIN
+    INSERT INTO messages_fts(rowid, text)
+    VALUES (new.rowid, new.text);
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS messages_fts_after_delete
+  AFTER DELETE ON messages
+  BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, text)
+    VALUES ('delete', old.rowid, old.text);
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS messages_fts_after_update
+  AFTER UPDATE OF text ON messages
+  BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, text)
+    VALUES ('delete', old.rowid, old.text);
+    INSERT INTO messages_fts(rowid, text)
+    VALUES (new.rowid, new.text);
+  END;
+`);
+// Only rebuild the FTS index if the virtual table is empty (first migration or new DB).
+// A full rebuild is O(N) in message count and blocks the sync event loop, so we skip it
+// when existing trigger-maintained rows are already present.
+{
+  const ftsRowCount = db.prepare(`SELECT COUNT(*) AS cnt FROM messages_fts`).get()?.cnt || 0;
+  if (ftsRowCount === 0) {
+    db.exec(`INSERT INTO messages_fts(messages_fts) VALUES ('rebuild')`);
+  }
+}
+
 // Backfill schema for pre-model databases.
 const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all().map((c) => c.name);
 if (!messageColumns.includes('attachments')) {
@@ -1018,10 +1057,10 @@ if (runtimeSessionColumns.length) {
     db.exec(`ALTER TABLE runtime_sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`);
   }
   if (!runtimeSessionColumns.includes('created_at')) {
-    db.exec(`ALTER TABLE runtime_sessions ADD COLUMN created_at TEXT NOT NULL DEFAULT (datetime('now'))`);
+    db.exec(`ALTER TABLE runtime_sessions ADD COLUMN created_at TEXT NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now'))`);
   }
   if (!runtimeSessionColumns.includes('last_used_at')) {
-    db.exec(`ALTER TABLE runtime_sessions ADD COLUMN last_used_at TEXT NOT NULL DEFAULT (datetime('now'))`);
+    db.exec(`ALTER TABLE runtime_sessions ADD COLUMN last_used_at TEXT NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now'))`);
   }
 }
 
@@ -2793,6 +2832,16 @@ const readContextFromSessionEvents = contextSnapshotService.readContextFromSessi
 const app        = express();
 const httpServer = http.createServer(app);
 const io         = new Server(httpServer, { cors: { origin: '*' } });
+const sessionWorkerWebSocketService = createSessionWorkerWebSocketService({
+  WebSocketServerImpl: WebSocketServer,
+  httpServer,
+  authToken: config.authToken,
+  queueCounts,
+  touchCli,
+  pathPrefix: remotePath,
+  pollIntervalMs: 1000,
+  logger: console,
+});
 
 app.use(express.json({ limit: '20mb' }));
 app.get(['/', '/index.html'], (req, res, next) => {
@@ -2819,6 +2868,7 @@ const runtimeState = {
   set relayPaused(value) { relayPaused = value; },
   get relayShutdown() { return getRelayShutdownState(); },
   get activeBridgeOwner() { return relayBridgeOwnerService.getOwner(); },
+  get workerWebSocketStatus() { return sessionWorkerWebSocketService.status(); },
   get featureFlags() { return featureFlags; },
   get sessionWorkerSupervisor() { return sessionWorkerSupervisor; },
 };
@@ -3204,6 +3254,7 @@ function touchCli() {
     io.emit('cli_status', { online: true });
   }
 }
+sessionWorkerWebSocketService.start();
 
 // POST /api/heartbeat — CLI sends a ping every poll interval
 
@@ -3356,22 +3407,49 @@ function spawnSshTunnel() {
   tunnelState.proc = proc;
 
   const connectedAt = Date.now();
-
-  proc.stdout.on('data', (d) => tunnelLog(`stdout: ${d.toString().trim()}`));
-  proc.stderr.on('data', (d) => tunnelLog(`stderr: ${d.toString().trim()}`));
-
-  proc.on('spawn', () => {
+  let readinessTimer = null;
+  let forwardingFailed = false;
+  const markConnected = () => {
+    if (tunnelState.connected) return;
     tunnelState.connected = true;
     tunnelState.connectedSince = new Date().toISOString();
     tunnelLog(`Tunnel up to ${user}@${host} remote port ${remotePort}`);
     io.emit('ssh_tunnel_status', { connected: true, host, remotePort });
+  };
+  const clearReadinessTimer = () => {
+    if (!readinessTimer) return;
+    clearTimeout(readinessTimer);
+    readinessTimer = null;
+  };
+
+  proc.stdout.on('data', (d) => tunnelLog(`stdout: ${d.toString().trim()}`));
+  proc.stderr.on('data', (d) => {
+    const text = d.toString().trim();
+    tunnelLog(`stderr: ${text}`);
+    if (/remote port forwarding failed for listen port/i.test(text)) {
+      forwardingFailed = true;
+    }
+  });
+
+  proc.on('spawn', () => {
+    clearReadinessTimer();
+    readinessTimer = setTimeout(() => {
+      readinessTimer = null;
+      if (runtimeShutdownStarted || forwardingFailed) return;
+      if (tunnelState.proc !== proc) return;
+      if (proc.exitCode !== null) return;
+      markConnected();
+    }, 1200);
+    if (typeof readinessTimer.unref === 'function') readinessTimer.unref();
   });
 
   proc.on('error', (e) => {
+    clearReadinessTimer();
     tunnelLog(`Error: ${e.message}`);
   });
 
   proc.on('close', (code) => {
+    clearReadinessTimer();
     const wasConnected = tunnelState.connected;
     tunnelState.connected = false;
     tunnelState.connectedSince = null;
@@ -3425,6 +3503,7 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
   runtimeShutdownStarted = true;
   console.log(`[${ts()}] Runtime shutdown started (${reason}, exitCode=${runtimeShutdownExitCode})`);
   clearRuntimeTimers();
+  sessionWorkerWebSocketService.stop();
   stopWorkspaceFileWatcher();
   stopSshTunnel();
   try { relaySingletonGuard.release(); } catch (error) {

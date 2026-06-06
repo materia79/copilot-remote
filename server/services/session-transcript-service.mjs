@@ -70,6 +70,62 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
     return String(match[1] || '').trim();
   }
 
+  function stripSystemReminderBlocks(text) {
+    const value = String(text || '');
+    if (!value) return '';
+    return value
+      .replace(/<system_reminder>[\s\S]*?<\/system_reminder>/gi, ' ')
+      .replace(/<current_datetime>[\s\S]*?<\/current_datetime>/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function collectEventTextSegments(value, out = [], { omitSystemReminders = false } = {}) {
+    if (value === null || value === undefined) return out;
+    if (typeof value === 'string') {
+      const text = value.trim();
+      if (text) out.push(text);
+      return out;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) collectEventTextSegments(item, out, { omitSystemReminders });
+      return out;
+    }
+    if (typeof value !== 'object') return out;
+
+    const type = String(value?.type || value?.kind || '').trim().toLowerCase();
+    if (
+      omitSystemReminders
+      && ['system_reminder', 'system-reminder', 'system', 'system_message', 'system-message'].includes(type)
+    ) {
+      return out;
+    }
+
+    collectEventTextSegments(value.text, out, { omitSystemReminders });
+    collectEventTextSegments(value.content, out, { omitSystemReminders });
+    collectEventTextSegments(value.input_text, out, { omitSystemReminders });
+    collectEventTextSegments(value.inputText, out, { omitSystemReminders });
+    collectEventTextSegments(value.output_text, out, { omitSystemReminders });
+    collectEventTextSegments(value.outputText, out, { omitSystemReminders });
+    collectEventTextSegments(value.message, out, { omitSystemReminders });
+    collectEventTextSegments(value.summary, out, { omitSystemReminders });
+    collectEventTextSegments(value.result, out, { omitSystemReminders });
+    collectEventTextSegments(value.response, out, { omitSystemReminders });
+    collectEventTextSegments(value.output, out, { omitSystemReminders });
+    collectEventTextSegments(value.answer, out, { omitSystemReminders });
+    return out;
+  }
+
+  function normalizeEventContentText(value, { omitSystemReminders = false } = {}) {
+    const segments = collectEventTextSegments(value, [], { omitSystemReminders });
+    if (!segments.length) {
+      const fallback = String(value || '').trim();
+      return omitSystemReminders ? stripSystemReminderBlocks(fallback) : fallback;
+    }
+    const joined = segments.join('\n').trim();
+    return omitSystemReminders ? stripSystemReminderBlocks(joined) : joined;
+  }
+
   function summarizeToolDetail(toolName, args, result) {
     const name = String(toolName || '').trim();
     if (!name) return '';
@@ -81,6 +137,7 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
         const target = parseApplyPatchTarget(args);
         if (target) return target;
       }
+
       const content = String(r?.content || '').trim();
       const modified = content.match(/Modified\s+\d+\s+file\(s\):\s+(.+)$/m);
       if (modified) return String(modified[1] || '').trim();
@@ -176,7 +233,7 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
       }
 
       if (event.type === 'user.message') {
-        const text = String(data.content || '').trim();
+        const text = normalizeEventContentText(data.content, { omitSystemReminders: true });
         if (!text) continue;
         messages.push({
           id: String(event?.id || data?.interactionId || `user-${messages.length + 1}`),
@@ -188,7 +245,7 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
       }
 
       if (event.type === 'assistant.message') {
-        const text = String(data.content || '').trim();
+        const text = normalizeEventContentText(data.content);
         if (!text) continue;
         const toolRequests = Array.isArray(data.toolRequests) ? data.toolRequests : [];
         const turnId = String(data.turnId || '').trim();
