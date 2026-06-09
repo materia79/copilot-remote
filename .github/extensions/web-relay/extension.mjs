@@ -26,6 +26,7 @@ import {
 import { buildPromptWithMode } from "./skills/prompt-context.mjs";
 import { createQuestionBridge } from "./skills/question-bridge.mjs";
 import { createQuestionRoutingHooks } from "./skills/question-routing-hooks.mjs";
+import { createReasoningStreamHandlers } from "./skills/reasoning-stream.mjs";
 import { createHeartbeatController } from "./polling/heartbeat.mjs";
 import { createPollingLoop } from "./polling/polling-loop.mjs";
 import { createManagedServerLifecycle } from "./server-lifecycle/managed-server.mjs";
@@ -172,6 +173,7 @@ let startupVerificationTimer = null;
 let restartControlGraceUntilMs = 0;
 let deferredSessionEnd = false;
 let workerWebSocketLink = null;
+let reasoningStreamUnsubscribe = null;
 
 function getCurrentConversationId() {
   const conversationId = String(activeMsg?.conversationId || "").trim();
@@ -543,6 +545,7 @@ async function startPolling() {
           ensureRelayScopeState(activeRelayScopeKey);
         } else {
           activeRelayScopeKey = null;
+          reasoningStreamHandlers.reset();
           flushDeferredSessionEnd();
         }
       },
@@ -603,6 +606,13 @@ const questionRoutingHooks = createQuestionRoutingHooks({
   },
 });
 
+const reasoningStreamHandlers = createReasoningStreamHandlers({
+  api,
+  dbg,
+  getRelayTurnActive: () => relayTurnActive,
+  getActiveMessage: () => activeMsg,
+});
+
 async function requeueActiveMessage(reason) {
   if (!waitingForAI || !activeMsg?.id) return false;
   const messageId = activeMsg.id;
@@ -631,6 +641,12 @@ async function gracefulShutdown(reason) {
   }
   pollingLoopController?.stopPolling?.();
   stopHeartbeat();
+  try {
+    reasoningStreamUnsubscribe?.();
+  } catch (e) {
+    dbg("reasoning-stream unsubscribe failed:", e?.message || String(e));
+  }
+  reasoningStreamUnsubscribe = null;
   workerWebSocketLink?.stop?.();
   workerWebSocketLink = null;
   sessionReady = false;
@@ -818,6 +834,9 @@ session = await joinSessionWithRetry({
   retries: 5,
   retryDelayMs: 1500,
   joinOptions: {
+  // Enable streaming so assistant.reasoning_delta and assistant.message_delta are emitted.
+  // (The complete assistant.reasoning event fires regardless; this flag only adds deltas.)
+  streaming: true,
   // onUserInputRequest must be a TOP-LEVEL property (not inside hooks) so the SDK calls
   // session.registerUserInputHandler() and sends requestUserInput: true to the CLI runtime.
   // When inside hooks it is silently ignored, causing the CLI to show its own terminal prompt.
@@ -859,6 +878,11 @@ session = await joinSessionWithRetry({
 refreshSessionRegistry();
 dbg("copilot session id:", session?.sessionId || "(none)");
 dbg("joinSession resolved");
+try {
+  reasoningStreamUnsubscribe = reasoningStreamHandlers.attach(session);
+} catch (e) {
+  dbg("reasoning-stream attach failed:", e?.message || String(e));
+}
 setTimeout(() => {
   ensureRelayActive("post-join-fallback").catch((e) => {
     dbg("post-join fallback activation failed:", e?.message || String(e));

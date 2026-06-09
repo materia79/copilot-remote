@@ -11,7 +11,6 @@ import {
 import {
   persistConversationModeModelPreference as persistConversationModeModelPreferenceTx,
 } from '../services/conversation-preferences-service.mjs';
-import { postRelayDebugLog } from '../../debugging/relay-debug-log.mjs';
 import { killTmuxSession } from '../services/session-worker-launch-service.mjs';
 
 export const SESSION_WORKER_OWNER_LEASE_MS = 120_000;
@@ -556,6 +555,29 @@ export function shouldAutoPrimeStrandedSession({
   return true;
 }
 
+export function shouldTakeOverStrandedPendingMessage({
+  strandedRow = null,
+  requesterSessionId = null,
+  primeResult = null,
+  strandedLifecycle = null,
+  nowMs = Date.now(),
+  heartbeatFreshWindowMs = STRANDED_SESSION_HEARTBEAT_FRESH_MS,
+} = {}) {
+  if (!shouldAutoPrimeStrandedSession({ strandedRow, requesterSessionId })) return false;
+  const lifecycle = (primeResult && typeof primeResult.lifecycle === 'object')
+    ? primeResult.lifecycle
+    : (strandedLifecycle && typeof strandedLifecycle === 'object' ? strandedLifecycle : null);
+  if (!lifecycle) return false;
+  const awaitingHeartbeat = lifecycle.awaitingHeartbeat === true;
+  const degradedReason = String(lifecycle.degradedReason || '').trim().toLowerCase();
+  const heartbeatAtMs = Date.parse(String(lifecycle.lastHeartbeatAt || '').trim());
+  const heartbeatWindowMs = Math.max(1_000, Number(heartbeatFreshWindowMs) || STRANDED_SESSION_HEARTBEAT_FRESH_MS);
+  const heartbeatFresh = Number.isFinite(heartbeatAtMs) && (nowMs - heartbeatAtMs) < heartbeatWindowMs;
+  if (heartbeatFresh) return false;
+  if (awaitingHeartbeat) return true;
+  return degradedReason === 'startup-heartbeat-timeout' || degradedReason === 'stale-pid';
+}
+
 export function dequeuePendingMessage({
   db,
   stmts,
@@ -677,21 +699,6 @@ export async function dequeuePendingMessageForWorkerLoop({
         blockedReason: String(ensureResult?.error || 'worker-unavailable').trim() || 'worker-unavailable',
         queue: null,
       });
-      // #region agent log
-      postRelayDebugLog({
-        runId: 'baseline-1',
-        hypothesisId: 'H1',
-        location: 'server/routes/messages-routes.mjs:worker.ensure.blocked',
-        message: 'dequeue blocked by ensureWorker',
-        data: {
-          requesterSessionId: requesterSid,
-          blockedReason: String(ensureResult?.error || 'worker-unavailable').trim() || 'worker-unavailable',
-          retryCount: Number(ensureResult?.lifecycle?.retryCount || 0),
-          workerStatus: String(ensureResult?.worker?.status || ''),
-          workerPid: Number(ensureResult?.worker?.pid || 0) || null,
-        },
-      });
-      // #endregion
       return {
         message: null,
         blockedReason: String(ensureResult?.error || 'worker-unavailable').trim() || 'worker-unavailable',
@@ -734,25 +741,6 @@ export async function dequeuePendingMessageForWorkerLoop({
         const queueWaitMs = Number.isFinite(dequeuedAtMs) && Number.isFinite(queuedAtMs)
           ? Math.max(0, dequeuedAtMs - queuedAtMs)
           : null;
-        // #region agent log
-        postRelayDebugLog({
-          runId: 'slow-turn-baseline',
-          hypothesisId: 'H6-queue-wait',
-          location: 'server/routes/messages-routes.mjs:queue.dequeue.success',
-          message: 'message dequeued for worker loop',
-          data: {
-            requesterSessionId: requesterSid,
-            queueMessageId: String(message?.id || ''),
-            queueConversationId: String(message?.conversation_id || ''),
-            ownerSessionId: String(message?.owner_sdk_session_id || ''),
-            status: String(message?.status || ''),
-            attempt,
-            queueWaitMs,
-            queuedAt: String(message?.timestamp || ''),
-            dequeuedAt: currentIso,
-          },
-        });
-        // #endregion
       }
       return {
         message,
@@ -776,20 +764,6 @@ export async function dequeuePendingMessageForWorkerLoop({
         queue: null,
         error: String(error?.message || error || 'dequeue-failed'),
       });
-      // #region agent log
-      postRelayDebugLog({
-        runId: 'baseline-1',
-        hypothesisId: 'H1',
-        location: 'server/routes/messages-routes.mjs:queue.dequeue.catch',
-        message: transient && attempt < retryLimit ? 'transient dequeue retry' : 'dequeue error',
-        data: {
-          requesterSessionId: requesterSid,
-          attempt: attempt + 1,
-          transient,
-          error: String(error?.message || error || 'dequeue-failed'),
-        },
-      });
-      // #endregion
       if (!routingWithWorker || !transient || attempt >= retryLimit) {
         if (routingWithWorker && typeof supervisor?.markError === 'function') {
           supervisor.markError(requesterSid, error);
@@ -930,6 +904,8 @@ export function registerMessagesRoutes(app, deps) {
     hydrateAttachment,
     relayActivityForResponse,
     relayActivityForQueueMessage,
+    relayThoughtsForResponse,
+    relayThoughtsForQueueMessage,
     sanitizeActivityText,
     readSessionTranscriptMessages,
     inFlightStateForConversation,
@@ -1202,15 +1178,32 @@ export function registerMessagesRoutes(app, deps) {
   const strandedPrimeCooldownBySession = new Map();
 
   const findPendingOwnedByOtherSession = db.prepare(`
-    SELECT id, conversation_id, owner_sdk_session_id, retry_count
-    FROM queue
-    WHERE status = 'pending'
-      AND owner_sdk_session_id IS NOT NULL
-      AND owner_sdk_session_id != ''
-      AND owner_sdk_session_id != ?
-      AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-    ORDER BY retry_count ASC, CASE WHEN next_attempt_at IS NULL THEN 0 ELSE 1 END ASC, COALESCE(next_attempt_at, timestamp) ASC, timestamp ASC
+    SELECT q.id, q.conversation_id, q.runtime_session_id, q.owner_sdk_session_id, q.retry_count
+    FROM queue q
+    WHERE q.status = 'pending'
+      AND q.owner_sdk_session_id IS NOT NULL
+      AND q.owner_sdk_session_id != ''
+      AND q.owner_sdk_session_id != ?
+      AND q.runtime_session_id IS NOT NULL
+      AND EXISTS (
+        SELECT 1
+        FROM runtime_sessions rs
+        WHERE rs.id = q.runtime_session_id
+          AND rs.sdk_session_id = ?
+      )
+      AND (q.next_attempt_at IS NULL OR q.next_attempt_at <= ?)
+    ORDER BY q.retry_count ASC, CASE WHEN q.next_attempt_at IS NULL THEN 0 ELSE 1 END ASC, COALESCE(q.next_attempt_at, q.timestamp) ASC, q.timestamp ASC
     LIMIT 1
+  `);
+  const transferPendingOwnerToSession = db.prepare(`
+    UPDATE queue
+    SET owner_sdk_session_id = ?,
+        owner_assigned_at = ?,
+        owner_lease_expires_at = NULL,
+        owner_last_claimed_at = NULL
+    WHERE id = ?
+      AND status = 'pending'
+      AND owner_sdk_session_id = ?
   `);
   const findActiveOwnedBySession = db.prepare(`
     SELECT *
@@ -2202,65 +2195,14 @@ export function registerMessagesRoutes(app, deps) {
 
     if (!shouldCreateConversation) {
       const sessionState = getConversationSessionState(conversationId);
-      // #region agent log
-      postRelayDebugLog({
-        runId: 'baseline-binding',
-        hypothesisId: 'H3-server-guard',
-        location: 'server/routes/messages-routes.mjs:api.message.session-state',
-        message: 'api/message existing conversation session state',
-        data: {
-          conversationId,
-          requesterSessionId: requesterSessionId || null,
-          conversationSdkSessionId: sessionState?.conversationSdkSessionId || null,
-          runtimeSessionSdkSessionId: sessionState?.runtimeSessionSdkSessionId || null,
-          runtimeSessionId: sessionState?.runtimeSession?.id || null,
-          runtimeSessionBySdkSessionId: sessionState?.runtimeSessionBySdkSessionId?.id || null,
-          runtimeSessionBySdkSdkSessionId: sessionState?.runtimeSessionBySdkSessionId?.sdk_session_id || null,
-        },
-      });
-      // #endregion
       if (!sessionState.ok) {
         return rejectSessionBinding(res, sessionState.status, sessionState.error);
       }
       conversationSdkSessionId = sessionState.conversationSdkSessionId || null;
       if (!sessionState.conversationSdkSessionId || !sessionState.runtimeSessionSdkSessionId) {
-        // #region agent log
-        postRelayDebugLog({
-          runId: 'baseline-binding',
-          hypothesisId: 'H4-server-missing-runtime',
-          location: 'server/routes/messages-routes.mjs:api.message.reject.not-bound',
-          message: 'api/message rejected because session binding is incomplete',
-          data: {
-            conversationId,
-            requesterSessionId: requesterSessionId || null,
-            conversationSdkSessionId: sessionState.conversationSdkSessionId || null,
-            runtimeSessionSdkSessionId: sessionState.runtimeSessionSdkSessionId || null,
-            runtimeSessionId: sessionState.runtimeSession?.id || null,
-            runtimeSessionBySdkSessionId: sessionState.runtimeSessionBySdkSessionId?.id || null,
-            runtimeSessionBySdkSdkSessionId: sessionState.runtimeSessionBySdkSessionId?.sdk_session_id || null,
-          },
-        });
-        // #endregion
         return rejectSessionBinding(res, 409, 'Conversation is not session-bound yet');
       }
       if (sessionState.conversationSdkSessionId !== sessionState.runtimeSessionSdkSessionId) {
-        // #region agent log
-        postRelayDebugLog({
-          runId: 'baseline-binding',
-          hypothesisId: 'H5-server-mismatch',
-          location: 'server/routes/messages-routes.mjs:api.message.reject.mismatch',
-          message: 'api/message rejected because bound and runtime sdk sessions differ',
-          data: {
-            conversationId,
-            requesterSessionId: requesterSessionId || null,
-            conversationSdkSessionId: sessionState.conversationSdkSessionId || null,
-            runtimeSessionSdkSessionId: sessionState.runtimeSessionSdkSessionId || null,
-            runtimeSessionId: sessionState.runtimeSession?.id || null,
-            runtimeSessionBySdkSessionId: sessionState.runtimeSessionBySdkSessionId?.id || null,
-            runtimeSessionBySdkSdkSessionId: sessionState.runtimeSessionBySdkSessionId?.sdk_session_id || null,
-          },
-        });
-        // #endregion
         return rejectSessionBinding(res, 409, 'Conversation session binding mismatch');
       }
     }
@@ -2374,25 +2316,6 @@ export function registerMessagesRoutes(app, deps) {
       null,
       null,
     );
-    // #region agent log
-    postRelayDebugLog({
-      runId: 'slow-turn-baseline',
-      hypothesisId: 'H6-queue-wait',
-      location: 'server/routes/messages-routes.mjs:api.message.enqueued',
-      message: 'message enqueued for relay processing',
-      data: {
-        queueMessageId: msgId,
-        conversationId: convId,
-        requesterSessionId: requesterSessionId || null,
-        ownerSessionId: ownerSessionId || null,
-        runtimeSessionId: runtimeSession?.id || null,
-        relayMode: requestedRelayMode,
-        model: requestedModel,
-        seededCarryOver: shouldApplySeed,
-        queuedTextChars: String(queueText || '').length,
-      },
-    });
-    // #endregion
     if (ownerSessionId) {
       const existingWorker = sessionWorkerRegistry?.getWorker?.(ownerSessionId) || null;
       sessionWorkerRegistry?.upsertWorker?.({
@@ -2666,9 +2589,9 @@ export function registerMessagesRoutes(app, deps) {
         releasedCount: releasedRows.length,
       });
     }
-    const msg = dequeueResult?.message || null;
-    const dequeueBlockedReason = String(dequeueResult?.blockedReason || '').trim() || null;
-    const fallbackRestart = dequeueResult?.fallbackRestart || null;
+    let msg = dequeueResult?.message || null;
+    let dequeueBlockedReason = String(dequeueResult?.blockedReason || '').trim() || null;
+    let fallbackRestart = dequeueResult?.fallbackRestart || null;
     let primedSessionId = null;
     if (!msg && sessionWorkerRoutingEnabled && requesterSessionId && dequeueBlockedReason) {
       const blockedTerminalFailure = resolveBlockedWorkerTerminalFailure({
@@ -2730,8 +2653,15 @@ export function registerMessagesRoutes(app, deps) {
       });
     }
     if (!msg && sessionWorkerRoutingEnabled && requesterSessionId && !dequeueBlockedReason) {
-      const strandedOwner = findPendingOwnedByOtherSession.get(requesterSessionId, now);
+      const strandedOwner = findPendingOwnedByOtherSession.get(requesterSessionId, requesterSessionId, now);
       const strandedSessionId = normalizeSessionWorkerId(strandedOwner?.owner_sdk_session_id);
+      const strandedRuntimeSession = strandedOwner?.runtime_session_id
+        ? stmts.getRuntimeSessionById.get(strandedOwner.runtime_session_id)
+        : null;
+      const strandedExpectedOwnerSessionId = normalizeSessionWorkerId(strandedRuntimeSession?.sdk_session_id);
+      const requesterMatchesRuntimeBinding = !!requesterSessionId
+        && !!strandedExpectedOwnerSessionId
+        && requesterSessionId === strandedExpectedOwnerSessionId;
       const strandedWorker = strandedSessionId
         ? (sessionWorkerRegistry?.getWorker?.(strandedSessionId) || sessionWorkerSupervisor?.getWorkerState?.(strandedSessionId) || null)
         : null;
@@ -2749,6 +2679,9 @@ export function registerMessagesRoutes(app, deps) {
         || strandedStatus === 'starting'
         || (strandedStatus === 'ready' && heartbeatFresh);
       if (
+        requesterMatchesRuntimeBinding
+        && !!strandedExpectedOwnerSessionId
+        && 
         shouldAutoPrimeStrandedSession({
           strandedRow: strandedOwner,
           requesterSessionId,
@@ -2759,6 +2692,14 @@ export function registerMessagesRoutes(app, deps) {
         strandedPrimeCooldownBySession.set(strandedSessionId, nowMs);
         try {
           const primeResult = await sessionWorkerSupervisor.ensureWorker(strandedSessionId);
+          const shouldTakeOver = shouldTakeOverStrandedPendingMessage({
+            strandedRow: strandedOwner,
+            requesterSessionId,
+            primeResult,
+            strandedLifecycle,
+            nowMs,
+            heartbeatFreshWindowMs: STRANDED_SESSION_HEARTBEAT_FRESH_MS,
+          });
           const primedTerminalFailure = resolvePrimedWorkerTerminalFailure({
             sessionId: strandedSessionId,
             primeResult,
@@ -2783,6 +2724,52 @@ export function registerMessagesRoutes(app, deps) {
                 responseText: failureText,
                 failureRecord: primedTerminalFailure,
               });
+            }
+          }
+          if (
+            shouldTakeOver
+            && strandedOwner?.id
+            && typeof transferPendingOwnerToSession?.run === 'function'
+          ) {
+            const transferResult = transferPendingOwnerToSession.run(
+              requesterSessionId,
+              now,
+              strandedOwner.id,
+              strandedSessionId,
+            );
+            if (Number(transferResult?.changes || 0) > 0) {
+              emitSessionWorkerTelemetry('worker.prime.takeover', {
+                sessionId: requesterSessionId,
+                workerId: sessionWorkerRegistry?.getWorker?.(requesterSessionId)?.workerId || null,
+                conversationId: strandedOwner?.conversation_id || null,
+                messageId: strandedOwner?.id || null,
+                continuationId: null,
+                state: 'ready',
+                retry: Number(strandedOwner?.retry_count || 0),
+                pid: requester?.pid || null,
+                queue: counts,
+                extra: {
+                  previousOwnerSessionId: strandedSessionId,
+                  degradedReason: String(primeResult?.lifecycle?.degradedReason || strandedLifecycle?.degradedReason || ''),
+                },
+              });
+              const recoveryDequeue = await dequeuePendingMessageForWorkerLoop({
+                db,
+                stmts,
+                nowIso: new Date().toISOString(),
+                routingEnabled: sessionWorkerRoutingEnabled,
+                requesterSessionId,
+                ownerLeaseMs: SESSION_WORKER_OWNER_LEASE_MS,
+                affinityOnly: affinityOnlyDequeue,
+                sessionWorkerSupervisor,
+                relayRestartOrchestrator,
+                inFlightProcessingCount: Number(queueCounts()?.processingCount || 0),
+              });
+              if (recoveryDequeue?.message) {
+                msg = recoveryDequeue.message;
+                dequeueBlockedReason = String(recoveryDequeue?.blockedReason || '').trim() || null;
+                fallbackRestart = recoveryDequeue?.fallbackRestart || null;
+              }
             }
           }
           primedSessionId = strandedSessionId;
@@ -2814,23 +2801,6 @@ export function registerMessagesRoutes(app, deps) {
             extra: { error: String(error?.message || error || 'worker-prime-failed') },
           });
         }
-      } else if (strandedSessionId && shouldSkipPrime) {
-        // #region agent log
-        postRelayDebugLog({
-          runId: 'baseline-1',
-          hypothesisId: 'H4',
-          location: 'server/routes/messages-routes.mjs:worker.prime.skipped',
-          message: 'stranded owner prime skipped by cooldown/health gate',
-          data: {
-            requesterSessionId,
-            strandedSessionId,
-            strandedStatus,
-            cooldownActive,
-            heartbeatFresh,
-            heartbeatAt: String(strandedLifecycle?.lastHeartbeatAt || ''),
-          },
-        });
-        // #endregion
       }
     }
     if (msg) {
@@ -3036,22 +3006,6 @@ export function registerMessagesRoutes(app, deps) {
     const targetConversationId = q?.conversation_id || conversationId;
     if (!targetConversationId) return res.status(400).json({ error: 'Missing conversationId' });
     const responseBridgeIdentity = readBridgeIdentity(req);
-    // #region agent log
-    postRelayDebugLog({
-      runId: 'baseline-1',
-      hypothesisId: 'H2',
-      location: 'server/routes/messages-routes.mjs:api.response.entry',
-      message: 'response received for queue message',
-      data: {
-        queueMessageId: String(messageId || ''),
-        queueStatus: String(q?.status || ''),
-        ownerSessionId: String(q?.owner_sdk_session_id || ''),
-        requesterSessionId: String(responseBridgeIdentity?.sessionId || ''),
-        requesterPid: Number(responseBridgeIdentity?.pid || 0) || null,
-        conversationId: String(targetConversationId || ''),
-      },
-    });
-    // #endregion
 
     if (q && q.status === 'done') {
       console.log(`[${ts()}] RESPONSE  ${messageId?.slice(0,8)} ignored=already_done`);
@@ -3100,6 +3054,9 @@ export function registerMessagesRoutes(app, deps) {
       return res.json({ ok: true, terminal: true, code: terminalFailure.stableCode });
     }
 
+    const holdCutoff = new Date(Date.now() - relayQuestionFinalizationHoldMs).toISOString();
+    const hasPendingQuestion = !!stmts.findPendingQuestionByMessage?.get(messageId);
+    const hasRecentlyAnsweredQuestion = !!stmts.findRecentlyAnsweredQuestionByMessage?.get(messageId, holdCutoff);
     const conversation = stmts.getConvAnyStatus?.get?.(targetConversationId) || null;
     const resolvedText = await resolveRelayResponseText({
       text: trimmedText,
@@ -3114,8 +3071,8 @@ export function registerMessagesRoutes(app, deps) {
         if (stmts.findPendingQuestionByMessage?.get(msgId)) return true;
         // Also hold for a short window after a question was answered. The SDK may fire another
         // onUserInputRequest (next ask_user call) within a few seconds of the previous answer.
-        const holdCutoff = new Date(Date.now() - relayQuestionFinalizationHoldMs).toISOString();
-        return !!(stmts.findRecentlyAnsweredQuestionByMessage?.get(msgId, holdCutoff));
+        const holdCutoffIso = new Date(Date.now() - relayQuestionFinalizationHoldMs).toISOString();
+        return !!(stmts.findRecentlyAnsweredQuestionByMessage?.get(msgId, holdCutoffIso));
       },
     });
     if (!resolvedText) return res.status(400).json({ error: 'Empty response' });
@@ -3129,6 +3086,7 @@ export function registerMessagesRoutes(app, deps) {
       stmts.insertMsg.run(responseId, targetConversationId, 'assistant', resolvedText, model || null, relayMode, null, now);
       stmts.linkActivityToResponse.run(responseId, messageId);
       stmts.linkStreamEventsToResponse?.run(responseId, messageId);
+      stmts.linkThoughtsToResponse?.run(responseId, messageId);
       stmts.updateConvTime.run(now, targetConversationId);
       stmts.pruneQueue.run();
       return true;
@@ -3136,24 +3094,9 @@ export function registerMessagesRoutes(app, deps) {
 
     const finalized = finalize();
     if (!finalized) {
-      // #region agent log
-      postRelayDebugLog({
-        runId: 'baseline-1',
-        hypothesisId: 'H2',
-        location: 'server/routes/messages-routes.mjs:api.response.finalize.false',
-        message: 'response ignored because queue row not pending/processing',
-        data: {
-          queueMessageId: String(messageId || ''),
-          queueStatus: String(q?.status || ''),
-          ownerSessionId: String(q?.owner_sdk_session_id || ''),
-          requesterSessionId: String(responseBridgeIdentity?.sessionId || ''),
-        },
-      });
-      // #endregion
       console.log(`[${ts()}] RESPONSE  ${messageId?.slice(0,8)} ignored=not_pending_or_processing`);
       return res.json({ ok: true, ignored: 'not_pending_or_processing' });
     }
-    // #region agent log
     const queuedAtMs = Date.parse(String(q?.timestamp || '').trim());
     const processingAtMs = Date.parse(String(q?.processing_at || '').trim());
     const finalizedAtMs = Date.parse(now);
@@ -3166,26 +3109,6 @@ export function registerMessagesRoutes(app, deps) {
     const queueToProcessingMs = Number.isFinite(queuedAtMs) && Number.isFinite(processingAtMs)
       ? Math.max(0, processingAtMs - queuedAtMs)
       : null;
-    postRelayDebugLog({
-      runId: 'slow-turn-baseline',
-      hypothesisId: 'H7-turn-duration',
-      location: 'server/routes/messages-routes.mjs:api.response.finalize.true',
-      message: 'response finalized queue message',
-      data: {
-        queueMessageId: String(messageId || ''),
-        priorQueueStatus: String(q?.status || ''),
-        ownerSessionId: String(q?.owner_sdk_session_id || ''),
-        requesterSessionId: String(responseBridgeIdentity?.sessionId || ''),
-        requesterPid: Number(responseBridgeIdentity?.pid || 0) || null,
-        queueToDoneMs,
-        processingToDoneMs,
-        queueToProcessingMs,
-        queuedAt: String(q?.timestamp || ''),
-        processingAt: String(q?.processing_at || ''),
-        finalizedAt: now,
-      },
-    });
-    // #endregion
     settleRelayAbortControlsForQueueMessage(messageId, {
       ok: true,
       note: 'queue message completed before stop control was applied',
@@ -3227,6 +3150,7 @@ export function registerMessagesRoutes(app, deps) {
       }
     }
     const activities = relayActivityForResponse(responseId);
+    const thoughts = relayThoughtsForResponse ? relayThoughtsForResponse(responseId) : [];
 
     console.log(`[${ts()}] RESPONSE  ${messageId?.slice(0,8)} conv=${targetConversationId?.slice(0,8)} mode=${relayMode} len=${text.length} preview="${text.slice(0,60)}"`);
 
@@ -3234,7 +3158,7 @@ export function registerMessagesRoutes(app, deps) {
       conversationId: targetConversationId,
       sourceMessageId: messageId,
       messageId: responseId,
-      message: { role: 'assistant', text: resolvedText, model: model || null, mode: relayMode, timestamp: now, activities },
+      message: { role: 'assistant', text: resolvedText, model: model || null, mode: relayMode, timestamp: now, activities, thoughts },
     });
     io.emit('message_status', { messageId, conversationId: targetConversationId, status: 'done' });
     res.json({ ok: true });
@@ -3337,21 +3261,6 @@ export function registerMessagesRoutes(app, deps) {
             return res.status(409).json({ error: error.message });
           }
           const shouldRetry = isStreamSeqConstraintError(error) && attempt < maxRetries;
-          if (shouldRetry) {
-            // #region agent log
-            postRelayDebugLog({
-              runId: 'baseline-1',
-              hypothesisId: 'H5',
-              location: 'server/routes/messages-routes.mjs:api.stream.retry',
-              message: 'stream sequence constraint retry',
-              data: {
-                queueMessageId: String(messageId || ''),
-                attempt,
-                error: String(error?.message || error || 'stream-seq-insert-failed'),
-              },
-            });
-            // #endregion
-          }
           if (!shouldRetry) throw error;
         }
       }
@@ -3364,6 +3273,99 @@ export function registerMessagesRoutes(app, deps) {
       conversationId,
       mode: normalizeRelayMode(mode) || DEFAULT_RELAY_MODE,
       text: streamText,
+      done: !!done,
+      seq,
+      timestamp: now,
+    });
+    res.json({ ok: true, seq });
+  });
+
+  // POST /api/thought — relay sends in-flight agent reasoning ("thoughts").
+  // Mirrors /api/stream but preserves full text (no 200-char cap). Only completed blocks
+  // (done:true) are persisted (one row per reasoning block); all updates are emitted live.
+  app.post('/api/thought', auth, (req, res) => {
+    touchCli();
+    const { messageId, conversationId, text, mode, reasoningId, done } = req.body || {};
+    const thoughtText = String(text || '');
+    if (!messageId || !conversationId) {
+      return res.status(400).json({ error: 'Missing thought payload' });
+    }
+
+    const now = new Date().toISOString();
+    const requestedConversationId = String(conversationId || '').trim();
+    const queueRow = stmts.findQById.get(messageId);
+    if (!queueRow) {
+      return res.status(404).json({ error: 'Queue message not found' });
+    }
+    const queueConversationId = String(queueRow.conversation_id || '').trim();
+    if (!queueConversationId || queueConversationId !== requestedConversationId) {
+      return res.status(409).json({ error: 'Thought conversationId does not match queue conversation' });
+    }
+
+    const relayMode = normalizeRelayMode(mode) || DEFAULT_RELAY_MODE;
+    const normalizedReasoningId = String(reasoningId || '').trim() || null;
+    let seq = null;
+    if (done) {
+      const isThoughtSeqConstraintError = (error) => {
+        const message = String(error?.message || '').toLowerCase();
+        return message.includes('unique constraint failed')
+          && message.includes('relay_thought')
+          && message.includes('queue_message_id')
+          && message.includes('seq');
+      };
+      try {
+        const insertThoughtTx = db.transaction(() => {
+          const q = stmts.findQById.get(messageId) || queueRow;
+          const currentConversationId = String(q?.conversation_id || '').trim();
+          if (!currentConversationId || currentConversationId !== requestedConversationId) {
+            const error = new Error('Thought conversationId does not match queue conversation');
+            error.code = 'THOUGHT_CONVERSATION_MISMATCH';
+            throw error;
+          }
+          const responseMessageId = q?.response_message_id || null;
+          const row = stmts.getLastThoughtSeqByQueueMessage?.get(messageId);
+          const maxSeq = Math.max(0, Number(row?.max_seq || 0));
+          const nextSeq = maxSeq + 1;
+          stmts.insertThought?.run(
+            messageId,
+            responseMessageId,
+            conversationId,
+            relayMode,
+            normalizedReasoningId,
+            nextSeq,
+            thoughtText,
+            1,
+            now,
+          );
+          return nextSeq;
+        });
+        const runInsertThought = typeof insertThoughtTx?.immediate === 'function'
+          ? insertThoughtTx.immediate.bind(insertThoughtTx)
+          : insertThoughtTx;
+        const maxRetries = 4;
+        for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
+          try {
+            seq = runInsertThought();
+            break;
+          } catch (error) {
+            if (error?.code === 'THOUGHT_CONVERSATION_MISMATCH') {
+              return res.status(409).json({ error: error.message });
+            }
+            const shouldRetry = isThoughtSeqConstraintError(error) && attempt < maxRetries;
+            if (!shouldRetry) throw error;
+          }
+        }
+      } catch (error) {
+        return res.status(500).json({ error: error?.message || 'Failed to persist thought' });
+      }
+    }
+
+    io.emit('relay_thought', {
+      messageId,
+      conversationId,
+      mode: relayMode,
+      reasoningId: normalizedReasoningId,
+      text: thoughtText,
       done: !!done,
       seq,
       timestamp: now,

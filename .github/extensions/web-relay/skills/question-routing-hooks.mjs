@@ -1,5 +1,29 @@
 import { extractToolName, parseMaybeJson, toolArgsSnapshot } from "./tool-activity.mjs";
 
+function isReportIntentTool(request) {
+  const name = extractToolName(request).toLowerCase();
+  return name.includes("report_intent") || name === "report_intent";
+}
+
+function extractReportIntentText(request) {
+  const args = toolArgsSnapshot(request);
+  const candidates = [
+    args?.intent,
+    args?.description,
+    args?.message,
+    args?.text,
+    args?.content,
+    args?.summary,
+    args?.thought,
+    args?.reasoning,
+  ];
+  for (const value of candidates) {
+    const text = String(value || "").trim();
+    if (text) return text;
+  }
+  return "";
+}
+
 export function createQuestionRoutingHooks({
   api,
   dbg,
@@ -177,8 +201,9 @@ export function createQuestionRoutingHooks({
       }).catch(() => {});
     }
 
+    const reportIntentTool = isReportIntentTool(request);
     const activityText = formatToolActivity(request, maxToolDetailLength);
-    if (activityText && activeMsg?.id && activityText !== getLastActivityText()) {
+    if (!reportIntentTool && activityText && activeMsg?.id && activityText !== getLastActivityText()) {
       setLastActivityText(activityText);
       await api("POST", "/api/activity", {
         messageId: activeMsg.id,
@@ -186,6 +211,23 @@ export function createQuestionRoutingHooks({
         mode: activeMsg.relayMode || "agent",
         text: activityText,
       }).catch(() => {});
+    }
+
+    // Route report_intent full text through thought pipeline (avoids 140-char activity truncation)
+    if (reportIntentTool && activeMsg?.id) {
+      const fullIntentText = extractReportIntentText(request);
+      if (fullIntentText) {
+        await api("POST", "/api/thought", {
+          messageId: activeMsg.id,
+          conversationId: activeMsg.conversationId,
+          mode: activeMsg.relayMode || "agent",
+          reasoningId: `intent-${Date.now()}`,
+          text: fullIntentText,
+          done: true,
+        }).catch((error) => {
+          dbg("report_intent thought publish failed", `msgId=${activeMsg.id}`, error?.message || String(error));
+        });
+      }
     }
 
     return allowToolUse;

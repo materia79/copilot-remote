@@ -7,7 +7,6 @@ import { spawn } from 'child_process';
 import { createSdkSessionSyncService } from '../services/sdk-session-sync-service.mjs';
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 import { persistConversationPreferences } from '../services/conversation-preferences-service.mjs';
-import { postRelayDebugLog } from '../../debugging/relay-debug-log.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SESSION_WORKER_STATUS_QUEUE_STATES = Object.freeze(['pending', 'processing', 'parked']);
@@ -65,16 +64,18 @@ export async function launchWorkspaceRootSession(runtimeState = {}, sessionWorke
   if (!sid) {
     return { ok: false, statusCode: 400, error: 'Missing session id' };
   }
+  const activeStatuses = ['starting', 'ready', 'processing'];
   const selectedWorkerState = typeof sessionWorkerSupervisor?.getWorkerState === 'function'
     ? sessionWorkerSupervisor.getWorkerState(sid)
     : null;
   const selectedWorkerPid = Number(selectedWorkerState?.pid);
+  const selectedWorkerHasPid = Number.isInteger(selectedWorkerPid) && selectedWorkerPid > 0;
   const selectedWorkerPidAlive = isPidAlive(selectedWorkerPid);
   const selectedWorkerStatus = String(selectedWorkerState?.status || '').trim().toLowerCase();
-  if (['starting', 'ready', 'processing'].includes(selectedWorkerStatus) && selectedWorkerPidAlive) {
+  if (activeStatuses.includes(selectedWorkerStatus) && (!selectedWorkerHasPid || selectedWorkerPidAlive)) {
     return { ok: false, statusCode: 409, error: 'Selected CLI is already running' };
   }
-  if (['starting', 'ready', 'processing'].includes(selectedWorkerStatus) && !selectedWorkerPidAlive) {
+  if (activeStatuses.includes(selectedWorkerStatus) && selectedWorkerHasPid && !selectedWorkerPidAlive) {
     sessionWorkerSupervisor?.clearRestartSchedule?.(sid);
     sessionWorkerRegistry?.removeWorker?.(sid);
   }
@@ -850,6 +851,7 @@ export function buildConversationMessages({
   dbMessages = [],
   transcriptMessages = [],
   relayActivitiesByMessageId = new Map(),
+  relayThoughtsByMessageId = new Map(),
   responseMessageToSourceId = new Map(),
   queueRows = [],
 } = {}) {
@@ -858,6 +860,7 @@ export function buildConversationMessages({
         const id = String(message?.id || '').trim();
         return {
           activities: message?.role === 'assistant' ? (relayActivitiesByMessageId.get(id) || []) : [],
+          thoughts: message?.role === 'assistant' ? (relayThoughtsByMessageId.get(id) || []) : [],
           id,
           role: message?.role,
           text: stripRelayPromptContext(message?.text, message?.mode),
@@ -880,6 +883,9 @@ export function buildConversationMessages({
         Array.isArray(message?.activities) ? message.activities : [],
         id ? (relayActivitiesByMessageId.get(id) || []) : [],
       ),
+      thoughts: (Array.isArray(message?.thoughts) && message.thoughts.length)
+        ? message.thoughts
+        : (id ? (relayThoughtsByMessageId.get(id) || []) : []),
       text: stripRelayPromptContext(message?.text, message?.mode),
       sourceMessageId: message?.role === 'assistant'
         ? (responseMessageToSourceId.get(id) || message?.sourceMessageId || undefined)
@@ -1018,6 +1024,7 @@ export function registerSessionsRoutes(app, deps) {
     parseAttachments,
     hydrateAttachment,
     relayActivityForResponse,
+    relayThoughtsForResponse,
     buildContextResponseText,
     readContextFromSessionEvents,
     inFlightStateForConversation,
@@ -1094,6 +1101,11 @@ export function registerSessionsRoutes(app, deps) {
       stmts.deleteConvStreamEvents.run(conversationId);
     } else {
       db.prepare(`DELETE FROM relay_stream_events WHERE conversation_id = ?`).run(conversationId);
+    }
+    if (typeof stmts.deleteConvThoughts?.run === 'function') {
+      stmts.deleteConvThoughts.run(conversationId);
+    } else {
+      db.prepare(`DELETE FROM relay_thought WHERE conversation_id = ?`).run(conversationId);
     }
     db.prepare(`DELETE FROM queue WHERE conversation_id = ?`).run(conversationId);
     db.prepare(`DELETE FROM messages WHERE conversation_id = ?`).run(conversationId);
@@ -1427,19 +1439,6 @@ export function registerSessionsRoutes(app, deps) {
     }
 
     if (!sdkSessionId || !conversationId) {
-      // #region agent log
-      postRelayDebugLog({
-        runId: 'baseline-1',
-        hypothesisId: 'H3',
-        location: 'server/routes/sessions-routes.mjs:api.session-sync.missing-fields',
-        message: 'session sync rejected due to missing ids',
-        data: {
-          sdkSessionId: String(sdkSessionId || ''),
-          conversationId: String(conversationId || ''),
-          hasWorkspaceRootPath: workspaceRootPath.length > 0,
-        },
-      });
-      // #endregion
       return res.status(400).json({ error: 'Missing sdk_session_id or conversation_id' });
     }
 
@@ -1466,23 +1465,6 @@ export function registerSessionsRoutes(app, deps) {
         console.log(
           `[session-sync] rebind outcome sid=${shortId(sdkSessionId)} tx=${shortId(orchestratorCorrelationId)} code=${String(rebind?.code || 'none')} completed=${rebind?.completed === true ? 'yes' : 'no'} state=${String(rebind?.state?.state || 'unknown')}`,
         );
-        // #region agent log
-        postRelayDebugLog({
-          runId: 'baseline-1',
-          hypothesisId: 'H3',
-          location: 'server/routes/sessions-routes.mjs:api.session-sync.rebind',
-          message: 'session sync rebind completion observed',
-          data: {
-            sdkSessionId,
-            conversationId,
-            correlationId: orchestratorCorrelationId,
-            targetSessionId: orchestratorTargetSessionId,
-            rebindCode: String(rebind?.code || ''),
-            completed: rebind?.completed === true,
-            state: String(rebind?.state?.state || ''),
-          },
-        });
-        // #endregion
       }
       if (rebindCompleted && rebind?.ok === false && rebind?.conflict) {
         const statusCode = rebind.retryable ? 409 : 409;
@@ -1558,21 +1540,6 @@ export function registerSessionsRoutes(app, deps) {
     } catch (error) {
       const statusCode = Number(error?.statusCode || 500);
       const retryable = statusCode >= 500;
-      // #region agent log
-      postRelayDebugLog({
-        runId: 'baseline-1',
-        hypothesisId: 'H3',
-        location: 'server/routes/sessions-routes.mjs:api.session-sync.catch',
-        message: 'session sync failed',
-        data: {
-          sdkSessionId,
-          conversationId,
-          statusCode,
-          retryable,
-          error: String(error?.message || error || 'session-sync-failed'),
-        },
-      });
-      // #endregion
       const payload = {
         error: error?.message || 'Failed to sync session',
         code: statusCode === 409 ? 'binding-conflict' : 'session-sync-failed',
@@ -1874,6 +1841,11 @@ export function registerSessionsRoutes(app, deps) {
         .filter((m) => m.role === 'assistant')
         .map((m) => [m.id, relayActivityForResponse(m.id)]),
     );
+    const relayThoughtsByMessageId = new Map(
+      dbMessages
+        .filter((m) => m.role === 'assistant')
+        .map((m) => [m.id, relayThoughtsForResponse ? relayThoughtsForResponse(m.id) : []]),
+    );
     let messages = buildConversationMessages({
       dbMessages: dbMessages.map((message) => ({
         ...message,
@@ -1881,6 +1853,7 @@ export function registerSessionsRoutes(app, deps) {
       })),
       transcriptMessages,
       relayActivitiesByMessageId,
+      relayThoughtsByMessageId,
       responseMessageToSourceId,
       queueRows,
     });

@@ -34,7 +34,7 @@ test('process inspector ignores relay server process on linux path form', () => 
       assert.equal(command, 'ps');
       assert.deepEqual(args, ['-eo', 'pid=,ppid=,comm=,args=', '-ww']);
       return Buffer.from([
-        `201 1 node /home/simon/git/copilot-remote/server/server.js --allow-all --session-id abc-123`,
+        `201 1 node /home/user/project/server/server.js --allow-all --session-id abc-123`,
         `202 1 node gh copilot -- --allow-all --session-id abc-123`,
       ].join('\n'));
     },

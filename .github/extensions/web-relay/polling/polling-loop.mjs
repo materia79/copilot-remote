@@ -592,10 +592,12 @@ export function createPollingLoop({
         await publishModelSnapshot("poll");
 
         if (getWaitingForAI()) return;
-        const processedDelete = await processPendingSdkSessionDeletes();
-        if (processedDelete) return;
+        // Keep SDK-session-delete maintenance best-effort only; never starve
+        // user turn dequeue when delete requests are backlogged/retrying.
+        await processPendingSdkSessionDeletes();
 
         const pending = await api("GET", "/api/pending");
+        const pendingBlockedReason = String(pending?.routing?.blockedReason || "").trim();
         const control = pending?.control || null;
         if (control && typeof handleControl === "function") {
           const handled = await handleControl(control, pending);
@@ -726,12 +728,10 @@ export function createPollingLoop({
 
             let finalEvent;
             let lastWorkerStatusCheckAt = 0;
-            const onStreamingEvent = async (event) => {
-              await checkActiveAbortControl(message);
-              const streamedText = extractStreamTextFromEvent(event);
-              if (!shouldEmitRelayStreamUpdate(streamedText, lastStreamedSent)) return;
-              await pushRelayStream(streamedText, false);
-            };
+            // Incremental assistant text now streams via the extension's assistant.message_delta
+            // session.on subscription (reasoning-stream.mjs) -> POST /api/stream. The previous
+            // onStreamingEvent callback was defined here but never wired into sendAndWait, so it
+            // has been removed to avoid confusion. The final /api/response remains authoritative.
             const inspectActiveWorkerLiveness = async () => {
               await checkActiveAbortControl(message, { force: true });
               const ownerSessionId = String(message?.ownerSessionId || "").trim();
@@ -795,9 +795,6 @@ export function createPollingLoop({
               // onUserInputRequest fires. For relay turns that would finalize the queue row too
               // early, so keep using the stable sendAndWait path here.
               sendAndWaitStartedAtMs = Date.now();
-              // #region agent log
-              if (typeof fetch === "function") fetch('http://127.0.0.1:7611/ingest/41e205ad-83bf-40b2-b2ab-5040e785036c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0e20dd'},body:JSON.stringify({sessionId:'0e20dd',id:`log_${Date.now()}_${Math.random().toString(36).slice(2,10)}`,runId:'slow-turn-baseline',hypothesisId:'H8-sdk-sendandwait',location:'.github/extensions/web-relay/polling/polling-loop.mjs:sendWithoutStreaming.start',message:'sendAndWait started',data:{queueMessageId:String(message?.id||''),conversationId:String(message?.conversationId||''),ownerSessionId:String(message?.ownerSessionId||''),relayMode:String(message?.relayMode||''),model:String(message?.model||''),promptChars:String(prompt||'').length,attachmentCount:Array.isArray(sdkAttachments)?sdkAttachments.length:0},timestamp:Date.now()})}).catch(()=>{});
-              // #endregion
               finalEvent = await sendWithoutStreaming(payload);
             } catch (attachmentError) {
               if (!sdkAttachments.length) throw attachmentError;
@@ -811,9 +808,6 @@ export function createPollingLoop({
               finalEvent = await sendWithoutStreaming({ prompt });
             }
             const sendAndWaitDurationMs = sendAndWaitStartedAtMs > 0 ? Math.max(0, Date.now() - sendAndWaitStartedAtMs) : null;
-            // #region agent log
-            if (typeof fetch === "function") fetch('http://127.0.0.1:7611/ingest/41e205ad-83bf-40b2-b2ab-5040e785036c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0e20dd'},body:JSON.stringify({sessionId:'0e20dd',id:`log_${Date.now()}_${Math.random().toString(36).slice(2,10)}`,runId:'slow-turn-baseline',hypothesisId:'H8-sdk-sendandwait',location:'.github/extensions/web-relay/polling/polling-loop.mjs:sendWithoutStreaming.done',message:'sendAndWait completed',data:{queueMessageId:String(message?.id||''),conversationId:String(message?.conversationId||''),ownerSessionId:String(message?.ownerSessionId||''),durationMs:sendAndWaitDurationMs,finalTextChars:String(extractFinalText(finalEvent)||'').length},timestamp:Date.now()})}).catch(()=>{});
-            // #endregion
             dbg("session.sendAndWait: completed for msgId", message.id);
 
             const text = stripPromptContextPrefix(extractFinalText(finalEvent), message, "", prompt);
@@ -938,11 +932,6 @@ export function createPollingLoop({
               await session.log(`✅ Sent response to web (${text.length} chars)`, { ephemeral: true });
             }
           } catch (e) {
-              if (sendAndWaitStartedAtMs > 0) {
-                // #region agent log
-                if (typeof fetch === "function") fetch('http://127.0.0.1:7611/ingest/41e205ad-83bf-40b2-b2ab-5040e785036c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0e20dd'},body:JSON.stringify({sessionId:'0e20dd',id:`log_${Date.now()}_${Math.random().toString(36).slice(2,10)}`,runId:'slow-turn-baseline',hypothesisId:'H8-sdk-sendandwait',location:'.github/extensions/web-relay/polling/polling-loop.mjs:sendWithoutStreaming.error',message:'sendAndWait failed',data:{queueMessageId:String(message?.id||''),conversationId:String(message?.conversationId||''),ownerSessionId:String(message?.ownerSessionId||''),durationMs:Math.max(0,Date.now()-sendAndWaitStartedAtMs),error:String(e?.message||e||'unknown')},timestamp:Date.now()})}).catch(()=>{});
-                // #endregion
-              }
               const terminalFailure = normalizeTerminalSendAndWaitError(e);
               dbg(
                 "sendAndWait ERROR for msgId",
@@ -999,7 +988,8 @@ export function createPollingLoop({
             activeTurnMessageId = "";
           }
         }
-    } catch {
+    } catch (error) {
+      dbg("runPollingIteration failed", error?.message || String(error));
       // Server may be down — keep retrying silently
     }
   }

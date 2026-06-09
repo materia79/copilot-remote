@@ -8,6 +8,7 @@ import {
   relayBoards,
   relayQuestionDrafts,
   relayActivities,
+  relayThoughts,
   repoBrowserState,
   workspaceRootPath,
   getConversationWorkspaceState,
@@ -81,7 +82,7 @@ import {
 } from './ask-user-view.js';
 import { openPendingQuestionFromBanner, submitRelayQuestionChoice, submitRelayQuestionAnswer, onRelayQuestionDraftInput, handleRelayQuestionKey } from './ask-user-view.js';
 import { loadRelayBoards, renderRelayBoards, upsertRelayBoard, submitRelayBoardAction } from './relay-board-view.js';
-import { showThinking, removeThinking, renderThinkingActivities, appendThinkingActivity, applyRelayStreamEvent, clearRelayStreamStateForMessage, restoreInFlightThinking, applyConversationTurnStatus, renderMessages, appendMessage, compactCurrentConversation, sendMessage, handleKey, getConversationLoadedMessageCount, loadOlderConversationMessages, syncComposerControlState, getRenderedConversationMessageFingerprints, initConversationHistoryLazyLoading,
+import { showThinking, removeThinking, renderThinkingActivities, appendThinkingActivity, appendThinkingThought, applyRelayStreamEvent, clearRelayStreamStateForMessage, restoreInFlightThinking, applyConversationTurnStatus, renderMessages, appendMessage, compactCurrentConversation, sendMessage, handleKey, getConversationLoadedMessageCount, loadOlderConversationMessages, syncComposerControlState, getRenderedConversationMessageFingerprints, initConversationHistoryLazyLoading,
 } from './conversation-view.js';
 import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { handleAttachmentInput, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
@@ -1160,6 +1161,15 @@ function getSelectedChangeCwdPath() {
   return normalizeKnownCwdPath(input?.value || '');
 }
 
+function getManualChangeCwdPath() {
+  const input = document.getElementById('change-cwd-manual-path');
+  return normalizeKnownCwdPath(input?.value || '');
+}
+
+function getEffectiveChangeCwdPath() {
+  return getManualChangeCwdPath() || getSelectedChangeCwdPath();
+}
+
 function closeChangeCwdMenu() {
   const menu = document.getElementById('change-cwd-menu');
   const trigger = document.getElementById('change-cwd-menu-trigger');
@@ -1171,6 +1181,7 @@ function syncChangeCwdPickerView() {
   const trigger = document.getElementById('change-cwd-menu-trigger');
   const details = document.getElementById('change-cwd-details');
   const menu = document.getElementById('change-cwd-menu');
+  const manualPath = getManualChangeCwdPath();
   const selectedPath = getSelectedChangeCwdPath();
   const itemNodes = Array.from(menu?.querySelectorAll('.change-cwd-menu-item[data-path]') || []);
   let selectedItem = null;
@@ -1193,6 +1204,10 @@ function syncChangeCwdPickerView() {
   if (details) {
     const label = String(selectedItem?.getAttribute('data-label') || '').trim();
     const note = String(selectedItem?.getAttribute('data-note') || '').trim();
+    if (manualPath) {
+      details.textContent = `Manual path: ${manualPath}`;
+      return;
+    }
     if (!selectedPath) {
       details.textContent = 'No known CWDs are available yet.';
       return;
@@ -1205,6 +1220,7 @@ function syncChangeCwdPickerView() {
 
 function bindChangeCwdPicker() {
   const modalBody = document.getElementById('summary-modal-body');
+  const manualInput = document.getElementById('change-cwd-manual-path');
   const trigger = document.getElementById('change-cwd-menu-trigger');
   const menu = document.getElementById('change-cwd-menu');
   const selectionInput = document.getElementById('change-cwd-selected-path');
@@ -1240,6 +1256,12 @@ function bindChangeCwdPicker() {
       selectionInput.value = pathValue;
       syncChangeCwdPickerView();
       closeChangeCwdMenu();
+    });
+  }
+  if (manualInput && manualInput.dataset.changeCwdInputBound !== '1') {
+    manualInput.dataset.changeCwdInputBound = '1';
+    manualInput.addEventListener('input', () => {
+      syncChangeCwdPickerView();
     });
   }
   syncChangeCwdPickerView();
@@ -1303,6 +1325,10 @@ function openChangeCwdModal() {
         <div><strong style="color:var(--text)">Current CWD:</strong> ${escHtml(currentCwd || 'Unknown')}</div>
         <div><strong style="color:var(--text)">Next launch:</strong> ${escHtml(nextLaunchCwd || currentCwd || 'Unknown')}</div>
       </div>
+      <label class="change-cwd-picker" style="margin-bottom:10px;font-size:0.84rem;color:var(--muted)">
+        <span>Manual path</span>
+        <input id="change-cwd-manual-path" class="change-cwd-manual-input" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Manual path">
+      </label>
       <label id="change-cwd-picker" class="change-cwd-picker" style="font-size:0.84rem;color:var(--muted)">
         <span>Known CWDs</span>
         <input id="change-cwd-selected-path" type="hidden" value="${escHtml(defaultPath)}">
@@ -1341,9 +1367,9 @@ async function confirmChangeCwdAndLaunch() {
 
 async function submitChangeCwd(launchAfterChange = false) {
   if (changeCwdInFlight) return;
-  const selectedPath = getSelectedChangeCwdPath();
-  if (!selectedPath) {
-    alert('Select a known CWD first.');
+  const targetPath = getEffectiveChangeCwdPath();
+  if (!targetPath) {
+    alert('Enter a manual path or select a known CWD first.');
     return;
   }
   const launchableSessionId = launchAfterChange ? getCurrentLaunchableSessionId() : '';
@@ -1358,18 +1384,18 @@ async function submitChangeCwd(launchAfterChange = false) {
   changeCwdInFlight = true;
   setSummaryModalLoading(true);
   try {
-  const result = await updateWorkspaceRoot(selectedPath, currentConvId);
+    const result = await updateWorkspaceRoot(targetPath, currentConvId);
     if (!result) {
       alert('Failed to update the launch CWD');
       return;
     }
-  applyConversationWorkspaceRootUpdate({
-    conversationId: currentConvId,
-    ...result,
-  });
-  const updatedPath = result.configuredWorkspaceRootPath || result.currentWorkspaceRootPath || result.workspaceRootPath || selectedPath;
-  if (launchAfterChange) {
-    const launchResult = await launchSessionWorker(launchableSessionId);
+    applyConversationWorkspaceRootUpdate({
+      conversationId: currentConvId,
+      ...result,
+    });
+    const updatedPath = result.configuredWorkspaceRootPath || result.currentWorkspaceRootPath || result.workspaceRootPath || targetPath;
+    if (launchAfterChange) {
+      const launchResult = await launchSessionWorker(launchableSessionId);
       if (!launchResult) {
         alert('Launch CWD updated, but the CLI launch request failed.');
         return;
@@ -1903,12 +1929,19 @@ async function connectSocket() {
       const cached = relayActivities.get(sourceMessageId) || [];
       if (cached.length) message.activities = cached.slice(0, 48);
     }
+    if ((!message?.thoughts || !message.thoughts.length) && sourceMessageId) {
+      const cachedThoughts = relayThoughts.get(sourceMessageId);
+      if (cachedThoughts && cachedThoughts.size) {
+        message.thoughts = Array.from(cachedThoughts.values());
+      }
+    }
     if (messageId && seenMessageIds?.has(messageId)) return;
     if (conversationId === currentConvId) {
       appendMessage(message, true, messageId || null, false, sourceMessageId || null);
       scheduleContextUsageRefresh(conversationId, 120);
     }
     if (sourceMessageId) relayActivities.delete(sourceMessageId);
+    if (sourceMessageId) relayThoughts.delete(sourceMessageId);
     if (sourceMessageId) clearRelayStreamStateForMessage(sourceMessageId);
     refreshSessionWorkerStatus().catch(() => {});
   });
@@ -1938,6 +1971,16 @@ async function connectSocket() {
       done: !!done,
       seq,
     });
+  });
+  socket.on('relay_thought', ({ conversationId, messageId, reasoningId, text, done }) => {
+    if (!messageId) return;
+    const key = String(reasoningId || 'reasoning');
+    const thoughtMap = relayThoughts.get(messageId) || new Map();
+    thoughtMap.set(key, { reasoningId: key, text: String(text || ''), done: !!done });
+    relayThoughts.set(messageId, thoughtMap);
+    if (conversationId === currentConvId) {
+      appendThinkingThought(key, String(text || ''), !!done);
+    }
   });
   socket.on('conversation_compacted', async ({ sourceConversationId, targetConversationId }) => {
     if (!sourceConversationId || !targetConversationId) return;

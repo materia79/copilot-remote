@@ -299,15 +299,9 @@ export function applyLoadedConversationState(id, response, { restoreScroll = fal
   if (!restoreScroll) return;
   const el = document.getElementById('messages');
   if (!el) return;
-  // #region agent log
-  fetch('http://127.0.0.1:7611/ingest/41e205ad-83bf-40b2-b2ab-5040e785036c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0e20dd'},body:JSON.stringify({sessionId:'0e20dd',id:`log_${Date.now()}_${Math.random().toString(36).slice(2,10)}`,runId:'ui-regressions-baseline',hypothesisId:'H12-scroll-restore',location:'server/public/app/journal-view.js:applyLoadedConversationState.before-restore',message:'attempting to restore conversation scroll position',data:{conversationId:String(id||'').trim()||null,restoreScroll,savedScrollTop:Number.isFinite(savedScrollTop)?savedScrollTop:null,currentScrollTop:el.scrollTop,scrollHeight:el.scrollHeight,clientHeight:el.clientHeight},timestamp:Date.now()})}).catch(()=>{});
-  // #endregion
   if (Number.isFinite(savedScrollTop)) {
     el.scrollTop = savedScrollTop;
     saveConversationScrollTop(id, el.scrollTop);
-    // #region agent log
-    fetch('http://127.0.0.1:7611/ingest/41e205ad-83bf-40b2-b2ab-5040e785036c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0e20dd'},body:JSON.stringify({sessionId:'0e20dd',id:`log_${Date.now()}_${Math.random().toString(36).slice(2,10)}`,runId:'ui-regressions-baseline',hypothesisId:'H13-scroll-overwrite',location:'server/public/app/journal-view.js:applyLoadedConversationState.after-restore',message:'restored conversation scroll position from saved value',data:{conversationId:String(id||'').trim()||null,restoredScrollTop:el.scrollTop,scrollHeight:el.scrollHeight,clientHeight:el.clientHeight},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion
     return;
   }
   el.scrollTop = el.scrollHeight;
@@ -344,9 +338,6 @@ export async function openConversation(id, options = {}) {
   const savedScrollTop = loadConversationScrollTop(id);
   const restoreScroll = !forceFreshWindow && Number.isFinite(savedScrollTop);
   const savedLoadedCount = loadConversationLoadedMessageCount(id);
-  // #region agent log
-  fetch('http://127.0.0.1:7611/ingest/41e205ad-83bf-40b2-b2ab-5040e785036c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0e20dd'},body:JSON.stringify({sessionId:'0e20dd',id:`log_${Date.now()}_${Math.random().toString(36).slice(2,10)}`,runId:'ui-regressions-baseline',hypothesisId:'H12-scroll-restore',location:'server/public/app/journal-view.js:openConversation.saved-scroll',message:'open conversation loaded saved view state',data:{conversationId:String(id||'').trim()||null,savedScrollTop:Number.isFinite(savedScrollTop)?savedScrollTop:null,savedLoadedCount:Number.isFinite(savedLoadedCount)?savedLoadedCount:null},timestamp:Date.now()})}).catch(()=>{});
-  // #endregion
   const requestLimit = forceFreshWindow
     ? 40
     : (Number.isFinite(savedLoadedCount)

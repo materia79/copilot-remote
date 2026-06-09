@@ -228,7 +228,7 @@ export function createSessionWorkerSupervisor({
     const normalizedReason = String(reason || 'degraded').trim() || 'degraded';
     const reasonChanged = lifecycle.uiState !== 'yellow' || lifecycle.degradedReason !== normalizedReason;
     const nextFailureCount = reasonChanged ? lifecycle.failureCount + 1 : lifecycle.failureCount;
-    return setLifecycle(sessionId, {
+    const next = setLifecycle(sessionId, {
       uiState: 'yellow',
       degradedReason: normalizedReason,
       degradedAtMs: lifecycle.degradedAtMs || atMs,
@@ -237,6 +237,7 @@ export function createSessionWorkerSupervisor({
       stalePidDetected: stalePidDetected || lifecycle.stalePidDetected,
       recoveryCandidateAtMs: null,
     });
+    return next;
   }
 
   function clearDegradedState(sessionId) {
@@ -390,10 +391,12 @@ export function createSessionWorkerSupervisor({
     return { scheduled: true, exhausted: false, lifecycle: toLifecycleSnapshot(sessionId, scheduled) };
   }
 
-  function clearRestartSchedule(sessionId) {
+  function clearRestartSchedule(sessionId, {
+    resetDegradedState = true,
+  } = {}) {
     if (!normalizeSessionId(sessionId)) return null;
     const nowAtMs = nowMs();
-    const cleared = setLifecycle(sessionId, {
+    const patch = {
       retryCount: 0,
       backoffMs: 0,
       nextRestartAtMs: null,
@@ -401,12 +404,15 @@ export function createSessionWorkerSupervisor({
       lastError: null,
       lastFailureAtMs: null,
       lastActivityAtMs: nowAtMs,
-      recoveryCandidateAtMs: null,
-      stalePidDetected: false,
-      degradedReason: null,
-      degradedAtMs: null,
-      uiState: 'white',
-    });
+    };
+    if (resetDegradedState) {
+      patch.recoveryCandidateAtMs = null;
+      patch.stalePidDetected = false;
+      patch.degradedReason = null;
+      patch.degradedAtMs = null;
+      patch.uiState = 'white';
+    }
+    const cleared = setLifecycle(sessionId, patch);
     return toLifecycleSnapshot(sessionId, cleared);
   }
 
@@ -468,10 +474,6 @@ export function createSessionWorkerSupervisor({
     }
 
     const existing = registry.getWorker(sessionId);
-    const restartGate = canAttemptRestart(sessionId);
-    if (!restartGate.allowed) {
-      return { ok: false, error: restartGate.reason, worker: existing, lifecycle: restartGate.lifecycle };
-    }
     if (shouldReuseLiveWorker(existing)) {
       const nowAtMs = nowMs();
       const reusedWorker = setWorkerState(sessionId, {
@@ -487,8 +489,16 @@ export function createSessionWorkerSupervisor({
           atMs: nowAtMs,
         });
       }
+      // A live worker should always be allowed to serve turns even if stale restart
+      // backoff/exhausted lifecycle state was left behind by earlier failures.
+      clearRestartSchedule(sessionId, { resetDegradedState: false });
       assessSessionHealth(sessionId, reusedWorker, { nowAtMs, questionPending: false });
       return { ok: true, reused: true, worker: reusedWorker, lifecycle: toLifecycleSnapshot(sessionId) };
+    }
+
+    const restartGate = canAttemptRestart(sessionId);
+    if (!restartGate.allowed) {
+      return { ok: false, error: restartGate.reason, worker: existing, lifecycle: restartGate.lifecycle };
     }
 
     const inFlight = pendingStarts.get(sessionId);

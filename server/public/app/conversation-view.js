@@ -13,6 +13,7 @@ import {
   trackPendingUserMessage,
   seenMessageIds,
   relayActivities,
+  relayThoughts,
   selectedAttachments,
   setCompactInFlight,
   setCurrentConv,
@@ -379,15 +380,17 @@ function createMessageNode(msg, msgId = null, force = false) {
     : renderMarkdownPreview(msg.text || '', false);
   const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
   const activities = Array.isArray(msg.activities) ? msg.activities.filter(Boolean).slice(0, 48) : [];
+  const thoughts = Array.isArray(msg.thoughts) ? msg.thoughts.filter((t) => t && String(t.text || '').trim()) : [];
   const attachmentHtml = attachments.length ? renderAttachmentMarkup(attachments) : '';
   const activityHtml = activities.length ? renderActivityMarkup(activities) : '';
+  const thoughtsHtml = thoughts.length ? renderThoughtsMarkup(thoughts) : '';
   const hasVisibleText = Boolean(String(msg.text || '').trim());
   const bubbleClass = (!hasVisibleText && attachments.length && !activities.length)
     ? 'msg-bubble msg-bubble-media-only'
     : 'msg-bubble';
 
   div.innerHTML = `
-    <div class="${bubbleClass}">${content}${attachmentHtml}${activityHtml}</div>
+    <div class="${bubbleClass}">${content}${attachmentHtml}${thoughtsHtml}${activityHtml}</div>
     <div class="msg-label">${label}${modelTag}${modeTag} · ${fmtDate(msg.timestamp)}</div>`;
 
   linkifyWorkspaceMentionsInNode(div.querySelector('.msg-bubble'));
@@ -469,6 +472,21 @@ export function decorateActivityText(text) {
   if (/^Tool \((sql|sqlite)\)/i.test(value)) return `🗄️ ${value}`;
   if (/^Tool \(/i.test(value)) return `🛠️ ${value}`;
   return `ℹ️ ${value}`;
+}
+
+export function renderThoughtsMarkup(thoughts) {
+  const items = (Array.isArray(thoughts) ? thoughts : [])
+    .map((t) => String(t?.text || '').trim())
+    .filter(Boolean);
+  if (!items.length) return '';
+  const blocks = items
+    .map((text) => `<div class="msg-thought-item"><p>${escHtml(text).replace(/\n/g, '<br>')}</p></div>`)
+    .join('');
+  return `
+    <details class="msg-thoughts">
+      <summary>💭 Thoughts (${items.length})</summary>
+      <div class="msg-thoughts-list">${blocks}</div>
+    </details>`;
 }
 
 export function renderActivityMarkup(activities) {
@@ -582,9 +600,19 @@ export function restoreInFlightThinking(inFlight) {
     Array.isArray(inFlight.activities) ? inFlight.activities : [],
   );
   relayActivities.set(messageId, activities);
+  const inFlightThoughts = Array.isArray(inFlight.thoughts) ? inFlight.thoughts : [];
+  if (inFlightThoughts.length) {
+    const thoughtMap = relayThoughts.get(messageId) || new Map();
+    for (const entry of inFlightThoughts) {
+      const key = String(entry?.reasoningId || `seq-${entry?.seq || thoughtMap.size}`);
+      thoughtMap.set(key, { reasoningId: key, text: String(entry?.text || ''), done: !!entry?.done });
+    }
+    relayThoughts.set(messageId, thoughtMap);
+  }
   thinkingText = '';
   showThinking(messageId);
   renderThinkingActivities();
+  renderThinkingThoughts();
   const streamState = deriveLatestInFlightStreamEvent(inFlight);
   if (streamState) {
     rememberRelayStreamState(messageId, streamState.seq, streamState.done || !!inFlight?.streamDone);
@@ -610,6 +638,47 @@ export function appendThinkingActivity(text, autoScroll = true) {
   row.textContent = decorated;
   box.appendChild(row);
   if (autoScroll) scrollBottom();
+}
+
+function thoughtSummaryText(text) {
+  const value = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!value) return 'Thinking…';
+  return value.length > 80 ? `${value.slice(0, 80)}…` : value;
+}
+
+export function appendThinkingThought(reasoningId, text, done = false, autoScroll = true) {
+  const box = document.getElementById('thinking-activity');
+  if (!box) return;
+  const key = String(reasoningId || 'reasoning');
+  const value = String(text || '');
+  let row = box.querySelector(`.thinking-thought[data-reasoning-id="${CSS.escape(key)}"]`);
+  if (!row) {
+    row = document.createElement('details');
+    row.className = 'thinking-thought';
+    row.dataset.reasoningId = key;
+    const summary = document.createElement('summary');
+    const body = document.createElement('div');
+    body.className = 'thinking-thought-body';
+    row.appendChild(summary);
+    row.appendChild(body);
+    box.appendChild(row);
+  }
+  const summaryEl = row.querySelector('summary');
+  const bodyEl = row.querySelector('.thinking-thought-body');
+  if (summaryEl) summaryEl.textContent = `💭 ${thoughtSummaryText(value)}`;
+  if (bodyEl) bodyEl.innerHTML = `<p>${escHtml(value).replace(/\n/g, '<br>')}</p>`;
+  row.dataset.done = done ? '1' : '0';
+  if (autoScroll) scrollBottom();
+}
+
+export function renderThinkingThoughts() {
+  const box = document.getElementById('thinking-activity');
+  if (!box) return;
+  const thoughtMap = thinkingMessageId ? relayThoughts.get(thinkingMessageId) : null;
+  if (!thoughtMap || !thoughtMap.size) return;
+  for (const entry of thoughtMap.values()) {
+    appendThinkingThought(entry.reasoningId, entry.text, entry.done, false);
+  }
 }
 
 export function updateThinkingText(text, messageId = null, done = false) {
@@ -920,17 +989,11 @@ export async function sendMessage() {
   const mobileSend = isMobileComposerViewport();
   const activeTurn = getActiveTurnForConversation(currentConvId);
   const hasDraft = hasComposerDraft({ text, attachmentCount: selectedAttachments.length });
-  // #region agent log
-  fetch('http://127.0.0.1:7611/ingest/41e205ad-83bf-40b2-b2ab-5040e785036c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0e20dd'},body:JSON.stringify({sessionId:'0e20dd',id:`log_${Date.now()}_${Math.random().toString(36).slice(2,10)}`,runId:'ui-regressions-baseline',hypothesisId:'H10-send-gating',location:'server/public/app/conversation-view.js:sendMessage.entry',message:'send message invocation snapshot',data:{conversationId:String(currentConvId||'').trim()||null,sendInFlight,activeTurnMessageId:String(activeTurn?.messageId||'').trim()||null,activeTurnStatus:String(activeTurn?.status||'').trim()||null,hasDraft,cliOnline,textChars:String(text||'').length},timestamp:Date.now()})}).catch(()=>{});
-  // #endregion
   if (sendInFlight) {
     showTransientRelayNotice('Please wait for the current message to finish sending.');
     return;
   }
   if (activeTurn?.messageId && !hasDraft) {
-    // #region agent log
-    fetch('http://127.0.0.1:7611/ingest/41e205ad-83bf-40b2-b2ab-5040e785036c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0e20dd'},body:JSON.stringify({sessionId:'0e20dd',id:`log_${Date.now()}_${Math.random().toString(36).slice(2,10)}`,runId:'ui-regressions-baseline',hypothesisId:'H10-send-gating',location:'server/public/app/conversation-view.js:sendMessage.stop-branch',message:'send button routed to stop active turn',data:{conversationId:String(currentConvId||'').trim()||null,activeTurnMessageId:String(activeTurn?.messageId||'').trim()||null},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion
     await stopCurrentConversationTurn(currentConvId);
     return;
   }
@@ -972,9 +1035,6 @@ export async function sendMessage() {
     releaseComposerFocusAfterSend(input);
     pendingUserMessageIds.add(clientMessageId);
     appendMessage({ role: 'user', text, model: selectedModel, mode: selectedMode, timestamp: msgTimestamp, attachments }, true, clientMessageId, true);
-    // #region agent log
-    fetch('http://127.0.0.1:7611/ingest/41e205ad-83bf-40b2-b2ab-5040e785036c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0e20dd'},body:JSON.stringify({sessionId:'0e20dd',id:`log_${Date.now()}_${Math.random().toString(36).slice(2,10)}`,runId:'ui-regressions-baseline',hypothesisId:'H11-pending-row',location:'server/public/app/conversation-view.js:sendMessage.optimistic-user-row',message:'optimistic pending user row appended',data:{clientMessageId,conversationId:targetConversationId||null,selectedMode,selectedModel,textChars:String(text||'').length},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion
     scrollBottomAfterSend();
 
     const body = {
@@ -1090,20 +1150,11 @@ async function validateSelectedConversationBeforeSend() {
 
   const conversationSessionId = String(current.sdkSessionId || current.sdk_session_id || '').trim();
   const runtimeSessionSessionId = String(current.runtimeSession?.sdkSessionId || current.runtimeSession?.sdk_session_id || '').trim();
-  // #region agent log
-  fetch('http://127.0.0.1:7611/ingest/41e205ad-83bf-40b2-b2ab-5040e785036c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0e20dd'},body:JSON.stringify({sessionId:'0e20dd',id:`log_${Date.now()}_${Math.random().toString(36).slice(2,10)}`,runId:'baseline-binding',hypothesisId:'H1-client-precheck',location:'server/public/app/conversation-view.js:validateSelectedConversationBeforeSend',message:'pre-send binding snapshot',data:{conversationId:convId,conversationSessionId:conversationSessionId||null,runtimeSessionSessionId:runtimeSessionSessionId||null,runtimeSessionId:String(current.runtimeSession?.id||'').trim()||null},timestamp:Date.now()})}).catch(()=>{});
-  // #endregion
   if (!conversationSessionId) {
-    // #region agent log
-    fetch('http://127.0.0.1:7611/ingest/41e205ad-83bf-40b2-b2ab-5040e785036c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0e20dd'},body:JSON.stringify({sessionId:'0e20dd',id:`log_${Date.now()}_${Math.random().toString(36).slice(2,10)}`,runId:'baseline-binding',hypothesisId:'H1-client-precheck',location:'server/public/app/conversation-view.js:validateSelectedConversationBeforeSend',message:'blocked send: conversation unbound',data:{conversationId:convId,conversationSessionId:null,runtimeSessionSessionId:runtimeSessionSessionId||null},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion
     setModelBanner('⚠️ This conversation is waiting to be claimed by the relay. Please wait, or open another conversation.');
     return false;
   }
   if (!runtimeSessionSessionId || conversationSessionId !== runtimeSessionSessionId) {
-    // #region agent log
-    fetch('http://127.0.0.1:7611/ingest/41e205ad-83bf-40b2-b2ab-5040e785036c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0e20dd'},body:JSON.stringify({sessionId:'0e20dd',id:`log_${Date.now()}_${Math.random().toString(36).slice(2,10)}`,runId:'baseline-binding',hypothesisId:'H2-client-mismatch-branch',location:'server/public/app/conversation-view.js:validateSelectedConversationBeforeSend',message:'blocked send: runtime mismatch or missing',data:{conversationId:convId,conversationSessionId:conversationSessionId||null,runtimeSessionSessionId:runtimeSessionSessionId||null,runtimeSessionId:String(current.runtimeSession?.id||'').trim()||null},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion
     setModelBanner('⚠️ This conversation is bound to a different relay session. Wait for the matching session to claim it, or open another conversation.');
     return false;
   }

@@ -27,6 +27,14 @@ export function createQuestionRepository(db) {
         listStreamEventsByQueueMessage: db.prepare(`SELECT seq, text, done, created_at FROM relay_stream_events WHERE queue_message_id = ? ORDER BY seq ASC, id ASC`),
         deleteConvStreamEvents: db.prepare(`DELETE FROM relay_stream_events WHERE conversation_id = ?`),
 
+        // relay thoughts (agent reasoning)
+        getLastThoughtSeqByQueueMessage: db.prepare(`SELECT COALESCE(MAX(seq), 0) AS max_seq FROM relay_thought WHERE queue_message_id = ?`),
+        insertThought: db.prepare(`INSERT INTO relay_thought (queue_message_id, response_message_id, conversation_id, relay_mode, reasoning_id, seq, text, done, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+        linkThoughtsToResponse: db.prepare(`UPDATE relay_thought SET response_message_id = ? WHERE queue_message_id = ? AND response_message_id IS NULL`),
+        listThoughtsByResponse: db.prepare(`SELECT reasoning_id, seq, text, done, created_at FROM relay_thought WHERE response_message_id = ? ORDER BY seq ASC, id ASC`),
+        listThoughtsByQueueMessage: db.prepare(`SELECT reasoning_id, seq, text, done, created_at FROM relay_thought WHERE queue_message_id = ? ORDER BY seq ASC, id ASC`),
+        deleteConvThoughts: db.prepare(`DELETE FROM relay_thought WHERE conversation_id = ?`),
+
         // relay boards
         insertBoard: db.prepare(`INSERT INTO relay_boards (id, queue_id, conversation_id, message_id, board_type, relay_mode, title, body, actions_json, recommended_action, context_json, status, selected_action, acted_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?)`),
         getBoard: db.prepare(`SELECT * FROM relay_boards WHERE id = ?`),

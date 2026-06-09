@@ -39,6 +39,7 @@ export let recentWorkspaceRoots = [];
 export let relayQuestions = new Map();
 export let relayBoards = new Map();
 export let relayActivities = new Map();
+export let relayThoughts = new Map();
 export let sessionWorkerStates = new Map();
 export let thinkingMessageId = null;
 export let relayQuestionPollTimer = null;

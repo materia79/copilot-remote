@@ -773,6 +773,59 @@
     overflow-wrap: anywhere;
     word-break: break-word;
   }
+  /* ── Agent thoughts (reasoning) ── */
+  .thinking-thought {
+    min-width: 0;
+    font-style: italic;
+    color: var(--muted);
+    opacity: 0.92;
+  }
+  .thinking-thought > summary {
+    cursor: pointer;
+    list-style: none;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  .thinking-thought > summary::-webkit-details-marker { display: none; }
+  .thinking-thought-body {
+    margin: 4px 0 6px 18px;
+    font-style: normal;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  .thinking-thought-body p { margin: 0; }
+  .msg-thoughts {
+    margin-top: 10px;
+    border-top: 1px dashed var(--border);
+    padding-top: 8px;
+  }
+  .msg-thoughts > summary {
+    cursor: pointer;
+    color: var(--muted);
+    font-size: 0.78rem;
+    font-style: italic;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  .msg-thoughts-list {
+    margin-top: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+  }
+  .msg-thought-item {
+    color: var(--muted);
+    font-size: 0.8rem;
+    min-width: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  .msg-thought-item p { margin: 0; }
   .dots span { display: inline-block; width: 6px; height: 6px; margin: 0 2px;
     border-radius: 50%; background: var(--muted); animation: bounce 1.2s infinite; }
   .dots span:nth-child(2) { animation-delay: 0.2s; }
@@ -1220,6 +1273,21 @@
     flex-direction: column;
     gap: 8px;
     position: relative;
+  }
+  .change-cwd-manual-input {
+    width: 100%;
+    min-width: 0;
+    height: 38px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg3);
+    color: var(--text);
+    padding: 0 10px;
+    font: inherit;
+    outline: none;
+  }
+  .change-cwd-manual-input:focus {
+    border-color: var(--accent);
   }
   .change-cwd-menu-trigger {
     width: 100%;

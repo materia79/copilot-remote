@@ -918,6 +918,26 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_relay_stream_events_conversation
     ON relay_stream_events(conversation_id, queue_message_id, seq);
 
+  CREATE TABLE IF NOT EXISTS relay_thought (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    queue_message_id    TEXT NOT NULL,
+    response_message_id TEXT,
+    conversation_id     TEXT NOT NULL,
+    relay_mode          TEXT NOT NULL DEFAULT 'agent',
+    reasoning_id        TEXT,
+    seq                 INTEGER NOT NULL,
+    text                TEXT NOT NULL,
+    done                INTEGER NOT NULL DEFAULT 0,
+    created_at          TEXT NOT NULL,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
+    UNIQUE(queue_message_id, seq)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_relay_thought_queue
+    ON relay_thought(queue_message_id, seq);
+  CREATE INDEX IF NOT EXISTS idx_relay_thought_response
+    ON relay_thought(response_message_id, seq);
+
   CREATE TABLE IF NOT EXISTS uploaded_files (
     sha256        TEXT PRIMARY KEY,
     original_name TEXT,
@@ -2664,6 +2684,27 @@ function relayStreamEventsForQueueMessage(queueMessageId) {
     .slice(0, 5000);
 }
 
+function mapRelayThoughtRow(row) {
+  const seq = Math.max(0, Math.trunc(Number(row?.seq || 0)));
+  return {
+    reasoningId: row?.reasoning_id ? String(row.reasoning_id) : null,
+    seq,
+    text: String(row?.text || ''),
+    done: Number(row?.done || 0) === 1,
+    timestamp: row?.created_at || null,
+  };
+}
+
+function relayThoughtsForResponse(responseMessageId) {
+  const rows = stmts.listThoughtsByResponse?.all(responseMessageId) || [];
+  return rows.map(mapRelayThoughtRow).slice(0, 5000);
+}
+
+function relayThoughtsForQueueMessage(queueMessageId) {
+  const rows = stmts.listThoughtsByQueueMessage?.all(queueMessageId) || [];
+  return rows.map(mapRelayThoughtRow).slice(0, 5000);
+}
+
 function inFlightStateForConversation(conversationId) {
   const row = stmts.getLatestProcessingQueueByConversation.get(conversationId);
   if (!row) return null;
@@ -2676,6 +2717,7 @@ function inFlightStateForConversation(conversationId) {
     timestamp: row.timestamp || null,
     processingAt: row.processing_at || null,
     activities: relayActivityForQueueMessage(row.id),
+    thoughts: relayThoughtsForQueueMessage(row.id),
     streamEvents,
     streamDone: !!lastStreamEvent?.done,
     lastStreamSeq: lastStreamEvent?.seq || 0,
@@ -2946,6 +2988,8 @@ const sharedRouteDeps = {
   hydrateAttachment,
   relayActivityForResponse,
   relayActivityForQueueMessage,
+  relayThoughtsForResponse,
+  relayThoughtsForQueueMessage,
   sanitizeActivityText,
   inFlightStateForConversation,
   emitToClientsExceptSessionId,
