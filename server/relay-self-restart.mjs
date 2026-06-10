@@ -86,6 +86,7 @@ export async function runDirectRelaySupervisor({
   env = process.env,
   execArgv = process.execArgv,
   spawnImpl = spawn,
+  stdio = ['ignore', 'pipe', 'pipe'],
   delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   exitImpl = (code) => process.exit(code),
   logger = console,
@@ -125,11 +126,16 @@ export async function runDirectRelaySupervisor({
         restartCount,
         crashCount,
         spawnImpl,
+        stdio,
         detached: false,
         logger,
       });
-      runtimeProc.stdout?.on?.('data', (chunk) => process.stdout.write(chunk));
-      runtimeProc.stderr?.on?.('data', (chunk) => process.stderr.write(chunk));
+      if (runtimeProc.stdout?.on) {
+        runtimeProc.stdout.on('data', (chunk) => process.stdout.write(chunk));
+      }
+      if (runtimeProc.stderr?.on) {
+        runtimeProc.stderr.on('data', (chunk) => process.stderr.write(chunk));
+      }
 
       const result = await waitForChildExit(runtimeProc);
       runtimeProc = null;

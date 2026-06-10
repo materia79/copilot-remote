@@ -10,3 +10,4 @@ server/uploads/*
 test-results/
 tests/
 tests/agents/
+server.log

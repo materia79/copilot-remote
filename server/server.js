@@ -5,6 +5,7 @@ import { isRelaySelfRestartWorker, runDirectRelaySupervisor } from './relay-self
 
 const scriptPath = fileURLToPath(import.meta.url);
 const runtimeArgs = process.argv.slice(2);
+const interactiveStdio = process.stdin.isTTY && process.stdout.isTTY && process.stderr.isTTY;
 
 if (isRelaySelfRestartWorker(process.env)) {
   await import('./server-runtime.mjs');
@@ -14,6 +15,7 @@ if (isRelaySelfRestartWorker(process.env)) {
     args: runtimeArgs,
     cwd: process.cwd(),
     env: process.env,
+    stdio: interactiveStdio ? 'inherit' : ['ignore', 'pipe', 'pipe'],
     logger: console,
   });
 }

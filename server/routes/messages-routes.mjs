@@ -922,6 +922,20 @@ export function registerMessagesRoutes(app, deps) {
     relayQuestionFinalizationHoldMs = RELAY_QUESTION_FINALIZATION_HOLD_MS,
   } = deps;
 
+  const ttyConsoleActive = runtimeState?.ttyConsoleActive === true;
+
+  function isAbnormalWorkerTelemetry(payload = {}, level = 'log') {
+    const normalizedLevel = String(level || 'log').trim().toLowerCase();
+    if (normalizedLevel === 'warn' || normalizedLevel === 'error') return true;
+    const event = String(payload?.event || '').trim().toLowerCase();
+    const state = String(payload?.state || '').trim().toLowerCase();
+    if (state === 'error') return true;
+    return event.includes('error')
+      || event.includes('failed')
+      || event.includes('failure')
+      || event.includes('blocked');
+  }
+
   function isLoopbackAddress(value) {
     const text = String(value || '').trim().toLowerCase();
     if (!text) return false;
@@ -1010,6 +1024,8 @@ export function registerMessagesRoutes(app, deps) {
     const payload = extra && typeof extra === 'object'
       ? { ...envelope, ...extra }
       : envelope;
+    const shouldLog = !ttyConsoleActive || isAbnormalWorkerTelemetry(payload, level);
+    if (!shouldLog) return;
     const method = typeof console[level] === 'function' ? level : 'log';
     console[method](`[${ts()}] WORKER    ${JSON.stringify(payload)}`);
   }

@@ -39,6 +39,7 @@ import { createSessionWorkerSupervisor } from './services/session-worker-supervi
 import { createSessionWorkerProcessInspector } from './services/session-worker-process-service.mjs';
 import { launchSessionCli } from './services/session-worker-launch-service.mjs';
 import { createSessionWorkerWebSocketService } from './services/session-worker-websocket-service.mjs';
+import { maybeStartTtyConsole } from './tty-console-bootstrap.mjs';
 import { FEATURES, normalizeFeatureFlags } from './features.mjs';
 import { RELAY_RESTART_EXIT_CODE } from './relay-exit-codes.mjs';
 import { DEFAULT_QUESTION_TIMEOUT_MS } from '../shared/question-timeout.mjs';
@@ -47,6 +48,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const INDEX_HTML_PATH = path.join(PUBLIC_DIR, 'index.html');
 const PWA_VERSION_PLACEHOLDER = /const __PWA_VERSION = '[^']*';/;
+const ttyConsoleRuntime = await maybeStartTtyConsole({
+  serverDir: __dirname,
+  logsDir: path.join(__dirname, 'logs'),
+  logger: console,
+});
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 const CONFIG_PATH    = process.env.COPILOT_WEB_RELAY_CONFIG
@@ -337,6 +343,7 @@ function workspaceRootPayload() {
 }
 
 const ACTIVE_SESSION_CWD_STATUSES = new Set(['starting', 'ready', 'processing']);
+const ACTIVE_TTY_CLI_WORKER_STATUSES = new Set(['starting', 'ready', 'processing']);
 
 function normalizeConversationWorkspaceRootPath(candidatePath) {
   const normalized = normalizeWorkspaceRootPath(candidatePath);
@@ -1734,7 +1741,7 @@ const sessionWorkerProcessInspector = createSessionWorkerProcessInspector({
 const relayCliLauncherService = createRelayCliLauncherService({
   cwd: (targetSessionId) => resolveLaunchWorkspaceRootForSession(targetSessionId),
   env: process.env,
-  log: (message) => console.log(`[${ts()}] ${message}`),
+  log: (message) => console.log(`${runtimeLogPrefix()}${message}`),
 });
 async function spawnSessionWorkerCli(targetSessionId) {
   const normalizedTargetSessionId = String(targetSessionId || '').trim();
@@ -1744,7 +1751,7 @@ async function spawnSessionWorkerCli(targetSessionId) {
   const liveWorker = sessionWorkerProcessInspector.findProcessForSession(normalizedTargetSessionId);
   if (liveWorker?.processId) {
     const workerId = `worker-${normalizedTargetSessionId.slice(0, 8)}`;
-    console.log(`[${ts()}] worker launcher: reused ${workerId} session=${normalizedTargetSessionId.slice(0, 8)} pid=${liveWorker.processId}`);
+    console.log(`${runtimeLogPrefix()}worker launcher: reused ${workerId} session=${normalizedTargetSessionId.slice(0, 8)} pid=${liveWorker.processId}`);
     return { workerId, pid: liveWorker.processId };
   }
   const launched = await launchSessionCli({
@@ -1760,14 +1767,14 @@ async function spawnSessionWorkerCli(targetSessionId) {
   const workerId = `worker-${normalizedTargetSessionId.slice(0, 8)}`;
   const launchMode = String(launched?.launchMode || 'detached').trim();
   const tmuxSessionName = String(launched?.tmuxSessionName || '').trim();
-  console.log(`[${ts()}] worker launcher: spawned ${workerId} session=${normalizedTargetSessionId.slice(0, 8)} pid=${workerPid || 'none'} mode=${launchMode}${tmuxSessionName ? ` tmux=${tmuxSessionName}` : ''}`);
+  console.log(`${runtimeLogPrefix()}worker launcher: spawned ${workerId} session=${normalizedTargetSessionId.slice(0, 8)} pid=${workerPid || 'none'} mode=${launchMode}${tmuxSessionName ? ` tmux=${tmuxSessionName}` : ''}`);
   return { workerId, pid: workerPid };
 }
 const sessionWorkerSupervisor = createSessionWorkerSupervisor({
   registry: sessionWorkerRegistry,
   spawnWorker: async (sdkSessionId) => spawnSessionWorkerCli(sdkSessionId),
   diagnosticPlanReference: () => path.join(currentWorkspaceRootPath(), '.cursor', 'plans', 'worker-startup-monitoring-plan.md'),
-  log: (message) => console.warn(`[${ts()}] ${message}`),
+  log: (message) => console.warn(`${runtimeLogPrefix()}${message}`),
 });
 const featureFlags = normalizeFeatureFlags(FEATURES);
 
@@ -1776,6 +1783,27 @@ function queueCounts() {
   const map = Object.fromEntries(rows.map(r => [r.status, r.cnt]));
   return { pendingCount: map.pending || 0, processingCount: map.processing || 0, parkedCount: map.parked || 0 };
 }
+
+function countActiveCliWorkers() {
+  const workers = sessionWorkerRegistry?.listWorkers?.() || [];
+  return workers.reduce((acc, worker) => {
+    const status = String(worker?.status || '').trim().toLowerCase();
+    return ACTIVE_TTY_CLI_WORKER_STATUSES.has(status) ? acc + 1 : acc;
+  }, 0);
+}
+
+function attachTtyConsoleRuntimeTitle(runtime) {
+  const addConsoleTitle = runtime?.tty?.addConsoleTitle;
+  if (typeof addConsoleTitle !== 'function') return;
+  addConsoleTitle(() => {
+    const counts = queueCounts();
+    const connectedClients = Number(io?.sockets?.sockets?.size || 0);
+    const activeCliWorkers = countActiveCliWorkers();
+    const cliState = cliOnline ? 'online' : 'offline';
+    return `Clients: ${connectedClients} :: Pen: ${counts.pendingCount} :: Proc: ${counts.processingCount} :: parked: ${counts.parkedCount} :: CLIs: ${activeCliWorkers} :: CLI: ${cliState}`;
+  });
+}
+attachTtyConsoleRuntimeTitle(ttyConsoleRuntime);
 
 let pendingRelayShutdownRequest = null;
 function normalizeRestartRequestFlag(value) {
@@ -1854,7 +1882,7 @@ function requestRelayShutdown({ reason = 'manual-request', requestedBy = 'localh
     const action = requestInfo?.action === 'restart' ? 'restart' : 'shutdown';
     const exitCode = action === 'restart' ? RELAY_RESTART_EXIT_CODE : 0;
     console.log(
-      `[${ts()}] Relay ${action} request accepted by ${requestInfo?.requestedBy || 'unknown'}`
+      `${runtimeLogPrefix()}Relay ${action} request accepted by ${requestInfo?.requestedBy || 'unknown'}`
       + `; queue is idle, exiting now (reason=${requestInfo?.reason || 'manual-request'})`,
     );
     void shutdownRuntime(`api-${action}:${requestInfo?.reason || 'manual-request'}`, { exitCode });
@@ -3468,6 +3496,7 @@ const runtimeState = {
   set cliOnline(value) { cliOnline = value; },
   get relayPaused() { return relayPaused; },
   set relayPaused(value) { relayPaused = value; },
+  get ttyConsoleActive() { return Boolean(ttyConsoleRuntime?.tty); },
   get relayShutdown() { return getRelayShutdownState(); },
   get activeBridgeOwner() { return relayBridgeOwnerService.getOwner(); },
   get workerWebSocketStatus() { return sessionWorkerWebSocketService.status(); },
@@ -3611,7 +3640,7 @@ function markCliOffline(reason = 'offline', { clearOwner = true } = {}) {
   }
   relayRestartOrchestrator.noteCliOffline();
   if (wasOnline) {
-    console.log(`[${ts()}] CLI OFFLINE${reason ? ` (${reason})` : ''}`);
+    console.log(`${runtimeLogPrefix()}CLI OFFLINE${reason ? ` (${reason})` : ''}`);
     io.emit('cli_status', { online: false });
   }
 }
@@ -3624,7 +3653,7 @@ function checkCliStatus() {
       markCliOffline('heartbeat-timeout');
       return;
     }
-    console.log(`[${ts()}] CLI ONLINE`);
+    console.log(`${runtimeLogPrefix()}CLI ONLINE`);
     io.emit('cli_status', { online: true });
   }
 }
@@ -3633,7 +3662,7 @@ runtimeTimers.cliStatus = setInterval(checkCliStatus, 2000);
 if (managedOwnerPid) {
   runtimeTimers.ownerWatchdog = setInterval(() => {
     if (isProcessAlive(managedOwnerPid)) return;
-    console.log(`[${ts()}] Owner process ${managedOwnerPid} is gone; shutting down managed relay.`);
+    console.log(`${runtimeLogPrefix()}Owner process ${managedOwnerPid} is gone; shutting down managed relay.`);
     void shutdownRuntime(`owner-pid-missing:${managedOwnerPid}`);
   }, 3000);
 }
@@ -3648,7 +3677,7 @@ function recoverStaleMessages() {
   const recoveredRows = recoverProcessingOlderThan(cutoff, requeueAt);
   if (recoveredRows.length > 0) {
     console.log(
-      `[${ts()}] Recovered ${recoveredRows.length} stale message(s) older than ${Math.round(staleWindowMs / 1000)}s (cliOnline=${cliOnline})`
+      `${runtimeLogPrefix()}Recovered ${recoveredRows.length} stale message(s) older than ${Math.round(staleWindowMs / 1000)}s (cliOnline=${cliOnline})`
     );
   }
 }
@@ -3659,7 +3688,7 @@ function expirePendingQuestions() {
   const now = new Date().toISOString();
   const result = stmts.expireQuestions.run(now);
   if (result.changes > 0) {
-    console.log(`[${ts()}] Timed out ${result.changes} relay question(s)`);
+    console.log(`${runtimeLogPrefix()}Timed out ${result.changes} relay question(s)`);
     io.emit('relay_question_changed', { expired: result.changes });
   }
 }
@@ -3667,10 +3696,13 @@ runtimeTimers.questionExpiry = setInterval(expirePendingQuestions, 10_000);
 expirePendingQuestions();
 const runtimeBindingsBootstrapped = bootstrapRuntimeSessionBindings();
 if (runtimeBindingsBootstrapped > 0) {
-  console.log(`[${ts()}] Runtime sessions bootstrapped: ${runtimeBindingsBootstrapped}`);
+  console.log(`${runtimeLogPrefix()}Runtime sessions bootstrapped: ${runtimeBindingsBootstrapped}`);
 }
 
 function ts() { return new Date().toISOString().slice(11, 23); }
+function runtimeLogPrefix() {
+  return ttyConsoleRuntime?.tty ? '' : `[${ts()}] `;
+}
 
 // ─── Auth Middleware ──────────────────────────────────────────────────────────
 function auth(req, res, next) {
@@ -3859,7 +3891,7 @@ function touchCli() {
   relayRestartOrchestrator.noteCliOnline();
   if (!cliOnline) {
     cliOnline = true;
-    console.log(`[${ts()}] CLI ONLINE (heartbeat)`);
+    console.log(`${runtimeLogPrefix()}CLI ONLINE (heartbeat)`);
     io.emit('cli_status', { online: true });
   }
 }
@@ -3981,7 +4013,7 @@ const tunnelState = {
 runtimeState.tunnelState = tunnelState;
 
 function tunnelLog(msg) {
-  console.log(`[${ts()}] [ssh-tunnel] ${msg}`);
+  console.log(`${runtimeLogPrefix()}[ssh-tunnel] ${msg}`);
 }
 
 function scheduleTunnelReconnect(delayOverrideMs = null) {
@@ -4179,13 +4211,13 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
     ? numericExitCode
     : 0;
   runtimeShutdownStarted = true;
-  console.log(`[${ts()}] Runtime shutdown started (${reason}, exitCode=${runtimeShutdownExitCode})`);
+  console.log(`${runtimeLogPrefix()}Runtime shutdown started (${reason}, exitCode=${runtimeShutdownExitCode})`);
   clearRuntimeTimers();
   sessionWorkerWebSocketService.stop();
   stopWorkspaceFileWatcher();
   stopSshTunnel();
   try { relaySingletonGuard.release(); } catch (error) {
-    console.warn(`[${ts()}] Failed to release singleton lock: ${error?.message || error}`);
+    console.warn(`${runtimeLogPrefix()}Failed to release singleton lock: ${error?.message || error}`);
   }
 
   runtimeShutdownPromise = new Promise((resolve) => {
@@ -4198,7 +4230,7 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
     };
 
     const forceExitTimer = setTimeout(() => {
-      console.warn(`[${ts()}] Runtime shutdown timeout reached; forcing exit.`);
+      console.warn(`${runtimeLogPrefix()}Runtime shutdown timeout reached; forcing exit.`);
       finish();
     }, 2000);
     if (typeof forceExitTimer.unref === 'function') forceExitTimer.unref();
