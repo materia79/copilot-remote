@@ -1117,6 +1117,7 @@ export function registerMessagesRoutes(app, deps) {
         role: 'assistant',
         text: responseText,
         model: model || null,
+        reasoningEffort: String(queueRow?.reasoning_effort || '').trim() || null,
         mode: relayMode,
         timestamp: now,
       },
@@ -2180,7 +2181,9 @@ export function registerMessagesRoutes(app, deps) {
     if (!trimmedText && attachments.length === 0) return res.status(400).json({ error: 'Empty message' });
     const modelResolution = resolveRequestedModel(model);
     if (!modelResolution.ok) return res.status(400).json({ error: modelResolution.error, supportedModels: modelResolution.available || [] });
-    const requestedModel = modelResolution.model;
+    const requestedModel = String(modelResolution.model || '').trim();
+    const requestedModelVariantId = String(modelResolution.modelVariantId || model || requestedModel).trim();
+    const requestedReasoningEffort = String(modelResolution.reasoningEffort || '').trim() || null;
     if (!requestedRelayMode) return res.status(400).json({ error: 'Unsupported relay mode' });
     const shouldCreateConversation = !!newConversation || !conversationId;
     const conversationWorkspaceState = (!shouldCreateConversation && typeof resolveConversationWorkspaceState === 'function')
@@ -2292,7 +2295,7 @@ export function registerMessagesRoutes(app, deps) {
         ].join('\n')
       : trimmedText;
 
-    stmts.insertMsg.run(msgId, convId, 'user', trimmedText, requestedModel, requestedRelayMode, attachments.length ? JSON.stringify(attachments) : null, now);
+    stmts.insertMsg.run(msgId, convId, 'user', trimmedText, requestedModelVariantId, requestedRelayMode, attachments.length ? JSON.stringify(attachments) : null, now);
     linkUploadReferences(convId, msgId, attachments);
     stmts.updateConvTime.run(now, convId);
     const conversationPreferences = persistConversationModeModelPreference(
@@ -2307,6 +2310,8 @@ export function registerMessagesRoutes(app, deps) {
       runtimeSession?.id || null,
       (!conversationId || !!newConversation) ? 1 : 0,
       requestedModel,
+      requestedModelVariantId,
+      requestedReasoningEffort,
       requestedRelayMode,
       queueText,
       attachments.length ? JSON.stringify(attachments) : null,
@@ -2377,11 +2382,11 @@ export function registerMessagesRoutes(app, deps) {
       stmts.clearConvSeed.run(now, convId);
     }
 
-    console.log(`[${ts()}] QUEUED    ${msgId.slice(0,8)} conv=${convId.slice(0,8)} rs=${String(runtimeSession?.id || 'none').slice(0,8)} owner=${String(ownerSessionId || 'none').slice(0,8)} new=${!conversationId || !!newConversation} model=${requestedModel} mode=${requestedRelayMode} text="${trimmedText.slice(0,60)}"${shouldApplySeed ? ' seeded=1' : ''}${attachments.length ? ` attachments=${attachments.length}` : ''}`);
+    console.log(`[${ts()}] QUEUED    ${msgId.slice(0,8)} conv=${convId.slice(0,8)} rs=${String(runtimeSession?.id || 'none').slice(0,8)} owner=${String(ownerSessionId || 'none').slice(0,8)} new=${!conversationId || !!newConversation} model=${requestedModel} variant=${requestedModelVariantId}${requestedReasoningEffort ? ` effort=${requestedReasoningEffort}` : ''} mode=${requestedRelayMode} text="${trimmedText.slice(0,60)}"${shouldApplySeed ? ' seeded=1' : ''}${attachments.length ? ` attachments=${attachments.length}` : ''}`);
 
     emitToClientsExceptSessionId(
       'user_message',
-      { conversationId: convId, messageId: msgId, senderClientId: sessionId, message: { role: 'user', text: trimmedText, model: requestedModel, mode: requestedRelayMode, timestamp: now, attachments } },
+      { conversationId: convId, messageId: msgId, senderClientId: sessionId, message: { role: 'user', text: trimmedText, model: requestedModelVariantId, mode: requestedRelayMode, timestamp: now, attachments } },
       sessionId,
     );
     io.emit('message_status', { messageId: msgId, conversationId: convId, status: 'pending' });
@@ -2408,6 +2413,9 @@ export function registerMessagesRoutes(app, deps) {
       preferredRelayMode: conversationPreferences.preferredRelayMode,
       preferredModelsByMode: conversationPreferences.preferredModelsByMode,
       warning: modelResolution.warning || null,
+      selectedModelVariantId: requestedModelVariantId,
+      selectedBaseModel: requestedModel,
+      selectedReasoningEffort: requestedReasoningEffort,
       workspaceRootWarning: workspaceRootUpdate.error || null,
       workspaceRootChanged: !!workspaceRootUpdate.changed,
       ...workspaceRootPayload(),
@@ -2825,7 +2833,9 @@ export function registerMessagesRoutes(app, deps) {
         conversationId:    msg.conversation_id,
         runtimeSessionId:  runtimeSession?.id || null,
         isNewConversation: msg.is_new_conversation === 1,
-        model:             String(msg.model || '').trim() || getModelCatalogState().currentModel || DEFAULT_MODEL,
+        model:             String(msg.model || '').trim() || DEFAULT_MODEL,
+        modelVariantId:    String(msg.model_variant_id || '').trim() || String(msg.model || '').trim() || null,
+        reasoningEffort:   String(msg.reasoning_effort || '').trim() || null,
         relayMode:         normalizeRelayMode(msg.relay_mode) || DEFAULT_RELAY_MODE,
         text:              msg.text,
         attachments,
@@ -2862,7 +2872,7 @@ export function registerMessagesRoutes(app, deps) {
           queue: counts,
         });
       }
-      console.log(`[${ts()}] DEQUEUED  ${out.id.slice(0,8)} conv=${out.conversationId.slice(0,8)} rs=${String(out.runtimeSessionId || 'none').slice(0,8)} owner=${String(out.ownerSessionId || 'none').slice(0,8)} model=${out.model} mode=${out.relayMode} text="${out.text.slice(0,60)}"${attachments.length ? ` attachments=${attachments.length}` : ''}`);
+      console.log(`[${ts()}] DEQUEUED  ${out.id.slice(0,8)} conv=${out.conversationId.slice(0,8)} rs=${String(out.runtimeSessionId || 'none').slice(0,8)} owner=${String(out.ownerSessionId || 'none').slice(0,8)} model=${out.model}${out.reasoningEffort ? ` effort=${out.reasoningEffort}` : ''} mode=${out.relayMode} text="${out.text.slice(0,60)}"${attachments.length ? ` attachments=${attachments.length}` : ''}`);
       io.emit('message_status', { messageId: out.id, conversationId: out.conversationId, status: 'processing' });
       res.json({
         message: out,
@@ -3158,7 +3168,16 @@ export function registerMessagesRoutes(app, deps) {
       conversationId: targetConversationId,
       sourceMessageId: messageId,
       messageId: responseId,
-      message: { role: 'assistant', text: resolvedText, model: model || null, mode: relayMode, timestamp: now, activities, thoughts },
+      message: {
+        role: 'assistant',
+        text: resolvedText,
+        model: model || null,
+        reasoningEffort: String(q?.reasoning_effort || '').trim() || null,
+        mode: relayMode,
+        timestamp: now,
+        activities,
+        thoughts,
+      },
     });
     io.emit('message_status', { messageId, conversationId: targetConversationId, status: 'done' });
     res.json({ ok: true });

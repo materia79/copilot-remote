@@ -675,7 +675,7 @@ export function createPollingLoop({
           setPendingAskUserRequest?.(null);
 
           const label = message.isNewConversation ? "new conv" : "existing conv";
-          await session.log(`📨 [${label}] Web message (${message.model || "default"} / ${message.relayMode || "agent"}): "${String(message.text || "").slice(0, 80)}"`);
+          await session.log(`📨 [${label}] Web message (${message.model || "default"}${message.reasoningEffort ? `:${message.reasoningEffort}` : ""} / ${message.relayMode || "agent"}): "${String(message.text || "").slice(0, 80)}"`);
           dbg("session.send: queuing for msgId", message.id);
           let lastStreamedSent = "";
           const pushRelayStream = async (text, done = false) => {
@@ -714,6 +714,9 @@ export function createPollingLoop({
 
             const sdkAttachments = buildSdkAttachments(message.attachments);
             const payload = sdkAttachments.length ? { prompt, attachments: sdkAttachments } : { prompt };
+            if (message.reasoningEffort && String(message.reasoningEffort || "").trim().toLowerCase() !== "none") {
+              payload.reasoningEffort = String(message.reasoningEffort || "").trim();
+            }
             if (sdkAttachments.length) {
               const imageCount = sdkAttachments.filter((att) => att.type === "blob").length;
               const fileCount = sdkAttachments.filter((att) => att.type === "file").length;

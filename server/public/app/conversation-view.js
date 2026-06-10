@@ -347,6 +347,17 @@ function syncHistoryLoadMoreControl() {
   btn.textContent = conversationHistoryState.loadingOlder ? 'Loading older…' : 'Load older messages';
 }
 
+function splitVariantId(modelVariantId = '') {
+  const value = String(modelVariantId || '').trim();
+  if (!value) return { baseModelId: '', reasoningEffort: null };
+  const match = value.match(/^(.*)-(none|low|medium|high|xhigh|max)$/i);
+  if (!match) return { baseModelId: value, reasoningEffort: null };
+  return {
+    baseModelId: String(match[1] || '').trim(),
+    reasoningEffort: String(match[2] || '').trim().toLowerCase(),
+  };
+}
+
 function createMessageNode(msg, msgId = null, force = false) {
   const el = getMessagesElement();
   if (!el) return null;
@@ -371,8 +382,13 @@ function createMessageNode(msg, msgId = null, force = false) {
   if (fingerprint.sourceMessageId) div.dataset.sourceMessageId = fingerprint.sourceMessageId;
 
   const label = msg.role === 'user' ? 'You' : 'Copilot';
-  const modelTag = (msg.role === 'assistant' && msg.model)
-    ? ` <span class="msg-model">${escHtml(msg.model)}</span>` : '';
+  const { baseModelId, reasoningEffort } = splitVariantId(msg.model);
+  const explicitReasoningEffort = String(msg?.reasoningEffort || '').trim().toLowerCase() || null;
+  const resolvedReasoningEffort = explicitReasoningEffort || reasoningEffort;
+  const modelTag = (msg.role === 'assistant' && baseModelId)
+    ? ` <span class="msg-model">${escHtml(baseModelId)}</span>` : '';
+  const reasoningTag = (msg.role === 'assistant' && resolvedReasoningEffort && resolvedReasoningEffort !== 'none')
+    ? ` <span class="msg-reasoning">${escHtml(resolvedReasoningEffort)}</span>` : '';
   const modeTag = msg.mode
     ? ` <span class="msg-mode">${escHtml(msg.mode)}</span>` : '';
   const content = msg.role === 'assistant'
@@ -391,7 +407,7 @@ function createMessageNode(msg, msgId = null, force = false) {
 
   div.innerHTML = `
     <div class="${bubbleClass}">${content}${attachmentHtml}${thoughtsHtml}${activityHtml}</div>
-    <div class="msg-label">${label}${modelTag}${modeTag} · ${fmtDate(msg.timestamp)}</div>`;
+    <div class="msg-label">${label}${modelTag}${reasoningTag}${modeTag} · ${fmtDate(msg.timestamp)}</div>`;
 
   linkifyWorkspaceMentionsInNode(div.querySelector('.msg-bubble'));
   div.querySelectorAll('pre code').forEach((b) => hljs.highlightElement(b));

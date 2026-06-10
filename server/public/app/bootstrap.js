@@ -60,6 +60,9 @@ import {
   loadUsageSummary,
   loadContextSummary,
   loadModelCatalog,
+  loadModelVariantCatalog,
+  refreshModelVariantCatalog,
+  saveEnabledModelVariants,
   loadConversation,
   updateConversationTitle,
   updateConversationPreferences,
@@ -110,20 +113,13 @@ const FALLBACK_MODE = 'agent';
 const THEME_COLOR_BASE = '#0d1117';
 const THEME_COLOR_IMMERSIVE = '#161b22';
 const LEGACY_KNOWN_CWD_HISTORY_KEY = 'copilot_known_cwds';
-const MODEL_LABELS = {
-  'gpt-5.4': 'GPT-5.4',
-  'gpt-5.4-mini': 'GPT-5.4 Mini',
-  'gpt-5.3-codex': 'GPT-5.3 Codex',
-  'claude-sonnet-4.6': 'Claude Sonnet 4.6',
-  'claude-haiku-4.5': 'Claude Haiku 4.5',
+const PROVIDER_LABELS = {
+  openai: 'OpenAI',
+  anthropic: 'Anthropic',
+  google: 'Google',
+  microsoft: 'Microsoft',
+  other: 'Other',
 };
-const CURATED_MODELS = [
-  'gpt-5.4',
-  'gpt-5.4-mini',
-  'gpt-5.3-codex',
-  'claude-sonnet-4.6',
-  'claude-haiku-4.5',
-];
 const CHAT_TITLE_MAX_LENGTH = 120;
 
 let socket = null;
@@ -144,6 +140,15 @@ let modelCatalogState = {
   stale: false,
   warning: null,
   refreshedAt: null,
+};
+let modelVariantCatalogState = {
+  variants: [],
+  enabledVariantIds: [],
+  source: null,
+  refreshedAt: null,
+  warning: null,
+  error: null,
+  reasoningEfforts: [],
 };
 let activeConversationPreferredModelsByMode = {};
 let suppressConversationPreferenceSync = false;
@@ -225,16 +230,60 @@ function syncQueueStatusMenuEntry(payload = null) {
   chip.textContent = `Queue: ${statusText}`;
 }
 
+function splitVariantId(modelVariantId = '') {
+  const value = String(modelVariantId || '').trim();
+  if (!value) return { baseModelId: '', reasoningEffort: null };
+  const match = value.match(/^(.*)-(none|low|medium|high|xhigh|max)$/i);
+  if (!match) return { baseModelId: value, reasoningEffort: null };
+  return {
+    baseModelId: String(match[1] || '').trim(),
+    reasoningEffort: String(match[2] || '').trim().toLowerCase(),
+  };
+}
+
+function humanizeModelLabel(modelId = '') {
+  const text = String(modelId || '').trim();
+  if (!text) return '';
+  if (/^gpt-/i.test(text)) {
+    return text
+      .replace(/^gpt-/i, 'GPT-')
+      .replace(/-codex$/i, ' Codex')
+      .replace(/-mini$/i, ' Mini');
+  }
+  if (/^claude-/i.test(text)) {
+    return text
+      .replace(/^claude-/i, 'Claude ')
+      .split('-')
+      .map((part) => (/^\d+(\.\d+)?$/.test(part) ? part : (part.charAt(0).toUpperCase() + part.slice(1))))
+      .join(' ');
+  }
+  if (/^gemini-/i.test(text)) {
+    return text
+      .replace(/^gemini-/i, 'Gemini ')
+      .split('-')
+      .map((part) => (/^\d+(\.\d+)?$/.test(part) ? part : (part.charAt(0).toUpperCase() + part.slice(1))))
+      .join(' ');
+  }
+  return text;
+}
+
+function modelOptionLabel(modelVariantId = '') {
+  const { baseModelId, reasoningEffort } = splitVariantId(modelVariantId);
+  if (!baseModelId) return modelVariantId;
+  const baseLabel = humanizeModelLabel(baseModelId);
+  return reasoningEffort ? `${baseLabel} (${reasoningEffort})` : baseLabel;
+}
+
 function updateModelCatalogState(payload) {
   const select = document.getElementById('model-select');
   if (!select) return;
   const models = Array.isArray(payload?.models)
     ? payload.models.map((m) => String(m || '').trim()).filter(Boolean)
     : [];
-  const currentModel = String(payload?.currentModel || '').trim();
-  const defaultModel = String(payload?.defaultModel || '').trim();
-  const deduped = Array.from(new Set([...CURATED_MODELS, currentModel, defaultModel, ...models].filter(Boolean)));
-  const nextModels = deduped.length ? deduped : [FALLBACK_MODEL];
+  const currentModel = String(payload?.currentModel || models[0] || '').trim();
+  const defaultModel = String(payload?.defaultModel || models[0] || '').trim();
+  const nextModels = Array.from(new Set(models.filter(Boolean)));
+  if (!nextModels.length) nextModels.push(FALLBACK_MODEL);
 
   modelCatalogState = {
     models: nextModels,
@@ -252,7 +301,7 @@ function updateModelCatalogState(payload) {
   for (const modelId of nextModels) {
     const opt = document.createElement('option');
     opt.value = modelId;
-    opt.textContent = MODEL_LABELS[modelId] || modelId;
+    opt.textContent = modelOptionLabel(modelId);
     select.appendChild(opt);
   }
 
@@ -446,6 +495,159 @@ function refreshModelCatalog(force = false) {
     }
     updateModelCatalogState(r);
   });
+}
+
+function applyModelVariantCatalogState(payload) {
+  const variants = Array.isArray(payload?.variants)
+    ? payload.variants.map((entry) => ({
+      variantId: String(entry?.variantId || '').trim(),
+      baseModelId: String(entry?.baseModelId || '').trim(),
+      provider: String(entry?.provider || 'other').trim().toLowerCase() || 'other',
+      label: String(entry?.label || '').trim(),
+      reasoningEffort: String(entry?.reasoningEffort || '').trim().toLowerCase() || null,
+      enabled: !!entry?.enabled,
+      sortOrder: Number.isFinite(Number(entry?.sortOrder)) ? Math.max(0, Math.trunc(Number(entry.sortOrder))) : 0,
+    })).filter((entry) => entry.variantId && entry.baseModelId)
+    : [];
+  const enabledVariantIds = new Set(
+    Array.isArray(payload?.enabledVariantIds)
+      ? payload.enabledVariantIds.map((value) => String(value || '').trim()).filter(Boolean)
+      : variants.filter((entry) => entry.enabled).map((entry) => entry.variantId),
+  );
+  modelVariantCatalogState = {
+    variants,
+    enabledVariantIds: Array.from(enabledVariantIds),
+    source: String(payload?.source || '').trim() || null,
+    refreshedAt: payload?.refreshedAt || null,
+    warning: payload?.warning ? String(payload.warning) : null,
+    error: payload?.error ? String(payload.error) : null,
+    reasoningEfforts: Array.isArray(payload?.reasoningEfforts)
+      ? payload.reasoningEfforts.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean)
+      : [],
+  };
+}
+
+function renderModelVariantCatalogBody() {
+  const grouped = new Map();
+  for (const entry of modelVariantCatalogState.variants) {
+    const providerKey = String(entry.provider || 'other').trim().toLowerCase() || 'other';
+    if (!grouped.has(providerKey)) grouped.set(providerKey, []);
+    grouped.get(providerKey).push(entry);
+  }
+  const providerOrder = Array.from(grouped.keys()).sort((a, b) => {
+    const aLabel = PROVIDER_LABELS[a] || a;
+    const bLabel = PROVIDER_LABELS[b] || b;
+    return aLabel.localeCompare(bLabel);
+  });
+  const refreshedLabel = modelVariantCatalogState.refreshedAt
+    ? new Date(modelVariantCatalogState.refreshedAt).toLocaleString()
+    : 'Never';
+  const selected = new Set(modelVariantCatalogState.enabledVariantIds);
+  const warnings = [
+    modelVariantCatalogState.warning ? `⚠️ ${escHtml(modelVariantCatalogState.warning)}` : '',
+    modelVariantCatalogState.error ? `⚠️ ${escHtml(modelVariantCatalogState.error)}` : '',
+  ].filter(Boolean);
+  const groupsHtml = providerOrder.map((providerKey) => {
+    const providerLabel = PROVIDER_LABELS[providerKey] || providerKey;
+    const rows = grouped.get(providerKey) || [];
+    rows.sort((a, b) => (a.sortOrder - b.sortOrder) || a.variantId.localeCompare(b.variantId));
+    const rowsHtml = rows.map((row) => {
+      const checked = selected.has(row.variantId);
+      const label = row.label || humanizeModelLabel(row.baseModelId) || row.baseModelId;
+      const effortChip = row.reasoningEffort ? ` <span style="font-size:0.72rem;color:var(--muted)">(${escHtml(row.reasoningEffort)})</span>` : '';
+      return `
+        <label style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px dashed var(--border);font-size:0.84rem">
+          <input class="model-variant-checkbox" type="checkbox" data-variant-id="${escHtml(row.variantId)}" ${checked ? 'checked' : ''}>
+          <span style="display:flex;flex-direction:column;gap:2px">
+            <span>${escHtml(label)}${effortChip}</span>
+            <code style="font-size:0.72rem;color:var(--muted)">${escHtml(row.variantId)}</code>
+          </span>
+        </label>
+      `;
+    }).join('');
+    return `
+      <section style="border:1px solid var(--border);border-radius:10px;padding:10px 12px;background:var(--bg3);display:flex;flex-direction:column;gap:6px">
+        <div style="font-weight:600">${escHtml(providerLabel)}</div>
+        ${rowsHtml || '<div style="color:var(--muted);font-size:0.82rem">No models</div>'}
+      </section>
+    `;
+  }).join('');
+  const bodyHtml = `
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <div style="font-size:0.8rem;color:var(--muted)">
+        Saved globally for this relay. Refreshed: <strong>${escHtml(refreshedLabel)}</strong>
+      </div>
+      ${warnings.map((line) => `<div style="font-size:0.78rem;color:var(--warn,#f7c873)">${line}</div>`).join('')}
+      <div style="display:grid;gap:10px">${groupsHtml || '<div style="color:var(--muted)">No models discovered yet. Click Refresh.</div>'}</div>
+      <div class="summary-modal-actions">
+        <button class="summary-btn" type="button" onclick="saveSelectedModelsFromModal()">💾 Save enabled models</button>
+        <button class="summary-close" type="button" onclick="closeSummaryModal()">Cancel</button>
+      </div>
+    </div>
+  `;
+  renderSummaryModalContent({
+    title: '🤗 Select Models',
+    subtitle: 'Choose model variants shown in the composer selector',
+    bodyHtml,
+    refresh: async () => {
+      const refreshed = await refreshModelVariantCatalog();
+      if (!refreshed) throw new Error('Failed to refresh model variants');
+      applyModelVariantCatalogState(refreshed);
+      renderModelVariantCatalogBody();
+      await refreshModelCatalog(true);
+    },
+    kind: 'select-models',
+  });
+}
+
+async function openSelectModelsModal() {
+  openSummaryModal({
+    title: '🤗 Select Models',
+    subtitle: 'Loading…',
+    bodyHtml: '<div class="summary-loading">Loading saved model variants…</div>',
+    kind: 'select-models',
+  });
+  setSummaryModalLoading(true);
+  try {
+    const payload = await loadModelVariantCatalog();
+    if (!payload) throw new Error('Failed to load model variants');
+    applyModelVariantCatalogState(payload);
+    renderModelVariantCatalogBody();
+  } catch (error) {
+    renderSummaryModalContent({
+      title: '🤗 Select Models',
+      subtitle: 'Unable to load',
+      bodyHtml: `<div class="summary-error">Failed to load model variants: ${escHtml(error?.message || 'Unknown error')}</div>`,
+      kind: 'select-models',
+    });
+  } finally {
+    setSummaryModalLoading(false);
+  }
+}
+
+async function saveSelectedModelsFromModal() {
+  const body = document.getElementById('summary-modal-body');
+  if (!body) return;
+  const selectedVariantIds = Array.from(body.querySelectorAll('.model-variant-checkbox:checked'))
+    .map((input) => String(input.getAttribute('data-variant-id') || '').trim())
+    .filter(Boolean);
+  if (!selectedVariantIds.length) {
+    alert('Select at least one model variant.');
+    return;
+  }
+  setSummaryModalLoading(true);
+  try {
+    const saved = await saveEnabledModelVariants(selectedVariantIds);
+    if (!saved) throw new Error('Failed to save model selection');
+    applyModelVariantCatalogState(saved);
+    renderModelVariantCatalogBody();
+    await refreshModelCatalog(true);
+    showTransientRelayNotice('Saved model selector variants.');
+  } catch (error) {
+    alert(error?.message || 'Failed to save model selection');
+  } finally {
+    setSummaryModalLoading(false);
+  }
 }
 
 async function loadUsageSummaryAndRender() {
@@ -1106,7 +1308,12 @@ function lockChatActionsMenuShield(ms = 300) {
 }
 
 function normalizeKnownCwdPath(value) {
-  return String(value || '').trim().replace(/[\\/]+$/, '');
+  const stripped = String(value || '').trim().replace(/[\\/]+$/, '');
+  // Always restore the trailing backslash for Windows drive roots ("D:" → "D:\").
+  // Without it, sending "D:" to the server causes path.resolve("D:") to return the
+  // server's remembered CWD for drive D, not the drive root.
+  if (/^[A-Za-z]:$/.test(stripped)) return `${stripped}\\`;
+  return stripped;
 }
 
 function clearLegacyKnownCwdHistoryStorage() {
@@ -2138,6 +2345,16 @@ async function initApp() {
       alert(error?.message || 'Failed to compact conversation');
     });
   });
+  const chatMenuSelectModelsBtn = document.getElementById('chat-menu-select-models');
+  bindMenuAction(chatMenuSelectModelsBtn, (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    lockChatActionsMenuShield(350);
+    closeChatActionsMenu();
+    openSelectModelsModal().catch((error) => {
+      alert(error?.message || 'Failed to open model selector');
+    });
+  });
   const chatMenuChangeCwdBtn = document.getElementById('chat-menu-change-cwd');
   bindMenuAction(chatMenuChangeCwdBtn, (event) => {
     event.preventDefault();
@@ -2305,6 +2522,7 @@ window.refreshRepoBrowser = refreshRepoBrowser;
 window.initModeSelector = initModeSelector;
 window.initModelSelector = initModelSelector;
 window.refreshModelCatalog = refreshModelCatalog;
+window.saveSelectedModelsFromModal = saveSelectedModelsFromModal;
 window.selectedModelValue = selectedModelValue;
 window.getPreferredModelSelection = () => selectedModelValue();
 window.applyConversationPreferences = applyConversationPreferencesForConversation;

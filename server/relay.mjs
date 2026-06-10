@@ -809,7 +809,7 @@ async function processNext(approveAll) {
   const started = Date.now();
   const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
   const sdkAttachments = buildSdkAttachments(msg);
-  log(`Processing msg ${msg.id.slice(0, 8)} conv=${msg.conversationId.slice(0, 8)} rs=${String(msg.runtimeSessionId || 'none').slice(0, 8)} model=${msg.model || 'default'} len=${(msg.text || '').length}${attachments.length ? ` attachments=${attachments.length}` : ''}`);
+  log(`Processing msg ${msg.id.slice(0, 8)} conv=${msg.conversationId.slice(0, 8)} rs=${String(msg.runtimeSessionId || 'none').slice(0, 8)} model=${msg.model || 'default'}${msg.reasoningEffort ? ` effort=${msg.reasoningEffort}` : ''} len=${(msg.text || '').length}${attachments.length ? ` attachments=${attachments.length}` : ''}`);
   logTextBlock(`PROMPT ${msg.id.slice(0, 8)}`, msg.text);
 
   try {
@@ -821,6 +821,9 @@ async function processNext(approveAll) {
     let response;
     try {
       const messageOptions = sdkAttachments.length ? { prompt, attachments: sdkAttachments } : { prompt };
+      if (msg.reasoningEffort && String(msg.reasoningEffort || '').trim().toLowerCase() !== 'none') {
+        messageOptions.reasoningEffort = String(msg.reasoningEffort || '').trim();
+      }
       response = await session.sendAndWait(messageOptions, 300_000);
     } finally {
       activeUserInputHandler = null;

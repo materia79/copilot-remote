@@ -627,6 +627,11 @@
     border: 1px solid var(--border); border-radius: 4px; padding: 0 5px;
     color: var(--accent); margin-left: 4px; vertical-align: middle;
   }
+  .msg-reasoning {
+    display: inline-block; font-size: 0.68rem; background: var(--bg3);
+    border: 1px solid var(--border); border-radius: 4px; padding: 0 5px;
+    color: var(--warn); margin-left: 4px; vertical-align: middle;
+  }
 
   .msg-bubble {
     display: inline-block; width: fit-content;
@@ -2283,6 +2288,7 @@
             <button id="chat-menu-edit-title" class="chat-actions-menu-item" type="button" role="menuitem">✍️ Edit conversation title</button>
             <button id="chat-menu-usage" class="chat-actions-menu-item" type="button" role="menuitem">📊 Check Usage</button>
             <button id="chat-menu-compact" class="chat-actions-menu-item" type="button" role="menuitem">🗜️ Compact</button>
+            <button id="chat-menu-select-models" class="chat-actions-menu-item" type="button" role="menuitem">🤗 Select Models</button>
             <button id="chat-menu-change-cwd" class="chat-actions-menu-item" type="button" role="menuitem">🗂️ Change CWD</button>
             <button id="chat-menu-restart-relay" class="chat-actions-menu-item" type="button" role="menuitem">🌄 Restart web relay</button>
             <button id="chat-menu-suspend-host" class="chat-actions-menu-item" type="button" role="menuitem" onclick="openSuspendHostConfirmation()">💤 Suspend host</button>

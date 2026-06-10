@@ -855,9 +855,18 @@ export function buildConversationMessages({
   responseMessageToSourceId = new Map(),
   queueRows = [],
 } = {}) {
+  const queueRowsById = new Map(
+    (Array.isArray(queueRows) ? queueRows : [])
+      .map((row) => [String(row?.id || '').trim(), row])
+      .filter(([id]) => !!id),
+  );
   const normalizedDbMessages = Array.isArray(dbMessages)
     ? dbMessages.map((message) => {
         const id = String(message?.id || '').trim();
+        const sourceMessageId = message?.role === 'assistant'
+          ? (responseMessageToSourceId.get(id) || undefined)
+          : undefined;
+        const queueRow = sourceMessageId ? queueRowsById.get(sourceMessageId) : null;
         return {
           activities: message?.role === 'assistant' ? (relayActivitiesByMessageId.get(id) || []) : [],
           thoughts: message?.role === 'assistant' ? (relayThoughtsByMessageId.get(id) || []) : [],
@@ -865,17 +874,20 @@ export function buildConversationMessages({
           role: message?.role,
           text: stripRelayPromptContext(message?.text, message?.mode),
           model: message?.model || undefined,
+          reasoningEffort: queueRow?.reasoning_effort || undefined,
           attachments: message?.attachments || [],
           mode: message?.mode || undefined,
           timestamp: message?.timestamp,
-          sourceMessageId: message?.role === 'assistant'
-            ? (responseMessageToSourceId.get(id) || undefined)
-            : undefined,
+          sourceMessageId,
         };
       })
     : [];
   const normalizedTranscriptMessages = (Array.isArray(transcriptMessages) ? transcriptMessages : []).map((message) => {
     const id = String(message?.id || '').trim();
+    const sourceMessageId = message?.role === 'assistant'
+      ? (responseMessageToSourceId.get(id) || message?.sourceMessageId || undefined)
+      : message?.sourceMessageId;
+    const queueRow = sourceMessageId ? queueRowsById.get(String(sourceMessageId || '').trim()) : null;
     return {
       ...message,
       id,
@@ -887,9 +899,8 @@ export function buildConversationMessages({
         ? message.thoughts
         : (id ? (relayThoughtsByMessageId.get(id) || []) : []),
       text: stripRelayPromptContext(message?.text, message?.mode),
-      sourceMessageId: message?.role === 'assistant'
-        ? (responseMessageToSourceId.get(id) || message?.sourceMessageId || undefined)
-        : message?.sourceMessageId,
+      sourceMessageId,
+      reasoningEffort: message?.reasoningEffort || queueRow?.reasoning_effort || undefined,
     };
   });
 
@@ -919,11 +930,6 @@ export function buildConversationMessages({
     bucket.push(message);
     dbMessagesByRoleText.set(key, bucket);
   }
-  const queueRowsById = new Map(
-    (Array.isArray(queueRows) ? queueRows : [])
-      .map((row) => [String(row?.id || '').trim(), row])
-      .filter(([id]) => !!id),
-  );
   const firstAssistantTimestampBySourceId = new Map();
   for (const message of normalizedDbMessages) {
     if (String(message?.role || '').trim().toLowerCase() !== 'assistant') continue;
@@ -1034,6 +1040,10 @@ export function registerSessionsRoutes(app, deps) {
     queueCounts,
     getModelCatalogState,
     updateModelCatalog,
+    listModelVariantRows,
+    refreshModelVariantCatalogFromCli,
+    setEnabledModelVariants,
+    SUPPORTED_REASONING_EFFORTS,
     buildRelayReadyBannerData,
     workspaceRootPayload,
     setWorkspaceRoot,
@@ -1827,7 +1837,7 @@ export function registerSessionsRoutes(app, deps) {
       : null;
     const dbMessages = stmts.getMessages.all(req.params.id);
     const queueRows = db.prepare(`
-      SELECT id, response_message_id, text, timestamp, retry_count
+      SELECT id, response_message_id, text, timestamp, retry_count, reasoning_effort
       FROM queue
       WHERE conversation_id = ?
     `).all(req.params.id);
@@ -2332,6 +2342,73 @@ export function registerSessionsRoutes(app, deps) {
       activeBridgeOwner: relayBridgeOwnerService?.getOwner?.() || null,
       restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
       launcher: null,
+    });
+  });
+
+  function buildModelVariantCatalogPayload() {
+    const rows = typeof listModelVariantRows === 'function' ? listModelVariantRows() : [];
+    const modelState = getModelCatalogState();
+    const enabledVariantIds = rows
+      .filter((row) => !!row.enabled)
+      .map((row) => row.variantId);
+    return {
+      variants: rows.map((row) => ({
+        variantId: row.variantId,
+        baseModelId: row.baseModelId,
+        provider: row.provider,
+        label: row.label,
+        releaseStatus: row.releaseStatus || null,
+        reasoningEffort: row.reasoningEffort || null,
+        enabled: !!row.enabled,
+        sortOrder: row.sortOrder,
+      })),
+      enabledVariantIds,
+      source: modelState.source,
+      refreshedAt: modelState.refreshedAt,
+      warning: modelState.warning,
+      error: modelState.error,
+      reasoningEfforts: Array.isArray(SUPPORTED_REASONING_EFFORTS) ? SUPPORTED_REASONING_EFFORTS : [],
+    };
+  }
+
+  app.get('/api/model-variants', auth, (req, res) => {
+    ensureSessionId(req, res);
+    res.json(buildModelVariantCatalogPayload());
+  });
+
+  app.post('/api/model-variants/refresh', auth, async (req, res) => {
+    ensureSessionId(req, res);
+    if (typeof refreshModelVariantCatalogFromCli !== 'function') {
+      return res.status(501).json({ error: 'Model refresh is unavailable' });
+    }
+    try {
+      await refreshModelVariantCatalogFromCli();
+      io.emit('models_updated', getModelCatalogState());
+      return res.json({
+        ok: true,
+        ...buildModelVariantCatalogPayload(),
+      });
+    } catch (error) {
+      return res.status(500).json({
+        ok: false,
+        error: String(error?.message || error || 'Model refresh failed'),
+      });
+    }
+  });
+
+  app.patch('/api/model-variants', auth, (req, res) => {
+    ensureSessionId(req, res);
+    if (typeof setEnabledModelVariants !== 'function') {
+      return res.status(501).json({ error: 'Model variant updates are unavailable' });
+    }
+    const enabledVariantIds = Array.isArray(req.body?.enabledVariantIds)
+      ? req.body.enabledVariantIds.map((value) => String(value || '').trim()).filter(Boolean)
+      : [];
+    setEnabledModelVariants(enabledVariantIds);
+    io.emit('models_updated', getModelCatalogState());
+    return res.json({
+      ok: true,
+      ...buildModelVariantCatalogPayload(),
     });
   });
 

@@ -89,7 +89,9 @@ export function registerRelayBoardRoutes(app, deps) {
     stmts,
     uuidv4,
     normalizeRelayMode,
+    resolveRequestedModel,
     DEFAULT_RELAY_MODE,
+    DEFAULT_MODEL,
     formatRelayBoardRow,
   } = deps;
 
@@ -193,15 +195,27 @@ export function registerRelayBoardRoutes(app, deps) {
         const convId = String(board?.conversationId || '').trim();
         const runtimeSession = stmts.getRuntimeSessionByConversation?.get?.(convId) || null;
         const latestModel = stmts.getLatestConversationModel?.get?.(convId)?.model || null;
+        const modelResolution = typeof resolveRequestedModel === 'function'
+          ? resolveRequestedModel(latestModel || DEFAULT_MODEL)
+          : { ok: true, model: latestModel || DEFAULT_MODEL, modelVariantId: latestModel || DEFAULT_MODEL, reasoningEffort: null };
+        const resolvedBaseModel = modelResolution?.ok ? String(modelResolution.model || '').trim() : (latestModel || DEFAULT_MODEL);
+        const resolvedVariantModel = modelResolution?.ok
+          ? String(modelResolution.modelVariantId || latestModel || resolvedBaseModel).trim()
+          : String(latestModel || resolvedBaseModel).trim();
+        const resolvedReasoningEffort = modelResolution?.ok
+          ? String(modelResolution.reasoningEffort || '').trim() || null
+          : null;
         queuedMessageId = uuidv4();
-        stmts.insertMsg.run(queuedMessageId, convId, 'user', followupPrompt, latestModel, relayMode, null, now);
+        stmts.insertMsg.run(queuedMessageId, convId, 'user', followupPrompt, resolvedVariantModel, relayMode, null, now);
         stmts.updateConvTime.run(now, convId);
         stmts.insertQ.run(
           queuedMessageId,
           convId,
           runtimeSession?.id || null,
           0,
-          latestModel,
+          resolvedBaseModel,
+          resolvedVariantModel,
+          resolvedReasoningEffort,
           relayMode,
           followupPrompt,
           null,
@@ -218,7 +232,7 @@ export function registerRelayBoardRoutes(app, deps) {
           message: {
             role: 'user',
             text: followupPrompt,
-            model: latestModel,
+            model: resolvedVariantModel,
             mode: relayMode,
             attachments: [],
             timestamp: now,

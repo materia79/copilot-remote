@@ -110,6 +110,25 @@ export async function loadModelCatalog() {
   return apiFetch('/api/models');
 }
 
+export async function loadModelVariantCatalog() {
+  return apiFetch('/api/model-variants');
+}
+
+export async function refreshModelVariantCatalog() {
+  return apiFetch('/api/model-variants/refresh', { method: 'POST' });
+}
+
+export async function saveEnabledModelVariants(enabledVariantIds = []) {
+  return apiFetch('/api/model-variants', {
+    method: 'PATCH',
+    body: JSON.stringify({
+      enabledVariantIds: Array.isArray(enabledVariantIds)
+        ? enabledVariantIds.map((value) => String(value || '').trim()).filter(Boolean)
+        : [],
+    }),
+  });
+}
+
 export async function loadConversations(options = {}) {
   const params = new URLSearchParams();
   const limit = Math.max(1, Math.trunc(Number(options.limit) || 0));
