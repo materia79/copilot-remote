@@ -3948,6 +3948,10 @@ const tunnelConfig = config.sshTunnel || {};
 const tunnelRemoteBindMode = String(tunnelConfig.remoteBind || 'loopback').trim().toLowerCase() === 'public'
   ? 'public'
   : 'loopback';
+const tunnelAutoReclaimPort = tunnelConfig.autoReclaimPort !== false;
+const tunnelRemoteCleanupCommand = typeof tunnelConfig.remoteCleanupCommand === 'string'
+  ? tunnelConfig.remoteCleanupCommand.trim()
+  : '';
 function buildTunnelRemoteForwardSpec(remotePort, localPort) {
   const localTargetHost = '127.0.0.1';
   if (tunnelRemoteBindMode === 'public') {
@@ -3971,6 +3975,7 @@ const tunnelState = {
   proc: null,
   backoffTimer: null,
   remoteBindMode: tunnelRemoteBindMode,
+  cleanupInFlight: false,
 };
 
 runtimeState.tunnelState = tunnelState;
@@ -3979,13 +3984,65 @@ function tunnelLog(msg) {
   console.log(`[${ts()}] [ssh-tunnel] ${msg}`);
 }
 
-function scheduleTunnelReconnect() {
+function scheduleTunnelReconnect(delayOverrideMs = null) {
   if (runtimeShutdownStarted) return;
+  if (tunnelState.backoffTimer) {
+    clearTimeout(tunnelState.backoffTimer);
+    tunnelState.backoffTimer = null;
+  }
   const BACKOFF_STEPS = [5_000, 10_000, 20_000, 40_000, 60_000];
-  const delay = BACKOFF_STEPS[Math.min(tunnelState.reconnectAttempts, BACKOFF_STEPS.length - 1)];
+  const computedDelay = BACKOFF_STEPS[Math.min(tunnelState.reconnectAttempts, BACKOFF_STEPS.length - 1)];
+  const delay = Number.isFinite(delayOverrideMs) && delayOverrideMs >= 0
+    ? Number(delayOverrideMs)
+    : computedDelay;
   tunnelState.reconnectAttempts += 1;
   tunnelLog(`Reconnecting in ${delay / 1000}s (attempt ${tunnelState.reconnectAttempts})...`);
   tunnelState.backoffTimer = setTimeout(spawnSshTunnel, delay);
+}
+
+async function reclaimRemoteTunnelPort() {
+  if (!tunnelEnabled || runtimeShutdownStarted || !tunnelAutoReclaimPort) return false;
+  if (tunnelState.cleanupInFlight) return false;
+  const { user, host, remotePort, identityFile } = tunnelConfig;
+  if (!user || !host || !remotePort) return false;
+  tunnelState.cleanupInFlight = true;
+
+  const cleanupCommand = tunnelRemoteCleanupCommand || [
+    `if command -v lsof >/dev/null 2>&1; then`,
+    `  pids=$(lsof -tiTCP:${remotePort} -sTCP:LISTEN 2>/dev/null || true);`,
+    `elif command -v fuser >/dev/null 2>&1; then`,
+    `  pids=$(fuser -n tcp ${remotePort} 2>/dev/null || true);`,
+    'else',
+    '  pids="";',
+    'fi;',
+    'if [ -n "$pids" ]; then kill $pids 2>/dev/null || true; fi',
+  ].join(' ');
+  const args = [
+    '-o', 'StrictHostKeyChecking=accept-new',
+    '-o', 'BatchMode=yes',
+  ];
+  if (identityFile) args.push('-i', identityFile.replace(/^~/, os.homedir()));
+  args.push(`${user}@${host}`, 'sh', '-lc', cleanupCommand);
+
+  tunnelLog(`Attempting remote reclaim for listen port ${remotePort}...`);
+  try {
+    const ok = await new Promise((resolve) => {
+      const proc = spawn('ssh', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+      proc.stdout.on('data', (d) => tunnelLog(`cleanup stdout: ${d.toString().trim()}`));
+      proc.stderr.on('data', (d) => tunnelLog(`cleanup stderr: ${d.toString().trim()}`));
+      proc.on('close', (code) => {
+        tunnelLog(`Remote reclaim finished (code=${code ?? 'null'})`);
+        resolve(code === 0);
+      });
+      proc.on('error', (error) => {
+        tunnelLog(`Remote reclaim error: ${error?.message || error}`);
+        resolve(false);
+      });
+    });
+    return ok;
+  } finally {
+    tunnelState.cleanupInFlight = false;
+  }
 }
 
 function spawnSshTunnel() {
@@ -4069,6 +4126,18 @@ function spawnSshTunnel() {
     }
     if (runtimeShutdownStarted) {
       tunnelLog(`Process exited (code=${code}) during shutdown.`);
+      return;
+    }
+    if (forwardingFailed) {
+      tunnelLog(`Process exited (code=${code}) after remote forward bind failure.`);
+      io.emit('ssh_tunnel_status', { connected: false, host, remotePort });
+      if (tunnelAutoReclaimPort) {
+        void reclaimRemoteTunnelPort().then((reclaimed) => {
+          scheduleTunnelReconnect(reclaimed ? 1_000 : null);
+        });
+      } else {
+        scheduleTunnelReconnect();
+      }
       return;
     }
     tunnelLog(`Process exited (code=${code}). Scheduling reconnect...`);

@@ -79,6 +79,35 @@
     --msg-attachment-max-width: min(360px, calc(var(--messages-width, 100vw) * 0.35));
   }
 
+  :root[data-theme="light"] {
+    --bg:        #ffffff;
+    --bg2:       #f6f8fa;
+    --bg3:       #ebf0f4;
+    --border:    #d0d7de;
+    --text:      #1F2328;
+    --muted:     #656d76;
+    --accent:    #0969da;
+    --user-bg:   #0969da;
+    --user-bubble-bg: #e1ebfa;
+    --user-bubble-fg: #1F2328;
+    --user-bubble-border: rgba(9, 105, 218, 0.2);
+    --user-bubble-chip-bg: rgba(9, 105, 218, 0.1);
+    --user-bubble-chip-fg: #0969da;
+    --user-bubble-link: #0969da;
+    --bot-bg:    #f6f8fa;
+    --danger:    #cf222e;
+    --success:   #1a7f37;
+    --warn:      #9a6700;
+    --conversation-title-offline: #1F2328;
+    --conversation-title-ready: #1a7f37;
+    --conversation-title-question: #cf222e;
+    --conversation-title-error: #9a6700;
+    --inline-code-bg: #eff1f3;
+  }
+  :root {
+    --inline-code-bg: #30363d;
+  }
+
   html, body {
     height: 100%;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -569,7 +598,7 @@
     padding: 6px 12px;
     border: 1px solid var(--border);
     border-radius: 999px;
-    background: rgba(13, 17, 23, 0.92);
+    background: var(--bg2);
     color: var(--muted);
     font-size: 0.8rem;
   }
@@ -583,7 +612,7 @@
     border: 1px solid var(--border);
     border-radius: 999px;
     padding: 6px 12px;
-    background: rgba(13, 17, 23, 0.92);
+    background: var(--bg2);
     color: var(--text);
     font-size: 0.8rem;
     cursor: pointer;
@@ -703,7 +732,7 @@
     white-space: inherit;
   }
   .msg-bubble code:not(pre code) {
-    background: #30363d; padding: 2px 6px; border-radius: 4px; font-size: 0.875em;
+    background: var(--inline-code-bg); padding: 2px 6px; border-radius: 4px; font-size: 0.875em;
   }
   .msg-bubble a { color: var(--accent); }
   .msg.user .msg-bubble code:not(pre code) {
@@ -1175,7 +1204,7 @@
     margin-top: 10px;
   }
 
-  #summary-modal {
+  #settings-modal, #summary-modal {
     position: fixed;
     inset: 0;
     z-index: 12050;
@@ -1185,7 +1214,7 @@
     background: rgba(0, 0, 0, 0.68);
     padding: 18px;
   }
-  #summary-modal.visible { display: flex; }
+  #settings-modal.visible, #summary-modal.visible { display: flex; }
   .summary-modal-actions {
     display: flex;
     gap: 10px;
@@ -2209,7 +2238,7 @@
       justify-content: flex-start;
     }
 
-    #summary-modal {
+    #settings-modal, #summary-modal {
       padding: 8px;
       align-items: stretch;
       justify-content: center;
@@ -2290,6 +2319,7 @@
             <button id="chat-menu-compact" class="chat-actions-menu-item" type="button" role="menuitem">🗜️ Compact</button>
             <button id="chat-menu-select-models" class="chat-actions-menu-item" type="button" role="menuitem">🤗 Select Models</button>
             <button id="chat-menu-change-cwd" class="chat-actions-menu-item" type="button" role="menuitem">🗂️ Change CWD</button>
+            <button id="chat-menu-settings" class="chat-actions-menu-item" type="button" role="menuitem">⚙️ Settings</button>
             <button id="chat-menu-restart-relay" class="chat-actions-menu-item" type="button" role="menuitem">🌄 Restart web relay</button>
             <button id="chat-menu-suspend-host" class="chat-actions-menu-item" type="button" role="menuitem" onclick="openSuspendHostConfirmation()">💤 Suspend host</button>
             <button id="chat-menu-kill-session" class="chat-actions-menu-item" type="button" role="menuitem">☠️ Kill session</button>
@@ -2365,6 +2395,28 @@
         <div id="repo-folder-breadcrumb" class="repo-pane-head repo-breadcrumb"></div>
         <div id="repo-folder"></div>
       </section>
+    </div>
+  </div>
+</div>
+
+<div id="settings-modal" aria-hidden="true">
+  <div class="summary-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-modal-title">
+    <div class="summary-header">
+      <div class="summary-header-copy">
+        <div id="settings-modal-title" class="summary-title">Settings</div>
+      </div>
+      <div class="summary-header-actions">
+        <button class="summary-close" onclick="closeSettingsModal()" aria-label="Close settings">×</button>
+      </div>
+    </div>
+    <div class="summary-body" style="padding: 16px;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+        <label for="theme-select" style="font-weight: 600;">Theme</label>
+        <select id="theme-select" style="background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; outline: none; font-size: 14px;" onchange="updateTheme(this.value)">
+          <option value="dark">Dark</option>
+          <option value="light">Light</option>
+        </select>
+      </div>
     </div>
   </div>
 </div>

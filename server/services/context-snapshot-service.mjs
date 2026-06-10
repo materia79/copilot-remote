@@ -2,11 +2,30 @@
 
 const CONTEXT_CACHE_MAX = 128;
 const MODEL_FALLBACK_LIMITS = Object.freeze({
-  'claude-sonnet-4.6': 160000,
-  'claude-haiku-4.5': 160000,
+  // Anthropic Claude Sonnet
+  'claude-sonnet-4.6': 200000,
+  'claude-sonnet-4.5': 200000,
+  // Anthropic Claude Haiku
+  'claude-haiku-4.5': 200000,
+  // Anthropic Claude Fable
+  'claude-fable-5': 200000,
+  // Anthropic Claude Opus
+  'claude-opus-4.8': 200000,
+  'claude-opus-4.7': 200000,
+  'claude-opus-4.6': 200000,
+  'claude-opus-4.6-fast': 200000,
+  'claude-opus-4.5': 200000,
+  // OpenAI GPT-5 series
+  'gpt-5.5': 256000,
   'gpt-5.4': 256000,
-  'gpt-5.4-mini': 256000,
   'gpt-5.3-codex': 256000,
+  'gpt-5.2-codex': 256000,
+  'gpt-5.2': 256000,
+  'gpt-5.4-mini': 256000,
+  'gpt-5-mini': 256000,
+  // Google Gemini
+  'gemini-3.1-pro-preview': 1000000,
+  'gemini-3.5-flash': 1000000,
 });
 
 function normalizeText(value) {

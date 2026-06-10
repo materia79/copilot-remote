@@ -2298,12 +2298,55 @@ async function connectSocket() {
   });
 }
 
+const THEME_STORAGE_KEY = 'copilot_theme';
+
+function initTheme() {
+  const saved = localStorage.getItem(THEME_STORAGE_KEY);
+  if (saved === 'light') {
+    document.documentElement.setAttribute('data-theme', 'light');
+  } else {
+    document.documentElement.removeAttribute('data-theme');
+  }
+}
+
+function updateTheme(theme) {
+  if (theme === 'light') {
+    document.documentElement.setAttribute('data-theme', 'light');
+    localStorage.setItem(THEME_STORAGE_KEY, 'light');
+  } else {
+    document.documentElement.removeAttribute('data-theme');
+    localStorage.setItem(THEME_STORAGE_KEY, 'dark');
+  }
+}
+
+function openSettingsModal() {
+  closeChatActionsMenu();
+  const modal = document.getElementById('settings-modal');
+  const select = document.getElementById('theme-select');
+  if (select) {
+    select.value = localStorage.getItem(THEME_STORAGE_KEY) === 'light' ? 'light' : 'dark';
+  }
+  modal?.classList.add('visible');
+  modal?.setAttribute('aria-hidden', 'false');
+}
+
+function closeSettingsModal() {
+  const modal = document.getElementById('settings-modal');
+  modal?.classList.remove('visible');
+  modal?.setAttribute('aria-hidden', 'true');
+}
+
+window.updateTheme = updateTheme;
+window.openSettingsModal = openSettingsModal;
+window.closeSettingsModal = closeSettingsModal;
+
 function showAuthGate() {
   document.getElementById('auth-gate').style.display = 'flex';
   document.getElementById('app').classList.remove('visible');
 }
 
 async function initApp() {
+  initTheme();
   clearLegacyKnownCwdHistoryStorage();
   syncPwaVersionMenuEntry();
   syncQueueStatusMenuEntry();
@@ -2362,6 +2405,14 @@ async function initApp() {
     lockChatActionsMenuShield(350);
     closeChatActionsMenu();
     openChangeCwdModal();
+  });
+  const chatMenuSettingsBtn = document.getElementById('chat-menu-settings');
+  bindMenuAction(chatMenuSettingsBtn, (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    lockChatActionsMenuShield(350);
+    closeChatActionsMenu();
+    openSettingsModal();
   });
   const chatMenuRestartRelayBtn = document.getElementById('chat-menu-restart-relay');
   bindMenuAction(chatMenuRestartRelayBtn, (event) => {

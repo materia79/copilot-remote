@@ -442,7 +442,8 @@ call `/api/usage` directly.
     "user": "ubuntu",
     "host": "relay.example.com",
     "remotePort": 4444,
-    "identityFile": "~/.ssh/id_rsa"
+    "identityFile": "~/.ssh/id_rsa",
+    "autoReclaimPort": true
   }
 }
 ```
@@ -468,6 +469,8 @@ call `/api/usage` directly.
 | `sshTunnel.host` | — | VPS hostname / IP |
 | `sshTunnel.remotePort` | — | Port opened on the VPS |
 | `sshTunnel.identityFile` | *(optional)* | SSH private key path (`~` expanded); uses ssh-agent if omitted |
+| `sshTunnel.autoReclaimPort` | `true` | When remote bind fails, run a remote reclaim step before retrying |
+| `sshTunnel.remoteCleanupCommand` | *(optional)* | Override reclaim command (`ssh user@host <command>`) for custom VPS cleanup |
 
 ## SSH Reverse Tunnel
 
@@ -488,6 +491,12 @@ ssh -N -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
 **Auto-reconnect** — if the tunnel exits for any reason it is rescheduled with
 exponential backoff (5 s → 10 s → 20 s → 40 s → 60 s cap, no retry limit).
 The counter resets after a connection is stable for >30 s.
+
+**Remote stale-forward reclaim** — on `remote port forwarding failed for listen port`,
+the relay runs a one-shot remote cleanup over SSH (default: kill listeners
+for that remote port via `lsof`/`fuser` when available) and retries quickly on the same
+fixed port. Set `sshTunnel.autoReclaimPort` to `false` to disable, or provide
+`sshTunnel.remoteCleanupCommand` for your own server-specific cleanup command.
 
 **Caddy VPS config:**
 
