@@ -329,6 +329,17 @@ export async function loadRepoTree(includeHidden = false, includeHeavy = false, 
   return apiFetch(`/api/repo/tree?${params.toString()}`);
 }
 
+export async function loadRepoChildren(pathValue = '', includeHidden = false, includeHeavy = false, conversationId = null) {
+  const params = new URLSearchParams({
+    path: String(pathValue || '').trim(),
+    includeHidden: includeHidden ? '1' : '0',
+    includeHeavy: includeHeavy ? '1' : '0',
+  });
+  const convId = String(conversationId || '').trim();
+  if (convId) params.set('conversationId', convId);
+  return apiFetch(`/api/repo/list?${params.toString()}`);
+}
+
 export async function loadDrivesRoots() {
   return apiFetch('/api/drives/roots');
 }

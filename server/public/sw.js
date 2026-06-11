@@ -16,7 +16,7 @@ function sameOrigin(url) {
 }
 
 function isApiRequest(url) {
-  return /\/api\//.test(url.pathname) || /\/socket\.io\//.test(url.pathname);
+  return /\/api(?:\/|$)/.test(url.pathname) || /\/socket\.io(?:\/|$)/.test(url.pathname);
 }
 
 function isPwaMetadataRequest(url) {

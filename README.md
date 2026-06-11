@@ -245,7 +245,7 @@ Selection is persisted in browser storage and attached per message.
 | `restartMaxAttempts`       | `3`                  | Bounded restart attempts before terminal exhaustion                       |
 | `restartRetryBackoffMs`    | `[1000,3000,7000]`   | Deterministic retry backoff schedule in milliseconds                      |
 | `maxRequeueRetries`        | `5`                  | Queue retry limit for failed processing                                   |
-| `remotePath`               | `""`                 | URL base path when reverse-proxied under a subpath                        |
+| `remotePath`               | `""`                 | URL base path when reverse-proxied under a subpath; also drives PWA URLs and socket.io path |
 | `sshTunnel.enabled`        | `false`              | Enable reverse SSH tunnel                                                 |
 | `sshTunnel.remoteBind`     | `loopback`           | Remote bind mode for SSH `-R` (`loopback` or `public`)                    |
 | `sshTunnel.user`           | —                    | SSH user                                                                  |

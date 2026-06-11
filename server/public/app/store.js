@@ -1,4 +1,14 @@
-export const BASE = window.location.pathname.replace(/\/+$/, '');
+function resolveAppBase() {
+  const configuredBase = typeof window.__COPILOT_APP_CONFIG?.basePath === 'string'
+    ? window.__COPILOT_APP_CONFIG.basePath.trim()
+    : '';
+  if (configuredBase && configuredBase !== '/') {
+    return configuredBase.startsWith('/') ? configuredBase.replace(/\/+$/, '') : `/${configuredBase.replace(/\/+$/, '')}`;
+  }
+  return window.location.pathname.replace(/\/+$/, '');
+}
+
+export const BASE = resolveAppBase();
 export let TOKEN = '';
 export let socket = null;
 export let currentConvId = null;

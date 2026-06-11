@@ -1,4 +1,5 @@
 import {
+  BASE,
   TOKEN,
   CLIENT_ID,
   currentConvId,
@@ -121,6 +122,11 @@ const PROVIDER_LABELS = {
   other: 'Other',
 };
 const CHAT_TITLE_MAX_LENGTH = 120;
+const FONT_SCALE_STORAGE_KEY = 'copilot_font_scale';
+const FONT_SCALE_MIN = 0.5;
+const FONT_SCALE_MAX = 1.5;
+const FONT_SCALE_DEFAULT = 1;
+const FONT_SCALE_WHEEL_STEP_BASE = 0.05;
 
 let socket = null;
 let relayQuestionPollTimer = null;
@@ -163,6 +169,12 @@ let latestQueueStatus = {
   pendingCount: 0,
   processingCount: 0,
   parkedCount: 0,
+};
+let fontScaleValue = FONT_SCALE_DEFAULT;
+let fontScalePinchState = {
+  active: false,
+  startDistance: 0,
+  startScale: FONT_SCALE_DEFAULT,
 };
 
 function getTokenFromUrl() {
@@ -2062,7 +2074,7 @@ function initFullscreenButton() {
 }
 
 async function connectSocket() {
-  socket = io({ path: `${window.location.pathname.replace(/\/+$/, '')}/socket.io/`, auth: TOKEN ? { token: TOKEN, clientId: CLIENT_ID } : { clientId: CLIENT_ID } });
+  socket = io({ path: `${BASE}/socket.io/`, auth: TOKEN ? { token: TOKEN, clientId: CLIENT_ID } : { clientId: CLIENT_ID } });
 
   socket.on('connect', () => {
     console.log('Socket connected');
@@ -2309,6 +2321,201 @@ function initTheme() {
   }
 }
 
+function clampFontScale(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return FONT_SCALE_DEFAULT;
+  return Math.min(FONT_SCALE_MAX, Math.max(FONT_SCALE_MIN, numeric));
+}
+
+function readStoredFontScale() {
+  return clampFontScale(localStorage.getItem(FONT_SCALE_STORAGE_KEY));
+}
+
+function normalizeFontScaleSelectValue(raw = '') {
+  const text = String(raw || '').trim();
+  if (!text) return null;
+  const numeric = Number(text);
+  if (!Number.isFinite(numeric)) return null;
+  if (numeric > 3) return clampFontScale(numeric / 100);
+  return clampFontScale(numeric);
+}
+
+function getMessageViewportAnchor() {
+  const container = document.getElementById('messages');
+  if (!container) return null;
+  const containerRect = container.getBoundingClientRect();
+  const messages = Array.from(container.querySelectorAll('.msg[data-message-id]'));
+  for (const message of messages) {
+    const rect = message.getBoundingClientRect();
+    if (rect.bottom <= containerRect.top || rect.top >= containerRect.bottom) continue;
+    const messageId = String(message.dataset.messageId || '').trim();
+    if (!messageId) continue;
+    return {
+      messageId,
+      offsetTop: rect.top - containerRect.top,
+    };
+  }
+  return null;
+}
+
+function restoreMessageViewportAnchor(anchor) {
+  if (!anchor?.messageId) return;
+  const container = document.getElementById('messages');
+  if (!container) return;
+  const messageId = String(anchor.messageId || '').trim();
+  if (!messageId) return;
+  const message = Array.from(container.querySelectorAll('.msg[data-message-id]'))
+    .find((node) => String(node?.dataset?.messageId || '').trim() === messageId);
+  if (!message) return;
+  const containerRect = container.getBoundingClientRect();
+  const rect = message.getBoundingClientRect();
+  const delta = rect.top - containerRect.top - Number(anchor.offsetTop || 0);
+  if (Math.abs(delta) > 0.5) {
+    container.scrollTop += delta;
+  }
+}
+
+function syncFontScaleSelect() {
+  const select = document.getElementById('font-scale-select');
+  if (!select) return;
+  const currentPercent = Math.round(clampFontScale(fontScaleValue) * 100);
+  const candidate = String(currentPercent);
+  if (Array.from(select.options).some((option) => option.value === candidate)) {
+    select.value = candidate;
+    return;
+  }
+  const dynamicValue = String(currentPercent);
+  const dynamicLabel = `${currentPercent}%`;
+  let dynamicOption = select.querySelector('option[data-dynamic-font-scale="1"]');
+  if (!dynamicOption) {
+    dynamicOption = document.createElement('option');
+    dynamicOption.setAttribute('data-dynamic-font-scale', '1');
+    select.appendChild(dynamicOption);
+  }
+  dynamicOption.value = dynamicValue;
+  dynamicOption.textContent = dynamicLabel;
+  select.value = dynamicValue;
+}
+
+function setFontScale(nextScale, { persist = true, preserveMessageAnchor = true } = {}) {
+  const normalized = clampFontScale(nextScale);
+  if (Math.abs(normalized - fontScaleValue) <= 0.0001) {
+    if (persist) localStorage.setItem(FONT_SCALE_STORAGE_KEY, String(normalized));
+    syncFontScaleSelect();
+    return normalized;
+  }
+  const anchor = preserveMessageAnchor ? getMessageViewportAnchor() : null;
+  fontScaleValue = normalized;
+  document.documentElement.style.setProperty('--font-scale', normalized.toFixed(4));
+  document.documentElement.style.setProperty('--font-scale-percent', `${Math.round(normalized * 100)}%`);
+  if (persist) localStorage.setItem(FONT_SCALE_STORAGE_KEY, String(normalized));
+  syncFontScaleSelect();
+  if (anchor) {
+    requestAnimationFrame(() => {
+      restoreMessageViewportAnchor(anchor);
+    });
+  }
+  return normalized;
+}
+
+function isImageZoomGestureTarget(target) {
+  if (!(target instanceof Element)) return false;
+  return !!target.closest('#file-preview-body.image-zoom-mode');
+}
+
+function pinchDistance(touchA, touchB) {
+  return Math.hypot(touchA.clientX - touchB.clientX, touchA.clientY - touchB.clientY);
+}
+
+function onGlobalFontScaleWheel(event) {
+  if (!(event.ctrlKey || event.metaKey)) return;
+  if (isImageZoomGestureTarget(event.target)) return;
+  event.preventDefault();
+  const deltaY = Number(event.deltaY);
+  if (!Number.isFinite(deltaY) || deltaY === 0) return;
+  const direction = deltaY < 0 ? 1 : -1;
+  const magnitude = Math.min(0.2, Math.max(FONT_SCALE_WHEEL_STEP_BASE, Math.abs(deltaY) / 400));
+  setFontScale(fontScaleValue + (direction * magnitude), { persist: true, preserveMessageAnchor: true });
+}
+
+function onGlobalFontScaleTouchStart(event) {
+  if (event.touches.length !== 2) return;
+  if (isImageZoomGestureTarget(event.target)) {
+    fontScalePinchState.active = false;
+    return;
+  }
+  const t0 = event.touches[0];
+  const t1 = event.touches[1];
+  fontScalePinchState = {
+    active: true,
+    startDistance: pinchDistance(t0, t1),
+    startScale: fontScaleValue,
+  };
+  event.preventDefault();
+}
+
+function onGlobalFontScaleTouchMove(event) {
+  if (!fontScalePinchState.active) return;
+  if (event.touches.length !== 2) {
+    fontScalePinchState.active = false;
+    return;
+  }
+  if (isImageZoomGestureTarget(event.target)) {
+    fontScalePinchState.active = false;
+    return;
+  }
+  event.preventDefault();
+  const t0 = event.touches[0];
+  const t1 = event.touches[1];
+  const distance = pinchDistance(t0, t1);
+  if (!fontScalePinchState.startDistance || !Number.isFinite(distance) || distance <= 0) return;
+  const ratio = distance / fontScalePinchState.startDistance;
+  const nextScale = fontScalePinchState.startScale * ratio;
+  setFontScale(nextScale, { persist: true, preserveMessageAnchor: true });
+}
+
+function onGlobalFontScaleTouchEnd(event) {
+  if (event.touches.length < 2) {
+    fontScalePinchState.active = false;
+  }
+}
+
+function populateFontScaleSelect() {
+  const select = document.getElementById('font-scale-select');
+  if (!select || select.dataset.populated === '1') return;
+  select.dataset.populated = '1';
+  for (let value = 50; value <= 150; value += 10) {
+    const option = document.createElement('option');
+    option.value = String(value);
+    option.textContent = `${value}%`;
+    select.appendChild(option);
+  }
+}
+
+function initFontScaling() {
+  populateFontScaleSelect();
+  const inlineScale = Number(document.documentElement.style.getPropertyValue('--font-scale'));
+  const initialScale = Number.isFinite(inlineScale) ? clampFontScale(inlineScale) : readStoredFontScale();
+  setFontScale(initialScale, { persist: false, preserveMessageAnchor: false });
+  if (!window.__fontScaleGestureHandlersBound) {
+    window.__fontScaleGestureHandlersBound = true;
+    window.addEventListener('wheel', onGlobalFontScaleWheel, { passive: false, capture: true });
+    window.addEventListener('touchstart', onGlobalFontScaleTouchStart, { passive: false, capture: true });
+    window.addEventListener('touchmove', onGlobalFontScaleTouchMove, { passive: false, capture: true });
+    window.addEventListener('touchend', onGlobalFontScaleTouchEnd, { passive: true, capture: true });
+    window.addEventListener('touchcancel', onGlobalFontScaleTouchEnd, { passive: true, capture: true });
+  }
+}
+
+function updateFontScaleFromSelect(rawValue) {
+  const next = normalizeFontScaleSelectValue(rawValue);
+  if (next == null) {
+    syncFontScaleSelect();
+    return;
+  }
+  setFontScale(next, { persist: true, preserveMessageAnchor: true });
+}
+
 function updateTheme(theme) {
   if (theme === 'light') {
     document.documentElement.setAttribute('data-theme', 'light');
@@ -2322,10 +2529,11 @@ function updateTheme(theme) {
 function openSettingsModal() {
   closeChatActionsMenu();
   const modal = document.getElementById('settings-modal');
-  const select = document.getElementById('theme-select');
-  if (select) {
-    select.value = localStorage.getItem(THEME_STORAGE_KEY) === 'light' ? 'light' : 'dark';
+  const themeSelect = document.getElementById('theme-select');
+  if (themeSelect) {
+    themeSelect.value = localStorage.getItem(THEME_STORAGE_KEY) === 'light' ? 'light' : 'dark';
   }
+  syncFontScaleSelect();
   modal?.classList.add('visible');
   modal?.setAttribute('aria-hidden', 'false');
 }
@@ -2337,6 +2545,7 @@ function closeSettingsModal() {
 }
 
 window.updateTheme = updateTheme;
+window.updateFontScaleFromSelect = updateFontScaleFromSelect;
 window.openSettingsModal = openSettingsModal;
 window.closeSettingsModal = closeSettingsModal;
 
@@ -2347,6 +2556,7 @@ function showAuthGate() {
 
 async function initApp() {
   initTheme();
+  initFontScaling();
   clearLegacyKnownCwdHistoryStorage();
   syncPwaVersionMenuEntry();
   syncQueueStatusMenuEntry();
@@ -2525,7 +2735,7 @@ async function doAuth() {
 
 function registerPwaShell() {
   if (!('serviceWorker' in navigator)) return;
-  const scopeBase = window.location.pathname.replace(/\/+$/, '');
+  const scopeBase = BASE;
   const scopeRoot = `${scopeBase}/`;
   const pwaVersion = String(window.__COPILOT_PWA_VERSION || '0').trim() || '0';
   return navigator.serviceWorker.register(`${scopeBase}/sw.js?v=${encodeURIComponent(pwaVersion)}`, { scope: scopeRoot, updateViaCache: 'none' }).catch(() => {});

@@ -10,8 +10,13 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <script>
-  const __APP_BASE = window.location.pathname.replace(/\/+$/, '');
+  window.__COPILOT_APP_CONFIG = { basePath: '' };
+  const __APP_CONFIG = window.__COPILOT_APP_CONFIG;
+  const __APP_BASE = typeof __APP_CONFIG?.basePath === 'string' && __APP_CONFIG.basePath.trim()
+    ? __APP_CONFIG.basePath.replace(/\/+$/, '')
+    : window.location.pathname.replace(/\/+$/, '');
   const __PWA_VERSION = '0';
+  __APP_CONFIG.pwaVersion = __PWA_VERSION;
   window.__COPILOT_PWA_VERSION = __PWA_VERSION;
   window.addEventListener('DOMContentLoaded', () => {
     const versionValueEntry = document.getElementById('chat-menu-pwa-version-value');
@@ -25,7 +30,7 @@
   document.write(`<link rel="apple-touch-icon" href="${__APP_BASE}/app-icon-192.png?${__PWA_BUST}">`);
 </script>
 <title>Copilot Remote</title>
-<script>document.write('<scr'+'ipt src="'+window.location.pathname.replace(/\/+$/,'')+'/socket.io/socket.io.js"><\/scr'+'ipt>');</script>
+<script>document.write('<scr'+'ipt src="'+__APP_BASE+'/socket.io/socket.io.js"><\/scr'+'ipt>');</script>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
@@ -34,6 +39,18 @@
   if (window.hljs && typeof window.hljs.registerAliases === 'function') {
     window.hljs.registerAliases(['pwsh', 'ps1'], { languageName: 'powershell' });
   }
+</script>
+<script>
+  (function applyStoredFontScaleEarly() {
+    const key = 'copilot_font_scale';
+    const min = 0.5;
+    const max = 1.5;
+    const fallback = 1;
+    const raw = Number(localStorage.getItem(key));
+    const value = Number.isFinite(raw) ? Math.min(max, Math.max(min, raw)) : fallback;
+    document.documentElement.style.setProperty('--font-scale', String(value));
+    document.documentElement.style.setProperty('--font-scale-percent', `${Math.round(value * 100)}%`);
+  })();
 </script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -77,6 +94,8 @@
     --messages-width: 100vw;
     --msg-attachment-max-height: calc(var(--messages-height, 100vh) * 0.35);
     --msg-attachment-max-width: min(360px, calc(var(--messages-width, 100vw) * 0.35));
+    --font-scale: 1;
+    --font-scale-percent: 100%;
   }
 
   :root[data-theme="light"] {
@@ -108,14 +127,17 @@
     --inline-code-bg: #30363d;
   }
 
+  html {
+    font-size: var(--font-scale-percent, 100%);
+  }
   html, body {
     height: 100%;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     background: var(--bg);
     color: var(--text);
-    font-size: 15px;
   }
   body {
+    font-size: 0.9375rem;
     overflow: hidden;
     position: relative;
   }
@@ -534,6 +556,25 @@
   .chat-actions-menu-meta-secondary {
     font-size: 0.78rem;
     color: var(--text);
+  }
+  .settings-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+    gap: 12px;
+  }
+  .settings-row label {
+    font-weight: 600;
+  }
+  .settings-row select {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 12px;
+    outline: none;
+    font-size: 0.88rem;
   }
   #pending-question-banner {
     display: none;
@@ -1984,7 +2025,7 @@
   }
 
   @media (max-width: 680px) {
-    html, body { font-size: clamp(12px, 3.4vw, 14px); }
+    html { font-size: calc(clamp(12px, 3.4vw, 14px) * var(--font-scale, 1)); }
     #sidebar {
       position: fixed; top: 0; left: 0; height: 100%; z-index: 20;
       transform: translateX(-100%);
@@ -2410,12 +2451,16 @@
       </div>
     </div>
     <div class="summary-body" style="padding: 16px;">
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-        <label for="theme-select" style="font-weight: 600;">Theme</label>
-        <select id="theme-select" style="background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; outline: none; font-size: 14px;" onchange="updateTheme(this.value)">
+      <div class="settings-row">
+        <label for="theme-select">Theme</label>
+        <select id="theme-select" onchange="updateTheme(this.value)">
           <option value="dark">Dark</option>
           <option value="light">Light</option>
         </select>
+      </div>
+      <div class="settings-row" style="margin-bottom: 0;">
+        <label for="font-scale-select">Text scaling</label>
+        <select id="font-scale-select" onchange="updateFontScaleFromSelect(this.value)" aria-label="Text scaling"></select>
       </div>
     </div>
   </div>

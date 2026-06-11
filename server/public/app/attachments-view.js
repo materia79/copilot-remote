@@ -17,6 +17,7 @@ import {
   loadWorkspaceFilePreview,
   loadDriveFilePreview,
   loadRepoTree,
+  loadRepoChildren,
   loadDrivesRoots,
   loadDriveChildren,
 } from './api-client.js';
@@ -1146,19 +1147,30 @@ export async function loadRepoBrowserTree() {
   flushQueuedRepoBrowserReload();
 }
 
-export async function ensureDriveChildrenLoaded(pathValue) {
-  if (repoBrowserState.activeRoot === 'workspace') return true;
-  const targetPath = normalizeDriveBrowserPath(pathValue);
-  if (!targetPath) return false;
-  const node = repoBrowserState.nodeMap.get(targetPath);
+export async function ensureRepoChildrenLoaded(pathValue) {
+  if (pathValue === null || pathValue === undefined) return false;
+  const normalizedPath = normalizeRepoPath(pathValue);
+  const nodePath = normalizedPath || '';
+  if (!nodePath && repoBrowserState.activeRoot !== 'workspace') return false;
+
+  const node = repoBrowserState.nodeMap.get(nodePath);
   if (!node || node.type !== 'dir') return false;
   if (node.childrenLoaded) return true;
   if (node.loadingChildren) return false;
+
   node.loadingChildren = true;
-  repoBrowserState.loadingPath = targetPath;
+  repoBrowserState.loadingPath = nodePath;
   renderRepoBrowser();
 
-  const payload = await loadDriveChildren(targetPath, repoBrowserState.drivesIncludeHidden);
+  const payload = repoBrowserState.activeRoot === 'workspace'
+    ? await loadRepoChildren(
+      nodePath,
+      repoBrowserState.workspaceIncludeHidden,
+      repoBrowserState.workspaceIncludeHeavy,
+      currentConversationId(),
+    )
+    : await loadDriveChildren(nodePath, repoBrowserState.drivesIncludeHidden);
+
   node.loadingChildren = false;
   repoBrowserState.loadingPath = '';
   if (!payload || payload.error || !payload.node || !Array.isArray(payload.node.children)) {
@@ -1177,6 +1189,14 @@ export async function ensureDriveChildrenLoaded(pathValue) {
   repoBrowserState.nodeCount = repoBrowserState.nodeMap.size;
   renderRepoBrowser();
   return true;
+}
+
+export async function ensureDriveChildrenLoaded(pathValue) {
+  return ensureRepoChildrenLoaded(pathValue);
+}
+
+export async function ensureWorkspaceChildrenLoaded(pathValue) {
+  return ensureRepoChildrenLoaded(pathValue);
 }
 
 export function setRepoBrowserRoot(root) {
@@ -1310,9 +1330,7 @@ export async function setRepoCurrentPath(pathValue) {
   const node = repoBrowserState.nodeMap.get(targetPath);
   if (!node || node.type !== 'dir') return;
   repoBrowserState.currentPath = targetPath;
-  if (repoBrowserState.activeRoot !== 'workspace' && targetPath) {
-    await ensureDriveChildrenLoaded(targetPath);
-  }
+  await ensureRepoChildrenLoaded(targetPath);
   renderRepoBreadcrumb();
   renderRepoFolder();
   updateRepoTreeSelection();

@@ -47,6 +47,8 @@ import { DEFAULT_QUESTION_TIMEOUT_MS } from '../shared/question-timeout.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const INDEX_HTML_PATH = path.join(PUBLIC_DIR, 'index.html');
+const SOCKET_IO_CLIENT_JS_PATH = path.join(__dirname, '..', 'node_modules', 'socket.io', 'client-dist', 'socket.io.js');
+const APP_CONFIG_PLACEHOLDER = /window\.__COPILOT_APP_CONFIG = \{ basePath: '[^']*' \};/;
 const PWA_VERSION_PLACEHOLDER = /const __PWA_VERSION = '[^']*';/;
 const ttyConsoleRuntime = await maybeStartTtyConsole({
   serverDir: __dirname,
@@ -306,9 +308,46 @@ const runtimeTimers = {
   shutdownDrain: null,
 };
 
+function normalizeRemotePath(value) {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === '/') return '';
+  const withLeadingSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+  return withLeadingSlash.replace(/\/+$/, '');
+}
+
+function stripRequestPathPrefix(req, pathPrefix) {
+  if (!pathPrefix) return false;
+  const originalUrl = String(req.url || '');
+  if (!originalUrl) return false;
+  const queryIndex = originalUrl.indexOf('?');
+  const pathname = queryIndex >= 0 ? originalUrl.slice(0, queryIndex) : originalUrl;
+  const search = queryIndex >= 0 ? originalUrl.slice(queryIndex) : '';
+  if (pathname !== pathPrefix && !pathname.startsWith(`${pathPrefix}/`)) return false;
+  req.url = `${pathname.slice(pathPrefix.length) || '/'}${search}`;
+  return true;
+}
+
+function rewriteSocketIoRequestPath(req, pathPrefix) {
+  if (!pathPrefix) return false;
+  const originalUrl = String(req.url || '');
+  if (!originalUrl) return false;
+  const queryIndex = originalUrl.indexOf('?');
+  const pathname = queryIndex >= 0 ? originalUrl.slice(0, queryIndex) : originalUrl;
+  const search = queryIndex >= 0 ? originalUrl.slice(queryIndex) : '';
+  const socketPrefix = `${pathPrefix}/socket.io`;
+  if (pathname !== socketPrefix && !pathname.startsWith(`${socketPrefix}/`)) return false;
+  req.url = `/socket.io${pathname.slice(socketPrefix.length)}${search}`;
+  return true;
+}
+
+function socketIoPath() {
+  return '/socket.io/';
+}
+
 // Remote path prefix when served behind a reverse proxy subpath.
 // Trailing slashes are stripped. Empty string means root.
-const remotePath = (config.remotePath || '').replace(/\/+$/, '');
+const remotePath = normalizeRemotePath(config.remotePath);
 
 let modelCatalog = {
   models: [DEFAULT_MODEL],
@@ -2889,6 +2928,137 @@ function fetchDriveDirectoryEntries(absoluteDirPath, { includeHidden = false } =
   });
 }
 
+function fetchWorkspaceDirectoryEntries(requestedPath, {
+  includeHidden = false,
+  includeHeavy = false,
+  rootPath = null,
+} = {}, cb) {
+  const activeWorkspaceRoot = normalizeConversationWorkspaceRootPath(rootPath) || currentWorkspaceRootPath();
+  if (!activeWorkspaceRoot) {
+    const error = new Error('Workspace root unavailable');
+    error.statusCode = 500;
+    cb(error);
+    return;
+  }
+
+  const rawPath = String(requestedPath || '').trim();
+  const normalizedRelativePath = rawPath
+    ? normalizeWorkspaceRelativePath(rawPath)
+    : '';
+  if (rawPath && !normalizedRelativePath) {
+    const error = new Error('Invalid workspace path');
+    error.statusCode = 400;
+    cb(error);
+    return;
+  }
+
+  const absolutePath = normalizedRelativePath
+    ? resolveWorkspaceFilePath(normalizedRelativePath, activeWorkspaceRoot)
+    : activeWorkspaceRoot;
+  if (!absolutePath) {
+    const error = new Error('Invalid workspace path');
+    error.statusCode = 400;
+    cb(error);
+    return;
+  }
+
+  let stat = null;
+  try {
+    stat = fs.statSync(absolutePath);
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') {
+      const notFound = new Error('Path not found');
+      notFound.statusCode = 404;
+      cb(notFound);
+      return;
+    }
+    const failed = new Error(error?.message || 'Failed to read path metadata');
+    failed.statusCode = 500;
+    cb(failed);
+    return;
+  }
+  if (!stat.isDirectory()) {
+    const error = new Error('Path must reference a directory');
+    error.statusCode = 400;
+    cb(error);
+    return;
+  }
+
+  let entries = [];
+  try {
+    entries = fs.readdirSync(absolutePath, { withFileTypes: true });
+  } catch (error) {
+    const failed = new Error(error?.message || 'Failed to list directory');
+    failed.statusCode = 500;
+    cb(failed);
+    return;
+  }
+
+  const children = [];
+  const visibleEntries = entries
+    .filter((entry) => !shouldSkipRepoEntryName(entry?.name, { includeHidden, includeHeavy }))
+    .sort(compareRepoDirEntries);
+  for (const entry of visibleEntries) {
+    const childName = String(entry?.name || '').trim();
+    if (!childName) continue;
+    const childAbsolutePath = path.join(absolutePath, childName);
+
+    let childStat = null;
+    try {
+      childStat = fs.lstatSync(childAbsolutePath);
+    } catch {
+      continue;
+    }
+    if (!childStat || childStat.isSymbolicLink()) continue;
+
+    const childRelativePath = normalizedRelativePath
+      ? path.join(normalizedRelativePath, childName)
+      : childName;
+    const childWebPath = toRepoWebPath(childRelativePath);
+    const childType = childStat.isDirectory() ? 'dir' : 'file';
+    const childNode = {
+      path: childWebPath,
+      name: childName,
+      type: childType,
+      mtime: childStat.mtime ? childStat.mtime.toISOString() : null,
+    };
+    if (childType === 'dir') {
+      childNode.children = [];
+      childNode.lazy = true;
+      childNode.childrenLoaded = false;
+      children.push(childNode);
+      continue;
+    }
+
+    const ext = path.extname(childAbsolutePath).toLowerCase();
+    const contentType = workspaceContentType(childAbsolutePath);
+    childNode.ext = ext || null;
+    childNode.size = Number(childStat.size || 0);
+    childNode.contentType = contentType;
+    childNode.previewKind = workspacePreviewKindForMeta(ext, contentType);
+    children.push(childNode);
+  }
+
+  const nodePath = toRepoWebPath(normalizedRelativePath);
+  const nodeName = normalizedRelativePath
+    ? (path.basename(absolutePath) || nodePath)
+    : workspaceRootDisplayName(activeWorkspaceRoot);
+  cb(null, {
+    node: {
+      path: nodePath,
+      name: nodeName,
+      type: 'dir',
+      children,
+      childrenLoaded: true,
+      lazy: false,
+    },
+    rootPath: activeWorkspaceRoot,
+    rootName: workspaceRootDisplayName(activeWorkspaceRoot),
+    includeHidden,
+    includeHeavy,
+  });
+}
+
 function buildRepositoryTreeSnapshot({
   includeHidden = false,
   includeHeavy = false,
@@ -3434,9 +3604,12 @@ function computePwaShellVersion() {
 }
 
 function renderIndexHtmlWithPwaVersion() {
+  const appConfig = JSON.stringify({ basePath: remotePath });
   const version = computePwaShellVersion();
   const source = fs.readFileSync(INDEX_HTML_PATH, 'utf8');
-  return source.replace(PWA_VERSION_PLACEHOLDER, `const __PWA_VERSION = '${version}';`);
+  return source
+    .replace(APP_CONFIG_PLACEHOLDER, `window.__COPILOT_APP_CONFIG = ${appConfig};`)
+    .replace(PWA_VERSION_PLACEHOLDER, `const __PWA_VERSION = '${version}';`);
 }
 
 const sessionDiscoveryService = createSessionDiscoveryService({
@@ -3461,7 +3634,13 @@ const readContextFromSessionEvents = contextSnapshotService.readContextFromSessi
 // ─── Express + Socket.io Setup ────────────────────────────────────────────────
 const app        = express();
 const httpServer = http.createServer(app);
-const io         = new Server(httpServer, { cors: { origin: '*' } });
+httpServer.prependListener('request', (req, _res) => {
+  rewriteSocketIoRequestPath(req, remotePath);
+});
+httpServer.prependListener('upgrade', (req, _socket, _head) => {
+  rewriteSocketIoRequestPath(req, remotePath);
+});
+const io         = new Server(httpServer, { cors: { origin: '*' }, path: socketIoPath() });
 const sessionWorkerWebSocketService = createSessionWorkerWebSocketService({
   WebSocketServerImpl: WebSocketServer,
   httpServer,
@@ -3474,6 +3653,16 @@ const sessionWorkerWebSocketService = createSessionWorkerWebSocketService({
 });
 
 app.use(express.json({ limit: '20mb' }));
+app.use((req, _res, next) => {
+  stripRequestPathPrefix(req, remotePath);
+  next();
+});
+app.get('/socket.io/socket.io.js', (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.sendFile(SOCKET_IO_CLIENT_JS_PATH, (error) => {
+    if (error) next(error);
+  });
+});
 app.get(['/', '/index.html'], (req, res, next) => {
   try {
     const html = renderIndexHtmlWithPwaVersion();
@@ -3524,12 +3713,15 @@ const sharedRouteDeps = {
   parseBooleanQueryFlag,
   buildRepositoryTreeSnapshot,
   fetchBrowsableDrives,
+  fetchWorkspaceDirectoryEntries,
   fetchDriveDirectoryEntries,
   mapDriveDirectoryEntry,
   driveDisplayName,
   normalizeDriveAbsolutePath,
   driveRootFromAbsolutePath,
   toDriveWebPath,
+  compareRepoDirEntries,
+  shouldSkipRepoEntryName,
   readWorkspaceFileMeta,
   resolveWorkspaceFilePath,
   normalizeWorkspaceRelativePath,

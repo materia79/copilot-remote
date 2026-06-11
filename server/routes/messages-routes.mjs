@@ -854,8 +854,8 @@ export function registerMessagesRoutes(app, deps) {
     MAX_REFERENCE_IMAGE_ATTACHMENT_BYTES,
     remotePath,
     parseBooleanQueryFlag,
-    buildRepositoryTreeSnapshot,
     fetchBrowsableDrives,
+    fetchWorkspaceDirectoryEntries,
     fetchDriveDirectoryEntries,
     mapDriveDirectoryEntry,
     driveDisplayName,
@@ -1956,16 +1956,56 @@ export function registerMessagesRoutes(app, deps) {
     const includeHidden = parseBooleanQueryFlag(req.query.includeHidden, false);
     const includeHeavy = parseBooleanQueryFlag(req.query.includeHeavy, false);
     const rootOverride = resolveScopedWorkspaceRootPath(req);
-    const snapshot = buildRepositoryTreeSnapshot({
+    fetchWorkspaceDirectoryEntries('', {
       includeHidden,
       includeHeavy,
-      maxNodes: MAX_REPO_TREE_NODES,
       rootPath: rootOverride,
+    }, (listErr, payload) => {
+      if (listErr) return res.status(Number(listErr?.statusCode) || 500).json({ error: listErr?.message || 'Failed to load repository tree' });
+      const root = payload?.node || {
+        path: '',
+        name: 'repo',
+        type: 'dir',
+        children: [],
+        childrenLoaded: true,
+        lazy: false,
+      };
+      const childCount = Array.isArray(root.children) ? root.children.length : 0;
+      res.setHeader('Cache-Control', 'no-store');
+      res.json({
+        ok: true,
+        root,
+        rootPath: payload?.rootPath || rootOverride || null,
+        rootName: payload?.rootName || String(root?.name || 'repo'),
+        includeHidden,
+        includeHeavy,
+        nodeCount: childCount + 1,
+        maxNodes: MAX_REPO_TREE_NODES,
+        truncated: false,
+      });
     });
-    res.setHeader('Cache-Control', 'no-store');
-    res.json({
-      ok: true,
-      ...snapshot,
+  });
+
+  app.get('/api/repo/list', auth, (req, res) => {
+    const includeHidden = parseBooleanQueryFlag(req.query.includeHidden, false);
+    const includeHeavy = parseBooleanQueryFlag(req.query.includeHeavy, false);
+    const requestedPath = String(req.query.path || '').trim();
+    const rootOverride = resolveScopedWorkspaceRootPath(req);
+    fetchWorkspaceDirectoryEntries(requestedPath, {
+      includeHidden,
+      includeHeavy,
+      rootPath: rootOverride,
+    }, (listErr, payload) => {
+      if (listErr) return res.status(Number(listErr?.statusCode) || 500).json({ error: listErr?.message || 'Failed to list repository directory' });
+      res.setHeader('Cache-Control', 'no-store');
+      res.json({
+        ok: true,
+        node: payload?.node || null,
+        rootPath: payload?.rootPath || rootOverride || null,
+        rootName: payload?.rootName || null,
+        includeHidden,
+        includeHeavy,
+      });
     });
   });
 

@@ -181,7 +181,7 @@ where supported (with standalone fallback), and hides install/fullscreen header 
 When opened in a regular browser tab, the in-app **Install** button remains available
 in the chat header (shown as `⬇` on small screens).
 
-If you host the relay behind a subpath, open the URL with a trailing slash so the PWA scope matches correctly for install prompts.
+If you host the relay behind a subpath, set `remotePath` in `server/config.json` to that public path prefix and open the URL with a trailing slash so the PWA scope matches correctly for install prompts.
 
 ## Model Selection
 
@@ -314,7 +314,8 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | GET | `/api/upload/:sha256/content` | Stream stored upload content by hash |
 | GET | `/api/files/*` | Stream a workspace file by repo-relative path (token required) |
 | GET | `/api/files-preview/*` | Return structured preview JSON for markdown/code/text/image/video files |
-| GET | `/api/repo/tree` | Return repository tree snapshot (supports `includeHidden` and `includeHeavy`) |
+| GET | `/api/repo/tree` | Return repository root + first-level entries for lazy workspace browsing |
+| GET | `/api/repo/list` | Lazy-load workspace directory entries (`path`, `includeHidden`, `includeHeavy`) |
 | GET | `/api/drives/roots` | Return browsable drive roots (local fixed + removable) for explorer drive mode |
 | GET | `/api/drives/list` | Lazy-load entries for a drive directory (`path`, optional `includeHidden`) |
 | GET | `/api/drives/file` | Stream a drive file by absolute drive path query (`path`) |
@@ -412,7 +413,8 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 
 - Use `/api/files/<repo-relative-path>` to open workspace files in a new tab. The browser sends the auth cookie automatically.
 - Use `/api/files-preview/<repo-relative-path>` for structured preview JSON (`kind`, `language`, `content`, `truncated`, `size`).
-- Use `/api/repo/tree?includeHidden=0&includeHeavy=0` for a full tree snapshot (toggleable hidden/heavy paths).
+- Use `/api/repo/tree?includeHidden=0&includeHeavy=0` to load workspace root and first-level entries.
+- Use `/api/repo/list?path=<repo-relative-dir>&includeHidden=0|1&includeHeavy=0|1` for lazy-loaded workspace directory browsing.
 - Use `/api/drives/roots` + `/api/drives/list?path=<drive-path>&includeHidden=0|1` for lazy-loaded drive browsing (separate from workspace heavy mode).
 - Use `/api/drives/file?path=<drive-path>` and `/api/drives/files-preview?path=<drive-path>` for drive file raw/preview access.
 - Requests are auth-protected and restricted to files inside the workspace root.
