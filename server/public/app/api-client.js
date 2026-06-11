@@ -1,4 +1,4 @@
-import { BASE, TOKEN, authHeaders, updateWorkspaceRootHints, applyContextUsageBar, readContextUsageRatio, currentConvId, conversations, setCliOnline, setActiveRuntimeSessionCount, setContextIndicatorMode } from './store.js';
+import { BASE, TOKEN, authHeaders, updateWorkspaceRootHints, applyContextUsageBar, readContextUsageRatio, currentConvId, conversations, setCliOnline, setActiveRuntimeSessionCount, setContextIndicatorMode, setServerPlatform } from './store.js';
 
 export async function apiFetch(url, opts = {}) {
   try {
@@ -30,6 +30,7 @@ export async function verifyExistingSession() {
     setContextIndicatorMode(payload?.contextIndicatorMode);
     setCliOnline(!!payload?.cliOnline);
     setActiveRuntimeSessionCount(payload?.activeRuntimeSessionCount);
+    if (payload?.platform) setServerPlatform(payload.platform);
     return true;
   } catch {
     return false;
@@ -47,6 +48,7 @@ export async function verifyToken(token) {
     setContextIndicatorMode(payload?.contextIndicatorMode);
     setCliOnline(!!payload?.cliOnline);
     setActiveRuntimeSessionCount(payload?.activeRuntimeSessionCount);
+    if (payload?.platform) setServerPlatform(payload.platform);
     return true;
   } catch {
     return false;
@@ -60,6 +62,7 @@ export async function refreshWorkspaceRootHints() {
     setContextIndicatorMode(status?.contextIndicatorMode);
     setCliOnline(!!status?.cliOnline);
     setActiveRuntimeSessionCount(status?.activeRuntimeSessionCount);
+    if (status?.platform) setServerPlatform(status.platform);
   }
   return status;
 }

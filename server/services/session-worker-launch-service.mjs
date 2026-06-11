@@ -98,6 +98,7 @@ export function buildTmuxWorkerShellCommand(targetSessionId, env = {}) {
     'COPILOT_WEB_RELAY_TOOLS',
     'COPILOT_WEB_RELAY_LOG_DIR',
     'COPILOT_WORKSPACE_ROOT',
+    'INIT_CWD',
   ]) {
     const value = String(env?.[key] || '').trim();
     if (!value) continue;
@@ -111,19 +112,25 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function buildWorkerLaunchEnv(cwd, env = process.env) {
-  const launchCwd = String(cwd || '').trim();
-  if (!launchCwd) return env;
+function buildWorkerLaunchEnv({ processCwd, workspaceRoot, env = process.env } = {}) {
+  const launchProcessCwd = String(processCwd || '').trim();
+  const launchWorkspaceRoot = String(workspaceRoot || '').trim() || launchProcessCwd;
+  if (!launchProcessCwd && !launchWorkspaceRoot) return env;
   return {
     ...env,
-    COPILOT_WORKSPACE_ROOT: launchCwd,
-    PWD: launchCwd,
+    ...(launchWorkspaceRoot ? {
+      COPILOT_WORKSPACE_ROOT: launchWorkspaceRoot,
+      INIT_CWD: launchWorkspaceRoot,
+    } : {}),
+    ...(launchProcessCwd ? { PWD: launchProcessCwd } : {}),
   };
 }
 
 export async function launchSessionCli({
   targetSessionId,
   cwd,
+  processCwd = '',
+  workspaceRoot = '',
   env = process.env,
   platform = process.platform,
   spawnImpl = spawn,
@@ -148,8 +155,13 @@ export async function launchSessionCli({
     };
   }
 
-  const launchCwd = String(cwd || process.cwd());
-  const launchEnv = buildWorkerLaunchEnv(launchCwd, env);
+  const launchWorkspaceRoot = String(workspaceRoot || cwd || process.cwd());
+  const launchProcessCwd = String(processCwd || cwd || process.cwd());
+  const launchEnv = buildWorkerLaunchEnv({
+    processCwd: launchProcessCwd,
+    workspaceRoot: launchWorkspaceRoot,
+    env,
+  });
 
   if (isTmuxAvailable({ platform, execFileSyncImpl })) {
     const sessionName = normalizeTmuxSessionName(target);
@@ -169,7 +181,7 @@ export async function launchSessionCli({
       '-s',
       sessionName,
       '-c',
-      launchCwd,
+      launchProcessCwd,
       'sh',
       '-lc',
       buildTmuxWorkerShellCommand(target, launchEnv),
@@ -205,7 +217,7 @@ export async function launchSessionCli({
   }
 
   const child = spawnImpl('gh', ['copilot', '--', '--allow-all', '--session-id', target], {
-    cwd: launchCwd,
+    cwd: launchProcessCwd,
     env: launchEnv,
     detached: true,
     stdio: 'ignore',

@@ -3,7 +3,7 @@
 Use your local GitHub Copilot CLI session from any browser (phone, tablet, or second computer) through a self-hosted web relay.
 
 ```text
-[Browser] <-- WebSocket --> [server.js :3333] <-- HTTP poll --> [Copilot CLI session]
+[Browser] <-- WebSocket --> [server.js :3333] <-- WebSocket-first relay --> [Copilot CLI session]
 ```
 
 ## In action
@@ -133,7 +133,7 @@ For day-to-day development workflows, relay restart steps, and worker debugging 
 | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | `copilot-remote`        | Global npm command (after `npm link` or `npm install -g .`) that starts the web relay if needed, then runs `gh copilot` in the same shell |
 | `copilot-remote --install-extension` | Installs/updates a user-global `web-relay` wrapper entrypoint and exits                                                                |
-| `npm run copilot:relay` | Starts Copilot CLI with an initial prompt so the extension loads and polling begins                                                       |
+| `npm run copilot:relay` | Starts Copilot CLI with an initial prompt so the extension loads and the relay worker link comes online                                      |
 | `npm run start:server`  | Server only (use with an active Copilot CLI session that loads the extension)                                                             |
 | `npm start`             | Standalone development mode (`server.js` + `relay.mjs`)                                                                                   |
 
@@ -141,17 +141,17 @@ For day-to-day development workflows, relay restart steps, and worker debugging 
 
 Run only one relay owner at a time:
 
-1. **Extension-managed mode**: Copilot CLI extension handles polling.
-2. **Standalone mode**: `npm start` handles polling itself.
+1. **Extension-managed mode**: Copilot CLI extension owns the relay worker WebSocket and fallback dequeue loop.
+2. **Standalone mode**: `npm start` handles the relay runtime itself.
 
-Do not run extension polling together with standalone relay polling.
+Do not run extension-managed relay transport together with standalone relay runtime transport.
 Do not restart the web relay unless the user has explicitly given permission.
 If a manual restart is requested, use `POST /api/relay/shutdown` only.
 Do not run tests that spawn Copilot CLI clients unless the user explicitly permits it.
 
-In extension-managed mode, polling begins after the CLI session becomes active (typically after the first prompt).
+In extension-managed mode, the worker WebSocket begins after the CLI session becomes active (typically after the first prompt), with HTTP dequeue kept only as fallback when the socket is unavailable.
 The extension now supervises managed `server.js` restarts (bounded backoff) while the CLI session is alive, and stops restart attempts on session shutdown.
-When the CLI extension connects, it also prints the relay info window (local/network/remote/auth/polling URLs) directly in the Copilot CLI client.
+When the CLI extension connects, it also prints the relay info window (local/network/remote/auth URLs) directly in the Copilot CLI client.
 
 Respawner scripts (`start:server:respawn`*) are legacy/manual troubleshooting tools only and are not part of the extension-managed startup path.
 Do not use them for manual restarts; use `POST /api/relay/shutdown` instead.
@@ -246,8 +246,11 @@ Selection is persisted in browser storage and attached per message.
 | `restartRetryBackoffMs`    | `[1000,3000,7000]`   | Deterministic retry backoff schedule in milliseconds                      |
 | `maxRequeueRetries`        | `5`                  | Queue retry limit for failed processing                                   |
 | `remotePath`               | `""`                 | URL base path when reverse-proxied under a subpath; also drives PWA URLs and socket.io path |
-| `sshTunnel.enabled`        | `false`              | Enable reverse SSH tunnel                                                 |
+| `sshTunnel.mode`           | `disabled`           | Tunnel mode (`disabled` or `managed`)                                    |
+| `sshTunnel.enabled`        | `false`              | Legacy alias (`true` => `managed`)                                       |
+| `sshTunnel.required`       | `false`              | Pause dequeue while managed tunnel is disconnected                        |
 | `sshTunnel.remoteBind`     | `loopback`           | Remote bind mode for SSH `-R` (`loopback` or `public`)                    |
+| `sshTunnel.command`        | `ssh`                | SSH executable path/command                                               |
 | `sshTunnel.user`           | —                    | SSH user                                                                  |
 | `sshTunnel.host`           | —                    | SSH host                                                                  |
 | `sshTunnel.remotePort`     | —                    | Remote forwarded port                                                     |
@@ -262,7 +265,8 @@ Configure:
 
 ```json
 "sshTunnel": {
-  "enabled": true,
+  "mode": "managed",
+  "required": false,
   "remoteBind": "loopback",
   "user": "ubuntu",
   "host": "relay.example.com",
@@ -300,6 +304,8 @@ copilot-remote --install-extension
 ```
 
 This writes/updates `extension.mjs` in the user-global extension directory as a wrapper that imports the repository extension entrypoint directly.
+The wrapper also avoids double-loading when you start Copilot from this repository itself, so the
+project-local extension remains the single runtime owner in repo-root sessions.
 
 Useful environment variables:
 
@@ -356,7 +362,7 @@ For deeper implementation/API details, see `[server/README.md](server/README.md)
 
 ```text
 copilot-remote/
-├── .github/extensions/web-relay/   # Copilot CLI extension (polling, ask_user bridge, model snapshotting)
+├── .github/extensions/web-relay/   # Copilot CLI extension (worker WebSocket, ask_user bridge, model snapshotting)
 ├── server/                         # Express + Socket.IO relay server and web app
 ├── docs/                           # Project planning notes
 └── README.md

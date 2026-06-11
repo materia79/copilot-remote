@@ -11,3 +11,4 @@ test-results/
 tests/
 tests/agents/
 server.log
+server/config.json~

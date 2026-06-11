@@ -554,6 +554,7 @@ async function startPolling() {
       getPendingAskUserRequest: () => getScopedPendingAskUserRequest(),
       setPendingAskUserRequest: (value) => { setScopedPendingAskUserRequest(value); },
       clearRelayScopeState: () => { clearScopedRelayState(); },
+      shouldFetchPending: () => !(workerWebSocketLink?.status?.().connected),
       syncActiveSession,
       ensureSessionForConversation,
       extractQuestionPrompt,
@@ -570,8 +571,12 @@ function startWorkerWebSocketLink() {
     serverUrl: SERVER_URL,
     token: TOKEN,
     dbg,
+    getPid: () => process.pid,
     getSessionReady: () => sessionReady,
     getSessionId: () => session?.sessionId || null,
+    onDeliver: async (pending, reason = "ws-deliver") => {
+      await pollingLoopController?.handlePendingPayload?.(pending, reason);
+    },
     pollNow: async () => {
       await pollingLoopController?.kick?.();
     },

@@ -23,9 +23,11 @@ When active, worker loop telemetry is summarized in the title bar (`Clients`, `P
 
 On Linux/macOS, session-affine worker launches prefer detached `tmux` sessions when `tmux`
 is available, using the worker SDK session id as the tmux session name so you can attach
-for debugging without changing the Windows launch path.
+for debugging without changing the Windows launch path. Worker processes now launch from the
+relay repository root so the project-local `web-relay` extension is always discoverable; the
+session's actual target workspace is still passed via `COPILOT_WORKSPACE_ROOT` / `INIT_CWD`.
 
-> **Single-owner rule:** Use either extension-managed polling **or** standalone `relay.mjs`, never both at the same time.
+> **Single-owner rule:** Use either extension-managed relay transport **or** standalone `relay.mjs`, never both at the same time.
 > Agent/runtime restart policy is defined in `.github/copilot-instructions.md`.
 
 Tell the Copilot CLI agent: **"launch the server"**
@@ -249,21 +251,24 @@ Question bridge rule:
 ## How It Works
 
 ```
-[Browser] ←── WebSocket ──→ [server.js :3333] ←── HTTP poll ──→ [Copilot CLI session]
+[Browser] ←── WebSocket ──→ [server.js :3333] ←── WebSocket-first relay ──→ [Copilot CLI session]
 ```
 
 1. Browser sends a message → stored in server queue
-2. CLI agent polls `GET /api/pending` every few seconds
-3. When a message is found, the CLI processes it and posts the response to `POST /api/response`  
+2. The relay worker socket delivers queued turns to the bound CLI session immediately
+3. The CLI processes the turn and posts the response to `POST /api/response`  
 4. Server broadcasts response via Socket.io → appears in browser instantly
 
 ## Monitoring Mode (CLI)
 
-After launching the server, the CLI enters a polling loop:
-- Checks `/api/pending` every ~3 seconds
+After launching the server, the CLI opens a worker WebSocket link:
+- Identifies itself with the bound SDK session id and worker pid
+- Receives queued turns over `ws(s)://.../api/session-worker/ws`
+- Reconnects starting at 1 second, with exponential backoff capped at 8 seconds
+- Falls back to `GET /api/pending` only while the worker socket is unavailable
 - Processes any message with full PC access (file system, commands, etc.)
 - Posts the response back
-- CLI appears **online** (green dot) in the web UI while polling
+- CLI appears **online** (green dot) in the web UI while the relay is connected
 - While working, relay tool activity is streamed into the pending assistant bubble
   (for example `Search (glob)` and `Search (grep)`).
 - Assistant reply text is streamed into the pending assistant bubble while the turn is running.
@@ -277,13 +282,13 @@ After launching the server, the CLI enters a polling loop:
 ### Session activation behavior (important)
 
 In extension-managed mode, the web server can already be running while the CLI is still
-shown as offline. Polling starts when the Copilot session becomes active (`onSessionStart`),
-which usually happens after your first prompt in the CLI.
+shown as offline. The worker socket starts when the Copilot session becomes active
+(`onSessionStart`), which usually happens after your first prompt in the CLI.
 
 This means the following startup sequence is expected:
 1. Open `http://localhost:3333` and briefly see "CLI is offline"
 2. Send one message in the CLI
-3. Extension starts polling and queued web messages begin processing
+3. Extension opens the worker socket and queued web messages begin processing
 
 If a conversation is still unbound when the CLI first sees it, the extension now claims it through `/api/session-sync` before processing so the browser can send back to the same SDK session. A separate startup sync to `/api/session-workspace-root` reports the CLI working directory for the already-bound session; it no longer creates a placeholder conversation on its own.
 
@@ -316,10 +321,10 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | GET | `/api/files-preview/*` | Return structured preview JSON for markdown/code/text/image/video files |
 | GET | `/api/repo/tree` | Return repository root + first-level entries for lazy workspace browsing |
 | GET | `/api/repo/list` | Lazy-load workspace directory entries (`path`, `includeHidden`, `includeHeavy`) |
-| GET | `/api/drives/roots` | Return browsable drive roots (local fixed + removable) for explorer drive mode |
-| GET | `/api/drives/list` | Lazy-load entries for a drive directory (`path`, optional `includeHidden`) |
-| GET | `/api/drives/file` | Stream a drive file by absolute drive path query (`path`) |
-| GET | `/api/drives/files-preview` | Return structured preview JSON for a drive file (`path`) |
+| GET | `/api/drives/roots` | Return browsable root(s) for explorer drive mode — on Windows returns fixed/removable drive letters; on Linux returns a single `/` root node |
+| GET | `/api/drives/list` | Lazy-load directory entries (`path`, optional `includeHidden`) — on Windows `path` is a drive-letter path (e.g. `C:/foo`); on Linux `path` is an absolute POSIX path (e.g. `/home/user`) |
+| GET | `/api/drives/file` | Stream a file by path — Windows drive path or Linux absolute path depending on server platform |
+| GET | `/api/drives/files-preview` | Return structured preview JSON for a file — Windows drive path or Linux absolute path depending on server platform |
 | GET | `/api/conversations` | List all conversations |
 | GET | `/api/sessions` | List runtime sessions bound 1:1 to conversations |
 | GET | `/api/conversation/:id` | Get conversation message windows (`before*`, `after*`, or `aroundMessageId`) plus session-root metadata |
@@ -415,10 +420,14 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 - Use `/api/files-preview/<repo-relative-path>` for structured preview JSON (`kind`, `language`, `content`, `truncated`, `size`).
 - Use `/api/repo/tree?includeHidden=0&includeHeavy=0` to load workspace root and first-level entries.
 - Use `/api/repo/list?path=<repo-relative-dir>&includeHidden=0|1&includeHeavy=0|1` for lazy-loaded workspace directory browsing.
-- Use `/api/drives/roots` + `/api/drives/list?path=<drive-path>&includeHidden=0|1` for lazy-loaded drive browsing (separate from workspace heavy mode).
-- Use `/api/drives/file?path=<drive-path>` and `/api/drives/files-preview?path=<drive-path>` for drive file raw/preview access.
+- Use `/api/drives/roots` + `/api/drives/list?path=<path>&includeHidden=0|1` for lazy-loaded drive/root browsing (separate from workspace heavy mode).
+- Use `/api/drives/file?path=<path>` and `/api/drives/files-preview?path=<path>` for drive/root file raw/preview access.
 - Requests are auth-protected and restricted to files inside the workspace root.
-- Drive browsing is auth-protected and restricted to local fixed/removable roots discovered on the host.
+- **Platform split** — the drives API adapts automatically based on the server OS:
+  - **Windows:** drive roots are discovered via `fsutil.exe`; paths use Windows drive-letter format (`C:/foo/bar`); directory listing uses PowerShell.
+  - **Linux:** a single `/` root is returned; paths are absolute POSIX paths (`/home/user/file.txt`); directory listing uses `fs.readdir` + `fs.stat`.
+- The `/api/status` response includes a `platform` field (`win32`, `linux`, `darwin`, etc.) so the browser UI can adapt path handling accordingly.
+- Drive browsing is auth-protected; path traversal attacks and non-absolute paths are rejected on both platforms.
 - Traversal or non-file paths are rejected.
 - The web UI opens workspace mentions in an in-app preview dialog with **Preview / Raw** mode buttons.
 - Markdown preview supports optional embedded-HTML mode with script/event-handler stripping and a visible warning.
@@ -444,8 +453,10 @@ call `/api/usage` directly.
   "conversationSessionMode": "isolated",
   "contextIndicatorMode": "default",
   "sshTunnel": {
-    "enabled": false,
+    "mode": "disabled",
+    "required": false,
     "remoteBind": "loopback",
+    "command": "ssh",
     "user": "ubuntu",
     "host": "relay.example.com",
     "remotePort": 4444,
@@ -470,8 +481,11 @@ call `/api/usage` directly.
 | `restartRebindTimeoutMs` | `20000` | Max wait for session-sync rebind confirmation |
 | `restartMaxAttempts` | `3` | Max restart attempts before terminal exhaustion |
 | `restartRetryBackoffMs` | `[1000,3000,7000]` | Deterministic retry backoff schedule |
-| `sshTunnel.enabled` | `false` | Start reverse tunnel on server boot |
+| `sshTunnel.mode` | `disabled` | Tunnel mode (`disabled` or `managed`) |
+| `sshTunnel.enabled` | `false` | Legacy alias for mode (`true` => `managed`, `false` => `disabled`) |
+| `sshTunnel.required` | `false` | Pause dequeue when tunnel is disconnected in managed mode |
 | `sshTunnel.remoteBind` | `loopback` | Remote bind mode for SSH `-R` (`loopback` or `public`) |
+| `sshTunnel.command` | `ssh` | SSH executable path or command name |
 | `sshTunnel.user` | — | SSH user on VPS |
 | `sshTunnel.host` | — | VPS hostname / IP |
 | `sshTunnel.remotePort` | — | Port opened on the VPS |
@@ -481,7 +495,7 @@ call `/api/usage` directly.
 
 ## SSH Reverse Tunnel
 
-When `sshTunnel.enabled` is `true`, `server.js` spawns:
+When `sshTunnel.mode` is `managed` (or legacy `sshTunnel.enabled=true`), `server.js` spawns:
 
 ```
 ssh -N -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
@@ -518,15 +532,26 @@ relay.example.com {
 ```json
 "contextIndicatorMode": "default",
 "sshTunnel": {
+  "mode": "managed",
+  "required": false,
   "enabled": true,
+  "blocking": false,
   "connected": true,
   "host": "relay.example.com",
   "remotePort": 4444,
   "remoteBindMode": "loopback",
   "reconnectAttempts": 0,
-  "connectedSince": "2026-05-18T01:00:00.000Z"
+  "connectedSince": "2026-05-18T01:00:00.000Z",
+  "lastError": null,
+  "valid": true
 }
 ```
+
+### SSH tunnel migration notes
+
+- `sshTunnel.mode` is now the canonical switch. Use `disabled` for direct relay deployments and `managed` for reverse SSH.
+- `sshTunnel.enabled` still works for compatibility and maps to `mode`.
+- Add `sshTunnel.required: true` only when queue dequeue must stop until the tunnel reconnects.
 
 `restartOrchestrator` in `/api/status` and `/api/restart-orchestrator` now exposes
 attempt/retry/timeout fields (`attempts`, `maxAttempts`, `retryAt`, `retryBackoffMs`,

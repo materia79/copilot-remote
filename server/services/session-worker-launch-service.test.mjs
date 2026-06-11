@@ -17,11 +17,13 @@ test('buildTmuxWorkerShellCommand injects only relay env needed for workers', ()
   const command = buildTmuxWorkerShellCommand('abc-123', {
     GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS: 'true',
     COPILOT_WEB_RELAY_SERVER_DIR: '/repo/server',
+    INIT_CWD: '/workspace',
     IGNORED_VAR: 'nope',
   });
 
   assert.match(command, /GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS='true'/);
   assert.match(command, /COPILOT_WEB_RELAY_SERVER_DIR='\/repo\/server'/);
+  assert.match(command, /INIT_CWD='\/workspace'/);
   assert.doesNotMatch(command, /IGNORED_VAR/);
   assert.match(command, /exec gh copilot -- --allow-all --session-id 'abc-123'/);
 });
@@ -74,7 +76,8 @@ test('launchSessionCli uses tmux on posix and returns discovered worker pid', as
 
   const launched = await launchSessionCli({
     targetSessionId: 'abc-123',
-    cwd: '/repo',
+    processCwd: '/relay',
+    workspaceRoot: '/repo',
     env: {
       GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS: 'true',
       COPILOT_WORKSPACE_ROOT: '/stale',
@@ -91,14 +94,16 @@ test('launchSessionCli uses tmux on posix and returns discovered worker pid', as
   assert.equal(launched.tmuxSessionName, 'abc-123');
   assert.ok(calls.length >= 2);
   const newSessionCall = calls.find((call) => call[1] === 'new-session');
-  assert.deepEqual(newSessionCall?.slice(-3), ['sh', '-lc', "GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS='true' COPILOT_WORKSPACE_ROOT='/repo' exec gh copilot -- --allow-all --session-id 'abc-123'"]);
+  assert.equal(newSessionCall?.[6], '/relay');
+  assert.deepEqual(newSessionCall?.slice(-3), ['sh', '-lc', "GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS='true' COPILOT_WORKSPACE_ROOT='/repo' INIT_CWD='/repo' exec gh copilot -- --allow-all --session-id 'abc-123'"]);
 });
 
 test('launchSessionCli falls back to detached spawn when tmux is unavailable', async () => {
   const spawnCalls = [];
   const launched = await launchSessionCli({
     targetSessionId: 'abc-123',
-    cwd: '/repo',
+    processCwd: '/relay',
+    workspaceRoot: '/repo',
     env: {
       PATH: process.env.PATH || '',
       COPILOT_WORKSPACE_ROOT: '/stale',
@@ -125,8 +130,10 @@ test('launchSessionCli falls back to detached spawn when tmux is unavailable', a
   assert.equal(launched.launchMode, 'detached');
   assert.equal(launched.pid, 4242);
   assert.equal(spawnCalls[0]?.command, 'gh');
+  assert.equal(spawnCalls[0]?.options?.cwd, '/relay');
   assert.equal(spawnCalls[0]?.options?.env?.COPILOT_WORKSPACE_ROOT, '/repo');
-  assert.equal(spawnCalls[0]?.options?.env?.PWD, '/repo');
+  assert.equal(spawnCalls[0]?.options?.env?.INIT_CWD, '/repo');
+  assert.equal(spawnCalls[0]?.options?.env?.PWD, '/relay');
 });
 
 test('launchSessionCli reuses a live existing process before launching', async () => {

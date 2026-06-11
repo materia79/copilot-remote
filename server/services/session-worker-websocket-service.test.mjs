@@ -3,14 +3,19 @@ import test from 'node:test';
 import { EventEmitter } from 'node:events';
 import { createSessionWorkerWebSocketService } from './session-worker-websocket-service.mjs';
 
+let lastWss = null;
+
 class FakeWebSocketServer extends EventEmitter {
   constructor() {
     super();
     this.closeCalls = 0;
+    this.sockets = [];
+    lastWss = this;
   }
 
   handleUpgrade(_req, _socket, _head, done) {
     const ws = new FakeSocket();
+    this.sockets.push(ws);
     done(ws);
   }
 
@@ -63,30 +68,72 @@ test('worker websocket service authenticates upgrade requests', () => {
   assert.equal(rawSocket.destroyed, true);
 });
 
-test('worker websocket service notifies connected clients on queue changes', () => {
+test('worker websocket service accepts both root and prefixed worker websocket paths', () => {
+  const httpServer = new EventEmitter();
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    pathPrefix: '/cpr2',
+    queueCounts: () => ({ pendingCount: 0, processingCount: 0, parkedCount: 0 }),
+  });
+
+  const rootHandled = service.handleUpgrade(
+    { url: '/api/session-worker/ws?token=secret-token', headers: { host: 'localhost:3333' } },
+    {},
+    Buffer.alloc(0),
+  );
+  const prefixedHandled = service.handleUpgrade(
+    { url: '/cpr2/api/session-worker/ws?token=secret-token', headers: { host: 'localhost:3333' } },
+    {},
+    Buffer.alloc(0),
+  );
+
+  assert.equal(rootHandled, true);
+  assert.equal(prefixedHandled, true);
+  assert.deepEqual(service.status().acceptedPaths, ['/api/session-worker/ws', '/cpr2/api/session-worker/ws']);
+});
+
+test('worker websocket service notifies connected clients on queue changes', async () => {
   const httpServer = new EventEmitter();
   let pendingCount = 0;
   let touchCalls = 0;
+  let requestCalls = 0;
   const service = createSessionWorkerWebSocketService({
     WebSocketServerImpl: FakeWebSocketServer,
     httpServer,
     authToken: 'secret-token',
     queueCounts: () => ({ pendingCount, processingCount: 0, parkedCount: 0 }),
     touchCli: () => { touchCalls += 1; },
+    requestWork: async ({ sessionId }) => {
+      requestCalls += 1;
+      return {
+        message: {
+          id: 'm1',
+          conversationId: 'c1',
+          ownerSessionId: sessionId,
+        },
+      };
+    },
   });
 
   service.start();
   httpServer.emit('upgrade',
-    { url: '/api/session-worker/ws?token=secret-token', headers: { host: 'localhost:3333' } },
+    { url: '/api/session-worker/ws?token=secret-token&sessionId=sdk-1&pid=99', headers: { host: 'localhost:3333' } },
     {},
     Buffer.alloc(0),
   );
 
   assert.equal(service.status().connectedCount, 1);
+  const socket = lastWss?.sockets?.[0] || null;
+  assert.ok(socket);
+  socket.emit('message', JSON.stringify({ type: 'worker.ready', reason: 'test' }));
+  await new Promise((resolve) => setImmediate(resolve));
   pendingCount = 3;
   const event = service.emitQueueChanged('test');
   assert.equal(event.pendingCount, 3);
   assert.equal(touchCalls >= 1, true);
+  assert.equal(requestCalls >= 1, true);
+  assert.equal(socket.sent.some((payload) => payload.includes('"type":"queue.deliver"')), true);
   service.stop();
 });
-

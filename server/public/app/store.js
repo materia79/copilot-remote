@@ -35,6 +35,7 @@ export const WORKSPACE_FILE_EXTENSIONS = new Set([
   'toml', 'ini', 'csv', 'sql', 'ps1', 'sh', 'bat', 'go', 'py', 'java', 'rb', 'php', 'c', 'h', 'cpp',
   'hpp', 'rs', 'lock', 'log', 'svg', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'pdf',
 ]);
+export let serverPlatform = '';
 export let workspaceRootName = '';
 export let workspaceRootPath = '';
 export let workspaceRootEntrySet = new Set([
@@ -83,6 +84,8 @@ export let repoBrowserState = {
   sessionRootName: 'Session',
   tree: null,
   nodeMap: new Map(),
+  expandedPaths: new Set(),
+  collapsedPaths: new Set(),
   currentPath: '',
   truncated: false,
   nodeCount: 0,
@@ -313,6 +316,10 @@ export function parseTimestampMs(value) {
   }
   const parsed = Date.parse(normalized);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+export function setServerPlatform(value) {
+  serverPlatform = String(value || '').trim().toLowerCase();
 }
 
 export function updateWorkspaceRootHints(payload) {

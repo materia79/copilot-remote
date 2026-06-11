@@ -880,23 +880,33 @@ export function renderRepoTreeNode(node) {
   const nodePath = String(node.path || '');
   const icon = repoIcon(node);
   if (node.type === 'dir') {
-    const children = Array.isArray(node.children) ? node.children : [];
+    const children = Array.isArray(node.children)
+      ? node.children.filter((child) => child?.type === 'dir')
+      : [];
     const currentPath = String(repoBrowserState.currentPath || '');
-    const isOpen = nodePath === '' || currentPath === nodePath || (currentPath && currentPath.startsWith(`${nodePath}/`));
+    const isLinuxRoot = nodePath === '/';
+    const isCollapsed = repoBrowserState.collapsedPaths instanceof Set && repoBrowserState.collapsedPaths.has(nodePath);
+    const isExpanded = repoBrowserState.expandedPaths instanceof Set && repoBrowserState.expandedPaths.has(nodePath);
+    const isOpen = !isCollapsed && (nodePath === ''
+      || isExpanded
+      || currentPath === nodePath
+      || (isLinuxRoot
+        ? currentPath.startsWith('/')
+        : (currentPath && currentPath.startsWith(`${nodePath}/`))));
     const openAttr = isOpen ? ' open' : '';
     const loading = !!node.loadingChildren;
     const lazyUnloaded = !!node.lazy && !node.childrenLoaded;
     const childrenHtml = loading
-      ? '<div class="repo-empty">Loading…</div>'
+      ? ''
       : (lazyUnloaded
         ? '<div class="repo-empty">Expand to load entries…</div>'
         : children.map(renderRepoTreeNode).join(''));
     return `<details class="repo-tree-node" data-repo-dir-path="${escHtml(nodePath)}"${openAttr}>
       <summary class="repo-tree-summary" data-repo-open-dir="${escHtml(nodePath)}">${icon} ${escHtml(node.name || '/')}</summary>
-      <div class="repo-tree-children">${childrenHtml || '<div class="repo-empty">Empty folder</div>'}</div>
+      <div class="repo-tree-children">${childrenHtml}</div>
     </details>`;
   }
-  return `<button class="repo-tree-file" data-repo-open-file="${escHtml(nodePath)}">${icon} ${escHtml(node.name || nodePath)}</button>`;
+  return '';
 }
 
 export function updateRepoTreeSelection() {
@@ -914,17 +924,29 @@ export function syncRepoTreeToCurrentPath(collapseOthers = false) {
   if (!treeHost) return;
   const ancestorPaths = new Set(['']);
   if (currentPath) {
-    const parts = currentPath.split('/').filter(Boolean);
-    let rolling = '';
-    for (const part of parts) {
-      rolling = rolling ? `${rolling}/${part}` : part;
-      ancestorPaths.add(rolling);
+    if (currentPath.startsWith('/')) {
+      ancestorPaths.add('/');
+      const parts = currentPath.split('/').filter(Boolean);
+      let rolling = '';
+      for (const part of parts) {
+        rolling = rolling ? `${rolling}/${part}` : `/${part}`;
+        ancestorPaths.add(rolling);
+      }
+    } else {
+      const parts = currentPath.split('/').filter(Boolean);
+      let rolling = '';
+      for (const part of parts) {
+        rolling = rolling ? `${rolling}/${part}` : part;
+        ancestorPaths.add(rolling);
+      }
     }
   }
   const details = treeHost.querySelectorAll('details.repo-tree-node[data-repo-dir-path]');
   details.forEach((el) => {
     const pathValue = String(el.getAttribute('data-repo-dir-path') || '');
-    if (ancestorPaths.has(pathValue)) {
+    const isCollapsed = repoBrowserState.collapsedPaths instanceof Set && repoBrowserState.collapsedPaths.has(pathValue);
+    const isExpanded = repoBrowserState.expandedPaths instanceof Set && repoBrowserState.expandedPaths.has(pathValue);
+    if (!isCollapsed && (ancestorPaths.has(pathValue) || isExpanded)) {
       el.open = true;
     } else if (collapseOthers) {
       el.open = false;
@@ -940,6 +962,9 @@ export function syncRepoTreeToCurrentPath(collapseOthers = false) {
 }
 
 export function focusRepoTree() {
+  if (repoBrowserState.expandedPaths instanceof Set) {
+    repoBrowserState.expandedPaths.clear();
+  }
   syncRepoTreeToCurrentPath(true);
 }
 
@@ -997,9 +1022,11 @@ export function renderRepoFolder() {
     folderHost.innerHTML = '<div class="repo-empty">Open this folder to load entries.</div>';
     return;
   }
-  const children = Array.isArray(node.children) ? node.children : [];
+  const children = Array.isArray(node.children)
+    ? node.children.filter((child) => child?.type !== 'dir')
+    : [];
   if (!children.length) {
-    folderHost.innerHTML = '<div class="repo-empty">This folder is empty.</div>';
+    folderHost.innerHTML = '<div class="repo-empty">This folder has no files.</div>';
     return;
   }
 
@@ -1010,13 +1037,6 @@ export function renderRepoFolder() {
     const rawHref = repoRawHref(childPath);
     const icon = repoIcon(child);
     if (isGrid) {
-      if (child.type === 'dir') {
-        return `<div class="repo-card">
-          <button class="repo-entry-action" data-repo-nav-dir="${escHtml(childPath)}">${icon} Open folder</button>
-          <div class="repo-card-name" title="${escHtml(child.name || childPath)}">${escHtml(child.name || childPath)}</div>
-          <div class="repo-entry-meta">Directory</div>
-        </div>`;
-      }
       const ext = String(child.ext || '').replace('.', '');
       const isImage = String(child.previewKind || '').toLowerCase() === 'image' || REPO_IMAGE_EXTENSIONS.has(ext.toLowerCase());
       const thumb = isImage && rawHref
@@ -1030,21 +1050,8 @@ export function renderRepoFolder() {
       </div>`;
     }
 
-    const mainMeta = child.type === 'dir'
-      ? (child.driveType ? `Directory · ${String(child.driveType)}` : 'Directory')
-      : `${String(child.previewKind || 'file')} · ${formatBytes(child.size || 0)}`;
-    if (child.type !== 'dir') {
-      return `<div class="repo-entry-row repo-entry-row-clickable" data-repo-open-file="${escHtml(childPath)}">
-        <div class="repo-entry-main">
-          <span>${icon}</span>
-          <div style="min-width:0">
-            <div class="repo-entry-name" title="${escHtml(child.name || childPath)}">${escHtml(child.name || childPath)}</div>
-            <div class="repo-entry-meta">${escHtml(mainMeta)}</div>
-          </div>
-        </div>
-      </div>`;
-    }
-    return `<div class="repo-entry-row">
+    const mainMeta = `${String(child.previewKind || 'file')} · ${formatBytes(child.size || 0)}`;
+    return `<div class="repo-entry-row repo-entry-row-clickable" data-repo-open-file="${escHtml(childPath)}">
       <div class="repo-entry-main">
         <span>${icon}</span>
         <div style="min-width:0">
@@ -1052,7 +1059,6 @@ export function renderRepoFolder() {
           <div class="repo-entry-meta">${escHtml(mainMeta)}</div>
         </div>
       </div>
-      <div class="repo-entry-actions"><button class="repo-entry-action" data-repo-nav-dir="${escHtml(childPath)}">Open</button></div>
     </div>`;
   }).join('');
 
@@ -1140,8 +1146,14 @@ export async function loadRepoBrowserTree() {
       rootNode.childrenLoaded = true;
       rootNode.lazy = false;
     }
+  } else if (!workspaceRoot && rootNode?.path && repoBrowserState.nodeMap.has(String(rootNode.path))) {
+    repoBrowserState.currentPath = String(rootNode.path);
   } else if (!repoBrowserState.nodeMap.has(repoBrowserState.currentPath)) {
     repoBrowserState.currentPath = '';
+  }
+  if (repoBrowserState.expandedPaths instanceof Set) {
+    const selectedPath = String(repoBrowserState.currentPath || '');
+    if (selectedPath) repoBrowserState.expandedPaths.add(selectedPath);
   }
   renderRepoBrowser();
   flushQueuedRepoBrowserReload();
@@ -1208,6 +1220,8 @@ export function setRepoBrowserRoot(root) {
   setRepoBrowserState({
     tree: null,
     nodeMap: new Map(),
+    expandedPaths: new Set(),
+    collapsedPaths: new Set(),
     currentPath: '',
     truncated: false,
     nodeCount: 0,
@@ -1232,6 +1246,8 @@ export function setRepoBrowserSessionInfo(sessionRootPath, sessionRootName = '')
     setRepoBrowserState({
       tree: null,
       nodeMap: new Map(),
+      expandedPaths: new Set(),
+      collapsedPaths: new Set(),
       currentPath: '',
       truncated: false,
       nodeCount: 0,
@@ -1288,6 +1304,8 @@ export function refreshRepoBrowser() {
   setRepoBrowserState({
     tree: null,
     nodeMap: new Map(),
+    expandedPaths: new Set(),
+    collapsedPaths: new Set(),
     currentPath: '',
     loadingPath: '',
     error: '',
@@ -1329,6 +1347,27 @@ export async function setRepoCurrentPath(pathValue) {
     : (normalized || '');
   const node = repoBrowserState.nodeMap.get(targetPath);
   if (!node || node.type !== 'dir') return;
+  if (repoBrowserState.expandedPaths instanceof Set) {
+    if (targetPath.startsWith('/')) {
+      repoBrowserState.expandedPaths.add('/');
+      const parts = targetPath.split('/').filter(Boolean);
+      let rolling = '';
+      for (const part of parts) {
+        rolling = rolling ? `${rolling}/${part}` : `/${part}`;
+        repoBrowserState.expandedPaths.add(rolling);
+      }
+    } else if (targetPath) {
+      const parts = targetPath.split('/').filter(Boolean);
+      let rolling = '';
+      for (const part of parts) {
+        rolling = rolling ? `${rolling}/${part}` : part;
+        repoBrowserState.expandedPaths.add(rolling);
+      }
+    }
+  }
+  if (repoBrowserState.collapsedPaths instanceof Set) {
+    repoBrowserState.collapsedPaths.delete(targetPath);
+  }
   repoBrowserState.currentPath = targetPath;
   await ensureRepoChildrenLoaded(targetPath);
   renderRepoBreadcrumb();
@@ -1378,6 +1417,26 @@ document.getElementById('repo-tree').addEventListener('click', (event) => {
   if (dirSummary) {
     event.preventDefault();
     const dirPath = dirSummary.getAttribute('data-repo-open-dir') || '';
+    const normalizedDirPath = normalizeRepoPath(dirPath);
+    const targetPath = repoBrowserState.nodeMap.has(dirPath) ? dirPath : (normalizedDirPath || '');
+    const node = repoBrowserState.nodeMap.get(targetPath);
+    const isDir = !!node && node.type === 'dir';
+    const isCurrent = String(repoBrowserState.currentPath || '') === targetPath;
+    const isCollapsed = repoBrowserState.collapsedPaths instanceof Set && repoBrowserState.collapsedPaths.has(targetPath);
+    if (isDir && isCurrent && !isCollapsed && targetPath) {
+      if (repoBrowserState.expandedPaths instanceof Set) {
+        repoBrowserState.expandedPaths.delete(targetPath);
+      }
+      repoBrowserState.collapsedPaths.add(targetPath);
+      renderRepoTree();
+      return;
+    }
+    if (repoBrowserState.expandedPaths instanceof Set && targetPath) {
+      repoBrowserState.expandedPaths.add(targetPath);
+    }
+    if (repoBrowserState.collapsedPaths instanceof Set) {
+      repoBrowserState.collapsedPaths.delete(targetPath);
+    }
     void setRepoCurrentPath(dirPath);
   }
 });

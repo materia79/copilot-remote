@@ -4,6 +4,7 @@ import {
   workspaceRootName,
   workspaceRootEntrySet,
   WORKSPACE_FILE_EXTENSIONS,
+  serverPlatform,
 } from './store.js';
 
 export function workspaceMentionRegex() {
@@ -89,8 +90,20 @@ export function normalizeDriveBrowserPath(rawPath) {
   } catch {
     return '';
   }
-  const normalized = decoded
-    .replace(/\0/g, '')
+  const withoutNulls = decoded.replace(/\0/g, '');
+
+  if (serverPlatform !== 'win32') {
+    const linuxNorm = withoutNulls
+      .replace(/\\/g, '/')
+      .replace(/\/+/g, '/')
+      .trimEnd()
+      .replace(/(.)\/$/, '$1');
+    if (!linuxNorm.startsWith('/')) return '';
+    if (linuxNorm.includes('/../') || linuxNorm.endsWith('/..')) return '';
+    return linuxNorm || '/';
+  }
+
+  const normalized = withoutNulls
     .replace(/\\/g, '/')
     .replace(/\/+/g, '/')
     .trim()

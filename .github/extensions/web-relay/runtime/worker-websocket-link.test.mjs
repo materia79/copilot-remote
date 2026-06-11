@@ -12,6 +12,7 @@ class FakeWebSocket {
     this.CLOSED = 3;
     this.readyState = this.CONNECTING;
     this.listeners = new Map();
+    this.sent = [];
     FakeWebSocket.instances.push(this);
   }
 
@@ -40,17 +41,24 @@ class FakeWebSocket {
     this.readyState = this.CLOSED;
     this.emit("close");
   }
+
+  send(payload) {
+    this.sent.push(String(payload));
+  }
 }
 
-test("worker websocket link triggers poll on queue change", async () => {
+test("worker websocket link sends ready and processes delivered queue messages", async () => {
   FakeWebSocket.instances = [];
-  let pollCalls = 0;
+  const deliveries = [];
   const link = createWorkerWebSocketLink({
     serverUrl: "http://localhost:3333",
     token: "tok",
     getSessionReady: () => true,
     getSessionId: () => "sdk-1",
-    pollNow: async () => { pollCalls += 1; },
+    getPid: () => 4242,
+    onDeliver: async (pending, reason) => {
+      deliveries.push({ pending, reason });
+    },
     WebSocketImpl: FakeWebSocket,
     jitterMs: 0,
   });
@@ -60,28 +68,32 @@ test("worker websocket link triggers poll on queue change", async () => {
   const socket = FakeWebSocket.instances[0];
   assert.match(socket.url, /token=tok/);
   assert.match(socket.url, /sessionId=sdk-1/);
+  assert.match(socket.url, /pid=4242/);
 
   socket.open();
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(pollCalls, 1);
+  assert.equal(socket.sent.length, 2);
+  assert.match(socket.sent[0], /"type":"worker.hello"/);
+  assert.match(socket.sent[1], /"type":"worker.ready"/);
 
-  socket.receive({ type: "queue.changed", pendingCount: 2 });
+  socket.receive({ type: "queue.deliver", reason: "test", pending: { message: { id: "m1" } } });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(pollCalls, 2);
+  assert.deepEqual(deliveries, [{ pending: { message: { id: "m1" } }, reason: "test" }]);
+  assert.equal(socket.sent.length, 3);
+  assert.match(socket.sent[2], /"type":"worker.ready"/);
   link.stop();
 });
 
-test("worker websocket link reconnect backoff caps at 32 seconds", () => {
+test("worker websocket link reconnect backoff caps at 8 seconds", () => {
   FakeWebSocket.instances = [];
   const scheduled = [];
   const link = createWorkerWebSocketLink({
     serverUrl: "http://localhost:3333",
     token: "tok",
     getSessionReady: () => true,
-    pollNow: async () => {},
     WebSocketImpl: FakeWebSocket,
     minBackoffMs: 1000,
-    maxBackoffMs: 32_000,
+    maxBackoffMs: 8_000,
     jitterMs: 0,
     setTimeoutImpl: (fn, delay) => {
       scheduled.push({ fn, delay });
@@ -120,17 +132,16 @@ test("worker websocket link reconnect backoff caps at 32 seconds", () => {
 
   const sixth = FakeWebSocket.instances[5];
   sixth.close();
-  assert.equal(scheduled[0]?.delay, 16_000);
+  assert.equal(scheduled[0]?.delay, 8_000);
   scheduled.shift()?.fn();
 
   const seventh = FakeWebSocket.instances[6];
   seventh.close();
-  assert.equal(scheduled[0]?.delay, 32_000);
+  assert.equal(scheduled[0]?.delay, 8_000);
   scheduled.shift()?.fn();
 
   const eighth = FakeWebSocket.instances[7];
   eighth.close();
-  assert.equal(scheduled[0]?.delay, 32_000);
+  assert.equal(scheduled[0]?.delay, 8_000);
   link.stop();
 });
-
