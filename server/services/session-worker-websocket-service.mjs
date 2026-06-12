@@ -294,6 +294,8 @@ export function createSessionWorkerWebSocketService({
         return;
       }
       if (payload.type === 'worker.ready') {
+        meta.sessionId = normalizeText(payload.sessionId) || meta.sessionId;
+        meta.pid = normalizePositiveInt(payload.pid) || meta.pid;
         meta.ready = true;
         void maybeDeliverToSocket(ws, String(payload.reason || 'worker-ready'));
       }

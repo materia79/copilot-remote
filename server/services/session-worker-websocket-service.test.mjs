@@ -137,3 +137,40 @@ test('worker websocket service notifies connected clients on queue changes', asy
   assert.equal(socket.sent.some((payload) => payload.includes('"type":"queue.deliver"')), true);
   service.stop();
 });
+
+test('worker websocket service uses session identity from ready payload', async () => {
+  const httpServer = new EventEmitter();
+  let requestSessionId = null;
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    queueCounts: () => ({ pendingCount: 1, processingCount: 0, parkedCount: 0 }),
+    requestWork: async ({ sessionId }) => {
+      requestSessionId = sessionId;
+      return {
+        message: {
+          id: 'm-ready',
+          conversationId: 'c-ready',
+          ownerSessionId: sessionId,
+        },
+      };
+    },
+  });
+
+  service.start();
+  httpServer.emit('upgrade',
+    { url: '/api/session-worker/ws?token=secret-token', headers: { host: 'localhost:3333' } },
+    {},
+    Buffer.alloc(0),
+  );
+
+  const socket = lastWss?.sockets?.[0] || null;
+  assert.ok(socket);
+  socket.emit('message', JSON.stringify({ type: 'worker.ready', sessionId: 'sdk-ready', pid: 123 }));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(requestSessionId, 'sdk-ready');
+  assert.equal(socket.sent.some((payload) => payload.includes('"type":"queue.deliver"')), true);
+  service.stop();
+});
