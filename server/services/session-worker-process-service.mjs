@@ -14,9 +14,35 @@ function escapeRegExp(value) {
 function parseSessionIdFromCommandLine(commandLine) {
   const text = String(commandLine || '');
   if (!text) return null;
-  const match = text.match(/--(?:session-id|resume)(?:=|\s+)(?:"([^"]+)"|'([^']+)'|([^\s"'=]+))/i);
+  const match = text.match(/["']?--(?:session-id|resume)["']?(?:=|\s+)(?:"([^"]+)"|'([^']+)'|([^\s"'=]+))/i);
   const value = match?.[1] || match?.[2] || match?.[3] || '';
   return normalizeSessionId(value);
+}
+
+function buildSessionArgPattern(targetSessionId, { includeResume = true } = {}) {
+  const target = normalizeSessionId(targetSessionId);
+  if (!target) return null;
+  const argName = includeResume ? 'session-id|resume' : 'session-id';
+  return new RegExp(
+    `["']?--(?:${argName})["']?(?:=|\\s+)(?:"${escapeRegExp(target)}"|'${escapeRegExp(target)}'|${escapeRegExp(target)})(?:\\s|$)`,
+    'i',
+  );
+}
+
+function scoreWindowsWorkerCandidate(proc) {
+  const name = String(proc?.name || '').trim().toLowerCase();
+  const cmd = String(proc?.commandLine || '').trim().toLowerCase();
+  if (name === 'copilot.exe') return 400;
+  if (name === 'gh.exe' && cmd.includes('copilot')) return 300;
+  if (cmd.includes('gh copilot')) return 250;
+  if (cmd.includes('copilot.cmd') || cmd.includes('copilot-win32')) return 225;
+  if (name === 'cmd.exe' || name === 'powershell.exe' || name === 'conhost.exe') return 50;
+  return 100;
+}
+
+function isWindowsWrapperProcess(proc) {
+  const name = String(proc?.name || '').trim().toLowerCase();
+  return name === 'cmd.exe' || name === 'powershell.exe' || name === 'conhost.exe';
 }
 
 function looksLikeCopilotWorkerProcess(proc) {
@@ -86,7 +112,7 @@ export function createSessionWorkerProcessInspector({
   function findWindowsProcessesForSession(targetSessionId) {
     const target = normalizeSessionId(targetSessionId);
     if (platform !== 'win32' || !target) return [];
-    const targetPattern = new RegExp(`--session-id(?:=|\\s+)(?:"${escapeRegExp(target)}"|'${escapeRegExp(target)}'|${escapeRegExp(target)})(?:\\s|$)`, 'i');
+    const targetPattern = buildSessionArgPattern(target, { includeResume: false });
     return getWindowsProcessSnapshot()
       .map((proc) => ({
         processId: Number.isInteger(Number(proc?.processId)) ? Number(proc.processId) : null,
@@ -99,18 +125,24 @@ export function createSessionWorkerProcessInspector({
       .filter((proc) => {
         const parsedSessionId = parseSessionIdFromCommandLine(proc.commandLine);
         if (parsedSessionId) return parsedSessionId === target;
-        return targetPattern.test(proc.commandLine);
+        return targetPattern?.test(proc.commandLine);
+      })
+      .sort((left, right) => {
+        const scoreDelta = scoreWindowsWorkerCandidate(right) - scoreWindowsWorkerCandidate(left);
+        if (scoreDelta !== 0) return scoreDelta;
+        return Number(right.processId || 0) - Number(left.processId || 0);
       });
   }
 
   function findWindowsProcessForSession(targetSessionId) {
-    return findWindowsProcessesForSession(targetSessionId)[0] || null;
+    const candidates = findWindowsProcessesForSession(targetSessionId);
+    return candidates.find((proc) => !isWindowsWrapperProcess(proc)) || null;
   }
 
   function findPosixProcessesForSession(targetSessionId) {
     const target = normalizeSessionId(targetSessionId);
     if (platform === 'win32' || !target) return [];
-    const targetPattern = new RegExp(`--(?:session-id|resume)(?:=|\\s+)(?:"${escapeRegExp(target)}"|'${escapeRegExp(target)}'|${escapeRegExp(target)})(?:\\s|$)`, 'i');
+    const targetPattern = buildSessionArgPattern(target, { includeResume: true });
     return getPosixProcessSnapshot()
       .map((proc) => ({
         processId: Number.isInteger(Number(proc?.processId)) ? Number(proc.processId) : null,
@@ -123,7 +155,7 @@ export function createSessionWorkerProcessInspector({
       .filter((proc) => {
         const parsedSessionId = parseSessionIdFromCommandLine(proc.commandLine);
         if (parsedSessionId) return parsedSessionId === target;
-        return targetPattern.test(proc.commandLine);
+        return targetPattern?.test(proc.commandLine);
       });
   }
 

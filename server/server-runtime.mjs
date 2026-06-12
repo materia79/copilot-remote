@@ -1785,9 +1785,32 @@ const sessionWorkerProcessInspector = createSessionWorkerProcessInspector({
   platform: process.platform,
   execFileSyncImpl: execFileSync,
 });
+function buildSessionWorkerLaunchEnv() {
+  const next = { ...process.env };
+  if (!String(next.GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS || '').trim()) {
+    next.GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS = 'true';
+  }
+  if (!String(next.COPILOT_WEB_RELAY_ROOT || '').trim()) {
+    next.COPILOT_WEB_RELAY_ROOT = REPO_ROOT;
+  }
+  if (!String(next.COPILOT_WEB_RELAY_SERVER_DIR || '').trim()) {
+    next.COPILOT_WEB_RELAY_SERVER_DIR = __dirname;
+  }
+  if (!String(next.COPILOT_WEB_RELAY_CONFIG || '').trim()) {
+    next.COPILOT_WEB_RELAY_CONFIG = CONFIG_PATH;
+  }
+  if (!String(next.COPILOT_WEB_RELAY_TOOLS || '').trim()) {
+    next.COPILOT_WEB_RELAY_TOOLS = path.join(__dirname, 'relay-tools.md');
+  }
+  if (!String(next.COPILOT_WEB_RELAY_LOG_DIR || '').trim()) {
+    next.COPILOT_WEB_RELAY_LOG_DIR = path.join(__dirname, 'logs');
+  }
+  return next;
+}
+const sessionWorkerLaunchEnv = buildSessionWorkerLaunchEnv();
 const relayCliLauncherService = createRelayCliLauncherService({
   cwd: (targetSessionId) => resolveLaunchWorkspaceRootForSession(targetSessionId),
-  env: process.env,
+  env: sessionWorkerLaunchEnv,
   log: (message) => console.log(`${runtimeLogPrefix()}${message}`),
 });
 async function spawnSessionWorkerCli(targetSessionId) {
@@ -1805,7 +1828,7 @@ async function spawnSessionWorkerCli(targetSessionId) {
     targetSessionId: normalizedTargetSessionId,
     processCwd: REPO_ROOT,
     workspaceRoot: resolveLaunchWorkspaceRootForSession(normalizedTargetSessionId),
-    env: process.env,
+    env: sessionWorkerLaunchEnv,
     platform: process.platform,
     spawnImpl: spawn,
     execFileSyncImpl: execFileSync,

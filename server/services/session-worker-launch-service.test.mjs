@@ -2,7 +2,6 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  buildWindowsWorkerCommand,
   buildTmuxWorkerShellCommand,
   killTmuxSession,
   launchSessionCli,
@@ -27,13 +26,6 @@ test('buildTmuxWorkerShellCommand injects only relay env needed for workers', ()
   assert.match(command, /INIT_CWD='\/workspace'/);
   assert.doesNotMatch(command, /IGNORED_VAR/);
   assert.match(command, /exec gh copilot -- --allow-all --session-id 'abc-123'/);
-});
-
-test('buildWindowsWorkerCommand quotes the worker launch command for cmd.exe', () => {
-  assert.equal(
-    buildWindowsWorkerCommand('abc-123'),
-    '"gh" "copilot" "--" "--allow-all" "--session-id" "abc-123"',
-  );
 });
 
 test('killTmuxSession returns false when tmux kill races after session exists', () => {
@@ -144,51 +136,9 @@ test('launchSessionCli falls back to detached spawn when tmux is unavailable', a
   assert.equal(spawnCalls[0]?.options?.env?.PWD, '/relay');
 });
 
-test('launchSessionCli uses cmd.exe without shell option on windows detached spawn', async () => {
+test('launchSessionCli opens a visible detached console on windows', async () => {
   const spawnCalls = [];
-  let inspectorCalls = 0;
-  const launched = await launchSessionCli({
-    targetSessionId: 'abc-123',
-    processCwd: 'C:\\relay',
-    workspaceRoot: 'C:\\repo',
-    env: {
-      PATH: process.env.PATH || '',
-      ComSpec: 'C:\\Windows\\System32\\cmd.exe',
-    },
-    platform: 'win32',
-    processInspector: {
-      findProcessForSession() {
-        inspectorCalls += 1;
-        return inspectorCalls >= 2
-          ? { processId: 9001, commandLine: 'gh copilot -- --allow-all --session-id abc-123' }
-          : null;
-      },
-    },
-    detachedPollAttempts: 2,
-    detachedPollDelayMs: 1,
-    spawnImpl(command, args, options) {
-      spawnCalls.push({ command, args, options });
-      return {
-        pid: 4244,
-        unref() {},
-      };
-    },
-  });
-
-  assert.equal(launched.launchMode, 'detached');
-  assert.equal(launched.pid, 9001);
-  assert.match(spawnCalls[0]?.command, /cmd\.exe$/i);
-  assert.deepEqual(spawnCalls[0]?.args, [
-    '/d',
-    '/s',
-    '/c',
-    '"gh" "copilot" "--" "--allow-all" "--session-id" "abc-123"',
-  ]);
-  assert.equal(spawnCalls[0]?.options?.shell, undefined);
-  assert.equal(spawnCalls[0]?.options?.windowsHide, true);
-});
-
-test('launchSessionCli falls back to wrapper pid when windows worker discovery misses', async () => {
+  let unrefCalled = false;
   const launched = await launchSessionCli({
     targetSessionId: 'abc-123',
     processCwd: 'C:\\relay',
@@ -203,18 +153,65 @@ test('launchSessionCli falls back to wrapper pid when windows worker discovery m
         return null;
       },
     },
-    detachedPollAttempts: 1,
-    detachedPollDelayMs: 1,
+    spawnImpl(command, args, options) {
+      spawnCalls.push({ command, args, options });
+      return {
+        pid: 4244,
+        unref() {
+          unrefCalled = true;
+        },
+      };
+    },
+  });
+
+  assert.equal(launched.launchMode, 'console');
+  assert.equal(launched.pid, null);
+  assert.match(spawnCalls[0]?.command, /cmd\.exe$/i);
+  assert.deepEqual(spawnCalls[0]?.args, [
+    '/d',
+    '/s',
+    '/c',
+    'start',
+    'Copilot Worker abc-123',
+    'gh',
+    'copilot',
+    '--',
+    '--allow-all',
+    '--session-id',
+    'abc-123',
+  ]);
+  assert.equal(spawnCalls[0]?.options?.shell, undefined);
+  assert.equal(spawnCalls[0]?.options?.detached, true);
+  assert.equal(spawnCalls[0]?.options?.stdio, 'ignore');
+  assert.equal(spawnCalls[0]?.options?.windowsHide, false);
+  assert.equal(unrefCalled, true);
+});
+
+test('launchSessionCli returns unknown pid when windows console spawn has no pid', async () => {
+  const launched = await launchSessionCli({
+    targetSessionId: 'abc-123',
+    processCwd: 'C:\\relay',
+    workspaceRoot: 'C:\\repo',
+    env: {
+      PATH: process.env.PATH || '',
+      ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+    },
+    platform: 'win32',
+    processInspector: {
+      findProcessForSession() {
+        return null;
+      },
+    },
     spawnImpl() {
       return {
-        pid: 4245,
+        pid: null,
         unref() {},
       };
     },
   });
 
-  assert.equal(launched.launchMode, 'detached');
-  assert.equal(launched.pid, 4245);
+  assert.equal(launched.launchMode, 'console');
+  assert.equal(launched.pid, null);
 });
 
 test('launchSessionCli reuses a live existing process before launching', async () => {

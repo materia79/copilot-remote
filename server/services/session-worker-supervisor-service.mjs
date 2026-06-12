@@ -51,6 +51,11 @@ function normalizePendingQuestionSessionIds(value) {
     .filter(Boolean));
 }
 
+function hasStartupFailureReason(lifecycle) {
+  const reason = String(lifecycle?.degradedReason || '').trim().toLowerCase();
+  return reason === 'startup-heartbeat-timeout' || reason === 'stale-pid';
+}
+
 export function createSessionWorkerSupervisor({
   registry,
   spawnWorker = null,
@@ -474,7 +479,9 @@ export function createSessionWorkerSupervisor({
     }
 
     const existing = registry.getWorker(sessionId);
-    if (shouldReuseLiveWorker(existing)) {
+    const existingLifecycle = getOrCreateLifecycle(sessionId);
+    const blockedByStartupFailure = hasStartupFailureReason(existingLifecycle);
+    if (!blockedByStartupFailure && shouldReuseLiveWorker(existing)) {
       const nowAtMs = nowMs();
       const reusedWorker = setWorkerState(sessionId, {
         ...existing,

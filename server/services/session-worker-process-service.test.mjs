@@ -80,3 +80,91 @@ test('process inspector ignores relay server process on windows path form', () =
   const matches = inspector.findWindowsProcessesForSession('abc-123');
   assert.deepEqual(matches.map((proc) => proc.processId), [302]);
 });
+
+test('process inspector parses quoted session-id flag tokens on windows command lines', () => {
+  const inspector = createSessionWorkerProcessInspector({
+    platform: 'win32',
+    execFileSyncImpl() {
+      return Buffer.from(JSON.stringify([
+        {
+          processId: 401,
+          parentProcessId: 1,
+          name: 'gh.exe',
+          commandLine: '"gh" "copilot" "--" "--allow-all" "--session-id" "abc-123"',
+        },
+      ]));
+    },
+  });
+
+  const match = inspector.findProcessForSession('abc-123');
+  assert.equal(match?.processId, 401);
+});
+
+test('process inspector prefers gh/copilot over transient cmd wrapper on windows', () => {
+  const inspector = createSessionWorkerProcessInspector({
+    platform: 'win32',
+    execFileSyncImpl() {
+      return Buffer.from(JSON.stringify([
+        {
+          processId: 501,
+          parentProcessId: 1,
+          name: 'cmd.exe',
+          commandLine: 'C:\\Windows\\System32\\cmd.exe /d /s /c ""gh" "copilot" "--" "--allow-all" "--session-id" "abc-123""',
+        },
+        {
+          processId: 502,
+          parentProcessId: 501,
+          name: 'gh.exe',
+          commandLine: '"gh" "copilot" "--" "--allow-all" "--session-id" "abc-123"',
+        },
+      ]));
+    },
+  });
+
+  const match = inspector.findProcessForSession('abc-123');
+  assert.equal(match?.processId, 502);
+});
+
+test('process inspector does not treat wrapper-only cmd.exe as live worker on windows', () => {
+  const inspector = createSessionWorkerProcessInspector({
+    platform: 'win32',
+    execFileSyncImpl() {
+      return Buffer.from(JSON.stringify([
+        {
+          processId: 601,
+          parentProcessId: 1,
+          name: 'cmd.exe',
+          commandLine: 'C:\\Windows\\System32\\cmd.exe /d /s /c ""gh" "copilot" "--" "--allow-all" "--session-id" "abc-123""',
+        },
+      ]));
+    },
+  });
+
+  const match = inspector.findProcessForSession('abc-123');
+  assert.equal(match, null);
+});
+
+test('process inspector prefers newest non-wrapper worker when multiple candidates match', () => {
+  const inspector = createSessionWorkerProcessInspector({
+    platform: 'win32',
+    execFileSyncImpl() {
+      return Buffer.from(JSON.stringify([
+        {
+          processId: 700,
+          parentProcessId: 1,
+          name: 'gh.exe',
+          commandLine: 'gh copilot -- --allow-all --session-id abc-123',
+        },
+        {
+          processId: 701,
+          parentProcessId: 1,
+          name: 'gh.exe',
+          commandLine: 'gh copilot -- --allow-all --session-id abc-123',
+        },
+      ]));
+    },
+  });
+
+  const match = inspector.findProcessForSession('abc-123');
+  assert.equal(match?.processId, 701);
+});

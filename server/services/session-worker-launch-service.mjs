@@ -6,10 +6,6 @@ function shellQuote(value) {
   return `'${String(value || '').replace(/'/g, `'\\''`)}'`;
 }
 
-function cmdQuote(value) {
-  return `"${String(value || '').replace(/"/g, '\\"')}"`;
-}
-
 function parsePositiveInt(value) {
   const num = Number.parseInt(String(value || ''), 10);
   return Number.isInteger(num) && num > 0 ? num : null;
@@ -110,17 +106,6 @@ export function buildTmuxWorkerShellCommand(targetSessionId, env = {}) {
   }
   const prefix = exports.length ? `${exports.join(' ')} ` : '';
   return `${prefix}exec gh copilot -- --allow-all --session-id ${shellQuote(targetSessionId)}`;
-}
-
-export function buildWindowsWorkerCommand(targetSessionId) {
-  return [
-    'gh',
-    'copilot',
-    '--',
-    '--allow-all',
-    '--session-id',
-    String(targetSessionId || '').trim(),
-  ].map(cmdQuote).join(' ');
 }
 
 function sleep(ms) {
@@ -233,34 +218,40 @@ export async function launchSessionCli({
     throw new Error('worker-spawn-unhealthy:tmux-pane-missing');
   }
 
-  const spawnCommand = platform === 'win32' ? (launchEnv.ComSpec || process.env.ComSpec || 'cmd.exe') : 'gh';
+  const spawnCommand = platform === 'win32'
+    ? (launchEnv.ComSpec || process.env.ComSpec || 'cmd.exe')
+    : 'gh';
   const spawnArgs = platform === 'win32'
-    ? ['/d', '/s', '/c', buildWindowsWorkerCommand(target)]
+    ? [
+      '/d',
+      '/s',
+      '/c',
+      'start',
+      `Copilot Worker ${target.slice(0, 8)}`,
+      'gh',
+      'copilot',
+      '--',
+      '--allow-all',
+      '--session-id',
+      target,
+    ]
     : ['copilot', '--', '--allow-all', '--session-id', target];
   const child = spawnImpl(spawnCommand, spawnArgs, {
     cwd: launchProcessCwd,
     env: launchEnv,
     detached: true,
     stdio: 'ignore',
-    windowsHide: platform === 'win32',
+    windowsHide: platform !== 'win32',
   });
   child.unref?.();
-  if (platform === 'win32' && typeof processInspector?.findProcessForSession === 'function') {
-    const attempts = Math.max(1, Number(detachedPollAttempts) || 1);
-    for (let index = 0; index < attempts; index += 1) {
-      await sleep(Math.max(50, Number(detachedPollDelayMs) || 200));
-      const processMatch = processInspector.findProcessForSession(target);
-      const processPid = parsePositiveInt(processMatch?.processId);
-      if (processPid) {
-        return {
-          pid: processPid,
-          reused: false,
-          launchMode: 'detached',
-          tmuxSessionName: null,
-          child,
-        };
-      }
-    }
+  if (platform === 'win32') {
+    return {
+      pid: null,
+      reused: false,
+      launchMode: 'console',
+      tmuxSessionName: null,
+      child,
+    };
   }
   const pid = parsePositiveInt(child?.pid);
   if (!pid) throw new Error('worker-spawn-unhealthy:missing-pid');
