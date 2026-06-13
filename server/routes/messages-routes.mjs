@@ -1215,8 +1215,8 @@ export function registerMessagesRoutes(app, deps) {
       } else {
         const existingWorker = sessionWorkerRegistry?.getWorker?.(ownerSessionId) || null;
         sessionWorkerRegistry?.upsertWorker?.({
-          ...existingWorker,
-          sessionId: ownerSessionId,
+          ...(existingWorker || {}),
+          sdkSessionId: ownerSessionId,
           status: 'ready',
         });
         sessionWorkerSupervisor?.markIdle?.(ownerSessionId, queueCounts?.().pendingCount || 0);
@@ -1597,9 +1597,14 @@ export function registerMessagesRoutes(app, deps) {
     const currentWorker = sessionWorkerRegistry?.getWorker?.(sdkSessionId) || null;
 
     // Collect ALL matching PIDs (not just first)
-    const discoveredProcesses = sessionWorkerProcessInspector?.findProcessesForSession?.(sdkSessionId)
-      || sessionWorkerProcessInspector?.findWindowsProcessesForSession?.(sdkSessionId)
-      || [];
+    const discoveredProcesses = process.platform === 'win32'
+      ? (
+          sessionWorkerProcessInspector?.findWindowsProcessTreeForSession?.(sdkSessionId)
+          || sessionWorkerProcessInspector?.findWindowsProcessesForSession?.(sdkSessionId)
+          || sessionWorkerProcessInspector?.findProcessesForSession?.(sdkSessionId)
+          || []
+        )
+      : (sessionWorkerProcessInspector?.findProcessesForSession?.(sdkSessionId) || []);
     const allPids = [...new Set([
       ...discoveredProcesses.map((p) => (p.processId ? Number(p.processId) : null)).filter(Boolean),
       currentWorker?.pid ? Number(currentWorker.pid) : null,
@@ -1645,13 +1650,18 @@ export function registerMessagesRoutes(app, deps) {
     // Post-kill verification — synchronous re-scan to confirm processes are gone
     const remainingPids = allPids.length
       ? (process.platform === 'win32'
-          ? (sessionWorkerProcessInspector?.findWindowsProcessesForSession?.(sdkSessionId) || []).map((p) => p.processId).filter(Boolean)
+          ? (
+              sessionWorkerProcessInspector?.findWindowsProcessTreeForSession?.(sdkSessionId)
+              || sessionWorkerProcessInspector?.findWindowsProcessesForSession?.(sdkSessionId)
+              || []
+            ).map((p) => p.processId).filter(Boolean)
           : ((sessionWorkerProcessInspector?.findProcessesForSession?.(sdkSessionId) || []).map((p) => p.processId).filter(Boolean)))
       : [];
 
     sessionWorkerRegistry?.removeWorker?.(sdkSessionId);
     sessionWorkerSupervisor?.clearRestartSchedule?.(sdkSessionId);
     sessionWorkerSupervisor?.resetHealth?.(sdkSessionId, { clearFailureCount: false });
+    sessionWorkerSupervisor?.markKilled?.(sdkSessionId);
 
     // Drain ALL owned processing rows, not just first
     const queueRows = findAllProcessingOwnedBySession.all(sdkSessionId) || [];
@@ -1683,6 +1693,7 @@ export function registerMessagesRoutes(app, deps) {
           model: queueRow.model || DEFAULT_MODEL,
           responseText: failureText,
           failureRecord,
+          markWorkerError: false,
         });
 
         if (failed?.responseId) failedMessageIds.push(failed.responseId);
@@ -1705,6 +1716,11 @@ export function registerMessagesRoutes(app, deps) {
       const released = clearNonProcessingOwnedBySession.run(sdkSessionId);
       releasedOwnedCount = Number(released?.changes || 0);
     }
+
+    sessionWorkerRegistry?.removeWorker?.(sdkSessionId);
+    sessionWorkerSupervisor?.clearRestartSchedule?.(sdkSessionId);
+    sessionWorkerSupervisor?.resetHealth?.(sdkSessionId, { clearFailureCount: false });
+    sessionWorkerSupervisor?.markKilled?.(sdkSessionId);
 
     const conversationId = queueRows[0]?.conversation_id || currentWorker?.conversationId || null;
 
