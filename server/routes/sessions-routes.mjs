@@ -76,8 +76,12 @@ export async function launchWorkspaceRootSession(runtimeState = {}, sessionWorke
     return { ok: false, statusCode: 409, error: 'Selected CLI is already running' };
   }
   if (activeStatuses.includes(selectedWorkerStatus) && selectedWorkerHasPid && !selectedWorkerPidAlive) {
-    sessionWorkerSupervisor?.clearRestartSchedule?.(sid);
+    sessionWorkerSupervisor?.clearRestartSchedule?.(sid, { resetKilledMarker: true });
     sessionWorkerRegistry?.removeWorker?.(sid);
+  } else {
+    // Explicit user-triggered launch always clears the kill block so it is not
+    // stuck behind the 30-second grace window from a prior kill.
+    sessionWorkerSupervisor?.clearRestartSchedule?.(sid, { resetKilledMarker: true });
   }
   if (!sessionWorkerSupervisor || typeof sessionWorkerSupervisor.ensureWorker !== 'function') {
     return { ok: false, statusCode: 500, error: 'Session worker launcher is unavailable' };

@@ -168,3 +168,97 @@ test('process inspector prefers newest non-wrapper worker when multiple candidat
   const match = inspector.findProcessForSession('abc-123');
   assert.equal(match?.processId, 701);
 });
+
+test('process inspector finds windows session process tree for kill', () => {
+  const inspector = createSessionWorkerProcessInspector({
+    platform: 'win32',
+    execFileSyncImpl() {
+      return Buffer.from(JSON.stringify([
+        {
+          processId: 800,
+          parentProcessId: 1,
+          name: 'cmd.exe',
+          commandLine: 'cmd.exe /d /s /c "gh copilot -- --allow-all --session-id abc-123"',
+        },
+        {
+          processId: 801,
+          parentProcessId: 800,
+          name: 'gh.exe',
+          commandLine: 'gh copilot -- --allow-all --session-id abc-123',
+        },
+        {
+          processId: 802,
+          parentProcessId: 801,
+          name: 'node.exe',
+          commandLine: 'node tool-child-without-session-arg.js',
+        },
+        {
+          processId: 803,
+          parentProcessId: 800,
+          name: 'conhost.exe',
+          commandLine: '\\??\\C:\\Windows\\system32\\conhost.exe 0x4',
+        },
+        {
+          processId: 804,
+          parentProcessId: 1,
+          name: 'gh.exe',
+          commandLine: 'gh copilot -- --allow-all --session-id def-456',
+        },
+      ]));
+    },
+  });
+
+  const pids = inspector.findWindowsProcessTreeForSession('abc-123')
+    .map((proc) => proc.processId)
+    .sort((left, right) => left - right);
+
+  assert.deepEqual(pids, [800, 801, 802, 803]);
+});
+
+test('process inspector keeps normal windows worker lookup limited to matching processes', () => {
+  const inspector = createSessionWorkerProcessInspector({
+    platform: 'win32',
+    execFileSyncImpl() {
+      return Buffer.from(JSON.stringify([
+        {
+          processId: 900,
+          parentProcessId: 1,
+          name: 'gh.exe',
+          commandLine: 'gh copilot -- --allow-all --session-id abc-123',
+        },
+        {
+          processId: 901,
+          parentProcessId: 900,
+          name: 'node.exe',
+          commandLine: 'node tool-child-without-session-arg.js',
+        },
+      ]));
+    },
+  });
+
+  assert.deepEqual(
+    inspector.findWindowsProcessesForSession('abc-123').map((proc) => proc.processId),
+    [900],
+  );
+});
+
+test('process inspector windows stop command expands descendants before stopping pids', () => {
+  let stopScript = '';
+  const inspector = createSessionWorkerProcessInspector({
+    platform: 'win32',
+    execFileSyncImpl(command, args) {
+      assert.equal(command, 'powershell.exe');
+      stopScript = String(args?.[2] || '');
+      return Buffer.from('');
+    },
+  });
+
+  const stopped = inspector.stopWindowsPids([1001, 1002, 1001]);
+
+  assert.deepEqual(stopped, [1001, 1002]);
+  assert.match(stopScript, /Get-CimInstance Win32_Process/);
+  assert.match(stopScript, /-ErrorAction Stop/);
+  assert.match(stopScript, /parentProcessId/);
+  assert.match(stopScript, /Stop-Process -Id \$id -Force/);
+  assert.match(stopScript, /exit 0/);
+});

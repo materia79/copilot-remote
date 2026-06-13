@@ -78,3 +78,156 @@ test('supervisor does not reuse worker after startup heartbeat timeout', async (
   assert.equal(second.reused, false);
   assert.equal(spawnCount, 2);
 });
+
+test('markKilled blocks ensureWorker within grace period', async () => {
+  const registry = createSessionWorkerRegistry();
+  let nowMs = 5_000;
+  let spawnCount = 0;
+  const supervisor = createSessionWorkerSupervisor({
+    registry,
+    now: () => nowMs,
+    killBlockGraceMs: 10_000,
+    spawnWorker: async () => {
+      spawnCount += 1;
+      return { workerId: `worker-killed-${spawnCount}`, pid: null };
+    },
+  });
+
+  // Spawn the worker first
+  const first = await supervisor.ensureWorker('killed-session');
+  assert.equal(first.ok, true);
+  assert.equal(spawnCount, 1);
+
+  // Simulate kill: remove from registry, clear schedule, then mark killed
+  registry.removeWorker('killed-session');
+  supervisor.clearRestartSchedule('killed-session');
+  supervisor.markKilled('killed-session');
+
+  // ensureWorker should now be blocked
+  const blocked = await supervisor.ensureWorker('killed-session');
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.error, 'session-killed');
+  assert.equal(spawnCount, 1, 'no new spawn should occur while kill-blocked');
+
+  // Lifecycle should report killedAt
+  const lifecycle = supervisor.getLifecycleState('killed-session');
+  assert.ok(lifecycle?.killedAt, 'killedAt should be set');
+});
+
+test('markKilled block expires after grace period', async () => {
+  const registry = createSessionWorkerRegistry();
+  let nowMs = 5_000;
+  let spawnCount = 0;
+  const supervisor = createSessionWorkerSupervisor({
+    registry,
+    now: () => nowMs,
+    killBlockGraceMs: 10_000,
+    spawnWorker: async () => {
+      spawnCount += 1;
+      return { workerId: `worker-expired-${spawnCount}`, pid: null };
+    },
+  });
+
+  // Spawn first worker
+  await supervisor.ensureWorker('grace-session');
+  assert.equal(spawnCount, 1);
+
+  // Kill the worker
+  registry.removeWorker('grace-session');
+  supervisor.clearRestartSchedule('grace-session');
+  supervisor.markKilled('grace-session');
+
+  // Still blocked inside grace window
+  const stillBlocked = await supervisor.ensureWorker('grace-session');
+  assert.equal(stillBlocked.ok, false);
+  assert.equal(stillBlocked.error, 'session-killed');
+  assert.equal(spawnCount, 1);
+
+  // Advance past grace period
+  nowMs += 11_000;
+
+  // Should now allow respawn (grace expired)
+  const respawned = await supervisor.ensureWorker('grace-session');
+  assert.equal(respawned.ok, true);
+  assert.equal(spawnCount, 2);
+});
+
+test('clearRestartSchedule preserves killedAtMs by default', async () => {
+  const registry = createSessionWorkerRegistry();
+  let nowMs = 3_000;
+  const supervisor = createSessionWorkerSupervisor({
+    registry,
+    now: () => nowMs,
+    killBlockGraceMs: 30_000,
+    spawnWorker: async () => ({ workerId: 'worker-preserve', pid: null }),
+  });
+
+  await supervisor.ensureWorker('preserve-session');
+  registry.removeWorker('preserve-session');
+  supervisor.markKilled('preserve-session');
+
+  // clearRestartSchedule without resetKilledMarker should keep the kill block
+  supervisor.clearRestartSchedule('preserve-session');
+  const stillBlocked = await supervisor.ensureWorker('preserve-session');
+  assert.equal(stillBlocked.ok, false);
+  assert.equal(stillBlocked.error, 'session-killed');
+
+  // clearRestartSchedule with resetKilledMarker:true should clear it
+  supervisor.clearRestartSchedule('preserve-session', { resetKilledMarker: true });
+  let spawnCount = 0;
+  // Need a fresh supervisor with spawn to verify it can spawn
+  const registry2 = createSessionWorkerRegistry();
+  const supervisor2 = createSessionWorkerSupervisor({
+    registry: registry2,
+    now: () => nowMs,
+    killBlockGraceMs: 30_000,
+    spawnWorker: async () => {
+      spawnCount += 1;
+      return { workerId: 'worker-reset', pid: null };
+    },
+  });
+  supervisor2.markKilled('reset-session');
+  supervisor2.clearRestartSchedule('reset-session', { resetKilledMarker: true });
+  const unblocked = await supervisor2.ensureWorker('reset-session');
+  assert.equal(unblocked.ok, true);
+  assert.equal(spawnCount, 1);
+});
+
+test('markKilled prevents respawn even when registry entry is re-inserted with no identity', async () => {
+  const registry = createSessionWorkerRegistry();
+  let nowMs = 7_000;
+  let spawnCount = 0;
+  const supervisor = createSessionWorkerSupervisor({
+    registry,
+    now: () => nowMs,
+    killBlockGraceMs: 30_000,
+    spawnWorker: async () => {
+      spawnCount += 1;
+      return { workerId: `worker-reinsert-${spawnCount}`, pid: null };
+    },
+  });
+
+  // Spawn first worker
+  await supervisor.ensureWorker('reinsert-session');
+  assert.equal(spawnCount, 1);
+
+  // Simulate kill sequence
+  registry.removeWorker('reinsert-session');
+  supervisor.clearRestartSchedule('reinsert-session');
+  supervisor.markKilled('reinsert-session');
+
+  // Simulate the heartbeat route re-inserting the worker WITHOUT workerId
+  // (the exact bug that triggered the respawn: no workerId means shouldReuseLiveWorker=false)
+  registry.upsertWorker({
+    sdkSessionId: 'reinsert-session',
+    status: 'ready',
+    workerId: null,
+    pid: null,
+  });
+
+  // ensureWorker must still be blocked despite the re-insertion
+  const blocked = await supervisor.ensureWorker('reinsert-session');
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.error, 'session-killed');
+  assert.equal(spawnCount, 1, 'kill block must win over identity-less re-insertion');
+});
