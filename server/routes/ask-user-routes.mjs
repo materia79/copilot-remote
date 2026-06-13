@@ -136,10 +136,27 @@ export function registerAskUserRoutes(app, deps) {
     }
 
     const effectiveMessageId = messageId || q.id;
+    
+    // Check for an identical pending question (same prompt + choices) to handle retries.
+    // Do NOT reuse questions with different prompts/choices - this allows multiple
+    // concurrent ask_user calls in the same turn to each create their own question.
+    const promptText = sanitizeRelayQuestionPrompt({ prompt });
+    const normalizedChoices = normalizeQuestionChoices(choices);
+    const choicesJson = normalizedChoices.length ? JSON.stringify(normalizedChoices) : null;
+    
     const existingPending = stmts.findPendingQuestionByMessage.get(effectiveMessageId);
     if (existingPending) {
-      const question = formatQuestionRow(existingPending);
-      return res.json({ question, reused: true });
+      const existingPrompt = String(existingPending.prompt || '');
+      const existingChoices = existingPending.choices || null;
+      const promptMatches = existingPrompt === promptText;
+      const choicesMatch = existingChoices === choicesJson;
+      
+      if (promptMatches && choicesMatch) {
+        // This is likely a retry of the same question - reuse it
+        const question = formatQuestionRow(existingPending);
+        return res.json({ question, reused: true });
+      }
+      // Different question - continue to create a new one
     }
 
     const relayMode = normalizeRelayMode(mode || q.relay_mode) || DEFAULT_RELAY_MODE;
@@ -153,9 +170,7 @@ export function registerAskUserRoutes(app, deps) {
     const ownerWorkerId = sdkSessionId
       ? normalizeId(sessionWorkerRegistry?.getWorker?.(sdkSessionId)?.workerId)
       : null;
-    const promptText = sanitizeRelayQuestionPrompt({ prompt });
     const parsedQuestionRequest = parseQuestionRequest(request);
-    const normalizedChoices = normalizeQuestionChoices(choices);
     const requestJson = sanitizeRelayQuestionRequest({
       request: parsedQuestionRequest,
       context: sanitizeRelayQuestionContext(context),
@@ -179,7 +194,7 @@ export function registerAskUserRoutes(app, deps) {
       effectiveMessageId,
       relayMode,
       promptText,
-      normalizedChoices.length ? JSON.stringify(normalizedChoices) : null,
+      choicesJson,
       requestJson,
       requestSchemaJson,
       sdkSessionId,
