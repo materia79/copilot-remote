@@ -57,7 +57,8 @@ Copilot Remote is still under active development, so expect occasional rough edg
 - Per-message **mode** picker: `plan`, `ask`, `agent`, `autopilot`
 - Per-message **model** picker (live model discovery + fallback catalog)
 - Streaming tool/activity updates while a turn runs
-- Web question cards for `ask_user` clarification flows
+- Web question cards for `ask_user` clarification flows (single-field text and multi-field structured forms)
+- Structured answer support: multi-field elicitation with JSON schema validation and UI-rendered forms
 - Conversation history stored in local SQLite
 - Conversation delete requests are relayed to Copilot CLI SDK `deleteSession()` so web deletes can remove resumable CLI sessions
 - Conversation **compact** workflow (`/compact`) to continue with summary carry-over

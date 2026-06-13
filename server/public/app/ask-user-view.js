@@ -341,7 +341,6 @@ export async function submitRelayStructuredAnswer(questionId) {
 
   try {
     const sdkSessionId = String(question?.sdkSessionId || '').trim();
-    console.log("submitRelayStructuredAnswer DEBUG:", { questionId, sdkSessionId, hasQuestion: !!question, questionKeys: question ? Object.keys(question).join(",") : "no-question" });
     const r = await answerRelayQuestionStructured(questionId, structuredAnswer, sdkSessionId || null);
     if (!r?.ok) {
       controls.forEach((el) => { el.disabled = false; });

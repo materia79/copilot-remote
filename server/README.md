@@ -229,9 +229,6 @@ Session-worker refactor gates are OFF by default and can be enabled per flag:
 
 - `SESSION_WORKER_ROUTING_ENABLED`
 - `SESSION_WORKER_CONTINUATION_ROUTING_ENABLED`
-- `SESSION_WORKER_FALLBACK_RESTART_ENABLED` (deprecated no-op)
-
-`SESSION_WORKER_FALLBACK_RESTART_ENABLED` is now a deprecated no-op. Session-worker routing no longer asks the global restart orchestrator to respawn CLIs for worker failures.
 
 Configuration precedence is:
 
@@ -251,6 +248,63 @@ Question bridge rule:
 - Relay now includes a fallback: if a turn clearly ends with a plain-text follow-up
   question and choices but no `ask_user` bridge was used, it auto-converts that
   question into a relay question card, waits for the answer, and resumes the turn.
+
+## Session Worker Management
+
+Session workers are long-running CLI processes that execute turns for Copilot agent sessions. The relay manages a pool of workers to enable:
+- Parallel execution (multiple sessions can run simultaneously)
+- Session persistence (a worker stays alive across turns for a given session)
+- Graceful restarts (degraded workers are replaced without losing queued work)
+
+### Worker Lifecycle States
+
+1. **Spawned** — Worker process created, initializing CLI connection
+2. **Ready** — Worker opened WebSocket to relay, registered in worker pool, ready to accept turns
+3. **Processing** — Worker actively executing a turn (streaming activity to browser)
+4. **Degraded** — Worker failed heartbeat or reported errors; relay moves pending work to other workers or restarts
+5. **Dead/Exited** — Worker process terminated; polling loop will spawn replacement if turns still pending
+
+### Worker Heartbeat & Health Check
+
+- Workers send keep-alive pings every 30 seconds (default) to `/api/workers/{id}/heartbeat`
+- Relay tracks last heartbeat time for each worker
+- If a worker misses 2+ consecutive heartbeats (~60 seconds), it's marked "degraded"
+- Degraded workers don't receive new turns; existing work is reassigned
+- Polling loop detects degraded workers and respawns them if they're still needed
+
+### Supervisor Service
+
+The **session-worker-supervisor-service** tracks all active workers:
+
+- Maintains registry: `workers[sdkSessionId] = { id, process, sdkSessionId, status, lastHeartbeat }`
+- Monitors process health: checks if process is still running, collects exit codes
+- Handles restarts: when a worker fails, spawns a replacement with exponential backoff
+- Cleans up: removes dead workers from registry after TTL (default 5 minutes)
+
+### Environment & Workspace
+
+Session workers inherit:
+
+- `COPILOT_WORKSPACE_ROOT` — Target workspace directory (from turn metadata or session config)
+- `INIT_CWD` — Initial working directory (fallback for workspace resolution)
+- `COPILOT_REMOTE_*` — All relay config via environment variables
+- CLI session state from the last known good checkpoint
+
+### Restart Orchestration
+
+When a worker needs restart:
+
+1. **Graceful shutdown** — Send SIGTERM, wait up to 5 seconds for clean exit
+2. **Kill if needed** — Force SIGKILL if SIGTERM timeout
+3. **Backoff** — Wait before respawn (start at 1s, double up to 30s max)
+4. **Reassign work** — Any pending turns for that session are placed back in queue for the new worker
+5. **Report status** — Relay broadcasts worker status to browser UI (shows "reconnecting..." briefly)
+
+### Platform-Specific Behavior
+
+- **macOS/Linux:** Workers prefer `tmux` sessions for better isolation and debugging (can attach with `tmux attach -t {sessionId}`)
+- **Windows:** Workers launch in a new Terminal window (TTY-Console if available, otherwise cmd)
+- Both: Worker inherits relay's environment and runs from relay repo root so project-local extensions are discoverable
 
 ## How It Works
 
@@ -306,6 +360,40 @@ If a conversation is still unbound when the CLI first sees it, the extension now
 | Question card stuck | Answer in the card UI; logs should show `relay question created` and `relay question answered` |
 | Tunnel not connecting | Check server console for `[ssh-tunnel]` lines; confirm SSH key auth works without password |
 | Tunnel keeps reconnecting | VPS `sshd_config` needs `GatewayPorts no` (default) — Caddy handles the public port |
+
+## Windows-Specific Runtime Behavior
+
+### Worker Launcher
+
+- Workers on Windows launch via a **stable Terminal window** (when available).
+- If TTY-Console (optional dependency) is installed, workers use an interactive terminal for debugging.
+- Otherwise, workers spawn in a new `cmd` or PowerShell window.
+- Window name is workspace-based so repeated worker restarts reuse the same window instead of opening duplicates.
+
+### Path Handling
+
+- **Drives API** — `/api/drives/roots` returns fixed/removable drive letters (`C:`, `D:`, etc.) instead of mount points.
+- **Path format** — `C:/Users/alice/project/file.txt` (forward slashes, drive letter prefix).
+- **Directory listing** — Uses PowerShell via `Get-ChildItem` for recursive listings (faster than fs.readdir on large directories).
+- **Workspace root** — Must be an absolute Windows path; relative paths or UNC paths (`\\server\share`) are handled but may behave unexpectedly.
+
+### Model Refresh
+
+- Model discovery on Windows invokes `copilot.ps1` via PowerShell with `-ExecutionPolicy Bypass` to bypass execution policy restrictions.
+- Command: `powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "copilot help config | Select-String -Pattern 'gpt'"`.
+- If PowerShell is not available, falls back to direct `copilot help config` (may fail due to execution policy).
+
+### Environment Variables
+
+- Workers inherit all relay server environment, including `COPILOT_WORKSPACE_ROOT` and `INIT_CWD`.
+- On Windows, these paths use backslash or forward-slash format; CLI normalize paths automatically.
+- `PYTHONUNBUFFERED=1` and `NODE_OPTIONS` should be set before relay startup for worker inheritance.
+
+### SSH Tunnel on Windows
+
+- SSH tunnel uses `ssh.exe` (assumes `git-bash` or OpenSSH is in PATH).
+- If SSH is not available, tunnel mode cannot be "managed"; stays in "disabled" mode.
+- Windows Firewall may require inbound rule for local relay port (default 3333) if browser is on another machine.
 
 ## API Reference
 
@@ -439,6 +527,59 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 - Markdown preview supports optional embedded-HTML mode with script/event-handler stripping and a visible warning.
 - The floating **📁 Browse files** button opens the explorer with **Workspace** and **Drives** roots, tree navigation, list/icon folder views, and image thumbnails.
 
+## Structured Answers and Multi-Field Elicitation
+
+The relay supports **structured answer forms** that extend beyond simple text `ask_user` questions. When a Copilot agent or tool needs multi-field input (e.g., confirmation with multiple checkboxes, form data with validation), the relay bridges the question into a web form.
+
+### Database Schema
+
+Structured answers are stored in the `relay_questions` table:
+
+- `id` (primary key, UUID)
+- `request_schema` (JSON schema defining form fields: types, validation, constraints)
+- `structured_answer` (JSON object containing user's multi-field response)
+
+The migration `server/migrations/0001-add-structured-answer.mjs` creates the `structured_answer` and `request_schema` columns.
+
+### Elicitation Flow
+
+1. **Agent sends multi-field question** → Copilot SDK sends `ElicitationRequest` with `requestSchema` (JSON schema).
+2. **Extension bridges question** → `.github/extensions/web-relay/skills/question-routing-hooks.mjs` detects structured schema and registers it in the relay.
+3. **Browser renders form** → `server/public/app/question-schema-view.mjs` generates UI from the JSON schema (text inputs, checkboxes, dropdowns, etc.).
+4. **User submits form** → `ask-user-view.js` validates and POSTs to `/api/ask-user` with `structuredAnswer` payload.
+5. **Relay stores + returns** → Answer stored in `structured_answer` column; extension retrieves via `/api/pending` and returns `ElicitationResponse` to SDK.
+
+### Schema Example
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "confirmation": {
+      "type": "boolean",
+      "title": "Do you want to proceed?"
+    },
+    "environment": {
+      "type": "string",
+      "enum": ["dev", "staging", "prod"],
+      "title": "Select environment"
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "title": "Enter tags"
+    }
+  },
+  "required": ["confirmation", "environment"]
+}
+```
+
+### Browser Behavior
+
+- Multi-field forms render form controls for each schema property.
+- Validation happens client-side (required fields, type checking) and server-side.
+- Single-field simple `ask_user` (legacy) still renders as a single text input or button group.
+
 ## Relay Tool Guidance
 
 The CLI extension (`.github/extensions/web-relay/extension.mjs`) loads `relay-tools.md`
@@ -553,6 +694,39 @@ relay.example.com {
 }
 ```
 
+### Managed vs. Disabled Mode
+
+| Setting | Behavior |
+|---------|----------|
+| `mode: "disabled"` | No SSH tunnel; relay is only accessible locally (localhost). Suitable for development or internal network access. |
+| `mode: "managed"` | SSH tunnel enabled; relay opens reverse port forward to VPS. Suitable for remote access or internet-facing deployments. |
+
+### Tunnel Connection & Queueing
+
+- **Tunnel required = false** (default): Queue continues to process even if tunnel is disconnected. Browser can still interact via localhost.
+- **Tunnel required = true**: Queue is paused (returns `paused: true` with reason `ssh_tunnel_required`) when tunnel is disconnected. Used when relay **must** be accessible via VPS (e.g., mobile browser always connects through VPS).
+
+When `required=true` and tunnel is down:
+- Relay stays running internally
+- `/api/pending` returns `{ paused: true, reason: "ssh_tunnel_required" }` 
+- Extension stops dequeuing turns
+- Browser sees "waiting for tunnel to reconnect..." status
+- Once tunnel reconnects, queue resumes automatically
+
+### SSH Tunnel Configuration Precedence
+
+1. `server/config.json` → `sshTunnel` object
+2. Environment variables → `COPILOT_REMOTE_SSH_TUNNEL_*` prefixed keys
+
+Example environment overrides:
+```bash
+COPILOT_REMOTE_SSH_TUNNEL_MODE=managed \
+COPILOT_REMOTE_SSH_TUNNEL_USER=deployer \
+COPILOT_REMOTE_SSH_TUNNEL_HOST=vps.example.com \
+COPILOT_REMOTE_SSH_TUNNEL_REMOTE_PORT=4444 \
+npm start
+```
+
 ### SSH tunnel migration notes
 
 - `sshTunnel.mode` is now the canonical switch. Use `disabled` for direct relay deployments and `managed` for reverse SSH.
@@ -576,6 +750,39 @@ This worker restart-orchestrator flow is separate from the manual relay self-res
 reported as `relayShutdown`.
 
 
+
+## Database Migrations
+
+The relay uses a simple SQL migration system to evolve the SQLite schema over time.
+
+**Migration File Location:** `server/migrations/`
+
+**Migration Lifecycle:**
+
+1. On server startup, relay checks the database for applied migrations
+2. Unapplied migrations (in filename order) are executed automatically
+3. Each migration file exports a `up()` function that creates/alters tables
+4. After successful execution, migration is recorded in the database metadata
+5. Migrations are idempotent: re-running a migration is safe (no duplicates)
+
+**Currently Deployed Migration:**
+
+- **`0001-add-structured-answer.mjs`** — Adds `structured_answer` and `request_schema` columns to the `relay_questions` table to support multi-field elicitation forms (see [Structured Answers and Multi-Field Elicitation](#structured-answers-and-multi-field-elicitation) section).
+  - `request_schema` (TEXT/JSON) — JSON schema defining form fields and validation
+  - `structured_answer` (TEXT/JSON) — User's submitted multi-field response object
+
+**To Deploy New Migrations:**
+
+1. Create file `server/migrations/000N-description.mjs` (increment the number)
+2. Export an async `up()` function that receives the database connection
+3. Write SQL alterations:
+   ```javascript
+   export async function up(db) {
+     await db.exec(`ALTER TABLE some_table ADD COLUMN new_col TEXT;`);
+   }
+   ```
+4. Restart the relay; migration runs automatically
+5. Verify: check relay logs for `[migrations] Applying 000N-description`
 
 ## Files
 
