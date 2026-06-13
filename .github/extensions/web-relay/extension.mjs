@@ -850,6 +850,13 @@ session = await joinSessionWithRetry({
     dbg("onUserInputRequest CALLED!", "keys=", Object.keys(request || {}).join(","), "platform=", process.platform);
     return questionRoutingHooks.onUserInputRequest(request);
   },
+  // onElicitationRequest handles multi-field structured `ask_user` forms (requestedSchema).
+  // Must be a TOP-LEVEL property so the SDK registers the elicitation capability and routes
+  // structured form requests here instead of flattening them through onUserInputRequest.
+  onElicitationRequest: async (request) => {
+    dbg("onElicitationRequest CALLED!", "keys=", Object.keys(request || {}).join(","), "mode=", request?.mode || "form", "platform=", process.platform);
+    return questionRoutingHooks.onElicitationRequest(request);
+  },
   hooks: {
     onSessionStart: async () => {
       dbg("onSessionStart fired");

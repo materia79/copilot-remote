@@ -1385,6 +1385,8 @@ db.exec(`
     request         TEXT,
     status          TEXT NOT NULL DEFAULT 'pending',
     answer          TEXT,
+    structured_answer TEXT,
+    request_schema  TEXT,
     sdk_session_id  TEXT,
     owner_worker_id TEXT,
     continuation_id TEXT,
@@ -1681,6 +1683,12 @@ if (relayQuestionColumns.length && !relayQuestionColumns.includes('continuation_
 }
 if (relayQuestionColumns.length && !relayQuestionColumns.includes('continuation_question_id')) {
   db.exec(`ALTER TABLE relay_questions ADD COLUMN continuation_question_id TEXT`);
+}
+if (relayQuestionColumns.length && !relayQuestionColumns.includes('structured_answer')) {
+  db.exec(`ALTER TABLE relay_questions ADD COLUMN structured_answer TEXT`);
+}
+if (relayQuestionColumns.length && !relayQuestionColumns.includes('request_schema')) {
+  db.exec(`ALTER TABLE relay_questions ADD COLUMN request_schema TEXT`);
 }
 db.exec(`CREATE INDEX IF NOT EXISTS idx_relay_questions_continuation ON relay_questions(continuation_id, continuation_question_id, status, created_at)`);
 
@@ -2271,6 +2279,8 @@ function formatQuestionRow(row) {
   const parsedRequest = parseQuestionRequest(row.request);
   const envelope = normalizeQuestionEnvelope(parsedRequest);
   const choices = parseQuestionChoices(row.choices);
+  const requestSchema = parseQuestionRequest(row.request_schema);
+  const structuredAnswer = parseQuestionRequest(row.structured_answer);
   return {
     id: row.id,
     queueId: row.queue_id,
@@ -2284,10 +2294,12 @@ function formatQuestionRow(row) {
     prompt: row.prompt,
     choices,
     request: envelope.request,
+    requestSchema: requestSchema && typeof requestSchema === 'object' ? requestSchema : null,
     context: envelope.context,
     allowFreeform: envelope.allowFreeform ?? !choices.length,
     status: row.status,
     answer: row.answer || null,
+    structuredAnswer: structuredAnswer && typeof structuredAnswer === 'object' ? structuredAnswer : null,
     createdAt: row.created_at,
     answeredAt: row.answered_at || null,
     expiresAt: row.expires_at,

@@ -6,8 +6,9 @@ import {
   relayQuestions,
   relayQuestionDrafts,
 } from './store.js';
-import { loadRelayQuestions as loadRelayQuestionsApi, answerRelayQuestion } from './api-client.js';
+import { loadRelayQuestions as loadRelayQuestionsApi, answerRelayQuestion, answerRelayQuestionStructured } from './api-client.js';
 import { renderLinkedPlainText } from './router.js';
+import { schemaFieldsFromQuestion, isMultiFieldQuestion } from './question-schema-view.mjs';
 
 let relayQuestionRenderHash = '';
 
@@ -131,6 +132,7 @@ export function renderRelayQuestions() {
       answeredAt: q.answeredAt || '',
       createdAt: q.createdAt || '',
       choices: Array.isArray(q.choices) ? q.choices : [],
+      schema: q.requestSchema || null,
     }))
   );
   const existingCards = el.querySelectorAll('.relay-question-container');
@@ -148,24 +150,33 @@ export function renderRelayQuestions() {
     const modeTag = question.mode ? ` <span class="msg-mode">${escHtml(question.mode)}</span>` : '';
     const contextText = String(question?.context?.rationale || '').trim();
     const contextHtml = contextText ? `<div class="relay-question-context">${renderLinkedPlainText(contextText)}</div>` : '';
-    const choices = Array.isArray(question.choices) ? question.choices : [];
-    const choiceHtml = choices.length
-      ? (question.status === 'pending'
-          ? `<div class="relay-question-choices">${
-              choices.map((choice) => `<button class="relay-question-choice" data-choice="${escHtml(choice)}" onclick="submitRelayQuestionChoice('${question.id}', this.dataset.choice)">${escHtml(choice)}</button>`).join('')
-            }</div>`
-          : `<div class="relay-question-choices">${
-              choices.map((choice) => `<button class="relay-question-choice" disabled>${escHtml(choice)}</button>`).join('')
-            }</div>`)
-      : '';
-    const showReplyControls = question.status === 'pending';
-    const draftText = String(relayQuestionDrafts.get(question.id) || '');
-    const replyHtml = showReplyControls
-      ? `<div class="relay-question-reply">
-          <textarea id="relay-question-input-${question.id}" placeholder="Type a reply… (Ctrl/Cmd+Enter to send)" onkeydown="handleRelayQuestionKey(event, '${question.id}')" oninput="onRelayQuestionDraftInput('${question.id}', this.value)">${escHtml(draftText)}</textarea>
-          <button class="relay-question-submit" onclick="submitRelayQuestionAnswer('${question.id}')">Reply</button>
-        </div>`
-      : '';
+    const multiField = isMultiFieldQuestion(question);
+
+    let interactiveHtml = '';
+    if (multiField) {
+      interactiveHtml = renderMultiFieldForm(question);
+    } else {
+      const choices = Array.isArray(question.choices) ? question.choices : [];
+      const choiceHtml = choices.length
+        ? (question.status === 'pending'
+            ? `<div class="relay-question-choices">${
+                choices.map((choice) => `<button class="relay-question-choice" data-choice="${escHtml(choice)}" onclick="submitRelayQuestionChoice('${question.id}', this.dataset.choice)">${escHtml(choice)}</button>`).join('')
+              }</div>`
+            : `<div class="relay-question-choices">${
+                choices.map((choice) => `<button class="relay-question-choice" disabled>${escHtml(choice)}</button>`).join('')
+              }</div>`)
+        : '';
+      const showReplyControls = question.status === 'pending';
+      const draftText = String(relayQuestionDrafts.get(question.id) || '');
+      const replyHtml = showReplyControls
+        ? `<div class="relay-question-reply">
+            <textarea id="relay-question-input-${question.id}" placeholder="Type a reply… (Ctrl/Cmd+Enter to send)" onkeydown="handleRelayQuestionKey(event, '${question.id}')" oninput="onRelayQuestionDraftInput('${question.id}', this.value)">${escHtml(draftText)}</textarea>
+            <button class="relay-question-submit" onclick="submitRelayQuestionAnswer('${question.id}')">Reply</button>
+          </div>`
+        : '';
+      interactiveHtml = `${choiceHtml}${replyHtml}`;
+    }
+
     const answeredHtml = question.status === 'answered' && question.answer
       ? `<div class="relay-question-context"><strong>Your answer:</strong> ${escHtml(question.answer)}</div>`
       : '';
@@ -179,8 +190,7 @@ export function renderRelayQuestions() {
         <div class="relay-question-body">${renderLinkedPlainText(question.prompt || '')}</div>
         ${contextHtml}
         ${answeredHtml}
-        ${choiceHtml}
-        ${replyHtml}
+        ${interactiveHtml}
         <div class="relay-question-status">${statusText}</div>
       </div>`;
 
@@ -188,6 +198,147 @@ export function renderRelayQuestions() {
   }
 
   window.scrollBottom?.();
+}
+
+function fieldDomId(questionId, index) {
+  return `relay-field-${questionId}-${index}`;
+}
+
+function renderMultiFieldForm(question) {
+  const fields = schemaFieldsFromQuestion(question);
+  if (!fields.length) return '';
+  const disabled = question.status !== 'pending';
+  const submitted = question.structuredAnswer && typeof question.structuredAnswer === 'object'
+    ? question.structuredAnswer
+    : {};
+
+  const fieldHtml = fields.map((field, index) => {
+    const id = fieldDomId(question.id, index);
+    const current = Object.prototype.hasOwnProperty.call(submitted, field.name)
+      ? submitted[field.name]
+      : (field.hasDefault ? field.default : undefined);
+    const requiredMark = field.required ? ' <span class="relay-field-required">*</span>' : '';
+    const descHtml = field.description
+      ? `<div class="relay-field-desc">${escHtml(field.description)}</div>`
+      : '';
+    const control = renderFieldControl(field, id, current, disabled);
+    return `<div class="relay-field" data-field-name="${escHtml(field.name)}" data-field-type="${escHtml(field.type)}" data-field-id="${id}">
+        <label class="relay-field-label" for="${id}">${escHtml(field.title)}${requiredMark}</label>
+        ${descHtml}
+        ${control}
+      </div>`;
+  }).join('');
+
+  const submitHtml = disabled
+    ? ''
+    : `<div class="relay-question-reply">
+        <div class="relay-field-error" id="relay-form-error-${question.id}"></div>
+        <button class="relay-question-submit" onclick="submitRelayStructuredAnswer('${question.id}')">Submit</button>
+      </div>`;
+
+  return `<form class="relay-question-form" data-question-id="${question.id}" onsubmit="return false;">${fieldHtml}${submitHtml}</form>`;
+}
+
+function renderFieldControl(field, id, current, disabled) {
+  const dis = disabled ? ' disabled' : '';
+  if (field.type === 'boolean') {
+    const checked = current === true || String(current).toLowerCase() === 'true' ? ' checked' : '';
+    return `<label class="relay-field-check"><input type="checkbox" id="${id}"${checked}${dis}> Yes</label>`;
+  }
+  if (field.isMultiSelect && field.choices.length) {
+    const selected = Array.isArray(current) ? current.map(String) : [];
+    return `<div class="relay-field-multi" id="${id}">${
+      field.choices.map((choice, ci) => {
+        const checked = selected.includes(String(choice.value)) ? ' checked' : '';
+        return `<label class="relay-field-check"><input type="checkbox" data-choice-value="${escHtml(String(choice.value))}" value="${escHtml(String(choice.value))}"${checked}${dis}> ${escHtml(choice.label)}</label>`;
+      }).join('')
+    }</div>`;
+  }
+  if (field.choices.length) {
+    const currentStr = current === undefined || current === null ? '' : String(current);
+    const options = [`<option value=""${currentStr === '' ? ' selected' : ''}>${field.required ? 'Select…' : '(none)'}</option>`]
+      .concat(field.choices.map((choice) => {
+        const value = String(choice.value);
+        const sel = value === currentStr ? ' selected' : '';
+        return `<option value="${escHtml(value)}"${sel}>${escHtml(choice.label)}</option>`;
+      }));
+    return `<select id="${id}"${dis}>${options.join('')}</select>`;
+  }
+  if (field.type === 'number' || field.type === 'integer') {
+    const val = current === undefined || current === null ? '' : escHtml(String(current));
+    const step = field.type === 'integer' ? ' step="1"' : '';
+    return `<input type="number" id="${id}" value="${val}"${step}${dis}>`;
+  }
+  const val = current === undefined || current === null ? '' : escHtml(String(current));
+  const inputType = field.format === 'email' ? 'email' : (field.format === 'uri' || field.format === 'url' ? 'url' : 'text');
+  return `<input type="${inputType}" id="${id}" value="${val}"${dis}>`;
+}
+
+function collectStructuredAnswer(question) {
+  const fields = schemaFieldsFromQuestion(question);
+  const answer = {};
+  fields.forEach((field, index) => {
+    const id = fieldDomId(question.id, index);
+    if (field.type === 'boolean') {
+      const el = document.getElementById(id);
+      if (el) answer[field.name] = !!el.checked;
+      return;
+    }
+    if (field.isMultiSelect && field.choices.length) {
+      const container = document.getElementById(id);
+      const checked = container ? Array.from(container.querySelectorAll('input[type="checkbox"]:checked')) : [];
+      const values = checked.map((el) => el.getAttribute('data-choice-value'));
+      if (values.length) answer[field.name] = values;
+      return;
+    }
+    const el = document.getElementById(id);
+    if (!el) return;
+    const raw = String(el.value || '').trim();
+    if (!raw) return;
+    if (field.type === 'number' || field.type === 'integer') {
+      const num = Number(raw);
+      if (Number.isFinite(num)) answer[field.name] = field.type === 'integer' ? Math.trunc(num) : num;
+      return;
+    }
+    answer[field.name] = raw;
+  });
+  return answer;
+}
+
+export async function submitRelayStructuredAnswer(questionId) {
+  const question = relayQuestions.get(questionId) || null;
+  if (!question) return;
+  const errorEl = document.getElementById(`relay-form-error-${questionId}`);
+  if (errorEl) errorEl.textContent = '';
+
+  const structuredAnswer = collectStructuredAnswer(question);
+  const card = document.querySelector(`.relay-question-container[data-question-id="${questionId}"]`);
+  const controls = card ? card.querySelectorAll('button, input, select, textarea') : [];
+  controls.forEach((el) => { el.disabled = true; });
+
+  try {
+    const sdkSessionId = String(question?.sdkSessionId || '').trim();
+    console.log("submitRelayStructuredAnswer DEBUG:", { questionId, sdkSessionId, hasQuestion: !!question, questionKeys: question ? Object.keys(question).join(",") : "no-question" });
+    const r = await answerRelayQuestionStructured(questionId, structuredAnswer, sdkSessionId || null);
+    if (!r?.ok) {
+      controls.forEach((el) => { el.disabled = false; });
+      const fieldErrors = Array.isArray(r?.fields) ? r.fields.map((f) => f.message).join('; ') : '';
+      const message = fieldErrors || r?.error || 'Failed to submit answer';
+      if (errorEl) errorEl.textContent = message;
+      else alert(message);
+      return;
+    }
+    relayQuestionDrafts.delete(questionId);
+    if (r.question) relayQuestions.set(questionId, r.question);
+    updatePendingQuestionBanner();
+    window.renderConvList?.();
+    renderRelayQuestions();
+    window.showTransientRelayNotice?.(`✅ Answer received · Agent continuing…`, 7000);
+  } catch (e) {
+    controls.forEach((el) => { el.disabled = false; });
+    if (errorEl) errorEl.textContent = e.message || 'Failed to submit answer';
+    else alert(e.message || 'Failed to submit answer');
+  }
 }
 
 export async function submitRelayQuestionChoice(questionId, choice) {

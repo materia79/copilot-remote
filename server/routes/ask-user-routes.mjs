@@ -1,6 +1,14 @@
 'use strict';
 
 import { createAskUserRoutingService } from '../services/ask-user-routing-service.mjs';
+import {
+  extractRequestedSchema,
+  normalizeSchema,
+  schemaFields,
+  validateStructuredAnswer,
+  summarizeStructuredAnswer,
+  flatAnswerToStructured,
+} from '../../shared/question-schema.mjs';
 
 function normalizeId(value) {
   const text = String(value || '').trim();
@@ -120,7 +128,7 @@ export function registerAskUserRoutes(app, deps) {
   });
 
   app.post('/api/relay-question', auth, (req, res) => {
-    const { queueId, messageId, conversationId, mode, prompt, choices, request, context, allowFreeform } = req.body;
+    const { queueId, messageId, conversationId, mode, prompt, choices, request, context, allowFreeform, requestedSchema } = req.body;
     console.log(`[${ts()}] relay-question POST: ${choices?.length ?? 0} possible answer(s)`);
     const q = stmts.findQById.get(queueId || messageId);
     if (!q || q.status !== 'processing') {
@@ -153,6 +161,12 @@ export function registerAskUserRoutes(app, deps) {
       context: sanitizeRelayQuestionContext(context),
       allowFreeform: typeof allowFreeform === 'boolean' ? allowFreeform : (!normalizedChoices.length),
     });
+    // Capture the elicitation requestedSchema (explicit field or nested in the request)
+    // so multi-field structured answers can be validated and rendered.
+    const resolvedSchema = normalizeSchema(requestedSchema)
+      || extractRequestedSchema(requestedSchema)
+      || extractRequestedSchema(parsedQuestionRequest);
+    const requestSchemaJson = resolvedSchema ? JSON.stringify(resolvedSchema) : null;
     const continuation = continuationRoutingEnabled
       ? extractContinuationOwnership(parsedQuestionRequest)
       : { continuationId: null, continuationQuestionId: null };
@@ -167,6 +181,7 @@ export function registerAskUserRoutes(app, deps) {
       promptText,
       normalizedChoices.length ? JSON.stringify(normalizedChoices) : null,
       requestJson,
+      requestSchemaJson,
       sdkSessionId,
       ownerWorkerId,
       continuation.continuationId,
@@ -176,30 +191,59 @@ export function registerAskUserRoutes(app, deps) {
     );
 
     const question = formatQuestionRow(stmts.getQuestion.get(questionId));
-    console.log(`[${ts()}] QUESTION  ${questionId.slice(0,8)} conv=${question.conversationId.slice(0,8)} mode=${relayMode} prompt="${promptText.slice(0,60)}"`);
+    const fieldCount = resolvedSchema ? schemaFields(resolvedSchema).length : 0;
+    console.log(`[${ts()}] QUESTION  ${questionId.slice(0,8)} conv=${question.conversationId.slice(0,8)} mode=${relayMode} fields=${fieldCount} prompt="${promptText.slice(0,60)}"`);
     io.emit('relay_question', { question });
     res.json({ question });
   });
 
   app.post('/api/relay-question/:id/answer', auth, (req, res) => {
     const id = String(req.params.id || '').trim();
-    const { answer, sdk_session_id, continuation_id, continuation_question_id } = req.body;
-    const text = String(answer || '').trim();
+    const { answer, structuredAnswer, sdk_session_id, continuation_id, continuation_question_id } = req.body;
     const sdkSessionId = normalizeId(sdk_session_id);
     const continuationId = normalizeId(continuation_id);
     const continuationQuestionId = normalizeId(continuation_question_id);
-    if (!text) return res.status(400).json({ error: 'Empty answer' });
 
     const row = stmts.getQuestion.get(id);
     if (!row) return res.status(404).json({ error: 'Not found' });
     if (row.status !== 'pending') return res.status(409).json({ error: `Question already ${row.status}` });
+
+    const schema = parseQuestionRequest(row.request_schema);
+    const hasSchema = schema && typeof schema === 'object' && schemaFields(schema).length > 0;
+
+    // Resolve a structured answer object when a schema is present. Accept either
+    // an explicit `structuredAnswer` object or, for single-field schemas, the
+    // flat `answer` string mapped onto the lone field (backward compatibility).
+    let structured = null;
+    let flatText = String(answer || '').trim();
+
+    if (hasSchema) {
+      let candidate = null;
+      if (structuredAnswer && typeof structuredAnswer === 'object' && !Array.isArray(structuredAnswer)) {
+        candidate = structuredAnswer;
+      } else if (flatText) {
+        candidate = flatAnswerToStructured(schema, flatText);
+      }
+      if (!candidate) {
+        return res.status(400).json({ error: 'Structured answer required', schema });
+      }
+      const validation = validateStructuredAnswer(schema, candidate);
+      if (!validation.ok) {
+        return res.status(400).json({ error: 'Invalid structured answer', fields: validation.errors });
+      }
+      structured = validation.value;
+      flatText = summarizeStructuredAnswer(schema, structured) || flatText;
+    } else if (!flatText) {
+      return res.status(400).json({ error: 'Empty answer' });
+    }
 
     const result = askUserRoutingService.routeAnswer({
       question_id: id,
       sdk_session_id: sdkSessionId,
       continuation_id: continuationId,
       continuation_question_id: continuationQuestionId,
-      answer: text,
+      answer: flatText,
+      structured_answer: structured ? JSON.stringify(structured) : null,
     });
     if (!result.ok) {
       console.warn(
@@ -213,7 +257,7 @@ export function registerAskUserRoutes(app, deps) {
     }
 
     const question = formatQuestionRow(stmts.getQuestion.get(id));
-    console.log(`[${ts()}] QUESTION  ${id.slice(0,8)} answered len=${text.length}`);
+    console.log(`[${ts()}] QUESTION  ${id.slice(0,8)} answered ${structured ? `fields=${Object.keys(structured).length}` : `len=${flatText.length}`}`);
     io.emit('relay_question_updated', { question });
     res.json({ ok: true, question });
   });

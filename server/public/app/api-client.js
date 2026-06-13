@@ -284,6 +284,26 @@ export async function answerRelayQuestion(questionId, answer, sdkSessionId = nul
   });
 }
 
+export async function answerRelayQuestionStructured(questionId, structuredAnswer, sdkSessionId = null) {
+  const id = String(questionId || '').trim();
+  if (!id) return { ok: false, error: 'Missing question id' };
+  const sessionId = String(sdkSessionId || '').trim();
+  try {
+    const response = await fetch(`${BASE}/api/relay-question/${encodeURIComponent(id)}/answer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify({ structuredAnswer, sdk_session_id: sessionId || undefined }),
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok) {
+      return { ok: false, error: data?.error || `Request failed (${response.status})`, fields: data?.fields || null };
+    }
+    return { ok: true, question: data?.question || null };
+  } catch (error) {
+    return { ok: false, error: error?.message || 'Network error' };
+  }
+}
+
 export async function loadRelayBoards(status = 'pending') {
   return apiFetch(`/api/relay-boards?status=${encodeURIComponent(status)}`);
 }

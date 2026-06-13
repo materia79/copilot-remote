@@ -21,6 +21,7 @@ export function createAskUserRoutingService(db, options = {}) {
   const hasContinuationColumns =
     relayQuestionColumns.has('continuation_id')
     && relayQuestionColumns.has('continuation_question_id');
+  const hasStructuredAnswerColumn = relayQuestionColumns.has('structured_answer');
 
   const findQuestion = db.prepare(`SELECT * FROM relay_questions WHERE id = ?`);
   const updateAnswered = db.prepare(`
@@ -28,6 +29,13 @@ export function createAskUserRoutingService(db, options = {}) {
     SET status = 'answered', answer = ?, answered_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
     WHERE id = ?
   `);
+  const updateAnsweredStructured = hasStructuredAnswerColumn
+    ? db.prepare(`
+      UPDATE relay_questions
+      SET status = 'answered', answer = ?, structured_answer = ?, answered_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      WHERE id = ?
+    `)
+    : null;
   const findBySdkSessionAndMessage = db.prepare(`
     SELECT * FROM relay_questions
     WHERE sdk_session_id = ? AND message_id = ?
@@ -44,7 +52,7 @@ export function createAskUserRoutingService(db, options = {}) {
     `)
     : null;
 
-  function routeAnswer({ question_id, sdk_session_id, answer, conversation_id, continuation_id, continuation_question_id }) {
+  function routeAnswer({ question_id, sdk_session_id, answer, structured_answer, conversation_id, continuation_id, continuation_question_id }) {
     const row = findQuestion.get(question_id);
     if (!row) return { ok: false, error: 'Question not found' };
 
@@ -83,7 +91,11 @@ export function createAskUserRoutingService(db, options = {}) {
       }
     }
 
-    updateAnswered.run(answer, question_id);
+    if (structured_answer && updateAnsweredStructured) {
+      updateAnsweredStructured.run(answer, structured_answer, question_id);
+    } else {
+      updateAnswered.run(answer, question_id);
+    }
     return { ok: true };
   }
 

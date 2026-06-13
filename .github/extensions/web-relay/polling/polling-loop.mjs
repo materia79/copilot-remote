@@ -13,6 +13,7 @@ import {
   shouldForceFallbackQuestionBridge,
 } from "./question-text.mjs";
 import { answerCliPromptViaTmux, declineCliPromptViaTmux } from "../utils/tmux-input-bridge.mjs";
+import { extractRequestedSchema, schemaFields } from "../../../../shared/question-schema.mjs";
 
 function isImageAttachment(att) {
   const type = String(att?.type || "").toLowerCase();
@@ -392,12 +393,16 @@ export function createPollingLoop({
       if (question.status === "answered") {
         return {
           answer: String(question.answer || "").trim(),
+          structuredAnswer: question.structuredAnswer && typeof question.structuredAnswer === "object"
+            ? question.structuredAnswer
+            : null,
           timedOut: false,
         };
       }
       if (question.status === "timed_out" || question.status === "cancelled") {
         return {
           answer: QUESTION_TIMEOUT_CONTINUATION_TEXT,
+          structuredAnswer: null,
           timedOut: true,
         };
       }
@@ -405,6 +410,7 @@ export function createPollingLoop({
         await api("POST", `/api/relay-question/${questionId}/timeout`, {}).catch(() => {});
         return {
           answer: QUESTION_TIMEOUT_CONTINUATION_TEXT,
+          structuredAnswer: null,
           timedOut: true,
         };
       }
@@ -474,6 +480,7 @@ export function createPollingLoop({
     const choices = extractQuestionChoices(request);
     if (!prompt) return null;
     const activeSession = getActiveSession();
+    const requestedSchema = extractRequestedSchema(request);
 
     const created = await api("POST", "/api/relay-question", {
       queueId: message.id,
@@ -483,6 +490,7 @@ export function createPollingLoop({
       prompt,
       choices,
       allowFreeform: choices.length === 0,
+      requestedSchema: requestedSchema || undefined,
       sdk_session_id: activeSession?.sdkSessionId || undefined,
       timeout_ms: sendTimeout,
       context: {
@@ -500,7 +508,7 @@ export function createPollingLoop({
 
     dbg("ask_user autopilot bridge: relay question created", questionId, "for msgId", message.id, "prompt=", prompt, "choices=", String(choices.length));
     const result = await waitForRelayQuestionAnswer(questionId, sendTimeout);
-    return { questionId, prompt, choices, answer: result.answer, timedOut: result.timedOut };
+    return { questionId, prompt, choices, answer: result.answer, structuredAnswer: result.structuredAnswer || null, timedOut: result.timedOut };
   }
 
   async function continueAfterAskUserAnswer(message, request, answer, timedOut = false) {
@@ -793,7 +801,9 @@ export function createPollingLoop({
                 // Create relay question for web UI
                 const prompt = extractQuestionPrompt?.(pendingReq) || "Clarification needed";
                 const choices = extractQuestionChoices?.(pendingReq) || [];
-                dbg("ask_user tmux bridge: extracted prompt=", prompt?.slice(0, 100), "choices=", JSON.stringify(choices));
+                const requestedSchema = extractRequestedSchema(pendingReq);
+                const fields = requestedSchema ? schemaFields(requestedSchema) : [];
+                dbg("ask_user tmux bridge: extracted prompt=", prompt?.slice(0, 100), "choices=", JSON.stringify(choices), "fields=", String(fields.length));
                 const created = await api("POST", "/api/relay-question", {
                   queueId: message.id,
                   messageId: message.id,
@@ -802,6 +812,7 @@ export function createPollingLoop({
                   prompt,
                   choices,
                   allowFreeform: true,
+                  requestedSchema: requestedSchema || undefined,
                   timeout_ms: sendTimeout,
                   context: {
                     source: "tmux-bridge",
@@ -820,10 +831,10 @@ export function createPollingLoop({
                   }).catch(() => {});
 
                   // Wait for answer from web UI
-                  const { answer, timedOut } = await waitForRelayQuestionAnswer(questionId, sendTimeout);
+                  const { answer, structuredAnswer, timedOut } = await waitForRelayQuestionAnswer(questionId, sendTimeout);
                   dbg("ask_user tmux bridge: got answer", `questionId=${questionId}`, `answer="${String(answer || "").slice(0, 50)}"`, `timedOut=${timedOut}`);
 
-                  if (!timedOut && answer) {
+                  if (!timedOut && (answer || structuredAnswer)) {
                     // Send answer to CLI via tmux
                     const wasFreeform = !choices.some((c) => String(c || "").trim().toLowerCase() === String(answer || "").trim().toLowerCase());
                     const sent = await answerCliPromptViaTmux({
@@ -831,6 +842,8 @@ export function createPollingLoop({
                       answer,
                       choices,
                       wasFreeform,
+                      structuredAnswer: structuredAnswer || null,
+                      fields: fields.length ? fields : null,
                       dbg,
                     });
                     if (sent) {

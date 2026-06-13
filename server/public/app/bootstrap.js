@@ -84,7 +84,7 @@ import {
   updatePendingQuestionBanner,
   getPendingQuestionCountsByConversation,
 } from './ask-user-view.js';
-import { openPendingQuestionFromBanner, submitRelayQuestionChoice, submitRelayQuestionAnswer, onRelayQuestionDraftInput, handleRelayQuestionKey } from './ask-user-view.js';
+import { openPendingQuestionFromBanner, submitRelayQuestionChoice, submitRelayQuestionAnswer, submitRelayStructuredAnswer, onRelayQuestionDraftInput, handleRelayQuestionKey } from './ask-user-view.js';
 import { loadRelayBoards, renderRelayBoards, upsertRelayBoard, submitRelayBoardAction } from './relay-board-view.js';
 import { showThinking, removeThinking, renderThinkingActivities, appendThinkingActivity, appendThinkingThought, applyRelayStreamEvent, clearRelayStreamStateForMessage, restoreInFlightThinking, applyConversationTurnStatus, renderMessages, appendMessage, compactCurrentConversation, sendMessage, handleKey, getConversationLoadedMessageCount, loadOlderConversationMessages, syncComposerControlState, getRenderedConversationMessageFingerprints, initConversationHistoryLazyLoading,
 } from './conversation-view.js';
@@ -2970,6 +2970,7 @@ window.setRepoCurrentPath = setRepoCurrentPath;
 window.toggleEmojiPicker = toggleEmojiPicker;
 window.submitRelayQuestionChoice = submitRelayQuestionChoice;
 window.submitRelayQuestionAnswer = submitRelayQuestionAnswer;
+window.submitRelayStructuredAnswer = submitRelayStructuredAnswer;
 window.onRelayQuestionDraftInput = onRelayQuestionDraftInput;
 window.handleRelayQuestionKey = handleRelayQuestionKey;
 window.openPendingQuestionFromBanner = openPendingQuestionFromBanner;
