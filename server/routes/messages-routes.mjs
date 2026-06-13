@@ -1296,6 +1296,22 @@ export function registerMessagesRoutes(app, deps) {
       AND status = 'processing'
     ORDER BY COALESCE(processing_at, timestamp) DESC, timestamp DESC
   `);
+  const findAllNonProcessingOwnedBySession = db.prepare(`
+    SELECT id, conversation_id, status
+    FROM queue
+    WHERE owner_sdk_session_id = ?
+      AND status IN ('pending', 'parked')
+    ORDER BY timestamp ASC
+  `);
+  const clearNonProcessingOwnedBySession = db.prepare(`
+    UPDATE queue
+    SET owner_sdk_session_id = NULL,
+        owner_assigned_at = NULL,
+        owner_lease_expires_at = NULL,
+        owner_last_claimed_at = NULL
+    WHERE owner_sdk_session_id = ?
+      AND status IN ('pending', 'parked')
+  `);
   const listRecoverableProcessingOwnedBySession = db.prepare(`
     SELECT *
     FROM queue
@@ -1640,6 +1656,7 @@ export function registerMessagesRoutes(app, deps) {
     // Drain ALL owned processing rows, not just first
     const queueRows = findAllProcessingOwnedBySession.all(sdkSessionId) || [];
     const failedMessageIds = [];
+    let releasedOwnedCount = 0;
 
     if (queueRows.length > 0) {
       for (const queueRow of queueRows) {
@@ -1683,6 +1700,12 @@ export function registerMessagesRoutes(app, deps) {
       }
     }
 
+    const nonProcessingOwnedRows = findAllNonProcessingOwnedBySession.all(sdkSessionId) || [];
+    if (nonProcessingOwnedRows.length > 0) {
+      const released = clearNonProcessingOwnedBySession.run(sdkSessionId);
+      releasedOwnedCount = Number(released?.changes || 0);
+    }
+
     const conversationId = queueRows[0]?.conversation_id || currentWorker?.conversationId || null;
 
     io.emit('session_worker_killed', {
@@ -1692,6 +1715,7 @@ export function registerMessagesRoutes(app, deps) {
       remainingPids,
       processStatus,
       failedMessageIds,
+      releasedOwnedCount,
     });
 
     return res.json({
@@ -1701,6 +1725,7 @@ export function registerMessagesRoutes(app, deps) {
       remainingPids,
       processStatus,
       failedMessageIds,
+      releasedOwnedCount,
     });
   });
 
