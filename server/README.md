@@ -183,6 +183,10 @@ where supported (with standalone fallback), and hides install/fullscreen header 
 When opened in a regular browser tab, the in-app **Install** button remains available
 in the chat header (shown as `⬇` on small screens).
 
+You can rename the installed app label from **⚙️ Settings → Install app name**.
+The new label is stored per browser and used for future installs; some platforms may
+require reinstalling the app before the launcher label updates.
+
 If you host the relay behind a subpath, set `remotePath` in `server/config.json` to that public path prefix and open the URL with a trailing slash so the PWA scope matches correctly for install prompts.
 
 ## Model Selection
