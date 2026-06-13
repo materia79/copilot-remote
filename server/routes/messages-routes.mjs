@@ -677,6 +677,7 @@ export async function dequeuePendingMessageForWorkerLoop({
   const supervisor = sessionWorkerSupervisor || null;
 
   if (routingWithWorker && typeof supervisor?.ensureWorker === 'function') {
+    supervisor?.clearRestartSchedule?.(requesterSid, { resetKilledMarker: true });
     const ensureResult = await supervisor.ensureWorker(requesterSid);
     if (!ensureResult?.ok) {
       const fallbackRestart = maybeTriggerWorkerFallbackRestart({
@@ -785,6 +786,52 @@ export async function dequeuePendingMessageForWorkerLoop({
   };
 }
 
+export function buildDequeuedRelayMessage({
+  msg,
+  stmts,
+  parseAttachments = () => [],
+  hydrateAttachment = (value) => value,
+  ensureRuntimeSessionBinding,
+  configuredConversationSessionMode,
+  normalizeRelayMode,
+  defaultRelayMode,
+  defaultModel,
+} = {}) {
+  if (!msg) return null;
+  const attachments = parseAttachments(msg.attachments).map(hydrateAttachment).filter(Boolean);
+  let runtimeSession = msg.runtime_session_id ? stmts.getRuntimeSessionById.get(msg.runtime_session_id) : null;
+  if (!runtimeSession) {
+    const now = new Date().toISOString();
+    runtimeSession = ensureRuntimeSessionBinding(
+      msg.conversation_id,
+      String(msg.model || '').trim() || null,
+      now,
+    );
+    if (runtimeSession?.id && runtimeSession.id !== msg.runtime_session_id) {
+      stmts.setQueueRuntimeSession.run(runtimeSession.id, msg.id);
+    }
+  }
+  return {
+    id: msg.id,
+    conversationId: msg.conversation_id,
+    runtimeSessionId: runtimeSession?.id || null,
+    isNewConversation: msg.is_new_conversation === 1,
+    model: String(msg.model || '').trim() || defaultModel,
+    modelVariantId: String(msg.model_variant_id || '').trim() || String(msg.model || '').trim() || null,
+    reasoningEffort: String(msg.reasoning_effort || '').trim() || null,
+    relayMode: normalizeRelayMode(msg.relay_mode) || defaultRelayMode,
+    text: msg.text,
+    attachments,
+    conversationSessionMode: configuredConversationSessionMode,
+    status: msg.status,
+    timestamp: msg.timestamp,
+    processingAt: msg.processing_at,
+    ownerSessionId: String(msg.owner_sdk_session_id || '').trim() || null,
+    ownerAssignedAt: msg.owner_assigned_at || null,
+    ownerLeaseExpiresAt: msg.owner_lease_expires_at || null,
+  };
+}
+
 function serveFileWithRangeSupport(req, res, filePath, meta, { safeName, cacheDelete = null } = {}) {
   const fileSize = meta.size;
   const name = safeName || path.basename(filePath).replace(/"/g, '');
@@ -862,6 +909,9 @@ export function registerMessagesRoutes(app, deps) {
     normalizeDriveAbsolutePath,
     driveRootFromAbsolutePath,
     toDriveWebPath,
+    normalizeLinuxAbsolutePath,
+    fetchLinuxDirectoryEntries,
+    mapLinuxDirectoryEntry,
     readWorkspaceFileMeta,
     resolveWorkspaceFilePath,
     normalizeWorkspaceRelativePath,
@@ -1166,8 +1216,8 @@ export function registerMessagesRoutes(app, deps) {
       } else {
         const existingWorker = sessionWorkerRegistry?.getWorker?.(ownerSessionId) || null;
         sessionWorkerRegistry?.upsertWorker?.({
-          ...existingWorker,
-          sessionId: ownerSessionId,
+          ...(existingWorker || {}),
+          sdkSessionId: ownerSessionId,
           status: 'ready',
         });
         sessionWorkerSupervisor?.markIdle?.(ownerSessionId, queueCounts?.().pendingCount || 0);
@@ -1246,6 +1296,22 @@ export function registerMessagesRoutes(app, deps) {
     WHERE owner_sdk_session_id = ?
       AND status = 'processing'
     ORDER BY COALESCE(processing_at, timestamp) DESC, timestamp DESC
+  `);
+  const findAllNonProcessingOwnedBySession = db.prepare(`
+    SELECT id, conversation_id, status
+    FROM queue
+    WHERE owner_sdk_session_id = ?
+      AND status IN ('pending', 'parked')
+    ORDER BY timestamp ASC
+  `);
+  const clearNonProcessingOwnedBySession = db.prepare(`
+    UPDATE queue
+    SET owner_sdk_session_id = NULL,
+        owner_assigned_at = NULL,
+        owner_lease_expires_at = NULL,
+        owner_last_claimed_at = NULL
+    WHERE owner_sdk_session_id = ?
+      AND status IN ('pending', 'parked')
   `);
   const listRecoverableProcessingOwnedBySession = db.prepare(`
     SELECT *
@@ -1532,9 +1598,14 @@ export function registerMessagesRoutes(app, deps) {
     const currentWorker = sessionWorkerRegistry?.getWorker?.(sdkSessionId) || null;
 
     // Collect ALL matching PIDs (not just first)
-    const discoveredProcesses = sessionWorkerProcessInspector?.findProcessesForSession?.(sdkSessionId)
-      || sessionWorkerProcessInspector?.findWindowsProcessesForSession?.(sdkSessionId)
-      || [];
+    const discoveredProcesses = process.platform === 'win32'
+      ? (
+          sessionWorkerProcessInspector?.findWindowsProcessTreeForSession?.(sdkSessionId)
+          || sessionWorkerProcessInspector?.findWindowsProcessesForSession?.(sdkSessionId)
+          || sessionWorkerProcessInspector?.findProcessesForSession?.(sdkSessionId)
+          || []
+        )
+      : (sessionWorkerProcessInspector?.findProcessesForSession?.(sdkSessionId) || []);
     const allPids = [...new Set([
       ...discoveredProcesses.map((p) => (p.processId ? Number(p.processId) : null)).filter(Boolean),
       currentWorker?.pid ? Number(currentWorker.pid) : null,
@@ -1580,17 +1651,23 @@ export function registerMessagesRoutes(app, deps) {
     // Post-kill verification — synchronous re-scan to confirm processes are gone
     const remainingPids = allPids.length
       ? (process.platform === 'win32'
-          ? (sessionWorkerProcessInspector?.findWindowsProcessesForSession?.(sdkSessionId) || []).map((p) => p.processId).filter(Boolean)
+          ? (
+              sessionWorkerProcessInspector?.findWindowsProcessTreeForSession?.(sdkSessionId)
+              || sessionWorkerProcessInspector?.findWindowsProcessesForSession?.(sdkSessionId)
+              || []
+            ).map((p) => p.processId).filter(Boolean)
           : ((sessionWorkerProcessInspector?.findProcessesForSession?.(sdkSessionId) || []).map((p) => p.processId).filter(Boolean)))
       : [];
 
     sessionWorkerRegistry?.removeWorker?.(sdkSessionId);
     sessionWorkerSupervisor?.clearRestartSchedule?.(sdkSessionId);
     sessionWorkerSupervisor?.resetHealth?.(sdkSessionId, { clearFailureCount: false });
+    sessionWorkerSupervisor?.markKilled?.(sdkSessionId);
 
     // Drain ALL owned processing rows, not just first
     const queueRows = findAllProcessingOwnedBySession.all(sdkSessionId) || [];
     const failedMessageIds = [];
+    let releasedOwnedCount = 0;
 
     if (queueRows.length > 0) {
       for (const queueRow of queueRows) {
@@ -1617,6 +1694,7 @@ export function registerMessagesRoutes(app, deps) {
           model: queueRow.model || DEFAULT_MODEL,
           responseText: failureText,
           failureRecord,
+          markWorkerError: false,
         });
 
         if (failed?.responseId) failedMessageIds.push(failed.responseId);
@@ -1634,6 +1712,17 @@ export function registerMessagesRoutes(app, deps) {
       }
     }
 
+    const nonProcessingOwnedRows = findAllNonProcessingOwnedBySession.all(sdkSessionId) || [];
+    if (nonProcessingOwnedRows.length > 0) {
+      const released = clearNonProcessingOwnedBySession.run(sdkSessionId);
+      releasedOwnedCount = Number(released?.changes || 0);
+    }
+
+    sessionWorkerRegistry?.removeWorker?.(sdkSessionId);
+    sessionWorkerSupervisor?.clearRestartSchedule?.(sdkSessionId);
+    sessionWorkerSupervisor?.resetHealth?.(sdkSessionId, { clearFailureCount: false });
+    sessionWorkerSupervisor?.markKilled?.(sdkSessionId);
+
     const conversationId = queueRows[0]?.conversation_id || currentWorker?.conversationId || null;
 
     io.emit('session_worker_killed', {
@@ -1643,6 +1732,7 @@ export function registerMessagesRoutes(app, deps) {
       remainingPids,
       processStatus,
       failedMessageIds,
+      releasedOwnedCount,
     });
 
     return res.json({
@@ -1652,6 +1742,7 @@ export function registerMessagesRoutes(app, deps) {
       remainingPids,
       processStatus,
       failedMessageIds,
+      releasedOwnedCount,
     });
   });
 
@@ -2010,6 +2101,31 @@ export function registerMessagesRoutes(app, deps) {
   });
 
   app.get('/api/drives/roots', auth, (req, res) => {
+    if (process.platform !== 'win32') {
+      return fetchLinuxDirectoryEntries('/', { includeHidden: false }, (listErr, entries) => {
+        if (listErr) return res.status(500).json({ error: listErr.message || 'Failed to enumerate Linux root' });
+        const children = entries.map(mapLinuxDirectoryEntry).filter((entry) => !!entry?.path);
+        const root = {
+          path: '/',
+          name: '/',
+          type: 'dir',
+          children,
+          childrenLoaded: true,
+          lazy: false,
+        };
+        res.setHeader('Cache-Control', 'no-store');
+        return res.json({
+          ok: true,
+          root,
+          nodeCount: children.length + 1,
+          truncated: false,
+          maxNodes: children.length + 1,
+          includeHidden: false,
+          includeHeavy: false,
+          rootName: 'Linux Root',
+        });
+      });
+    }
     fetchBrowsableDrives((err, drives) => {
       if (err) return res.status(500).json({ error: err.message || 'Failed to enumerate drives' });
       const root = {
@@ -2048,6 +2164,34 @@ export function registerMessagesRoutes(app, deps) {
   app.get('/api/drives/list', auth, (req, res) => {
     const includeHidden = parseBooleanQueryFlag(req.query.includeHidden, false);
     const requestedPath = String(req.query.path || '').trim();
+
+    if (process.platform !== 'win32') {
+      const absolutePath = normalizeLinuxAbsolutePath(requestedPath);
+      if (!absolutePath) return res.status(400).json({ error: 'Invalid Linux path' });
+
+      let stat = null;
+      try {
+        stat = fs.statSync(absolutePath);
+      } catch (error) {
+        if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return res.status(404).json({ error: 'Path not found' });
+        return res.status(500).json({ error: error?.message || 'Failed to read path metadata' });
+      }
+      if (!stat.isDirectory()) return res.status(400).json({ error: 'Path must reference a directory' });
+
+      return fetchLinuxDirectoryEntries(absolutePath, { includeHidden }, (listErr, entries) => {
+        if (listErr) return res.status(500).json({ error: listErr.message || 'Failed to list directory' });
+        const children = entries.map(mapLinuxDirectoryEntry).filter((entry) => !!entry?.path);
+        const node = {
+          path: absolutePath,
+          name: absolutePath === '/' ? '/' : (path.basename(absolutePath) || absolutePath),
+          type: 'dir',
+          children,
+          childrenLoaded: true,
+        };
+        res.setHeader('Cache-Control', 'no-store');
+        return res.json({ ok: true, node, includeHidden });
+      });
+    }
 
     fetchBrowsableDrives((drivesErr, drives) => {
       if (drivesErr) return res.status(500).json({ error: drivesErr.message || 'Failed to enumerate drives' });
@@ -2099,6 +2243,27 @@ export function registerMessagesRoutes(app, deps) {
 
   app.get('/api/drives/file', auth, (req, res) => {
     const requestedPath = String(req.query.path || '').trim();
+
+    if (process.platform !== 'win32') {
+      const filePath = normalizeLinuxAbsolutePath(requestedPath);
+      if (!filePath) return res.status(400).json({ error: 'Invalid Linux file path' });
+
+      let meta = null;
+      try {
+        meta = readWorkspaceFileMeta(filePath);
+      } catch (error) {
+        return res.status(500).json({ error: error?.message || 'Failed to read file metadata' });
+      }
+
+      if (!meta || meta.kind === 'missing') return res.status(404).json({ error: 'File not found' });
+      if (meta.kind !== 'file') return res.status(400).json({ error: 'Path must reference a file' });
+
+      return serveFileWithRangeSupport(req, res, filePath, meta, {
+        safeName: path.basename(filePath).replace(/"/g, ''),
+        cacheDelete: (p) => workspaceFileMetaCache.delete(p),
+      });
+    }
+
     fetchBrowsableDrives((drivesErr, drives) => {
       if (drivesErr) return res.status(500).json({ error: drivesErr.message || 'Failed to enumerate drives' });
       const allowedRoots = new Set(drives.map((drive) => drive.rootAbsolute.toUpperCase()));
@@ -2127,6 +2292,74 @@ export function registerMessagesRoutes(app, deps) {
 
   app.get('/api/drives/files-preview', auth, (req, res) => {
     const requestedPath = String(req.query.path || '').trim();
+
+    if (process.platform !== 'win32') {
+      const filePath = normalizeLinuxAbsolutePath(requestedPath);
+      if (!filePath) return res.status(400).json({ error: 'Invalid Linux file path' });
+
+      let meta = null;
+      try {
+        meta = readWorkspaceFileMeta(filePath);
+      } catch (error) {
+        return res.status(500).json({ error: error?.message || 'Failed to read file metadata' });
+      }
+
+      if (!meta || meta.kind === 'missing') return res.status(404).json({ error: 'File not found' });
+      if (meta.kind !== 'file') return res.status(400).json({ error: 'Path must reference a file' });
+
+      const ext = path.extname(filePath).toLowerCase();
+      const size = Number(meta.size || 0);
+      const contentType = meta.contentType || workspaceContentType(filePath);
+      const language = previewLanguageForWorkspaceFile(filePath);
+
+      let previewBuffer = Buffer.alloc(0);
+      try {
+        previewBuffer = readWorkspaceFilePreviewBuffer(filePath, size);
+      } catch (error) {
+        workspaceFileMetaCache.delete(filePath);
+        if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') {
+          return res.status(404).json({ error: 'File not found' });
+        }
+        return res.status(500).json({ error: 'Failed to read file' });
+      }
+
+      const truncated = size > MAX_WORKSPACE_PREVIEW_BYTES;
+      const contentBuffer = truncated
+        ? previewBuffer.subarray(0, Math.min(previewBuffer.length, MAX_WORKSPACE_PREVIEW_BYTES))
+        : previewBuffer;
+
+      const likelyBinaryType = contentType === 'application/pdf' || contentType === 'application/octet-stream';
+      const likelyBinaryBytes = isLikelyBinaryPreviewBuffer(contentBuffer);
+      const likelyTextType = isLikelyTextContentType(contentType);
+
+      let kind = workspacePreviewKindForMeta(ext, contentType);
+      if ((kind === 'markdown' || kind === 'code' || kind === 'text') && likelyBinaryType) {
+        kind = 'binary';
+      } else if ((kind === 'markdown' || kind === 'code' || kind === 'text') && (!likelyTextType && likelyBinaryBytes)) {
+        kind = 'binary';
+      }
+
+      const payload = {
+        ok: true,
+        path: filePath,
+        name: path.basename(filePath),
+        kind,
+        language,
+        contentType,
+        size,
+        truncated,
+        previewBytes: contentBuffer.length,
+        rawUrl: `${remotePath}/api/drives/file?path=${encodeURIComponent(filePath)}`,
+      };
+
+      if (kind !== 'binary' && kind !== 'image' && kind !== 'video') {
+        payload.content = contentBuffer.toString('utf8');
+      }
+
+      res.setHeader('Cache-Control', 'no-store');
+      return res.json(payload);
+    }
+
     fetchBrowsableDrives((drivesErr, drives) => {
       if (drivesErr) return res.status(500).json({ error: drivesErr.message || 'Failed to enumerate drives' });
       const allowedRoots = new Set(drives.map((drive) => drive.rootAbsolute.toUpperCase()));
@@ -2402,6 +2635,7 @@ export function registerMessagesRoutes(app, deps) {
         const activeOwnerSessionId = normalizeSessionWorkerId(relayBridgeOwnerService?.getOwner?.()?.sessionId);
         const shouldPrimeWorker = ownerSessionId !== activeOwnerSessionId;
         if (shouldPrimeWorker && typeof sessionWorkerSupervisor?.ensureWorker === 'function') {
+          sessionWorkerSupervisor?.clearRestartSchedule?.(ownerSessionId, { resetKilledMarker: true });
           void sessionWorkerSupervisor.ensureWorker(ownerSessionId).then((result) => {
             if (!result?.ok) {
               emitSessionWorkerTelemetry('worker.prime.failed', {
@@ -2554,7 +2788,23 @@ export function registerMessagesRoutes(app, deps) {
         restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
       });
     }
+    if (sessionWorkerRoutingEnabled && requesterSessionId) {
+      sessionWorkerSupervisor?.noteSessionHeartbeat?.(requesterSessionId);
+    }
     if (runtimeState.relayPaused) return res.json({ message: null, paused: true });
+    if (runtimeState.tunnelState?.blocking) {
+      return res.json({
+        message: null,
+        paused: true,
+        reason: 'ssh_tunnel_required',
+        sshTunnel: {
+          mode: runtimeState.tunnelState?.mode ?? null,
+          required: runtimeState.tunnelState?.required ?? false,
+          connected: runtimeState.tunnelState?.connected ?? false,
+          lastError: runtimeState.tunnelState?.lastError ?? null,
+        },
+      });
+    }
     const counts = queueCounts();
     if (sessionWorkerRoutingEnabled && requesterSessionId) {
       const existingRequesterWorker = sessionWorkerRegistry?.getWorker?.(requesterSessionId) || null;
@@ -2577,7 +2827,6 @@ export function registerMessagesRoutes(app, deps) {
           queueDepth: Math.max(0, Number(counts.pendingCount || 0)),
         });
       }
-      sessionWorkerSupervisor?.noteSessionHeartbeat?.(requesterSessionId);
     }
     const restartProbe = relayRestartOrchestrator?.onDequeueProbe({
       processingCount: counts.processingCount,
@@ -2755,6 +3004,7 @@ export function registerMessagesRoutes(app, deps) {
       ) {
         strandedPrimeCooldownBySession.set(strandedSessionId, nowMs);
         try {
+          sessionWorkerSupervisor?.clearRestartSchedule?.(strandedSessionId, { resetKilledMarker: true });
           const primeResult = await sessionWorkerSupervisor.ensureWorker(strandedSessionId);
           const shouldTakeOver = shouldTakeOverStrandedPendingMessage({
             strandedRow: strandedOwner,
@@ -2868,41 +3118,17 @@ export function registerMessagesRoutes(app, deps) {
       }
     }
     if (msg) {
-      const attachments = parseAttachments(msg.attachments).map(hydrateAttachment).filter(Boolean);
-      let runtimeSession = msg.runtime_session_id
-        ? stmts.getRuntimeSessionById.get(msg.runtime_session_id)
-        : null;
-      if (!runtimeSession) {
-        const now = new Date().toISOString();
-        runtimeSession = ensureRuntimeSessionBinding(
-          msg.conversation_id,
-          String(msg.model || '').trim() || null,
-          now,
-        );
-        if (runtimeSession?.id && runtimeSession.id !== msg.runtime_session_id) {
-          stmts.setQueueRuntimeSession.run(runtimeSession.id, msg.id);
-        }
-      }
-      // Normalise snake_case → camelCase for the relay
-      const out = {
-        id:                msg.id,
-        conversationId:    msg.conversation_id,
-        runtimeSessionId:  runtimeSession?.id || null,
-        isNewConversation: msg.is_new_conversation === 1,
-        model:             String(msg.model || '').trim() || DEFAULT_MODEL,
-        modelVariantId:    String(msg.model_variant_id || '').trim() || String(msg.model || '').trim() || null,
-        reasoningEffort:   String(msg.reasoning_effort || '').trim() || null,
-        relayMode:         normalizeRelayMode(msg.relay_mode) || DEFAULT_RELAY_MODE,
-        text:              msg.text,
-        attachments,
-        conversationSessionMode: configuredConversationSessionMode,
-        status:            msg.status,
-        timestamp:         msg.timestamp,
-        processingAt:      msg.processing_at,
-        ownerSessionId:    String(msg.owner_sdk_session_id || '').trim() || null,
-        ownerAssignedAt:   msg.owner_assigned_at || null,
-        ownerLeaseExpiresAt: msg.owner_lease_expires_at || null,
-      };
+      const out = buildDequeuedRelayMessage({
+        msg,
+        stmts,
+        parseAttachments,
+        hydrateAttachment,
+        ensureRuntimeSessionBinding,
+        configuredConversationSessionMode,
+        normalizeRelayMode,
+        defaultRelayMode: DEFAULT_RELAY_MODE,
+        defaultModel: DEFAULT_MODEL,
+      });
       if (sessionWorkerRoutingEnabled && out.ownerSessionId) {
         const existingWorker = sessionWorkerRegistry?.getWorker?.(out.ownerSessionId) || null;
         sessionWorkerRegistry?.upsertWorker?.({
@@ -2928,7 +3154,7 @@ export function registerMessagesRoutes(app, deps) {
           queue: counts,
         });
       }
-      console.log(`[${ts()}] DEQUEUED  ${out.id.slice(0,8)} conv=${out.conversationId.slice(0,8)} rs=${String(out.runtimeSessionId || 'none').slice(0,8)} owner=${String(out.ownerSessionId || 'none').slice(0,8)} model=${out.model}${out.reasoningEffort ? ` effort=${out.reasoningEffort}` : ''} mode=${out.relayMode} text="${out.text.slice(0,60)}"${attachments.length ? ` attachments=${attachments.length}` : ''}`);
+      console.log(`[${ts()}] DEQUEUED  ${out.id.slice(0,8)} conv=${out.conversationId.slice(0,8)} rs=${String(out.runtimeSessionId || 'none').slice(0,8)} owner=${String(out.ownerSessionId || 'none').slice(0,8)} model=${out.model}${out.reasoningEffort ? ` effort=${out.reasoningEffort}` : ''} mode=${out.relayMode} text="${out.text.slice(0,60)}"${out.attachments.length ? ` attachments=${out.attachments.length}` : ''}`);
       io.emit('message_status', { messageId: out.id, conversationId: out.conversationId, status: 'processing' });
       res.json({
         message: out,

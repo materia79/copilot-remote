@@ -12,6 +12,8 @@ import {
   parseQuestionFromText,
   shouldForceFallbackQuestionBridge,
 } from "./question-text.mjs";
+import { answerCliPromptViaTmux, declineCliPromptViaTmux } from "../utils/tmux-input-bridge.mjs";
+import { extractRequestedSchema, schemaFields } from "../../../../shared/question-schema.mjs";
 
 function isImageAttachment(att) {
   const type = String(att?.type || "").toLowerCase();
@@ -372,9 +374,11 @@ export function createPollingLoop({
   getPendingAskUserRequest,
   setPendingAskUserRequest,
   clearRelayScopeState,
+  shouldFetchPending = () => true,
   extractQuestionPrompt,
   extractQuestionChoices,
   handleControl,
+  getSessionId = () => null,
 }) {
   let stopRequested = false;
   let lastAbortControlCheckAt = 0;
@@ -389,12 +393,16 @@ export function createPollingLoop({
       if (question.status === "answered") {
         return {
           answer: String(question.answer || "").trim(),
+          structuredAnswer: question.structuredAnswer && typeof question.structuredAnswer === "object"
+            ? question.structuredAnswer
+            : null,
           timedOut: false,
         };
       }
       if (question.status === "timed_out" || question.status === "cancelled") {
         return {
           answer: QUESTION_TIMEOUT_CONTINUATION_TEXT,
+          structuredAnswer: null,
           timedOut: true,
         };
       }
@@ -402,6 +410,7 @@ export function createPollingLoop({
         await api("POST", `/api/relay-question/${questionId}/timeout`, {}).catch(() => {});
         return {
           answer: QUESTION_TIMEOUT_CONTINUATION_TEXT,
+          structuredAnswer: null,
           timedOut: true,
         };
       }
@@ -471,6 +480,7 @@ export function createPollingLoop({
     const choices = extractQuestionChoices(request);
     if (!prompt) return null;
     const activeSession = getActiveSession();
+    const requestedSchema = extractRequestedSchema(request);
 
     const created = await api("POST", "/api/relay-question", {
       queueId: message.id,
@@ -480,6 +490,7 @@ export function createPollingLoop({
       prompt,
       choices,
       allowFreeform: choices.length === 0,
+      requestedSchema: requestedSchema || undefined,
       sdk_session_id: activeSession?.sdkSessionId || undefined,
       timeout_ms: sendTimeout,
       context: {
@@ -497,7 +508,7 @@ export function createPollingLoop({
 
     dbg("ask_user autopilot bridge: relay question created", questionId, "for msgId", message.id, "prompt=", prompt, "choices=", String(choices.length));
     const result = await waitForRelayQuestionAnswer(questionId, sendTimeout);
-    return { questionId, prompt, choices, answer: result.answer, timedOut: result.timedOut };
+    return { questionId, prompt, choices, answer: result.answer, structuredAnswer: result.structuredAnswer || null, timedOut: result.timedOut };
   }
 
   async function continueAfterAskUserAnswer(message, request, answer, timedOut = false) {
@@ -583,6 +594,476 @@ export function createPollingLoop({
     throw abortError;
   }
 
+  async function handlePendingPayload(pending, source = "poll") {
+    const pendingBlockedReason = String(pending?.routing?.blockedReason || "").trim();
+    const control = pending?.control || null;
+    if (control && typeof handleControl === "function") {
+      const handled = await handleControl(control, pending);
+      if (handled) return true;
+    }
+    const { message } = pending || {};
+
+    if (!message) return false;
+
+    activeTurnMessageId = String(message.id || "");
+    setActiveMsg(message);
+    if (typeof ensureSessionForConversation !== "function") {
+      dbg("session routing unavailable for msgId", message.id, "ensureSessionForConversation is not configured");
+      await session.log("⚠️ Session routing is unavailable for this turn", { level: "warn" });
+      await api("POST", "/api/response", {
+        messageId: message.id,
+        conversationId: message.conversationId,
+        text: "I couldn't process this turn because session routing is unavailable in the relay runtime. Please retry after the relay extension is fully initialized.",
+        model: await getCurrentModelId() || message.model || null,
+      }).catch(async () => {
+        await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
+      });
+      setActiveMsg(null);
+      return true;
+    }
+
+    const sessionResolution = await ensureSessionForConversation(message.conversationId, source);
+    if (sessionResolution && !sessionResolution.ok) {
+      const activeSdkSessionId = String(sessionResolution?.activeSessionId || "").trim();
+      const targetSdkSessionId = String(sessionResolution?.targetSessionId || "").trim();
+      const detail = String(sessionResolution?.message || "").trim();
+      const retryable = sessionResolution?.retryable === true;
+      dbg(
+        "session availability check failed for msgId",
+        message.id,
+        `reason=${sessionResolution.reason || "unknown"}`,
+        `active=${activeSdkSessionId || "none"}`,
+        `target=${targetSdkSessionId || "none"}`,
+      );
+      await session.log(
+        detail
+          ? `⚠️ Session unavailable for this turn: ${detail}`
+          : "⚠️ Session unavailable for this turn",
+        { level: "warn" },
+      );
+      if (retryable) {
+        await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
+      } else {
+        await api("POST", "/api/response", {
+          messageId: message.id,
+          conversationId: message.conversationId,
+          text: detail
+            ? `System note: I could not process this turn because the bound SDK session is unavailable (${detail}).`
+            : "System note: I could not process this turn because the bound SDK session is unavailable.",
+          model: await getCurrentModelId() || message.model || null,
+        }).catch(async () => {
+          await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
+        });
+      }
+      setActiveMsg(null);
+      return true;
+    }
+
+    const synced = await syncActiveSession?.(source, true);
+    if (!synced) {
+      dbg("session sync failed before processing msgId", message.id, "- requeueing");
+      await session.log("⚠️ Session sync failed before processing; re-queuing turn", { level: "warn" });
+      await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
+      setActiveMsg(null);
+      return true;
+    }
+    setWaitingForAI(true);
+    setRelayTurnActive(true, message);
+    setLastActivityText("");
+    setLastAskUserBridge(null);
+    setPendingAskUserRequest?.(null);
+
+    const label = message.isNewConversation ? "new conv" : "existing conv";
+    await session.log(`📨 [${label}] Web message (${message.model || "default"}${message.reasoningEffort ? `:${message.reasoningEffort}` : ""} / ${message.relayMode || "agent"}): "${String(message.text || "").slice(0, 80)}"`);
+    dbg("session.send: queuing for msgId", message.id, `source=${source}`, pendingBlockedReason ? `blocked=${pendingBlockedReason}` : "");
+    let lastStreamedSent = "";
+    const pushRelayStream = async (text, done = false) => {
+      const value = String(text || "");
+      if (!value && !done) return;
+      if (!done && value === lastStreamedSent) return;
+      const publish = await publishRelayStreamEvent({
+        api,
+        message,
+        text: value,
+        done,
+        dbg,
+      });
+      if (!done && publish.ok) lastStreamedSent = value;
+    };
+    let sendAndWaitStartedAtMs = 0;
+
+    try {
+      if (message.model) {
+        const modelSwitch = await setModelForMessage(message.model);
+        const activeModel = modelSwitch.after || modelSwitch.current || "unknown";
+        const switchText = modelSwitch.switched
+          ? `Model selected: requested=${message.model} active=${activeModel} via=${modelSwitch.via || "switchTo"}`
+          : `Model switch failed: requested=${message.model} active=${activeModel}${modelSwitch.error ? ` error=${modelSwitch.error}` : ""}`;
+        await publishModelSnapshot("model-switch", true);
+        await api("POST", "/api/activity", {
+          messageId: message.id,
+          conversationId: message.conversationId,
+          mode: message.relayMode || "agent",
+          text: switchText,
+        }).catch(() => {});
+        dbg("model switch", switchText);
+      }
+
+      const prompt = await buildPromptWithRelayContext(message);
+
+      const sdkAttachments = buildSdkAttachments(message.attachments);
+      const payload = sdkAttachments.length ? { prompt, attachments: sdkAttachments } : { prompt };
+      if (message.reasoningEffort && String(message.reasoningEffort || "").trim().toLowerCase() !== "none") {
+        payload.reasoningEffort = String(message.reasoningEffort || "").trim();
+      }
+      if (sdkAttachments.length) {
+        const imageCount = sdkAttachments.filter((att) => att.type === "blob").length;
+        const fileCount = sdkAttachments.filter((att) => att.type === "file").length;
+        dbg("sdk attachments prepared", `msgId=${message.id}`, `total=${sdkAttachments.length}`, `images=${imageCount}`, `files=${fileCount}`);
+        await api("POST", "/api/activity", {
+          messageId: message.id,
+          conversationId: message.conversationId,
+          mode: message.relayMode || "agent",
+          text: `Attached ${sdkAttachments.length} file(s) to SDK request${imageCount ? ` (images=${imageCount})` : ""}${fileCount ? ` (files=${fileCount})` : ""}.`,
+        }).catch(() => {});
+      }
+
+      let finalEvent;
+      let lastWorkerStatusCheckAt = 0;
+      const inspectActiveWorkerLiveness = async () => {
+        await checkActiveAbortControl(message, { force: true });
+        const ownerSessionId = String(message?.ownerSessionId || "").trim();
+        if (!ownerSessionId) return;
+        const now = Date.now();
+        if ((now - lastWorkerStatusCheckAt) < 10_000) return;
+        lastWorkerStatusCheckAt = now;
+
+        const status = await api("GET", "/api/status").catch(() => null);
+        const workers = Array.isArray(status?.sessionWorker?.workers) ? status.sessionWorker.workers : [];
+        const worker = workers.find((entry) => String(entry?.sdkSessionId || "").trim() === ownerSessionId) || null;
+        if (!worker) {
+          throw Object.assign(new Error("Active session worker is missing from relay status"), {
+            code: "RELAY_WORKER_UNAVAILABLE",
+            terminalFailure: buildWorkerLivenessTerminalFailure({
+              message,
+              ownerSessionId,
+              issueReason: "worker-missing",
+              detail: "No worker snapshot was reported for the owning session.",
+            }),
+          });
+        }
+
+        const degraded = String(worker?.uiState || "").trim().toLowerCase() === "yellow";
+        const degradedReason = String(worker?.degradedReason || "").trim().toLowerCase();
+        const routingMismatch = (
+          (worker?.conversationId && String(worker.conversationId).trim() !== String(message?.conversationId || "").trim())
+          || (message?.runtimeSessionId && worker?.runtimeSessionId && String(worker.runtimeSessionId).trim() !== String(message.runtimeSessionId).trim())
+        );
+        if (!degraded && !routingMismatch) return;
+
+        const issueReason = routingMismatch
+          ? "worker-routing-mismatch"
+          : (degradedReason || "worker-degraded");
+        const detail = routingMismatch
+          ? `workerConversation=${String(worker?.conversationId || "").trim() || "none"} workerRuntime=${String(worker?.runtimeSessionId || "").trim() || "none"}`
+          : String(worker?.lastError || worker?.degradedReason || "").trim();
+        throw Object.assign(new Error(`Active session worker became unavailable (${issueReason})`), {
+          code: "RELAY_WORKER_UNAVAILABLE",
+          terminalFailure: buildWorkerLivenessTerminalFailure({
+            message,
+            ownerSessionId,
+            issueReason,
+            detail,
+          }),
+        });
+      };
+      const sendWithoutStreaming = async (sendPayload) => {
+        const turnPromise = Promise.resolve().then(() => sendAndWaitWithHardTimeout(sendPayload, sendTimeout));
+        let tmuxBridgeAttempted = false;
+        while (true) {
+          const outcome = await Promise.race([
+            turnPromise.then((value) => ({ done: true, value })),
+            sleep(1000).then(() => ({ done: false })),
+          ]);
+          if (outcome.done) return outcome.value;
+          await inspectActiveWorkerLiveness();
+
+          // Check for pending ask_user that wasn't handled by onUserInputRequest
+          // This happens on Linux where the CLI shows its terminal prompt instead
+          const pendingReq = !tmuxBridgeAttempted ? getPendingAskUserRequest?.() : null;
+          if (pendingReq && !getLastAskUserBridge?.()) {
+            const sessionId = getSessionId?.();
+            if (sessionId) {
+              tmuxBridgeAttempted = true;
+              dbg("ask_user tmux bridge: detected pending request while sendAndWait blocked", `sessionId=${sessionId}`, `msgId=${message.id}`);
+              dbg("ask_user tmux bridge: pendingReq keys=", Object.keys(pendingReq || {}).join(","), "toolArgs=", JSON.stringify(pendingReq?.toolArgs)?.slice(0, 300));
+              try {
+                // Create relay question for web UI
+                const prompt = extractQuestionPrompt?.(pendingReq) || "Clarification needed";
+                const choices = extractQuestionChoices?.(pendingReq) || [];
+                const requestedSchema = extractRequestedSchema(pendingReq);
+                const fields = requestedSchema ? schemaFields(requestedSchema) : [];
+                dbg("ask_user tmux bridge: extracted prompt=", prompt?.slice(0, 100), "choices=", JSON.stringify(choices), "fields=", String(fields.length));
+                const created = await api("POST", "/api/relay-question", {
+                  queueId: message.id,
+                  messageId: message.id,
+                  conversationId: message.conversationId,
+                  mode: message.relayMode || "agent",
+                  prompt,
+                  choices,
+                  allowFreeform: true,
+                  requestedSchema: requestedSchema || undefined,
+                  timeout_ms: sendTimeout,
+                  context: {
+                    source: "tmux-bridge",
+                    rationale: "CLI showed terminal prompt instead of using SDK callback; bridging via tmux.",
+                    queueMessageId: message.id,
+                  },
+                });
+                const questionId = created?.question?.id;
+                if (questionId) {
+                  dbg("ask_user tmux bridge: question created", `questionId=${questionId}`, `msgId=${message.id}`);
+                  await api("POST", "/api/activity", {
+                    messageId: message.id,
+                    conversationId: message.conversationId,
+                    mode: message.relayMode || "agent",
+                    text: "Tool (ask_user): question posted via tmux bridge; waiting for web answer",
+                  }).catch(() => {});
+
+                  // Wait for answer from web UI
+                  const { answer, structuredAnswer, timedOut } = await waitForRelayQuestionAnswer(questionId, sendTimeout);
+                  dbg("ask_user tmux bridge: got answer", `questionId=${questionId}`, `answer="${String(answer || "").slice(0, 50)}"`, `timedOut=${timedOut}`);
+
+                  if (!timedOut && (answer || structuredAnswer)) {
+                    // Send answer to CLI via tmux
+                    const wasFreeform = !choices.some((c) => String(c || "").trim().toLowerCase() === String(answer || "").trim().toLowerCase());
+                    const sent = await answerCliPromptViaTmux({
+                      sessionName: sessionId,
+                      answer,
+                      choices,
+                      wasFreeform,
+                      structuredAnswer: structuredAnswer || null,
+                      fields: fields.length ? fields : null,
+                      dbg,
+                    });
+                    if (sent) {
+                      dbg("ask_user tmux bridge: answer sent to terminal", `sessionId=${sessionId}`);
+                      setLastAskUserBridge?.({ source: "tmux-bridge", at: Date.now(), messageId: message.id });
+                      await api("POST", "/api/activity", {
+                        messageId: message.id,
+                        conversationId: message.conversationId,
+                        mode: message.relayMode || "agent",
+                        text: `Tool (ask_user): user answered "${String(answer || "").slice(0, 60)}" (via tmux bridge)`,
+                      }).catch(() => {});
+                    }
+                  } else if (timedOut) {
+                    // Send Ctrl+D to decline the prompt
+                    dbg("ask_user tmux bridge: timeout, sending Ctrl+D to decline");
+                    await declineCliPromptViaTmux(sessionId, dbg).catch(() => {});
+                  }
+                  setPendingAskUserRequest?.(null);
+                }
+              } catch (bridgeErr) {
+                dbg("ask_user tmux bridge failed", `msgId=${message.id}`, bridgeErr?.message || String(bridgeErr));
+              }
+            }
+          }
+        }
+      };
+      try {
+        sendAndWaitStartedAtMs = Date.now();
+        finalEvent = await sendWithoutStreaming(payload);
+      } catch (attachmentError) {
+        if (!sdkAttachments.length) throw attachmentError;
+        dbg("sdk attachment delivery failed", `msgId=${message.id}`, attachmentError?.message || String(attachmentError));
+        await api("POST", "/api/activity", {
+          messageId: message.id,
+          conversationId: message.conversationId,
+          mode: message.relayMode || "agent",
+          text: `Attachment delivery failed (${attachmentError?.message || "unknown error"}). Retrying without SDK attachments.`,
+        }).catch(() => {});
+        finalEvent = await sendWithoutStreaming({ prompt });
+      }
+      const sendAndWaitDurationMs = sendAndWaitStartedAtMs > 0 ? Math.max(0, Date.now() - sendAndWaitStartedAtMs) : null;
+      dbg("session.sendAndWait: completed for msgId", message.id, sendAndWaitDurationMs ? `durationMs=${sendAndWaitDurationMs}` : "");
+
+      const text = stripPromptContextPrefix(extractFinalText(finalEvent), message, "", prompt);
+      const model = await getCurrentModelId() || finalEvent?.data?.model || finalEvent?.data?.modelId || message.model || null;
+      const bridgedViaAskUser = !!getLastAskUserBridge?.();
+      const pendingAskUserReq = !bridgedViaAskUser ? getPendingAskUserRequest?.() : null;
+      const boardPayload = buildPlanReadyBoardPayload({
+        finalEvent,
+        message,
+        finalText: text,
+      });
+      if (boardPayload) {
+        try {
+          await api("POST", "/api/relay-board", boardPayload);
+        } catch (boardError) {
+          dbg("plan board publish failed", `msgId=${message.id}`, boardError?.message || String(boardError));
+        }
+      }
+
+      if (!bridgedViaAskUser && pendingAskUserReq) {
+        dbg("ask_user safety-net bridge triggered — onUserInputRequest was not called for msgId", message.id, "(unexpected; should fire via SDK handler now)");
+        try {
+          const bridged = await createRelayQuestionFromAskUserRequest(message, pendingAskUserReq);
+          if (bridged?.questionId) {
+            let resumedText = "";
+            try {
+              resumedText = await continueAfterAskUserAnswer(message, pendingAskUserReq, bridged.answer, bridged.timedOut);
+            } catch (evaluateErr) {
+              dbg("ask_user autopilot resume failed", `msgId=${message.id}`, evaluateErr?.message || String(evaluateErr));
+            }
+            await api("POST", "/api/response", {
+              messageId: message.id,
+              conversationId: message.conversationId,
+              text: resumedText || (
+                bridged.timedOut
+                  ? "The user did not respond before timeout. I continued with the current relay mode."
+                  : `Thanks — I received your answer: "${bridged.answer}". I hit a problem while resuming the turn from it.`
+              ),
+              model,
+            });
+            await session.log("✅ ask_user safety-net bridge: relay question card shown, answer received, turn resumed", { ephemeral: true });
+            return true;
+          }
+        } catch (bridgeErr) {
+          dbg("ask_user safety-net bridge failed", `msgId=${message.id}`, bridgeErr?.message || String(bridgeErr));
+          await api("POST", "/api/activity", {
+            messageId: message.id,
+            conversationId: message.conversationId,
+            mode: message.relayMode || "agent",
+            text: `ask_user safety-net bridge failed (${bridgeErr?.message || "unknown error"}). Falling through to normal response.`,
+          }).catch(() => {});
+        }
+      }
+
+      const fallbackBridgeCheck = !bridgedViaAskUser && !pendingAskUserReq && !!text
+        ? shouldForceFallbackQuestionBridge(text)
+        : { shouldForce: false, parsed: null };
+      const shouldForceQuestionBridge = fallbackBridgeCheck.shouldForce;
+
+      if (shouldForceQuestionBridge) {
+        try {
+          const bridged = await createFallbackRelayQuestion(message, fallbackBridgeCheck.parsed);
+          if (bridged?.questionId) {
+            let resumedText = "";
+            try {
+              resumedText = await continueAfterQuestionAnswer(message, {
+                questionPrompt: bridged.prompt,
+                choices: bridged.choices,
+                answer: bridged.answer,
+                timedOut: bridged.timedOut,
+                assistantText: text,
+              });
+            } catch (evaluateErr) {
+              dbg("fallback question resume failed", `msgId=${message.id}`, evaluateErr?.message || String(evaluateErr));
+            }
+            await api("POST", "/api/response", {
+              messageId: message.id,
+              conversationId: message.conversationId,
+              text: resumedText || (
+                bridged.timedOut
+                  ? "The user did not respond before timeout. I continued with the current relay mode."
+                  : `Thanks — I received your answer: "${bridged.answer}". I hit a problem while resuming the turn from it.`
+              ),
+              model,
+            });
+            await session.log("✅ Converted plain-text question into relay bridge card and resumed the turn", { ephemeral: true });
+            return true;
+          }
+        } catch (bridgeErr) {
+          dbg("fallback question bridge failed", `msgId=${message.id}`, bridgeErr?.message || String(bridgeErr));
+          await api("POST", "/api/activity", {
+            messageId: message.id,
+            conversationId: message.conversationId,
+            mode: message.relayMode || "agent",
+            text: `Question bridge fallback failed (${bridgeErr?.message || "unknown error"}).`,
+          }).catch(() => {});
+        }
+      }
+
+      if (!text) {
+        const emptyHandling = resolveEmptyFinalTextHandling({
+          lastStreamedSent,
+          lastActivityText: String(getLastActivityText?.() || ""),
+        });
+        if (emptyHandling.action === "use_stream_text") {
+          const streamedText = String(emptyHandling.text || "");
+          dbg("sendAndWait returned empty content; finalizing from streamed text msgId", message.id, `len=${streamedText.length}`);
+          await session.log("⚠️ Empty final envelope text — using streamed text as final reply", { level: "warn" });
+          await pushRelayStream(streamedText, true);
+          await api("POST", "/api/response", { messageId: message.id, conversationId: message.conversationId, text: streamedText, model });
+        } else {
+          dbg("sendAndWait returned empty content; re-queueing msgId", message.id, emptyHandling.reason || "empty-final-text");
+          await session.log("⚠️ Empty assistant response envelope — re-queuing instead of sending fallback", { level: "warn" });
+          await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
+        }
+      } else {
+        await pushRelayStream(text || lastStreamedSent, true);
+        await api("POST", "/api/response", { messageId: message.id, conversationId: message.conversationId, text, model });
+        await session.log(`✅ Sent response to web (${text.length} chars)`, { ephemeral: true });
+      }
+    } catch (e) {
+      const terminalFailure = normalizeTerminalSendAndWaitError(e);
+      dbg(
+        "sendAndWait ERROR for msgId",
+        message.id,
+        ":",
+        e.message,
+        `terminal=${terminalFailure ? "yes" : "no"}`,
+        `stableCode=${terminalFailure?.stableCode || "none"}`,
+      );
+      if (String(e?.code || "").trim() === "RELAY_TURN_ABORTED") {
+        await pushRelayStream(lastStreamedSent, true);
+      } else if (isTerminalSendAndWaitError(e)) {
+        const failureText = buildTerminalFailureText(e);
+        await session.log("❌ Terminal SDK/tool-output error — marking turn failed", { level: "error" }).catch((logError) => {
+          dbg("session.log failed while reporting terminal error", message.id, logError?.message || String(logError));
+        });
+        await pushRelayStream(lastStreamedSent, true);
+        await api("POST", "/api/response", {
+          messageId: message.id,
+          conversationId: message.conversationId,
+          text: failureText,
+          terminalError: terminalFailure || undefined,
+          model: await getCurrentModelId() || message.model || null,
+        }).catch(async (responseError) => {
+          dbg("terminal response publish failed for msgId", message.id, responseError?.message || String(responseError));
+          await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
+        });
+      } else if (e?.code === "RELAY_WORKER_UNAVAILABLE" && e?.terminalFailure) {
+        await session.log("⚠️ Session worker became unavailable during the turn — marking it failed", { level: "warn" }).catch((logError) => {
+          dbg("session.log failed while reporting worker-unavailable", message.id, logError?.message || String(logError));
+        });
+        await pushRelayStream(lastStreamedSent, true);
+        await api("POST", "/api/response", {
+          messageId: message.id,
+          conversationId: message.conversationId,
+          terminalError: e.terminalFailure,
+          model: await getCurrentModelId() || message.model || null,
+        }).catch(async () => {
+          await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
+        });
+      } else {
+        await session.log(`❌ Response failed: ${e.message}; re-queuing`, { level: "error" }).catch((logError) => {
+          dbg("session.log failed while reporting generic send error", message.id, logError?.message || String(logError));
+        });
+        api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
+      }
+    } finally {
+      setLastActivityText("");
+      setPendingAskUserRequest?.(null);
+      clearRelayScopeState?.();
+      setRelayTurnActive(false, message);
+      setActiveMsg(null);
+      setWaitingForAI(false);
+      activeTurnMessageId = "";
+    }
+    return true;
+  }
+
   async function runPollingIteration() {
     if (!getSessionReady()) return;
     try {
@@ -595,402 +1076,10 @@ export function createPollingLoop({
         // Keep SDK-session-delete maintenance best-effort only; never starve
         // user turn dequeue when delete requests are backlogged/retrying.
         await processPendingSdkSessionDeletes();
+        if (!shouldFetchPending()) return;
 
         const pending = await api("GET", "/api/pending");
-        const pendingBlockedReason = String(pending?.routing?.blockedReason || "").trim();
-        const control = pending?.control || null;
-        if (control && typeof handleControl === "function") {
-          const handled = await handleControl(control, pending);
-          if (handled) return;
-        }
-        const { message } = pending || {};
-
-        if (message) {
-          activeTurnMessageId = String(message.id || "");
-          setActiveMsg(message);
-          if (typeof ensureSessionForConversation !== "function") {
-            dbg("session routing unavailable for msgId", message.id, "ensureSessionForConversation is not configured");
-            await session.log("⚠️ Session routing is unavailable for this turn", { level: "warn" });
-            await api("POST", "/api/response", {
-              messageId: message.id,
-              conversationId: message.conversationId,
-              text: "I couldn't process this turn because session routing is unavailable in the relay runtime. Please retry after the relay extension is fully initialized.",
-              model: await getCurrentModelId() || message.model || null,
-            }).catch(async () => {
-              await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
-            });
-            setActiveMsg(null);
-            return;
-          }
-
-          const sessionResolution = await ensureSessionForConversation(message.conversationId, "dequeue");
-          if (sessionResolution && !sessionResolution.ok) {
-            const activeSdkSessionId = String(sessionResolution?.activeSessionId || "").trim();
-            const targetSdkSessionId = String(sessionResolution?.targetSessionId || "").trim();
-            const detail = String(sessionResolution?.message || "").trim();
-            const retryable = sessionResolution?.retryable === true;
-            dbg(
-              "session availability check failed for msgId",
-              message.id,
-              `reason=${sessionResolution.reason || "unknown"}`,
-              `active=${activeSdkSessionId || "none"}`,
-              `target=${targetSdkSessionId || "none"}`,
-            );
-            await session.log(
-              detail
-                ? `⚠️ Session unavailable for this turn: ${detail}`
-                : "⚠️ Session unavailable for this turn",
-              { level: "warn" },
-            );
-            if (retryable) {
-              await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
-            } else {
-              await api("POST", "/api/response", {
-                messageId: message.id,
-                conversationId: message.conversationId,
-                text: detail
-                  ? `System note: I could not process this turn because the bound SDK session is unavailable (${detail}).`
-                  : "System note: I could not process this turn because the bound SDK session is unavailable.",
-                model: await getCurrentModelId() || message.model || null,
-              }).catch(async () => {
-                await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
-              });
-            }
-            setActiveMsg(null);
-            return;
-          }
-
-          const synced = await syncActiveSession?.("dequeue", true);
-          if (!synced) {
-            dbg("session sync failed before processing msgId", message.id, "- requeueing");
-            await session.log("⚠️ Session sync failed before processing; re-queuing turn", { level: "warn" });
-            await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
-            setActiveMsg(null);
-            return;
-          }
-          setWaitingForAI(true);
-          setRelayTurnActive(true, message);
-          setLastActivityText("");
-          setLastAskUserBridge(null);
-          setPendingAskUserRequest?.(null);
-
-          const label = message.isNewConversation ? "new conv" : "existing conv";
-          await session.log(`📨 [${label}] Web message (${message.model || "default"}${message.reasoningEffort ? `:${message.reasoningEffort}` : ""} / ${message.relayMode || "agent"}): "${String(message.text || "").slice(0, 80)}"`);
-          dbg("session.send: queuing for msgId", message.id);
-          let lastStreamedSent = "";
-          const pushRelayStream = async (text, done = false) => {
-            const value = String(text || "");
-            if (!value && !done) return;
-            if (!done && value === lastStreamedSent) return;
-            const publish = await publishRelayStreamEvent({
-              api,
-              message,
-              text: value,
-              done,
-              dbg,
-            });
-            if (!done && publish.ok) lastStreamedSent = value;
-          };
-          let sendAndWaitStartedAtMs = 0;
-
-          try {
-            if (message.model) {
-              const modelSwitch = await setModelForMessage(message.model);
-              const activeModel = modelSwitch.after || modelSwitch.current || "unknown";
-              const switchText = modelSwitch.switched
-                ? `Model selected: requested=${message.model} active=${activeModel} via=${modelSwitch.via || "switchTo"}`
-                : `Model switch failed: requested=${message.model} active=${activeModel}${modelSwitch.error ? ` error=${modelSwitch.error}` : ""}`;
-              await publishModelSnapshot("model-switch", true);
-              await api("POST", "/api/activity", {
-                messageId: message.id,
-                conversationId: message.conversationId,
-                mode: message.relayMode || "agent",
-                text: switchText,
-              }).catch(() => {});
-              dbg("model switch", switchText);
-            }
-
-            const prompt = await buildPromptWithRelayContext(message);
-
-            const sdkAttachments = buildSdkAttachments(message.attachments);
-            const payload = sdkAttachments.length ? { prompt, attachments: sdkAttachments } : { prompt };
-            if (message.reasoningEffort && String(message.reasoningEffort || "").trim().toLowerCase() !== "none") {
-              payload.reasoningEffort = String(message.reasoningEffort || "").trim();
-            }
-            if (sdkAttachments.length) {
-              const imageCount = sdkAttachments.filter((att) => att.type === "blob").length;
-              const fileCount = sdkAttachments.filter((att) => att.type === "file").length;
-              dbg("sdk attachments prepared", `msgId=${message.id}`, `total=${sdkAttachments.length}`, `images=${imageCount}`, `files=${fileCount}`);
-              await api("POST", "/api/activity", {
-                messageId: message.id,
-                conversationId: message.conversationId,
-                mode: message.relayMode || "agent",
-                text: `Attached ${sdkAttachments.length} file(s) to SDK request${imageCount ? ` (images=${imageCount})` : ""}${fileCount ? ` (files=${fileCount})` : ""}.`,
-              }).catch(() => {});
-            }
-
-            let finalEvent;
-            let lastWorkerStatusCheckAt = 0;
-            // Incremental assistant text now streams via the extension's assistant.message_delta
-            // session.on subscription (reasoning-stream.mjs) -> POST /api/stream. The previous
-            // onStreamingEvent callback was defined here but never wired into sendAndWait, so it
-            // has been removed to avoid confusion. The final /api/response remains authoritative.
-            const inspectActiveWorkerLiveness = async () => {
-              await checkActiveAbortControl(message, { force: true });
-              const ownerSessionId = String(message?.ownerSessionId || "").trim();
-              if (!ownerSessionId) return;
-              const now = Date.now();
-              if ((now - lastWorkerStatusCheckAt) < 10_000) return;
-              lastWorkerStatusCheckAt = now;
-
-              const status = await api("GET", "/api/status").catch(() => null);
-              const workers = Array.isArray(status?.sessionWorker?.workers) ? status.sessionWorker.workers : [];
-              const worker = workers.find((entry) => String(entry?.sdkSessionId || "").trim() === ownerSessionId) || null;
-              if (!worker) {
-                throw Object.assign(new Error("Active session worker is missing from relay status"), {
-                  code: "RELAY_WORKER_UNAVAILABLE",
-                  terminalFailure: buildWorkerLivenessTerminalFailure({
-                    message,
-                    ownerSessionId,
-                    issueReason: "worker-missing",
-                    detail: "No worker snapshot was reported for the owning session.",
-                  }),
-                });
-              }
-
-              const degraded = String(worker?.uiState || "").trim().toLowerCase() === "yellow";
-              const degradedReason = String(worker?.degradedReason || "").trim().toLowerCase();
-              const routingMismatch = (
-                (worker?.conversationId && String(worker.conversationId).trim() !== String(message?.conversationId || "").trim())
-                || (message?.runtimeSessionId && worker?.runtimeSessionId && String(worker.runtimeSessionId).trim() !== String(message.runtimeSessionId).trim())
-              );
-              if (!degraded && !routingMismatch) return;
-
-              const issueReason = routingMismatch
-                ? "worker-routing-mismatch"
-                : (degradedReason || "worker-degraded");
-              const detail = routingMismatch
-                ? `workerConversation=${String(worker?.conversationId || "").trim() || "none"} workerRuntime=${String(worker?.runtimeSessionId || "").trim() || "none"}`
-                : String(worker?.lastError || worker?.degradedReason || "").trim();
-              throw Object.assign(new Error(`Active session worker became unavailable (${issueReason})`), {
-                code: "RELAY_WORKER_UNAVAILABLE",
-                terminalFailure: buildWorkerLivenessTerminalFailure({
-                  message,
-                  ownerSessionId,
-                  issueReason,
-                  detail,
-                }),
-              });
-            };
-            const sendWithoutStreaming = async (sendPayload) => {
-              const turnPromise = Promise.resolve().then(() => sendAndWaitWithHardTimeout(sendPayload, sendTimeout));
-              while (true) {
-                const outcome = await Promise.race([
-                  turnPromise.then((value) => ({ done: true, value })),
-                  sleep(1000).then(() => ({ done: false })),
-                ]);
-                if (outcome.done) return outcome.value;
-                await inspectActiveWorkerLiveness();
-              }
-            };
-            try {
-              // The extension SDK's session.send() can resolve to an opaque request id before
-              // onUserInputRequest fires. For relay turns that would finalize the queue row too
-              // early, so keep using the stable sendAndWait path here.
-              sendAndWaitStartedAtMs = Date.now();
-              finalEvent = await sendWithoutStreaming(payload);
-            } catch (attachmentError) {
-              if (!sdkAttachments.length) throw attachmentError;
-              dbg("sdk attachment delivery failed", `msgId=${message.id}`, attachmentError?.message || String(attachmentError));
-              await api("POST", "/api/activity", {
-                messageId: message.id,
-                conversationId: message.conversationId,
-                mode: message.relayMode || "agent",
-                text: `Attachment delivery failed (${attachmentError?.message || "unknown error"}). Retrying without SDK attachments.`,
-              }).catch(() => {});
-              finalEvent = await sendWithoutStreaming({ prompt });
-            }
-            const sendAndWaitDurationMs = sendAndWaitStartedAtMs > 0 ? Math.max(0, Date.now() - sendAndWaitStartedAtMs) : null;
-            dbg("session.sendAndWait: completed for msgId", message.id);
-
-            const text = stripPromptContextPrefix(extractFinalText(finalEvent), message, "", prompt);
-            const model = await getCurrentModelId() || finalEvent?.data?.model || finalEvent?.data?.modelId || message.model || null;
-            const bridgedViaAskUser = !!getLastAskUserBridge?.();
-            const pendingAskUserReq = !bridgedViaAskUser ? getPendingAskUserRequest?.() : null;
-            const boardPayload = buildPlanReadyBoardPayload({
-              finalEvent,
-              message,
-              finalText: text,
-            });
-            if (boardPayload) {
-              try {
-                await api("POST", "/api/relay-board", boardPayload);
-              } catch (boardError) {
-                dbg("plan board publish failed", `msgId=${message.id}`, boardError?.message || String(boardError));
-              }
-            }
-
-            // Safety-net fallback: ask_user was called but onUserInputRequest did not fire.
-            // With onUserInputRequest registered as a top-level joinSession property this should
-            // never trigger for normal relay turns — kept here only as a last-resort guard.
-            if (!bridgedViaAskUser && pendingAskUserReq) {
-              dbg("ask_user safety-net bridge triggered — onUserInputRequest was not called for msgId", message.id, "(unexpected; should fire via SDK handler now)");
-              try {
-                const bridged = await createRelayQuestionFromAskUserRequest(message, pendingAskUserReq);
-                if (bridged?.questionId) {
-                  let resumedText = "";
-                  try {
-                    resumedText = await continueAfterAskUserAnswer(message, pendingAskUserReq, bridged.answer, bridged.timedOut);
-                  } catch (evaluateErr) {
-                    dbg("ask_user autopilot resume failed", `msgId=${message.id}`, evaluateErr?.message || String(evaluateErr));
-                  }
-                  await api("POST", "/api/response", {
-                    messageId: message.id,
-                    conversationId: message.conversationId,
-                    text: resumedText || (
-                      bridged.timedOut
-                        ? "The user did not respond before timeout. I continued with the current relay mode."
-                        : `Thanks — I received your answer: "${bridged.answer}". I hit a problem while resuming the turn from it.`
-                    ),
-                    model,
-                  });
-                  await session.log("✅ ask_user safety-net bridge: relay question card shown, answer received, turn resumed", { ephemeral: true });
-                  return;
-                }
-              } catch (bridgeErr) {
-                dbg("ask_user safety-net bridge failed", `msgId=${message.id}`, bridgeErr?.message || String(bridgeErr));
-                await api("POST", "/api/activity", {
-                  messageId: message.id,
-                  conversationId: message.conversationId,
-                  mode: message.relayMode || "agent",
-                  text: `ask_user safety-net bridge failed (${bridgeErr?.message || "unknown error"}). Falling through to normal response.`,
-                }).catch(() => {});
-              }
-            }
-
-            const fallbackBridgeCheck = !bridgedViaAskUser && !pendingAskUserReq && !!text
-              ? shouldForceFallbackQuestionBridge(text)
-              : { shouldForce: false, parsed: null };
-            const shouldForceQuestionBridge = fallbackBridgeCheck.shouldForce;
-
-            if (shouldForceQuestionBridge) {
-              try {
-                const bridged = await createFallbackRelayQuestion(message, fallbackBridgeCheck.parsed);
-                if (bridged?.questionId) {
-                  let resumedText = "";
-                  try {
-                    resumedText = await continueAfterQuestionAnswer(message, {
-                      questionPrompt: bridged.prompt,
-                      choices: bridged.choices,
-                      answer: bridged.answer,
-                      timedOut: bridged.timedOut,
-                      assistantText: text,
-                    });
-                  } catch (evaluateErr) {
-                    dbg("fallback question resume failed", `msgId=${message.id}`, evaluateErr?.message || String(evaluateErr));
-                  }
-                  await api("POST", "/api/response", {
-                    messageId: message.id,
-                    conversationId: message.conversationId,
-                    text: resumedText || (
-                      bridged.timedOut
-                        ? "The user did not respond before timeout. I continued with the current relay mode."
-                        : `Thanks — I received your answer: "${bridged.answer}". I hit a problem while resuming the turn from it.`
-                    ),
-                    model,
-                  });
-                  await session.log("✅ Converted plain-text question into relay bridge card and resumed the turn", { ephemeral: true });
-                  return;
-                }
-              } catch (bridgeErr) {
-                dbg("fallback question bridge failed", `msgId=${message.id}`, bridgeErr?.message || String(bridgeErr));
-                await api("POST", "/api/activity", {
-                  messageId: message.id,
-                  conversationId: message.conversationId,
-                  mode: message.relayMode || "agent",
-                  text: `Question bridge fallback failed (${bridgeErr?.message || "unknown error"}).`,
-                }).catch(() => {});
-              }
-            }
-
-            if (!text) {
-              const emptyHandling = resolveEmptyFinalTextHandling({
-                lastStreamedSent,
-                lastActivityText: String(getLastActivityText?.() || ""),
-              });
-              if (emptyHandling.action === "use_stream_text") {
-                const streamedText = String(emptyHandling.text || "");
-                dbg("sendAndWait returned empty content; finalizing from streamed text msgId", message.id, `len=${streamedText.length}`);
-                await session.log("⚠️ Empty final envelope text — using streamed text as final reply", { level: "warn" });
-                await pushRelayStream(streamedText, true);
-                await api("POST", "/api/response", { messageId: message.id, conversationId: message.conversationId, text: streamedText, model });
-              } else {
-                dbg("sendAndWait returned empty content; re-queueing msgId", message.id, emptyHandling.reason || "empty-final-text");
-                await session.log("⚠️ Empty assistant response envelope — re-queuing instead of sending fallback", { level: "warn" });
-                await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
-              }
-            } else {
-              await pushRelayStream(text || lastStreamedSent, true);
-              await api("POST", "/api/response", { messageId: message.id, conversationId: message.conversationId, text, model });
-              await session.log(`✅ Sent response to web (${text.length} chars)`, { ephemeral: true });
-            }
-          } catch (e) {
-              const terminalFailure = normalizeTerminalSendAndWaitError(e);
-              dbg(
-                "sendAndWait ERROR for msgId",
-                message.id,
-                ":",
-                e.message,
-                `terminal=${terminalFailure ? "yes" : "no"}`,
-                `stableCode=${terminalFailure?.stableCode || "none"}`,
-              );
-              if (String(e?.code || "").trim() === "RELAY_TURN_ABORTED") {
-                await pushRelayStream(lastStreamedSent, true);
-              } else if (isTerminalSendAndWaitError(e)) {
-                const failureText = buildTerminalFailureText(e);
-                await session.log("❌ Terminal SDK/tool-output error — marking turn failed", { level: "error" }).catch((logError) => {
-                  dbg("session.log failed while reporting terminal error", message.id, logError?.message || String(logError));
-                });
-                await pushRelayStream(lastStreamedSent, true);
-                await api("POST", "/api/response", {
-                  messageId: message.id,
-                  conversationId: message.conversationId,
-                  text: failureText,
-                  terminalError: terminalFailure || undefined,
-                  model: await getCurrentModelId() || message.model || null,
-                }).catch(async (responseError) => {
-                  dbg("terminal response publish failed for msgId", message.id, responseError?.message || String(responseError));
-                  await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
-                });
-            } else if (e?.code === "RELAY_WORKER_UNAVAILABLE" && e?.terminalFailure) {
-              await session.log("⚠️ Session worker became unavailable during the turn — marking it failed", { level: "warn" }).catch((logError) => {
-                dbg("session.log failed while reporting worker-unavailable", message.id, logError?.message || String(logError));
-              });
-              await pushRelayStream(lastStreamedSent, true);
-              await api("POST", "/api/response", {
-                messageId: message.id,
-                conversationId: message.conversationId,
-                terminalError: e.terminalFailure,
-                model: await getCurrentModelId() || message.model || null,
-              }).catch(async () => {
-                await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
-              });
-            } else {
-              await session.log(`❌ Response failed: ${e.message}; re-queuing`, { level: "error" }).catch((logError) => {
-                dbg("session.log failed while reporting generic send error", message.id, logError?.message || String(logError));
-              });
-              api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
-            }
-          } finally {
-            setLastActivityText("");
-            setPendingAskUserRequest?.(null);
-            clearRelayScopeState?.();
-            setRelayTurnActive(false, message);
-            setActiveMsg(null);
-            setWaitingForAI(false);
-            activeTurnMessageId = "";
-          }
-        }
+        await handlePendingPayload(pending, "poll");
     } catch (error) {
       dbg("runPollingIteration failed", error?.message || String(error));
       // Server may be down — keep retrying silently
@@ -1035,6 +1124,7 @@ export function createPollingLoop({
   }
 
   return {
+    handlePendingPayload,
     startPolling,
     kick,
     stopPolling,

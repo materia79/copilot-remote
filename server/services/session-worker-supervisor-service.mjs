@@ -51,6 +51,11 @@ function normalizePendingQuestionSessionIds(value) {
     .filter(Boolean));
 }
 
+function hasStartupFailureReason(lifecycle) {
+  const reason = String(lifecycle?.degradedReason || '').trim().toLowerCase();
+  return reason === 'startup-heartbeat-timeout' || reason === 'stale-pid';
+}
+
 export function createSessionWorkerSupervisor({
   registry,
   spawnWorker = null,
@@ -61,6 +66,7 @@ export function createSessionWorkerSupervisor({
   idleEvictionMs = 0,
   heartbeatTimeoutMs = 30_000,
   degradedRecoveryGraceMs = 10_000,
+  killBlockGraceMs = 30_000,
   isPidAlive = defaultIsPidAlive,
   diagnosticPlanReference = null,
   log = null,
@@ -77,6 +83,7 @@ export function createSessionWorkerSupervisor({
   const idleTimeoutMs = clampInt(idleEvictionMs, 0);
   const heartbeatStaleAfterMs = Math.max(1_000, clampInt(heartbeatTimeoutMs, 30_000));
   const recoveryGraceMs = Math.max(0, clampInt(degradedRecoveryGraceMs, 10_000));
+  const killGraceMs = Math.max(0, clampInt(killBlockGraceMs, 30_000));
   function resolvePlanReference() {
     const value = typeof diagnosticPlanReference === 'function'
       ? diagnosticPlanReference()
@@ -131,6 +138,7 @@ export function createSessionWorkerSupervisor({
       awaitingHeartbeat: false,
       firstObservedHeartbeatAtMs: null,
       monitorLoggedAtMs: null,
+      killedAtMs: null,
     };
     lifecycleBySession.set(sessionId, state);
     return state;
@@ -169,6 +177,7 @@ export function createSessionWorkerSupervisor({
         ? Math.max(0, nowMs() - lifecycle.launchAtMs)
         : 0,
       diagnosticPlanReference: resolvePlanReference() || null,
+      killedAt: lifecycle.killedAtMs ? new Date(lifecycle.killedAtMs).toISOString() : null,
     };
   }
 
@@ -248,6 +257,19 @@ export function createSessionWorkerSupervisor({
       stalePidDetected: false,
       recoveryCandidateAtMs: null,
     });
+  }
+
+  function markKilled(sessionId) {
+    if (!normalizeSessionId(sessionId)) return null;
+    const killed = setLifecycle(sessionId, { killedAtMs: nowMs() });
+    return toLifecycleSnapshot(sessionId, killed);
+  }
+
+  function isKillBlocked(sessionId) {
+    if (killGraceMs <= 0) return false;
+    const lifecycle = lifecycleBySession.get(sessionId);
+    if (!lifecycle?.killedAtMs) return false;
+    return (nowMs() - lifecycle.killedAtMs) < killGraceMs;
   }
 
   function checkPidLiveness(worker) {
@@ -393,6 +415,7 @@ export function createSessionWorkerSupervisor({
 
   function clearRestartSchedule(sessionId, {
     resetDegradedState = true,
+    resetKilledMarker = false,
   } = {}) {
     if (!normalizeSessionId(sessionId)) return null;
     const nowAtMs = nowMs();
@@ -411,6 +434,9 @@ export function createSessionWorkerSupervisor({
       patch.degradedReason = null;
       patch.degradedAtMs = null;
       patch.uiState = 'white';
+    }
+    if (resetKilledMarker) {
+      patch.killedAtMs = null;
     }
     const cleared = setLifecycle(sessionId, patch);
     return toLifecycleSnapshot(sessionId, cleared);
@@ -473,8 +499,20 @@ export function createSessionWorkerSupervisor({
       return { ok: false, error: 'missing-session-id', worker: null };
     }
 
+    if (isKillBlocked(sessionId)) {
+      const lifecycle = getOrCreateLifecycle(sessionId);
+      return {
+        ok: false,
+        error: 'session-killed',
+        worker: registry.getWorker(sessionId) || null,
+        lifecycle: toLifecycleSnapshot(sessionId, lifecycle),
+      };
+    }
+
     const existing = registry.getWorker(sessionId);
-    if (shouldReuseLiveWorker(existing)) {
+    const existingLifecycle = getOrCreateLifecycle(sessionId);
+    const blockedByStartupFailure = hasStartupFailureReason(existingLifecycle);
+    if (!blockedByStartupFailure && shouldReuseLiveWorker(existing)) {
       const nowAtMs = nowMs();
       const reusedWorker = setWorkerState(sessionId, {
         ...existing,
@@ -774,10 +812,15 @@ export function createSessionWorkerSupervisor({
       if (!sessionId) return null;
       return scheduleRestart(sessionId, error, options);
     },
-    clearRestartSchedule: (sdkSessionId) => {
+    clearRestartSchedule: (sdkSessionId, options) => {
       const sessionId = normalizeSessionId(sdkSessionId);
       if (!sessionId) return null;
-      return clearRestartSchedule(sessionId);
+      return clearRestartSchedule(sessionId, options);
+    },
+    markKilled: (sdkSessionId) => {
+      const sessionId = normalizeSessionId(sdkSessionId);
+      if (!sessionId) return null;
+      return markKilled(sessionId);
     },
     getLifecycleState,
     canAttemptRestart: (sdkSessionId) => {

@@ -1,5 +1,6 @@
 import { getActiveSession } from '../runtime/session-registry.mjs';
 import { QUESTION_TIMEOUT_CONTINUATION_TEXT } from "../../../../shared/question-timeout.mjs";
+import { extractRequestedSchema } from "../../../../shared/question-schema.mjs";
 
 export function createQuestionBridge({
   api,
@@ -58,12 +59,16 @@ export function createQuestionBridge({
       if (question.status === "answered") {
         return {
           answer: String(question.answer || ""),
+          structuredAnswer: question.structuredAnswer && typeof question.structuredAnswer === "object"
+            ? question.structuredAnswer
+            : null,
           timedOut: false,
         };
       }
       if (question.status === "timed_out" || question.status === "cancelled") {
         return {
           answer: QUESTION_TIMEOUT_CONTINUATION_TEXT,
+          structuredAnswer: null,
           timedOut: true,
         };
       }
@@ -71,6 +76,7 @@ export function createQuestionBridge({
         await api("POST", `/api/relay-question/${questionId}/timeout`, {}).catch(() => {});
         return {
           answer: QUESTION_TIMEOUT_CONTINUATION_TEXT,
+          structuredAnswer: null,
           timedOut: true,
         };
       }
@@ -84,6 +90,7 @@ export function createQuestionBridge({
     const allowFreeform = extractAllowFreeform(request);
     const activeSession = getActiveSession();
     const questionTimeoutMs = resolveQuestionWaitTimeoutMs();
+    const requestedSchema = extractRequestedSchema(request);
     const questionPayload = {
       queueId: activeMsg?.id,
       messageId: activeMsg?.id,
@@ -92,6 +99,7 @@ export function createQuestionBridge({
       prompt: extractQuestionPrompt(request),
       choices,
       allowFreeform: allowFreeform ?? !choices.length,
+      requestedSchema: requestedSchema || undefined,
       sdk_session_id: activeSession?.sdkSessionId || undefined,
       timeout_ms: questionTimeoutMs,
       context: {
@@ -119,6 +127,8 @@ export function createQuestionBridge({
       questionPayload.prompt,
       "choices=",
       String(questionPayload.choices?.length || 0),
+      "fields=",
+      String(requestedSchema?.properties ? Object.keys(requestedSchema.properties).length : 0),
     );
 
     return waitForRelayQuestionAnswer(questionId, questionTimeoutMs);

@@ -554,10 +554,12 @@ async function startPolling() {
       getPendingAskUserRequest: () => getScopedPendingAskUserRequest(),
       setPendingAskUserRequest: (value) => { setScopedPendingAskUserRequest(value); },
       clearRelayScopeState: () => { clearScopedRelayState(); },
+      shouldFetchPending: () => !(workerWebSocketLink?.status?.().connected),
       syncActiveSession,
       ensureSessionForConversation,
       extractQuestionPrompt,
       extractQuestionChoices,
+      getSessionId: () => session?.sessionId || null,
     });
   }
 
@@ -570,8 +572,12 @@ function startWorkerWebSocketLink() {
     serverUrl: SERVER_URL,
     token: TOKEN,
     dbg,
+    getPid: () => process.pid,
     getSessionReady: () => sessionReady,
     getSessionId: () => session?.sessionId || null,
+    onDeliver: async (pending, reason = "ws-deliver") => {
+      await pollingLoopController?.handlePendingPayload?.(pending, reason);
+    },
     pollNow: async () => {
       await pollingLoopController?.kick?.();
     },
@@ -841,7 +847,15 @@ session = await joinSessionWithRetry({
   // session.registerUserInputHandler() and sends requestUserInput: true to the CLI runtime.
   // When inside hooks it is silently ignored, causing the CLI to show its own terminal prompt.
   onUserInputRequest: async (request) => {
+    dbg("onUserInputRequest CALLED!", "keys=", Object.keys(request || {}).join(","), "platform=", process.platform);
     return questionRoutingHooks.onUserInputRequest(request);
+  },
+  // onElicitationRequest handles multi-field structured `ask_user` forms (requestedSchema).
+  // Must be a TOP-LEVEL property so the SDK registers the elicitation capability and routes
+  // structured form requests here instead of flattening them through onUserInputRequest.
+  onElicitationRequest: async (request) => {
+    dbg("onElicitationRequest CALLED!", "keys=", Object.keys(request || {}).join(","), "mode=", request?.mode || "form", "platform=", process.platform);
+    return questionRoutingHooks.onElicitationRequest(request);
   },
   hooks: {
     onSessionStart: async () => {
@@ -878,6 +892,7 @@ session = await joinSessionWithRetry({
 refreshSessionRegistry();
 dbg("copilot session id:", session?.sessionId || "(none)");
 dbg("joinSession resolved");
+dbg("platform:", process.platform, "onUserInputRequest handler registered at top level");
 try {
   reasoningStreamUnsubscribe = reasoningStreamHandlers.attach(session);
 } catch (e) {

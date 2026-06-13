@@ -1,4 +1,11 @@
 import { extractToolName, parseMaybeJson, toolArgsSnapshot } from "./tool-activity.mjs";
+import {
+  extractRequestedSchema,
+  schemaFields,
+  validateStructuredAnswer,
+  flatAnswerToStructured,
+  summarizeStructuredAnswer,
+} from "../../../../shared/question-schema.mjs";
 
 function isReportIntentTool(request) {
   const name = extractToolName(request).toLowerCase();
@@ -191,6 +198,9 @@ export function createQuestionRoutingHooks({
     }
 
     if (isAskUserTool(request) && activeMsg?.id) {
+      const extractedChoices = extractQuestionChoices(request);
+      dbg("onPreToolUse: detected ask_user tool", `msgId=${activeMsg.id}`, "waiting for onUserInputRequest callback...");
+      dbg("onPreToolUse: ask_user request keys=", Object.keys(request || {}).join(","), "toolArgs=", JSON.stringify(request?.toolArgs)?.slice(0, 300), "choices=", JSON.stringify(extractedChoices));
       setLastAskUserBridge(null);
       setPendingAskUserRequest?.(request);
       await api("POST", "/api/activity", {
@@ -293,8 +303,129 @@ export function createQuestionRoutingHooks({
     };
   }
 
+  function buildDefaultsContent(schema) {
+    const fields = schemaFields(schema);
+    if (!fields.length) return null;
+    const content = {};
+    for (const field of fields) {
+      if (field.hasDefault) {
+        content[field.name] = field.default;
+      } else if (field.required) {
+        // A required field has no default — cannot synthesize a complete answer.
+        return null;
+      }
+    }
+    return content;
+  }
+
+  function buildElicitationContent(schema, result) {
+    // Prefer the validated structured answer captured by the relay UI.
+    if (result?.structuredAnswer && typeof result.structuredAnswer === "object") {
+      const validation = validateStructuredAnswer(schema, result.structuredAnswer);
+      return validation.ok ? validation.value : result.structuredAnswer;
+    }
+    // Fall back to mapping a flat string answer onto a single-field schema.
+    const flat = String(result?.answer || "").trim();
+    if (flat) {
+      const mapped = flatAnswerToStructured(schema, flat);
+      if (mapped) return mapped;
+      const fields = schemaFields(schema);
+      if (fields.length === 1) return { [fields[0].name]: flat };
+    }
+    return null;
+  }
+
+  async function onElicitationRequest(request) {
+    const activeMsg = getActiveMessage();
+    if (!getRelayTurnActive() || !activeMsg?.id) {
+      dbg(
+        "elicitation bridge skipped: no active relay turn",
+        `relayTurnActive=${String(getRelayTurnActive())}`,
+        `hasActiveMessage=${String(!!activeMsg?.id)}`,
+      );
+      throw new Error("ask_user: no active relay turn — user input unavailable outside web relay context.");
+    }
+
+    const schema = extractRequestedSchema(request);
+    const fieldCount = schema ? schemaFields(schema).length : 0;
+    dbg(
+      "forwarding elicitation request for msgId",
+      activeMsg.id,
+      "mode",
+      activeMsg.relayMode || "agent",
+      "fields",
+      String(fieldCount),
+    );
+
+    await api("POST", "/api/activity", {
+      messageId: activeMsg.id,
+      conversationId: activeMsg.conversationId,
+      mode: activeMsg.relayMode || "agent",
+      text: fieldCount > 1
+        ? `Tool (ask_user): ${fieldCount}-field form posted; waiting for user answer`
+        : "Tool (ask_user): question posted; waiting for user answer",
+    }).catch(() => {});
+
+    setPendingAskUserRequest?.(null);
+    const result = await forwardRelayQuestion(request);
+    setLastAskUserBridge({
+      source: "onElicitationRequest",
+      at: Date.now(),
+      messageId: activeMsg.id,
+    });
+
+    if (result?.timedOut) {
+      const defaults = buildDefaultsContent(schema);
+      const activity = timeoutActivityText();
+      await api("POST", "/api/activity", {
+        messageId: activeMsg.id,
+        conversationId: activeMsg.conversationId,
+        mode: activeMsg.relayMode || "agent",
+        text: activity.text,
+      }).catch(() => {});
+      if (defaults) {
+        dbg("elicitation timed out for msgId", activeMsg.id, "— accepting schema defaults");
+        return { action: "accept", content: defaults };
+      }
+      dbg("elicitation timed out for msgId", activeMsg.id, "— declining");
+      return { action: "decline" };
+    }
+
+    const content = buildElicitationContent(schema, result);
+    if (!content) {
+      dbg("elicitation produced no usable content for msgId", activeMsg.id, "— declining");
+      await api("POST", "/api/activity", {
+        messageId: activeMsg.id,
+        conversationId: activeMsg.conversationId,
+        mode: activeMsg.relayMode || "agent",
+        text: "Tool (ask_user): no answer captured; continuing according to relay mode",
+      }).catch(() => {});
+      return { action: "decline" };
+    }
+
+    const summary = summarizeStructuredAnswer(schema, content) || String(result?.answer || "");
+    const escaped = summary.replace(/"/g, "'");
+    await api("POST", "/api/activity", {
+      messageId: activeMsg.id,
+      conversationId: activeMsg.conversationId,
+      mode: activeMsg.relayMode || "agent",
+      text: summary ? `Tool (ask_user): user answered "${escaped}"` : "Tool (ask_user): answered via web relay",
+    }).catch(() => {});
+
+    dbg(
+      "elicitation answered for msgId",
+      activeMsg.id,
+      "fields",
+      String(Object.keys(content).length),
+      `summary="${summary.slice(0, 120)}"`,
+    );
+
+    return { action: "accept", content };
+  }
+
   return {
     onPreToolUse,
     onUserInputRequest,
+    onElicitationRequest,
   };
 }

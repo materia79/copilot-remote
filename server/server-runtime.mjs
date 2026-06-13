@@ -22,11 +22,17 @@ import { createSessionRepository } from './repositories/session-repository.mjs';
 import { createMessageRepository } from './repositories/message-repository.mjs';
 import { createQuestionRepository } from './repositories/question-repository.mjs';
 import { registerSessionsRoutes } from './routes/sessions-routes.mjs';
-import { registerMessagesRoutes } from './routes/messages-routes.mjs';
+import { buildDequeuedRelayMessage, dequeuePendingMessageForWorkerLoop, registerMessagesRoutes } from './routes/messages-routes.mjs';
 import { registerAskUserRoutes } from './routes/ask-user-routes.mjs';
 import { registerRelayBoardRoutes } from './routes/relay-board-routes.mjs';
 import { registerCacheRoutes } from './routes/cache-routes.mjs';
 import { createDeleteArchiveService } from './services/delete-archive-service.mjs';
+import {
+  normalizeDriveAbsolutePath as _normalizeDriveAbsolutePath,
+  driveRootFromAbsolutePath as _driveRootFromAbsolutePath,
+  toDriveWebPath as _toDriveWebPath,
+  normalizeLinuxAbsolutePath as _normalizeLinuxAbsolutePath,
+} from './services/drives-path-helpers.mjs';
 import { createSessionDiscoveryService } from './services/session-discovery-service.mjs';
 import { createSessionTranscriptService } from './services/session-transcript-service.mjs';
 import { createContextSnapshotService } from './services/context-snapshot-service.mjs';
@@ -38,6 +44,7 @@ import { createSessionWorkerRegistry } from './services/session-worker-registry-
 import { createSessionWorkerSupervisor } from './services/session-worker-supervisor-service.mjs';
 import { createSessionWorkerProcessInspector } from './services/session-worker-process-service.mjs';
 import { launchSessionCli } from './services/session-worker-launch-service.mjs';
+import { createSshTunnelManager } from './services/ssh-tunnel-manager-service.mjs';
 import { createSessionWorkerWebSocketService } from './services/session-worker-websocket-service.mjs';
 import { maybeStartTtyConsole } from './tty-console-bootstrap.mjs';
 import { FEATURES, normalizeFeatureFlags } from './features.mjs';
@@ -45,6 +52,7 @@ import { RELAY_RESTART_EXIT_CODE } from './relay-exit-codes.mjs';
 import { DEFAULT_QUESTION_TIMEOUT_MS } from '../shared/question-timeout.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = path.resolve(__dirname, '..');
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const INDEX_HTML_PATH = path.join(PUBLIC_DIR, 'index.html');
 const SOCKET_IO_CLIENT_JS_PATH = path.join(__dirname, '..', 'node_modules', 'socket.io', 'client-dist', 'socket.io.js');
@@ -1377,6 +1385,8 @@ db.exec(`
     request         TEXT,
     status          TEXT NOT NULL DEFAULT 'pending',
     answer          TEXT,
+    structured_answer TEXT,
+    request_schema  TEXT,
     sdk_session_id  TEXT,
     owner_worker_id TEXT,
     continuation_id TEXT,
@@ -1674,6 +1684,12 @@ if (relayQuestionColumns.length && !relayQuestionColumns.includes('continuation_
 if (relayQuestionColumns.length && !relayQuestionColumns.includes('continuation_question_id')) {
   db.exec(`ALTER TABLE relay_questions ADD COLUMN continuation_question_id TEXT`);
 }
+if (relayQuestionColumns.length && !relayQuestionColumns.includes('structured_answer')) {
+  db.exec(`ALTER TABLE relay_questions ADD COLUMN structured_answer TEXT`);
+}
+if (relayQuestionColumns.length && !relayQuestionColumns.includes('request_schema')) {
+  db.exec(`ALTER TABLE relay_questions ADD COLUMN request_schema TEXT`);
+}
 db.exec(`CREATE INDEX IF NOT EXISTS idx_relay_questions_continuation ON relay_questions(continuation_id, continuation_question_id, status, created_at)`);
 
 // ─── Prepared Statements ──────────────────────────────────────────────────────
@@ -1777,9 +1793,32 @@ const sessionWorkerProcessInspector = createSessionWorkerProcessInspector({
   platform: process.platform,
   execFileSyncImpl: execFileSync,
 });
+function buildSessionWorkerLaunchEnv() {
+  const next = { ...process.env };
+  if (!String(next.GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS || '').trim()) {
+    next.GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS = 'true';
+  }
+  if (!String(next.COPILOT_WEB_RELAY_ROOT || '').trim()) {
+    next.COPILOT_WEB_RELAY_ROOT = REPO_ROOT;
+  }
+  if (!String(next.COPILOT_WEB_RELAY_SERVER_DIR || '').trim()) {
+    next.COPILOT_WEB_RELAY_SERVER_DIR = __dirname;
+  }
+  if (!String(next.COPILOT_WEB_RELAY_CONFIG || '').trim()) {
+    next.COPILOT_WEB_RELAY_CONFIG = CONFIG_PATH;
+  }
+  if (!String(next.COPILOT_WEB_RELAY_TOOLS || '').trim()) {
+    next.COPILOT_WEB_RELAY_TOOLS = path.join(__dirname, 'relay-tools.md');
+  }
+  if (!String(next.COPILOT_WEB_RELAY_LOG_DIR || '').trim()) {
+    next.COPILOT_WEB_RELAY_LOG_DIR = path.join(__dirname, 'logs');
+  }
+  return next;
+}
+const sessionWorkerLaunchEnv = buildSessionWorkerLaunchEnv();
 const relayCliLauncherService = createRelayCliLauncherService({
   cwd: (targetSessionId) => resolveLaunchWorkspaceRootForSession(targetSessionId),
-  env: process.env,
+  env: sessionWorkerLaunchEnv,
   log: (message) => console.log(`${runtimeLogPrefix()}${message}`),
 });
 async function spawnSessionWorkerCli(targetSessionId) {
@@ -1793,10 +1832,12 @@ async function spawnSessionWorkerCli(targetSessionId) {
     console.log(`${runtimeLogPrefix()}worker launcher: reused ${workerId} session=${normalizedTargetSessionId.slice(0, 8)} pid=${liveWorker.processId}`);
     return { workerId, pid: liveWorker.processId };
   }
+  const resolvedWorkspaceRoot = resolveLaunchWorkspaceRootForSession(normalizedTargetSessionId);
   const launched = await launchSessionCli({
     targetSessionId: normalizedTargetSessionId,
-    cwd: resolveLaunchWorkspaceRootForSession(normalizedTargetSessionId),
-    env: process.env,
+    processCwd: resolvedWorkspaceRoot,
+    workspaceRoot: resolvedWorkspaceRoot,
+    env: sessionWorkerLaunchEnv,
     platform: process.platform,
     spawnImpl: spawn,
     execFileSyncImpl: execFileSync,
@@ -1924,6 +1965,7 @@ function requestRelayShutdown({ reason = 'manual-request', requestedBy = 'localh
       `${runtimeLogPrefix()}Relay ${action} request accepted by ${requestInfo?.requestedBy || 'unknown'}`
       + `; queue is idle, exiting now (reason=${requestInfo?.reason || 'manual-request'})`,
     );
+    sessionWorkerWebSocketService.emitDraining(`api-${action}:${requestInfo?.reason || 'manual-request'}`);
     void shutdownRuntime(`api-${action}:${requestInfo?.reason || 'manual-request'}`, { exitCode });
   };
 
@@ -2237,6 +2279,8 @@ function formatQuestionRow(row) {
   const parsedRequest = parseQuestionRequest(row.request);
   const envelope = normalizeQuestionEnvelope(parsedRequest);
   const choices = parseQuestionChoices(row.choices);
+  const requestSchema = parseQuestionRequest(row.request_schema);
+  const structuredAnswer = parseQuestionRequest(row.structured_answer);
   return {
     id: row.id,
     queueId: row.queue_id,
@@ -2250,10 +2294,12 @@ function formatQuestionRow(row) {
     prompt: row.prompt,
     choices,
     request: envelope.request,
+    requestSchema: requestSchema && typeof requestSchema === 'object' ? requestSchema : null,
     context: envelope.context,
     allowFreeform: envelope.allowFreeform ?? !choices.length,
     status: row.status,
     answer: row.answer || null,
+    structuredAnswer: structuredAnswer && typeof structuredAnswer === 'object' ? structuredAnswer : null,
     createdAt: row.created_at,
     answeredAt: row.answered_at || null,
     expiresAt: row.expires_at,
@@ -2788,43 +2834,9 @@ function toRepoWebPath(value) {
   return String(value || '').replace(/\\/g, '/');
 }
 
-function normalizeDriveAbsolutePath(rawPath) {
-  const value = String(rawPath || '').trim();
-  if (!value) return '';
-  let decoded = value;
-  try {
-    decoded = decodeURIComponent(value);
-  } catch {
-    return '';
-  }
-  const withoutNulls = decoded.replace(/\0/g, '');
-  let normalized = withoutNulls
-    .replace(/\//g, '\\')
-    .replace(/\\+/g, '\\')
-    .trim();
-  if (!normalized) return '';
-  if (/^[A-Za-z]:$/.test(normalized)) normalized = `${normalized}\\`;
-  if (!/^[A-Za-z]:\\/.test(normalized)) return '';
-  normalized = path.win32.normalize(normalized);
-  if (!/^[A-Za-z]:\\/.test(normalized)) return '';
-  const drive = `${normalized.slice(0, 1).toUpperCase()}:`;
-  const rest = normalized.slice(3).replace(/^\\+/, '');
-  return rest ? `${drive}\\${rest}` : `${drive}\\`;
-}
-
-function driveRootFromAbsolutePath(absolutePath) {
-  const normalized = normalizeDriveAbsolutePath(absolutePath);
-  if (!normalized) return '';
-  return `${normalized.slice(0, 1).toUpperCase()}:\\`;
-}
-
-function toDriveWebPath(absolutePath) {
-  const normalized = normalizeDriveAbsolutePath(absolutePath);
-  if (!normalized) return '';
-  const drive = `${normalized.slice(0, 1).toUpperCase()}:`;
-  const rest = normalized.slice(3).replace(/\\/g, '/');
-  return rest ? `${drive}/${rest}` : drive;
-}
+const normalizeDriveAbsolutePath = _normalizeDriveAbsolutePath;
+const driveRootFromAbsolutePath = _driveRootFromAbsolutePath;
+const toDriveWebPath = _toDriveWebPath;
 
 function driveDisplayName(drive) {
   const id = String(drive?.drive || '').trim();
@@ -2927,6 +2939,82 @@ function fetchDriveDirectoryEntries(absoluteDirPath, { includeHidden = false } =
     }
   });
 }
+
+// ---------------------------------------------------------------------------
+// Linux root browsing helpers
+// ---------------------------------------------------------------------------
+
+const normalizeLinuxAbsolutePath = _normalizeLinuxAbsolutePath;
+
+function fetchLinuxDirectoryEntries(absoluteDirPath, { includeHidden = false } = {}, cb) {
+  const normalized = normalizeLinuxAbsolutePath(absoluteDirPath);
+  if (!normalized) return cb(new Error('Invalid Linux path'));
+  fs.readdir(normalized, { withFileTypes: true }, (err, dirents) => {
+    if (err) return cb(new Error(`Linux dir list failed: ${err.message}`));
+    const entries = [];
+    let pending = dirents.length;
+    if (pending === 0) return cb(null, []);
+    for (const dirent of dirents) {
+      const name = dirent.name;
+      if (!includeHidden && name.startsWith('.')) {
+        pending -= 1;
+        if (pending === 0) cb(null, entries.filter(Boolean).sort((a, b) => {
+          if (a.type !== b.type) return a.type === 'dir' ? -1 : 1;
+          return a.name.localeCompare(b.name);
+        }));
+        continue;
+      }
+      const fullPath = path.posix.join(normalized, name);
+      fs.stat(fullPath, (statErr, stat) => {
+        if (!statErr && stat) {
+          entries.push({
+            name,
+            fullPath,
+            type: stat.isDirectory() ? 'dir' : 'file',
+            ext: stat.isDirectory() ? '' : path.extname(name).toLowerCase(),
+            size: stat.isDirectory() ? null : stat.size,
+            mtime: stat.mtime ? stat.mtime.toISOString() : null,
+          });
+        }
+        pending -= 1;
+        if (pending === 0) {
+          cb(null, entries.filter(Boolean).sort((a, b) => {
+            if (a.type !== b.type) return a.type === 'dir' ? -1 : 1;
+            return a.name.localeCompare(b.name);
+          }));
+        }
+      });
+    }
+  });
+}
+
+function mapLinuxDirectoryEntry(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+  const absolutePath = normalizeLinuxAbsolutePath(entry.fullPath);
+  if (!absolutePath) return null;
+  const type = String(entry.type || '').toLowerCase() === 'dir' ? 'dir' : 'file';
+  const node = {
+    path: absolutePath,
+    name: String(entry.name || path.posix.basename(absolutePath) || absolutePath),
+    type,
+    mtime: entry.mtime ? String(entry.mtime) : null,
+  };
+  if (type === 'dir') {
+    node.children = [];
+    node.lazy = true;
+    node.childrenLoaded = false;
+    return node;
+  }
+  const ext = path.extname(absolutePath).toLowerCase();
+  const contentType = workspaceContentType(absolutePath);
+  node.ext = ext || null;
+  node.size = Number(entry.size || 0);
+  node.contentType = contentType;
+  node.previewKind = workspacePreviewKindForMeta(ext, contentType);
+  return node;
+}
+
+// ---------------------------------------------------------------------------
 
 function fetchWorkspaceDirectoryEntries(requestedPath, {
   includeHidden = false,
@@ -3513,20 +3601,27 @@ function recoverProcessingOlderThan(cutoffIso, requeueAtIso) {
 }
 
 function fetchUsageSummary(cb) {
-  execFile('gh', ['auth', 'token'], (err, stdout) => {
-    if (err) return cb(new Error('gh auth token failed'));
-    const ghToken = stdout.trim();
+  const envToken = String(process.env.GH_TOKEN || process.env.GITHUB_TOKEN || '').trim();
+  const useToken = (token) => {
     fetch('https://api.github.com/copilot_internal/user', {
-      headers: { Authorization: `Bearer ${ghToken}`, Accept: 'application/json' },
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
     })
-      .then((r) => r.json())
+      .then(async (response) => {
+        if (!response.ok) {
+          const bodyText = await response.text().catch(() => '');
+          const compactBody = String(bodyText || '').replace(/\s+/g, ' ').trim().slice(0, 240);
+          const suffix = compactBody ? `: ${compactBody}` : '';
+          throw new Error(`GitHub usage API failed (${response.status})${suffix}`);
+        }
+        return response.json();
+      })
       .then((data) => {
-        const snap = data.quota_snapshots || {};
+        const snap = data?.quota_snapshots || {};
         const premium = snap.premium_interactions || {};
         const chat = snap.chat || {};
         cb(null, {
-          plan: data.copilot_plan,
-          resetDate: data.quota_reset_date,
+          plan: data?.copilot_plan,
+          resetDate: data?.quota_reset_date,
           chat: {
             unlimited: chat.unlimited ?? true,
             remaining: chat.remaining ?? null,
@@ -3540,7 +3635,23 @@ function fetchUsageSummary(cb) {
           },
         });
       })
-      .catch((e) => cb(new Error(e.message)));
+      .catch((e) => cb(new Error(e?.message || 'Failed to fetch usage data')));
+  };
+
+  if (envToken) {
+    useToken(envToken);
+    return;
+  }
+
+  execFile('gh', ['auth', 'token'], (err, stdout, stderr) => {
+    const ghToken = String(stdout || '').trim();
+    if (!err && ghToken) {
+      useToken(ghToken);
+      return;
+    }
+    const reason = String(stderr || stdout || '').trim();
+    const reasonSuffix = reason ? ` (${reason})` : '';
+    cb(new Error(`GitHub token unavailable: run gh auth login or set GH_TOKEN/GITHUB_TOKEN${reasonSuffix}`));
   });
 }
 
@@ -3641,14 +3752,122 @@ httpServer.prependListener('upgrade', (req, _socket, _head) => {
   rewriteSocketIoRequestPath(req, remotePath);
 });
 const io         = new Server(httpServer, { cors: { origin: '*' }, path: socketIoPath() });
+async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'worker-ready' } = {}) {
+  const requesterSessionId = String(sessionId || '').trim();
+  if (!requesterSessionId) return { message: null, reason: 'missing-session-id' };
+  touchCli();
+  const sessionWorkerRoutingEnabled = featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true;
+  if (!sessionWorkerRoutingEnabled) {
+    return { message: null, paused: true, reason: 'session_worker_routing_disabled' };
+  }
+  sessionWorkerSupervisor?.noteSessionHeartbeat?.(requesterSessionId);
+  if (runtimeState.relayPaused) {
+    return { message: null, paused: true, reason: 'relay_paused' };
+  }
+  if (runtimeState.tunnelState?.blocking) {
+    return {
+      message: null,
+      paused: true,
+      reason: 'ssh_tunnel_required',
+      sshTunnel: {
+        mode: runtimeState.tunnelState?.mode ?? null,
+        required: runtimeState.tunnelState?.required ?? false,
+        connected: runtimeState.tunnelState?.connected ?? false,
+        lastError: runtimeState.tunnelState?.lastError ?? null,
+      },
+    };
+  }
+
+  const counts = queueCounts();
+  const existingWorker = sessionWorkerRegistry?.getWorker?.(requesterSessionId) || null;
+  if (!existingWorker) {
+    sessionWorkerRegistry?.upsertWorker?.({
+      sdkSessionId: requesterSessionId,
+      workerId: `worker-${requesterSessionId.slice(0, 8)}`,
+      status: 'ready',
+      pid: pid || null,
+      queueDepth: Math.max(0, Number(counts.pendingCount || 0)),
+    });
+  } else if (pid && existingWorker.pid !== pid) {
+    sessionWorkerRegistry?.upsertWorker?.({
+      ...existingWorker,
+      sdkSessionId: requesterSessionId,
+      pid,
+      status: existingWorker.status || 'ready',
+      queueDepth: Math.max(0, Number(counts.pendingCount || 0)),
+    });
+  }
+
+  const dequeueResult = await dequeuePendingMessageForWorkerLoop({
+    db,
+    stmts,
+    nowIso: new Date().toISOString(),
+    routingEnabled: true,
+    requesterSessionId,
+    ownerLeaseMs: 60_000,
+    affinityOnly: false,
+    sessionWorkerSupervisor,
+    relayRestartOrchestrator,
+    inFlightProcessingCount: Number(counts.processingCount || 0),
+  });
+  if (!dequeueResult?.message) {
+    return {
+      message: null,
+      routing: {
+        enabled: true,
+        requesterSessionId,
+        blockedReason: String(dequeueResult?.blockedReason || '').trim() || null,
+        lifecycle: dequeueResult?.lifecycle || null,
+        fallbackRestart: dequeueResult?.fallbackRestart || null,
+      },
+      restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
+    };
+  }
+
+  const out = buildDequeuedRelayMessage({
+    msg: dequeueResult.message,
+    stmts,
+    parseAttachments,
+    hydrateAttachment,
+    ensureRuntimeSessionBinding,
+    configuredConversationSessionMode,
+    normalizeRelayMode,
+    defaultRelayMode: DEFAULT_RELAY_MODE,
+    defaultModel: DEFAULT_MODEL,
+  });
+  if (out?.ownerSessionId) {
+    const worker = sessionWorkerRegistry?.getWorker?.(out.ownerSessionId) || null;
+    sessionWorkerRegistry?.upsertWorker?.({
+      ...(worker || {}),
+      sdkSessionId: out.ownerSessionId,
+      conversationId: out.conversationId,
+      runtimeSessionId: out.runtimeSessionId,
+      pid: pid || worker?.pid || null,
+      status: 'processing',
+      queueDepth: Math.max(0, Number(queueCounts?.().pendingCount || 0)),
+    });
+    sessionWorkerSupervisor?.markProcessing?.(out.ownerSessionId, Number(queueCounts?.().processingCount || 0));
+  }
+  console.log(`${runtimeLogPrefix()}WS DEQUEUE ${out.id.slice(0, 8)} session=${requesterSessionId.slice(0, 8)} reason=${String(reason || 'worker-ready')}`);
+  io.emit('message_status', { messageId: out.id, conversationId: out.conversationId, status: 'processing' });
+  return {
+    message: out,
+    routing: {
+      enabled: true,
+      requesterSessionId,
+    },
+    restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
+  };
+}
 const sessionWorkerWebSocketService = createSessionWorkerWebSocketService({
   WebSocketServerImpl: WebSocketServer,
   httpServer,
   authToken: config.authToken,
   queueCounts,
   touchCli,
+  requestWork: requestSessionWorkerSocketDelivery,
   pathPrefix: remotePath,
-  pollIntervalMs: 1000,
+  pollIntervalMs: 500,
   logger: console,
 });
 
@@ -3720,6 +3939,9 @@ const sharedRouteDeps = {
   normalizeDriveAbsolutePath,
   driveRootFromAbsolutePath,
   toDriveWebPath,
+  normalizeLinuxAbsolutePath,
+  fetchLinuxDirectoryEntries,
+  mapLinuxDirectoryEntry,
   compareRepoDirEntries,
   shouldSkipRepoEntryName,
   readWorkspaceFileMeta,
@@ -4168,218 +4390,17 @@ io.on('connection', (socket) => {
 });
 
 // ─── SSH Reverse Tunnel ────────────────────────────────────────────────────────
-const tunnelConfig = config.sshTunnel || {};
-const tunnelRemoteBindMode = String(tunnelConfig.remoteBind || 'loopback').trim().toLowerCase() === 'public'
-  ? 'public'
-  : 'loopback';
-const tunnelAutoReclaimPort = tunnelConfig.autoReclaimPort !== false;
-const tunnelRemoteCleanupCommand = typeof tunnelConfig.remoteCleanupCommand === 'string'
-  ? tunnelConfig.remoteCleanupCommand.trim()
-  : '';
-function buildTunnelRemoteForwardSpec(remotePort, localPort) {
-  const localTargetHost = '127.0.0.1';
-  if (tunnelRemoteBindMode === 'public') {
-    return `*:${remotePort}:${localTargetHost}:${localPort}`;
-  }
-  // SSH default loopback bind is the most compatible for localhost-based reverse proxies.
-  return `${remotePort}:${localTargetHost}:${localPort}`;
-}
-const tunnelEnabled = tunnelConfig.enabled === true
-  && typeof tunnelConfig.host === 'string' && tunnelConfig.host.trim()
-  && typeof tunnelConfig.user === 'string' && tunnelConfig.user.trim()
-  && typeof tunnelConfig.remotePort === 'number' && tunnelConfig.remotePort > 0;
-
-const tunnelState = {
-  enabled: tunnelEnabled,
-  connected: false,
-  host: tunnelConfig.host || null,
-  remotePort: tunnelConfig.remotePort || null,
-  reconnectAttempts: 0,
-  connectedSince: null,
-  proc: null,
-  backoffTimer: null,
-  remoteBindMode: tunnelRemoteBindMode,
-  cleanupInFlight: false,
-};
-
+const sshTunnelManager = createSshTunnelManager({
+  tunnelConfig: config.sshTunnel || {},
+  localPort: config.port || 3333,
+  runtimeLogPrefix,
+  io,
+  logger: console,
+  runtimeShutdownRef: () => runtimeShutdownStarted,
+  configBaseDir: __dirname,
+});
+const tunnelState = sshTunnelManager.state;
 runtimeState.tunnelState = tunnelState;
-
-function tunnelLog(msg) {
-  console.log(`${runtimeLogPrefix()}[ssh-tunnel] ${msg}`);
-}
-
-function scheduleTunnelReconnect(delayOverrideMs = null) {
-  if (runtimeShutdownStarted) return;
-  if (tunnelState.backoffTimer) {
-    clearTimeout(tunnelState.backoffTimer);
-    tunnelState.backoffTimer = null;
-  }
-  const BACKOFF_STEPS = [5_000, 10_000, 20_000, 40_000, 60_000];
-  const computedDelay = BACKOFF_STEPS[Math.min(tunnelState.reconnectAttempts, BACKOFF_STEPS.length - 1)];
-  const delay = Number.isFinite(delayOverrideMs) && delayOverrideMs >= 0
-    ? Number(delayOverrideMs)
-    : computedDelay;
-  tunnelState.reconnectAttempts += 1;
-  tunnelLog(`Reconnecting in ${delay / 1000}s (attempt ${tunnelState.reconnectAttempts})...`);
-  tunnelState.backoffTimer = setTimeout(spawnSshTunnel, delay);
-}
-
-async function reclaimRemoteTunnelPort() {
-  if (!tunnelEnabled || runtimeShutdownStarted || !tunnelAutoReclaimPort) return false;
-  if (tunnelState.cleanupInFlight) return false;
-  const { user, host, remotePort, identityFile } = tunnelConfig;
-  if (!user || !host || !remotePort) return false;
-  tunnelState.cleanupInFlight = true;
-
-  const cleanupCommand = tunnelRemoteCleanupCommand || [
-    `if command -v lsof >/dev/null 2>&1; then`,
-    `  pids=$(lsof -tiTCP:${remotePort} -sTCP:LISTEN 2>/dev/null || true);`,
-    `elif command -v fuser >/dev/null 2>&1; then`,
-    `  pids=$(fuser -n tcp ${remotePort} 2>/dev/null || true);`,
-    'else',
-    '  pids="";',
-    'fi;',
-    'if [ -n "$pids" ]; then kill $pids 2>/dev/null || true; fi',
-  ].join(' ');
-  const args = [
-    '-o', 'StrictHostKeyChecking=accept-new',
-    '-o', 'BatchMode=yes',
-  ];
-  if (identityFile) args.push('-i', identityFile.replace(/^~/, os.homedir()));
-  args.push(`${user}@${host}`, 'sh', '-lc', cleanupCommand);
-
-  tunnelLog(`Attempting remote reclaim for listen port ${remotePort}...`);
-  try {
-    const ok = await new Promise((resolve) => {
-      const proc = spawn('ssh', args, { stdio: ['ignore', 'pipe', 'pipe'] });
-      proc.stdout.on('data', (d) => tunnelLog(`cleanup stdout: ${d.toString().trim()}`));
-      proc.stderr.on('data', (d) => tunnelLog(`cleanup stderr: ${d.toString().trim()}`));
-      proc.on('close', (code) => {
-        tunnelLog(`Remote reclaim finished (code=${code ?? 'null'})`);
-        resolve(code === 0);
-      });
-      proc.on('error', (error) => {
-        tunnelLog(`Remote reclaim error: ${error?.message || error}`);
-        resolve(false);
-      });
-    });
-    return ok;
-  } finally {
-    tunnelState.cleanupInFlight = false;
-  }
-}
-
-function spawnSshTunnel() {
-  if (!tunnelEnabled || runtimeShutdownStarted) return;
-  if (tunnelState.proc && tunnelState.proc.exitCode === null) {
-    tunnelLog('Spawn skipped: existing tunnel process is still running.');
-    return;
-  }
-
-  const { user, host, remotePort, identityFile } = tunnelConfig;
-  const localPort = config.port || 3333;
-
-  const args = [
-    '-N',
-    '-o', 'ServerAliveInterval=30',
-    '-o', 'ServerAliveCountMax=3',
-    '-o', 'StrictHostKeyChecking=accept-new',
-    '-o', 'BatchMode=yes',
-    '-o', 'ExitOnForwardFailure=yes',
-    '-R', buildTunnelRemoteForwardSpec(remotePort, localPort),
-  ];
-  if (identityFile) args.push('-i', identityFile.replace(/^~/, os.homedir()));
-  args.push(`${user}@${host}`);
-
-  tunnelLog(`Spawning: ssh ${args.join(' ')}`);
-
-  const proc = spawn('ssh', args, { stdio: ['ignore', 'pipe', 'pipe'] });
-  tunnelState.proc = proc;
-
-  const connectedAt = Date.now();
-  let readinessTimer = null;
-  let forwardingFailed = false;
-  const markConnected = () => {
-    if (tunnelState.connected) return;
-    tunnelState.connected = true;
-    tunnelState.connectedSince = new Date().toISOString();
-    tunnelLog(`Tunnel up to ${user}@${host} remote port ${remotePort}`);
-    io.emit('ssh_tunnel_status', { connected: true, host, remotePort });
-  };
-  const clearReadinessTimer = () => {
-    if (!readinessTimer) return;
-    clearTimeout(readinessTimer);
-    readinessTimer = null;
-  };
-
-  proc.stdout.on('data', (d) => tunnelLog(`stdout: ${d.toString().trim()}`));
-  proc.stderr.on('data', (d) => {
-    const text = d.toString().trim();
-    tunnelLog(`stderr: ${text}`);
-    if (/remote port forwarding failed for listen port/i.test(text)) {
-      forwardingFailed = true;
-    }
-  });
-
-  proc.on('spawn', () => {
-    clearReadinessTimer();
-    readinessTimer = setTimeout(() => {
-      readinessTimer = null;
-      if (runtimeShutdownStarted || forwardingFailed) return;
-      if (tunnelState.proc !== proc) return;
-      if (proc.exitCode !== null) return;
-      markConnected();
-    }, 1200);
-    if (typeof readinessTimer.unref === 'function') readinessTimer.unref();
-  });
-
-  proc.on('error', (e) => {
-    clearReadinessTimer();
-    tunnelLog(`Error: ${e.message}`);
-  });
-
-  proc.on('close', (code) => {
-    clearReadinessTimer();
-    const wasConnected = tunnelState.connected;
-    tunnelState.connected = false;
-    tunnelState.connectedSince = null;
-    tunnelState.proc = null;
-    // Reset backoff counter if connection lived long enough (>30s = stable)
-    if (wasConnected && Date.now() - connectedAt > 30_000) {
-      tunnelState.reconnectAttempts = 0;
-    }
-    if (runtimeShutdownStarted) {
-      tunnelLog(`Process exited (code=${code}) during shutdown.`);
-      return;
-    }
-    if (forwardingFailed) {
-      tunnelLog(`Process exited (code=${code}) after remote forward bind failure.`);
-      io.emit('ssh_tunnel_status', { connected: false, host, remotePort });
-      if (tunnelAutoReclaimPort) {
-        void reclaimRemoteTunnelPort().then((reclaimed) => {
-          scheduleTunnelReconnect(reclaimed ? 1_000 : null);
-        });
-      } else {
-        scheduleTunnelReconnect();
-      }
-      return;
-    }
-    tunnelLog(`Process exited (code=${code}). Scheduling reconnect...`);
-    io.emit('ssh_tunnel_status', { connected: false, host, remotePort });
-    scheduleTunnelReconnect();
-  });
-}
-
-function stopSshTunnel() {
-  if (tunnelState.backoffTimer) {
-    clearTimeout(tunnelState.backoffTimer);
-    tunnelState.backoffTimer = null;
-  }
-  if (tunnelState.proc) {
-    try { tunnelState.proc.kill('SIGTERM'); } catch (_) {}
-    tunnelState.proc = null;
-  }
-}
 
 function clearRuntimeTimers() {
   for (const timer of Object.values(runtimeTimers)) {
@@ -4407,7 +4428,7 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
   clearRuntimeTimers();
   sessionWorkerWebSocketService.stop();
   stopWorkspaceFileWatcher();
-  stopSshTunnel();
+  sshTunnelManager.stop();
   try { relaySingletonGuard.release(); } catch (error) {
     console.warn(`${runtimeLogPrefix()}Failed to release singleton lock: ${error?.message || error}`);
   }
@@ -4464,7 +4485,8 @@ function buildRelayReadyBannerData() {
   const localUrl = `http://localhost:${config.port}/`;
   const networkUrl = localhostOnly ? null : `http://${String(localIp).slice(0, 15)}:${config.port}/`;
   const networkText = localhostOnly ? 'disabled (localhost only)' : networkUrl;
-  const remoteUrl = tunnelEnabled ? `https://${String(tunnelConfig.host || '').slice(0, 30)}/` : null;
+  const tunnelActive = tunnelState.enabled === true && tunnelState.mode === 'managed';
+  const remoteUrl = tunnelActive ? `https://${String(tunnelState.host || '').slice(0, 30)}/` : null;
   const pollingUrl = `http://localhost:${config.port}/api/pending`;
   const authText = 'token required';
 
@@ -4474,7 +4496,7 @@ function buildRelayReadyBannerData() {
     networkUrl,
     networkText,
     remoteUrl,
-    remoteBindMode: tunnelRemoteBindMode,
+    remoteBindMode: tunnelState.remoteBindMode,
     authText,
     pollingUrl,
     localhostOnly,
@@ -4486,7 +4508,7 @@ function buildRelayReadyBannerData() {
       `║  Local:      ${localUrl.padEnd(47)} ║`,
       `║  Network:    ${String(networkText || '').padEnd(47)} ║`,
       ...(remoteUrl ? [`║  Remote:     ${remoteUrl.padEnd(47)} ║`] : []),
-      ...(remoteUrl ? [`║  Tunnel:     ${(`mode=${tunnelRemoteBindMode}`).padEnd(47)} ║`] : []),
+      ...(remoteUrl ? [`║  Tunnel:     ${(`mode=${tunnelState.remoteBindMode}`).padEnd(47)} ║`] : []),
       `║  Auth:       ${authText.padEnd(47)} ║`,
       '╠══════════════════════════════════════════════════════════════╣',
       '║  CLI polling URL (for monitoring mode):                      ║',
@@ -4518,8 +4540,5 @@ httpServer.listen(config.port, listenHost, () => {
   console.log('\nCLI status: waiting for first heartbeat...\n');
 
   // Start SSH tunnel after server is listening
-  if (tunnelEnabled) {
-    tunnelLog(`SSH tunnel enabled (${tunnelRemoteBindMode}) to ${tunnelConfig.user}@${tunnelConfig.host}:${tunnelConfig.remotePort}`);
-    spawnSshTunnel();
-  }
+  sshTunnelManager.start();
 });

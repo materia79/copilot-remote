@@ -17,13 +17,19 @@ test('buildTmuxWorkerShellCommand injects only relay env needed for workers', ()
   const command = buildTmuxWorkerShellCommand('abc-123', {
     GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS: 'true',
     COPILOT_WEB_RELAY_SERVER_DIR: '/repo/server',
+    INIT_CWD: '/workspace',
     IGNORED_VAR: 'nope',
   });
 
   assert.match(command, /GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS='true'/);
   assert.match(command, /COPILOT_WEB_RELAY_SERVER_DIR='\/repo\/server'/);
+  assert.match(command, /INIT_CWD='\/workspace'/);
   assert.doesNotMatch(command, /IGNORED_VAR/);
-  assert.match(command, /exec gh copilot -- --allow-all --session-id 'abc-123'/);
+  assert.match(command, /exec script -q -c/);
+  assert.match(command, /gh copilot -- --allow-all --session-id/);
+  assert.match(command, /abc-123/);
+  assert.match(command, /\/dev\/null/);
+  assert.doesNotMatch(command, /GH_FORCE_TTY/);
 });
 
 test('killTmuxSession returns false when tmux kill races after session exists', () => {
@@ -74,7 +80,8 @@ test('launchSessionCli uses tmux on posix and returns discovered worker pid', as
 
   const launched = await launchSessionCli({
     targetSessionId: 'abc-123',
-    cwd: '/repo',
+    processCwd: '/relay',
+    workspaceRoot: '/repo',
     env: {
       GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS: 'true',
       COPILOT_WORKSPACE_ROOT: '/stale',
@@ -91,14 +98,22 @@ test('launchSessionCli uses tmux on posix and returns discovered worker pid', as
   assert.equal(launched.tmuxSessionName, 'abc-123');
   assert.ok(calls.length >= 2);
   const newSessionCall = calls.find((call) => call[1] === 'new-session');
-  assert.deepEqual(newSessionCall?.slice(-3), ['sh', '-lc', "GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS='true' COPILOT_WORKSPACE_ROOT='/repo' exec gh copilot -- --allow-all --session-id 'abc-123'"]);
+  assert.equal(newSessionCall?.[6], '/relay');
+  const shellCommand = newSessionCall?.slice(-1)?.[0] || '';
+  assert.match(shellCommand, /GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS='true'/);
+  assert.match(shellCommand, /COPILOT_WORKSPACE_ROOT='\/repo'/);
+  assert.match(shellCommand, /exec script -q -c/);
+  assert.match(shellCommand, /gh copilot -- --allow-all --session-id/);
+  assert.match(shellCommand, /abc-123/);
+  assert.doesNotMatch(shellCommand, /GH_FORCE_TTY/);
 });
 
 test('launchSessionCli falls back to detached spawn when tmux is unavailable', async () => {
   const spawnCalls = [];
   const launched = await launchSessionCli({
     targetSessionId: 'abc-123',
-    cwd: '/repo',
+    processCwd: '/relay',
+    workspaceRoot: '/repo',
     env: {
       PATH: process.env.PATH || '',
       COPILOT_WORKSPACE_ROOT: '/stale',
@@ -125,8 +140,88 @@ test('launchSessionCli falls back to detached spawn when tmux is unavailable', a
   assert.equal(launched.launchMode, 'detached');
   assert.equal(launched.pid, 4242);
   assert.equal(spawnCalls[0]?.command, 'gh');
+  assert.equal(spawnCalls[0]?.options?.cwd, '/relay');
   assert.equal(spawnCalls[0]?.options?.env?.COPILOT_WORKSPACE_ROOT, '/repo');
-  assert.equal(spawnCalls[0]?.options?.env?.PWD, '/repo');
+  assert.equal(spawnCalls[0]?.options?.env?.INIT_CWD, '/repo');
+  assert.equal(spawnCalls[0]?.options?.env?.PWD, '/relay');
+});
+
+test('launchSessionCli opens a visible detached console on windows', async () => {
+  const spawnCalls = [];
+  let unrefCalled = false;
+  const launched = await launchSessionCli({
+    targetSessionId: 'abc-123',
+    processCwd: 'C:\\relay',
+    workspaceRoot: 'C:\\repo',
+    env: {
+      PATH: process.env.PATH || '',
+      ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+    },
+    platform: 'win32',
+    processInspector: {
+      findProcessForSession() {
+        return null;
+      },
+    },
+    spawnImpl(command, args, options) {
+      spawnCalls.push({ command, args, options });
+      return {
+        pid: 4244,
+        unref() {
+          unrefCalled = true;
+        },
+      };
+    },
+  });
+
+  assert.equal(launched.launchMode, 'console');
+  assert.equal(launched.pid, null);
+  assert.match(spawnCalls[0]?.command, /cmd\.exe$/i);
+  assert.deepEqual(spawnCalls[0]?.args, [
+    '/d',
+    '/s',
+    '/c',
+    'start',
+    'Copilot Worker abc-123',
+    'gh',
+    'copilot',
+    '--',
+    '--allow-all',
+    '--session-id',
+    'abc-123',
+  ]);
+  assert.equal(spawnCalls[0]?.options?.shell, undefined);
+  assert.equal(spawnCalls[0]?.options?.detached, true);
+  assert.equal(spawnCalls[0]?.options?.stdio, 'ignore');
+  assert.equal(spawnCalls[0]?.options?.windowsHide, false);
+  assert.equal(unrefCalled, true);
+});
+
+test('launchSessionCli returns unknown pid when windows console spawn has no pid', async () => {
+  const launched = await launchSessionCli({
+    targetSessionId: 'abc-123',
+    processCwd: 'C:\\relay',
+    workspaceRoot: 'C:\\repo',
+    env: {
+      PATH: process.env.PATH || '',
+      ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+    },
+    platform: 'win32',
+    processInspector: {
+      findProcessForSession() {
+        return null;
+      },
+    },
+    spawnImpl() {
+      return {
+        pid: null,
+        unref() {},
+      };
+    },
+  });
+
+  assert.equal(launched.launchMode, 'console');
+  assert.equal(launched.pid, null);
 });
 
 test('launchSessionCli reuses a live existing process before launching', async () => {

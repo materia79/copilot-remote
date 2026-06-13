@@ -14,6 +14,12 @@ function normalizePathPrefix(value) {
   return prefixed.replace(/\/+$/, '');
 }
 
+function buildAcceptedWorkerPaths(pathPrefix) {
+  const basePath = '/api/session-worker/ws';
+  const prefixed = `${normalizePathPrefix(pathPrefix)}${basePath}` || basePath;
+  return Array.from(new Set([basePath, prefixed]));
+}
+
 function parseCookies(header) {
   const out = {};
   for (const part of String(header || '').split(/;\s*/)) {
@@ -51,6 +57,27 @@ function normalizeQueueSnapshot(value) {
   return { pendingCount, processingCount, parkedCount };
 }
 
+function normalizePositiveInt(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return null;
+  const intValue = Math.trunc(numeric);
+  return intValue > 0 ? intValue : null;
+}
+
+function parseUpgradeIdentity(req) {
+  const host = String(req?.headers?.host || 'localhost');
+  let parsedUrl = null;
+  try {
+    parsedUrl = new URL(String(req?.url || ''), `http://${host}`);
+  } catch {
+    parsedUrl = null;
+  }
+  return {
+    sessionId: normalizeText(parsedUrl?.searchParams?.get('sessionId')),
+    pid: normalizePositiveInt(parsedUrl?.searchParams?.get('pid')),
+  };
+}
+
 function queueSnapshotChanged(left, right) {
   if (!left || !right) return true;
   return left.pendingCount !== right.pendingCount
@@ -64,6 +91,7 @@ export function createSessionWorkerWebSocketService({
   authToken,
   queueCounts,
   touchCli = () => {},
+  requestWork = async () => null,
   pathPrefix = '',
   pollIntervalMs = 1000,
   nowIso = () => new Date().toISOString(),
@@ -73,9 +101,11 @@ export function createSessionWorkerWebSocketService({
   if (!httpServer) throw new Error('createSessionWorkerWebSocketService requires httpServer');
   if (typeof queueCounts !== 'function') throw new Error('createSessionWorkerWebSocketService requires queueCounts');
 
-  const wsPath = `${normalizePathPrefix(pathPrefix)}/api/session-worker/ws` || '/api/session-worker/ws';
+  const acceptedPaths = buildAcceptedWorkerPaths(pathPrefix);
+  const wsPath = acceptedPaths[acceptedPaths.length - 1];
   const wss = new WebSocketServerImpl({ noServer: true });
   const clients = new Set();
+  const clientState = new Map();
   const noop = () => {};
   const logDebug = typeof logger?.debug === 'function' ? logger.debug.bind(logger) : noop;
   const logWarn = typeof logger?.warn === 'function' ? logger.warn.bind(logger) : noop;
@@ -110,11 +140,82 @@ export function createSessionWorkerWebSocketService({
     return event;
   }
 
+  function emitEvent(socket, event) {
+    if (!socket || socket.readyState !== socket.OPEN) return false;
+    try {
+      socket.send(JSON.stringify(event));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function maybeDeliverToSocket(socket, reason = 'ready') {
+    const meta = clientState.get(socket);
+    if (!meta || meta.delivering || !meta.ready) return false;
+    if (!meta.sessionId) return false;
+    if (socket.readyState !== socket.OPEN) return false;
+    meta.delivering = true;
+    try {
+      const pending = await requestWork({
+        sessionId: meta.sessionId,
+        pid: meta.pid,
+        reason,
+      });
+      touchCli();
+      if (!pending || typeof pending !== 'object') return false;
+      if (pending.message) {
+        meta.ready = false;
+        meta.lastDeliveredAt = nowIso();
+        return emitEvent(socket, {
+          type: 'queue.deliver',
+          reason,
+          pending,
+          timestamp: meta.lastDeliveredAt,
+        });
+      }
+      if (pending.paused || pending.reason || pending.routing?.blockedReason) {
+        emitEvent(socket, {
+          type: 'queue.blocked',
+          reason: String(pending.reason || pending.routing?.blockedReason || reason || 'blocked'),
+          pending,
+          timestamp: nowIso(),
+        });
+      }
+      return false;
+    } catch (error) {
+      logWarn(`[worker-ws] delivery failed for ${String(meta.sessionId || 'unknown').slice(0, 8)}: ${error?.message || error}`);
+      emitEvent(socket, {
+        type: 'queue.error',
+        reason: 'delivery-failed',
+        error: String(error?.message || error || 'unknown delivery failure'),
+        timestamp: nowIso(),
+      });
+      return false;
+    } finally {
+      meta.delivering = false;
+    }
+  }
+
+  async function maybeDeliverToReadyClients(reason = 'queue-update') {
+    const deliveries = [];
+    for (const socket of clients) {
+      const meta = clientState.get(socket);
+      if (!meta?.ready || meta.delivering) continue;
+      deliveries.push(maybeDeliverToSocket(socket, reason));
+    }
+    if (!deliveries.length) return;
+    await Promise.allSettled(deliveries);
+  }
+
   function monitorQueue() {
     const snapshot = normalizeQueueSnapshot(queueCounts());
-    if (!queueSnapshotChanged(snapshot, lastSnapshot)) return;
+    const changed = queueSnapshotChanged(snapshot, lastSnapshot);
     lastSnapshot = snapshot;
-    emitQueueChanged('queue-count-changed');
+    if (changed) {
+      emitQueueChanged('queue-count-changed');
+    }
+    void maybeDeliverToReadyClients(changed ? 'queue-count-changed' : 'ready-check');
   }
 
   function rejectUpgrade(socket) {
@@ -134,7 +235,7 @@ export function createSessionWorkerWebSocketService({
     } catch {
       return false;
     }
-    return pathname === wsPath;
+    return acceptedPaths.includes(pathname);
   }
 
   function handleUpgrade(req, socket, head) {
@@ -150,21 +251,62 @@ export function createSessionWorkerWebSocketService({
     return true;
   }
 
-  function onConnection(ws) {
+  function onConnection(ws, req) {
     clients.add(ws);
+    const identity = parseUpgradeIdentity(req);
+    clientState.set(ws, {
+      sessionId: identity.sessionId,
+      pid: identity.pid,
+      ready: false,
+      delivering: false,
+      connectedAt: nowIso(),
+      lastDeliveredAt: null,
+    });
     touchCli();
-    try {
-      ws.send(JSON.stringify(toQueueChangedEvent('connected')));
-    } catch {}
+    emitEvent(ws, {
+      type: 'server.hello',
+      reason: 'connected',
+      queue: normalizeQueueSnapshot(queueCounts()),
+      sessionId: identity.sessionId,
+      timestamp: nowIso(),
+    });
 
-    ws.on('message', () => {
+    ws.on('message', (raw) => {
       touchCli();
+      let payload = null;
+      try {
+        payload = JSON.parse(String(raw || ''));
+      } catch {
+        payload = null;
+      }
+      const meta = clientState.get(ws);
+      if (!meta || !payload || typeof payload !== 'object') return;
+      if (payload.type === 'worker.hello') {
+        meta.sessionId = normalizeText(payload.sessionId) || meta.sessionId;
+        meta.pid = normalizePositiveInt(payload.pid) || meta.pid;
+        emitEvent(ws, {
+          type: 'server.hello',
+          reason: 'ack',
+          queue: normalizeQueueSnapshot(queueCounts()),
+          sessionId: meta.sessionId,
+          timestamp: nowIso(),
+        });
+        return;
+      }
+      if (payload.type === 'worker.ready') {
+        meta.sessionId = normalizeText(payload.sessionId) || meta.sessionId;
+        meta.pid = normalizePositiveInt(payload.pid) || meta.pid;
+        meta.ready = true;
+        void maybeDeliverToSocket(ws, String(payload.reason || 'worker-ready'));
+      }
     });
     ws.on('close', () => {
       clients.delete(ws);
+      clientState.delete(ws);
     });
     ws.on('error', () => {
       clients.delete(ws);
+      clientState.delete(ws);
     });
   }
 
@@ -196,15 +338,32 @@ export function createSessionWorkerWebSocketService({
       try { socket.close(); } catch {}
     }
     clients.clear();
+    clientState.clear();
     try { wss.close(); } catch (error) {
       logWarn(`[worker-ws] close failed: ${error?.message || error}`);
     }
   }
 
+  function emitDraining(reason = 'relay-shutdown') {
+    for (const socket of clients) {
+      emitEvent(socket, {
+        type: 'server.draining',
+        reason,
+        timestamp: nowIso(),
+      });
+    }
+  }
+
   function status() {
+    let readyCount = 0;
+    for (const meta of clientState.values()) {
+      if (meta?.ready) readyCount += 1;
+    }
     return {
       connectedCount: clients.size,
+      readyCount,
       path: wsPath,
+      acceptedPaths,
     };
   }
 
@@ -217,7 +376,7 @@ export function createSessionWorkerWebSocketService({
     stop,
     status,
     emitQueueChanged,
+    emitDraining,
     handleUpgrade,
   };
 }
-

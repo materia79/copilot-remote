@@ -76,8 +76,12 @@ export async function launchWorkspaceRootSession(runtimeState = {}, sessionWorke
     return { ok: false, statusCode: 409, error: 'Selected CLI is already running' };
   }
   if (activeStatuses.includes(selectedWorkerStatus) && selectedWorkerHasPid && !selectedWorkerPidAlive) {
-    sessionWorkerSupervisor?.clearRestartSchedule?.(sid);
+    sessionWorkerSupervisor?.clearRestartSchedule?.(sid, { resetKilledMarker: true });
     sessionWorkerRegistry?.removeWorker?.(sid);
+  } else {
+    // Explicit user-triggered launch always clears the kill block so it is not
+    // stuck behind the 30-second grace window from a prior kill.
+    sessionWorkerSupervisor?.clearRestartSchedule?.(sid, { resetKilledMarker: true });
   }
   if (!sessionWorkerSupervisor || typeof sessionWorkerSupervisor.ensureWorker !== 'function') {
     return { ok: false, statusCode: 500, error: 'Session worker launcher is unavailable' };
@@ -2154,17 +2158,23 @@ export function registerSessionsRoutes(app, deps) {
       remotePath,
       sshTunnel: {
         enabled: runtimeState.tunnelState?.enabled ?? false,
+        mode: runtimeState.tunnelState?.mode ?? 'disabled',
+        required: runtimeState.tunnelState?.required ?? false,
+        blocking: runtimeState.tunnelState?.blocking ?? false,
         connected: runtimeState.tunnelState?.connected ?? false,
         host: runtimeState.tunnelState?.host ?? null,
         remotePort: runtimeState.tunnelState?.remotePort ?? null,
         remoteBindMode: runtimeState.tunnelState?.remoteBindMode ?? null,
         reconnectAttempts: runtimeState.tunnelState?.reconnectAttempts ?? 0,
         connectedSince: runtimeState.tunnelState?.connectedSince ?? null,
+        lastError: runtimeState.tunnelState?.lastError ?? null,
+        valid: runtimeState.tunnelState?.valid ?? true,
       },
       workerWebSocket: runtimeState.workerWebSocketStatus || null,
       activeBridgeOwner: runtimeState.activeBridgeOwner || null,
       restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
       relayShutdown: runtimeState.relayShutdown || null,
+      platform: process.platform,
       features: featureFlags || {},
       sessionWorker: buildSessionWorkerStatusPayload({
         featureFlags,

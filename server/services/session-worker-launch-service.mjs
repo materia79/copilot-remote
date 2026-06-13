@@ -98,32 +98,42 @@ export function buildTmuxWorkerShellCommand(targetSessionId, env = {}) {
     'COPILOT_WEB_RELAY_TOOLS',
     'COPILOT_WEB_RELAY_LOG_DIR',
     'COPILOT_WORKSPACE_ROOT',
+    'INIT_CWD',
   ]) {
     const value = String(env?.[key] || '').trim();
     if (!value) continue;
     exports.push(`${key}=${shellQuote(value)}`);
   }
   const prefix = exports.length ? `${exports.join(' ')} ` : '';
-  return `${prefix}exec gh copilot -- --allow-all --session-id ${shellQuote(targetSessionId)}`;
+  // Use script to create a pseudo-TTY without GH_FORCE_TTY so the CLI routes
+  // ask_user requests through the SDK's onUserInputRequest handler instead of
+  // drawing terminal prompts.
+  return `${prefix}exec script -q -c ${shellQuote(`gh copilot -- --allow-all --session-id ${shellQuote(targetSessionId)}`)} /dev/null`;
 }
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function buildWorkerLaunchEnv(cwd, env = process.env) {
-  const launchCwd = String(cwd || '').trim();
-  if (!launchCwd) return env;
+function buildWorkerLaunchEnv({ processCwd, workspaceRoot, env = process.env } = {}) {
+  const launchProcessCwd = String(processCwd || '').trim();
+  const launchWorkspaceRoot = String(workspaceRoot || '').trim() || launchProcessCwd;
+  if (!launchProcessCwd && !launchWorkspaceRoot) return env;
   return {
     ...env,
-    COPILOT_WORKSPACE_ROOT: launchCwd,
-    PWD: launchCwd,
+    ...(launchWorkspaceRoot ? {
+      COPILOT_WORKSPACE_ROOT: launchWorkspaceRoot,
+      INIT_CWD: launchWorkspaceRoot,
+    } : {}),
+    ...(launchProcessCwd ? { PWD: launchProcessCwd } : {}),
   };
 }
 
 export async function launchSessionCli({
   targetSessionId,
   cwd,
+  processCwd = '',
+  workspaceRoot = '',
   env = process.env,
   platform = process.platform,
   spawnImpl = spawn,
@@ -131,6 +141,8 @@ export async function launchSessionCli({
   processInspector = null,
   tmuxPollAttempts = 4,
   tmuxPollDelayMs = 200,
+  detachedPollAttempts = 10,
+  detachedPollDelayMs = 200,
 } = {}) {
   const target = String(targetSessionId || '').trim();
   if (!target) throw new Error('missing-target-session-id');
@@ -148,8 +160,13 @@ export async function launchSessionCli({
     };
   }
 
-  const launchCwd = String(cwd || process.cwd());
-  const launchEnv = buildWorkerLaunchEnv(launchCwd, env);
+  const launchWorkspaceRoot = String(workspaceRoot || cwd || process.cwd());
+  const launchProcessCwd = String(processCwd || cwd || process.cwd());
+  const launchEnv = buildWorkerLaunchEnv({
+    processCwd: launchProcessCwd,
+    workspaceRoot: launchWorkspaceRoot,
+    env,
+  });
 
   if (isTmuxAvailable({ platform, execFileSyncImpl })) {
     const sessionName = normalizeTmuxSessionName(target);
@@ -169,7 +186,7 @@ export async function launchSessionCli({
       '-s',
       sessionName,
       '-c',
-      launchCwd,
+      launchProcessCwd,
       'sh',
       '-lc',
       buildTmuxWorkerShellCommand(target, launchEnv),
@@ -204,15 +221,41 @@ export async function launchSessionCli({
     throw new Error('worker-spawn-unhealthy:tmux-pane-missing');
   }
 
-  const child = spawnImpl('gh', ['copilot', '--', '--allow-all', '--session-id', target], {
-    cwd: launchCwd,
+  const spawnCommand = platform === 'win32'
+    ? (launchEnv.ComSpec || process.env.ComSpec || 'cmd.exe')
+    : 'gh';
+  const spawnArgs = platform === 'win32'
+    ? [
+      '/d',
+      '/s',
+      '/c',
+      'start',
+      `Copilot Worker ${target.slice(0, 8)}`,
+      'gh',
+      'copilot',
+      '--',
+      '--allow-all',
+      '--session-id',
+      target,
+    ]
+    : ['copilot', '--', '--allow-all', '--session-id', target];
+  const child = spawnImpl(spawnCommand, spawnArgs, {
+    cwd: launchProcessCwd,
     env: launchEnv,
     detached: true,
     stdio: 'ignore',
-    shell: platform === 'win32',
-    windowsHide: platform === 'win32',
+    windowsHide: platform !== 'win32',
   });
   child.unref?.();
+  if (platform === 'win32') {
+    return {
+      pid: null,
+      reused: false,
+      launchMode: 'console',
+      tmuxSessionName: null,
+      child,
+    };
+  }
   const pid = parsePositiveInt(child?.pid);
   if (!pid) throw new Error('worker-spawn-unhealthy:missing-pid');
   return {

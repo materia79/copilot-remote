@@ -155,6 +155,18 @@ export function extractQuestionChoices(request) {
       source?.items,
       source?.suggestions,
     );
+    // Also check JSON Schema format: requestedSchema.properties.*.oneOf or enum
+    const schema = source?.requestedSchema;
+    if (schema?.properties) {
+      for (const prop of Object.values(schema.properties)) {
+        if (Array.isArray(prop?.oneOf)) {
+          rawCandidates.push(prop.oneOf);
+        }
+        if (Array.isArray(prop?.enum)) {
+          rawCandidates.push(prop.enum);
+        }
+      }
+    }
   }
 
   const raw = rawCandidates.find((value) => Array.isArray(value)) || [];
@@ -163,7 +175,8 @@ export function extractQuestionChoices(request) {
     .map((choice) => {
       if (typeof choice === "string") return choice.trim();
       if (choice && typeof choice === "object") {
-        return String(choice.label || choice.text || choice.value || choice.title || "").trim();
+        // Support JSON Schema oneOf format: {const: "value", title: "Display Label"}
+        return String(choice.title || choice.label || choice.text || choice.value || choice.const || "").trim();
       }
       return "";
     })

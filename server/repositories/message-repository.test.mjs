@@ -1,0 +1,154 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import Database from 'better-sqlite3';
+
+function createTestDb() {
+  const db = new Database(':memory:');
+  db.exec(`
+    CREATE TABLE conversations (
+      id TEXT PRIMARY KEY,
+      title TEXT,
+      status TEXT,
+      sdk_session_id TEXT
+    );
+
+    CREATE TABLE runtime_sessions (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT,
+      sdk_session_id TEXT
+    );
+
+    CREATE TABLE messages (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT,
+      role TEXT,
+      text TEXT,
+      model TEXT,
+      mode TEXT,
+      attachments TEXT,
+      timestamp TEXT
+    );
+
+    CREATE VIRTUAL TABLE messages_fts USING fts5(text);
+
+    CREATE TABLE queue (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT,
+      runtime_session_id TEXT,
+      is_new_conversation INTEGER,
+      model TEXT,
+      model_variant_id TEXT,
+      reasoning_effort TEXT,
+      relay_mode TEXT,
+      text TEXT,
+      attachments TEXT,
+      status TEXT,
+      timestamp TEXT,
+      processing_at TEXT,
+      response_message_id TEXT,
+      response TEXT,
+      retry_count INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT,
+      owner_sdk_session_id TEXT,
+      owner_assigned_at TEXT,
+      owner_lease_expires_at TEXT,
+      owner_last_claimed_at TEXT,
+      parked_at TEXT,
+      parked_target_session_id TEXT,
+      parked_transaction_id TEXT,
+      parked_reason TEXT
+    );
+
+    CREATE TABLE uploaded_files (
+      sha256 TEXT PRIMARY KEY,
+      original_name TEXT,
+      mime_type TEXT,
+      size_bytes INTEGER,
+      created_at TEXT
+    );
+
+    CREATE TABLE upload_refs (
+      file_sha256 TEXT,
+      conversation_id TEXT,
+      message_id TEXT,
+      created_at TEXT
+    );
+  `);
+  return db;
+}
+
+test('routed worker dequeue uses runtime session binding when queue owner is empty', () => {
+  const db = createTestDb();
+  const findPendingForWorker = db.prepare(`
+    SELECT q.*
+    FROM queue q
+    LEFT JOIN runtime_sessions rs
+      ON rs.id = q.runtime_session_id
+    LEFT JOIN conversations c
+      ON c.id = q.conversation_id
+    WHERE q.status = 'pending'
+      AND (q.next_attempt_at IS NULL OR q.next_attempt_at <= ?)
+      AND (
+        COALESCE(
+          NULLIF(q.owner_sdk_session_id, ''),
+          NULLIF(rs.sdk_session_id, ''),
+          NULLIF(c.sdk_session_id, '')
+        ) IS NULL
+        OR COALESCE(
+          NULLIF(q.owner_sdk_session_id, ''),
+          NULLIF(rs.sdk_session_id, ''),
+          NULLIF(c.sdk_session_id, '')
+        ) = ?
+      )
+    ORDER BY
+      CASE
+        WHEN COALESCE(
+          NULLIF(q.owner_sdk_session_id, ''),
+          NULLIF(rs.sdk_session_id, ''),
+          NULLIF(c.sdk_session_id, '')
+        ) = ? THEN 0
+        ELSE 1
+      END ASC,
+      q.retry_count ASC,
+      CASE WHEN q.next_attempt_at IS NULL THEN 0 ELSE 1 END ASC,
+      COALESCE(q.next_attempt_at, q.timestamp) ASC,
+      q.timestamp ASC
+    LIMIT 1
+  `);
+  const now = '2026-06-11T20:00:00.000Z';
+
+  db.prepare('INSERT INTO conversations (id, title, status, sdk_session_id) VALUES (?, ?, ?, ?)').run(
+    'conv-a',
+    'Conversation A',
+    'active',
+    'sdk-a',
+  );
+  db.prepare('INSERT INTO runtime_sessions (id, conversation_id, sdk_session_id) VALUES (?, ?, ?)').run(
+    'runtime-a',
+    'conv-a',
+    'sdk-a',
+  );
+  db.prepare(`
+    INSERT INTO queue (
+      id, conversation_id, runtime_session_id, is_new_conversation, model,
+      model_variant_id, reasoning_effort, relay_mode, text, attachments,
+      status, timestamp, retry_count, next_attempt_at, owner_sdk_session_id
+    ) VALUES (?, ?, ?, 0, ?, ?, NULL, ?, ?, NULL, 'pending', ?, 0, NULL, ?)
+  `).run(
+    'message-a',
+    'conv-a',
+    'runtime-a',
+    'gpt-5.4-mini',
+    'gpt-5.4-mini',
+    'agent',
+    'test',
+    now,
+    '',
+  );
+
+  const matchingWorkerRow = findPendingForWorker.get(now, 'sdk-a', 'sdk-a');
+  assert.equal(matchingWorkerRow?.id, 'message-a');
+
+  const wrongWorkerRow = findPendingForWorker.get(now, 'sdk-b', 'sdk-b');
+  assert.equal(wrongWorkerRow, undefined);
+});

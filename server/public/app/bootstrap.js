@@ -84,7 +84,7 @@ import {
   updatePendingQuestionBanner,
   getPendingQuestionCountsByConversation,
 } from './ask-user-view.js';
-import { openPendingQuestionFromBanner, submitRelayQuestionChoice, submitRelayQuestionAnswer, onRelayQuestionDraftInput, handleRelayQuestionKey } from './ask-user-view.js';
+import { openPendingQuestionFromBanner, submitRelayQuestionChoice, submitRelayQuestionAnswer, submitRelayStructuredAnswer, onRelayQuestionDraftInput, handleRelayQuestionKey } from './ask-user-view.js';
 import { loadRelayBoards, renderRelayBoards, upsertRelayBoard, submitRelayBoardAction } from './relay-board-view.js';
 import { showThinking, removeThinking, renderThinkingActivities, appendThinkingActivity, appendThinkingThought, applyRelayStreamEvent, clearRelayStreamStateForMessage, restoreInFlightThinking, applyConversationTurnStatus, renderMessages, appendMessage, compactCurrentConversation, sendMessage, handleKey, getConversationLoadedMessageCount, loadOlderConversationMessages, syncComposerControlState, getRenderedConversationMessageFingerprints, initConversationHistoryLazyLoading,
 } from './conversation-view.js';
@@ -123,6 +123,9 @@ const PROVIDER_LABELS = {
 };
 const CHAT_TITLE_MAX_LENGTH = 120;
 const FONT_SCALE_STORAGE_KEY = 'copilot_font_scale';
+const PWA_APP_NAME_STORAGE_KEY = 'copilot_pwa_app_name';
+const PWA_APP_NAME_DEFAULT = 'Copilot Remote';
+const PWA_APP_NAME_MAX_LENGTH = 60;
 const FONT_SCALE_MIN = 0.5;
 const FONT_SCALE_MAX = 1.5;
 const FONT_SCALE_DEFAULT = 1;
@@ -176,6 +179,8 @@ let fontScalePinchState = {
   startDistance: 0,
   startScale: FONT_SCALE_DEFAULT,
 };
+let manifestTemplateCache = null;
+let customManifestUrl = null;
 
 function getTokenFromUrl() {
   return new URLSearchParams(window.location.search).get('token');
@@ -2312,6 +2317,154 @@ async function connectSocket() {
 
 const THEME_STORAGE_KEY = 'copilot_theme';
 
+function normalizePwaAppName(rawValue, { allowEmpty = true } = {}) {
+  const normalized = String(rawValue || '').replace(/\s+/g, ' ').trim();
+  if (!normalized) {
+    return allowEmpty
+      ? { value: '', error: null }
+      : { value: '', error: 'App name cannot be empty.' };
+  }
+  if (normalized.length > PWA_APP_NAME_MAX_LENGTH) {
+    return { value: '', error: `App name must be ${PWA_APP_NAME_MAX_LENGTH} characters or fewer.` };
+  }
+  return { value: normalized, error: null };
+}
+
+function derivePwaShortName(name) {
+  const text = String(name || '').trim();
+  if (!text) return 'Copilot';
+  const firstWord = text.split(/\s+/)[0] || text;
+  if (firstWord.length <= 12) return firstWord;
+  return text.slice(0, 12).trim() || 'Copilot';
+}
+
+function resolveManifestUrlValue(rawValue, baseHref) {
+  const value = String(rawValue || '').trim();
+  if (!value || value.startsWith('data:') || value.startsWith('blob:')) return value;
+  try {
+    return new URL(value, baseHref).href;
+  } catch {
+    return value;
+  }
+}
+
+function normalizeManifestForBlob(manifest, defaultHref) {
+  const baseHref = new URL(String(defaultHref || '').trim(), window.location.href).href;
+  const next = { ...(manifest || {}) };
+  next.id = resolveManifestUrlValue(next.id, baseHref);
+  next.start_url = resolveManifestUrlValue(next.start_url, baseHref);
+  next.scope = resolveManifestUrlValue(next.scope, baseHref);
+  if (Array.isArray(next.icons)) {
+    next.icons = next.icons.map((icon) => {
+      if (!icon || typeof icon !== 'object') return icon;
+      const source = resolveManifestUrlValue(icon.src, baseHref);
+      return { ...icon, src: source };
+    });
+  }
+  return next;
+}
+
+function readStoredPwaAppName() {
+  const { value } = normalizePwaAppName(localStorage.getItem(PWA_APP_NAME_STORAGE_KEY), { allowEmpty: true });
+  return value;
+}
+
+function syncPwaAppNameInput() {
+  const input = document.getElementById('pwa-app-name-input');
+  if (!input) return;
+  input.value = readStoredPwaAppName();
+}
+
+async function loadManifestTemplate(defaultHref) {
+  if (manifestTemplateCache) return { ...manifestTemplateCache };
+  const fallback = {
+    name: PWA_APP_NAME_DEFAULT,
+    short_name: derivePwaShortName(PWA_APP_NAME_DEFAULT),
+    description: 'Installable Copilot Remote web app with standalone launcher support.',
+    id: './',
+    start_url: './',
+    scope: './',
+    display_override: ['standalone'],
+    display: 'standalone',
+    background_color: '#161b22',
+    theme_color: '#161b22',
+    icons: [
+      { src: 'app-icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any' },
+      { src: 'app-icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
+      { src: 'app-icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+    ],
+  };
+  try {
+    const response = await fetch(defaultHref, { cache: 'no-store' });
+    const manifest = response.ok ? await response.json() : null;
+    if (manifest && typeof manifest === 'object' && !Array.isArray(manifest)) {
+      manifestTemplateCache = manifest;
+      return { ...manifestTemplateCache };
+    }
+  } catch (error) {
+    console.warn('Failed to load manifest template; using fallback.', error);
+  }
+  manifestTemplateCache = fallback;
+  return { ...manifestTemplateCache };
+}
+
+async function applyPwaManifestFromSettings() {
+  const manifestLink = document.querySelector('link[rel="manifest"]');
+  if (!manifestLink) return;
+
+  const defaultHref = String(manifestLink.dataset.defaultHref || manifestLink.getAttribute('href') || '').trim();
+  if (!defaultHref) return;
+  if (!manifestLink.dataset.defaultHref) manifestLink.dataset.defaultHref = defaultHref;
+
+  const customName = readStoredPwaAppName();
+  if (!customName) {
+    if (customManifestUrl) {
+      URL.revokeObjectURL(customManifestUrl);
+      customManifestUrl = null;
+    }
+    manifestLink.setAttribute('href', defaultHref);
+    return;
+  }
+
+  const baseManifest = await loadManifestTemplate(defaultHref);
+  const nextManifest = {
+    ...baseManifest,
+    name: customName,
+    short_name: derivePwaShortName(customName),
+  };
+  const normalizedManifest = normalizeManifestForBlob(nextManifest, defaultHref);
+  const manifestBlob = new Blob([JSON.stringify(normalizedManifest, null, 2)], { type: 'application/manifest+json' });
+  const objectUrl = URL.createObjectURL(manifestBlob);
+  if (customManifestUrl) URL.revokeObjectURL(customManifestUrl);
+  customManifestUrl = objectUrl;
+  manifestLink.setAttribute('href', objectUrl);
+}
+
+function updatePwaAppName(rawValue) {
+  const normalized = normalizePwaAppName(rawValue, { allowEmpty: true });
+  if (normalized.error) {
+    alert(normalized.error);
+    syncPwaAppNameInput();
+    return;
+  }
+  if (normalized.value) {
+    localStorage.setItem(PWA_APP_NAME_STORAGE_KEY, normalized.value);
+  } else {
+    localStorage.removeItem(PWA_APP_NAME_STORAGE_KEY);
+  }
+  applyPwaManifestFromSettings()
+    .then(() => {
+      syncPwaAppNameInput();
+      showTransientRelayNotice(normalized.value
+        ? `Install app name updated to "${normalized.value}".`
+        : 'Install app name reset to default.');
+    })
+    .catch((error) => {
+      alert(error?.message || 'Failed to apply install app name');
+      syncPwaAppNameInput();
+    });
+}
+
 function initTheme() {
   const saved = localStorage.getItem(THEME_STORAGE_KEY);
   if (saved === 'light') {
@@ -2534,6 +2687,7 @@ function openSettingsModal() {
     themeSelect.value = localStorage.getItem(THEME_STORAGE_KEY) === 'light' ? 'light' : 'dark';
   }
   syncFontScaleSelect();
+  syncPwaAppNameInput();
   modal?.classList.add('visible');
   modal?.setAttribute('aria-hidden', 'false');
 }
@@ -2546,6 +2700,7 @@ function closeSettingsModal() {
 
 window.updateTheme = updateTheme;
 window.updateFontScaleFromSelect = updateFontScaleFromSelect;
+window.updatePwaAppName = updatePwaAppName;
 window.openSettingsModal = openSettingsModal;
 window.closeSettingsModal = closeSettingsModal;
 
@@ -2743,6 +2898,7 @@ function registerPwaShell() {
 
 async function bootstrap() {
   if (ensureTrailingSlashPath()) return;
+  await applyPwaManifestFromSettings();
   registerPwaShell();
   initInstallButton();
   const urlToken = getTokenFromUrl();
@@ -2814,6 +2970,7 @@ window.setRepoCurrentPath = setRepoCurrentPath;
 window.toggleEmojiPicker = toggleEmojiPicker;
 window.submitRelayQuestionChoice = submitRelayQuestionChoice;
 window.submitRelayQuestionAnswer = submitRelayQuestionAnswer;
+window.submitRelayStructuredAnswer = submitRelayStructuredAnswer;
 window.onRelayQuestionDraftInput = onRelayQuestionDraftInput;
 window.handleRelayQuestionKey = handleRelayQuestionKey;
 window.openPendingQuestionFromBanner = openPendingQuestionFromBanner;

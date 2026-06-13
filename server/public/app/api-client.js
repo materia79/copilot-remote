@@ -1,4 +1,4 @@
-import { BASE, TOKEN, authHeaders, updateWorkspaceRootHints, applyContextUsageBar, readContextUsageRatio, currentConvId, conversations, setCliOnline, setActiveRuntimeSessionCount, setContextIndicatorMode } from './store.js';
+import { BASE, TOKEN, authHeaders, updateWorkspaceRootHints, applyContextUsageBar, readContextUsageRatio, currentConvId, conversations, setCliOnline, setActiveRuntimeSessionCount, setContextIndicatorMode, setServerPlatform } from './store.js';
 
 export async function apiFetch(url, opts = {}) {
   try {
@@ -30,6 +30,7 @@ export async function verifyExistingSession() {
     setContextIndicatorMode(payload?.contextIndicatorMode);
     setCliOnline(!!payload?.cliOnline);
     setActiveRuntimeSessionCount(payload?.activeRuntimeSessionCount);
+    if (payload?.platform) setServerPlatform(payload.platform);
     return true;
   } catch {
     return false;
@@ -47,6 +48,7 @@ export async function verifyToken(token) {
     setContextIndicatorMode(payload?.contextIndicatorMode);
     setCliOnline(!!payload?.cliOnline);
     setActiveRuntimeSessionCount(payload?.activeRuntimeSessionCount);
+    if (payload?.platform) setServerPlatform(payload.platform);
     return true;
   } catch {
     return false;
@@ -60,6 +62,7 @@ export async function refreshWorkspaceRootHints() {
     setContextIndicatorMode(status?.contextIndicatorMode);
     setCliOnline(!!status?.cliOnline);
     setActiveRuntimeSessionCount(status?.activeRuntimeSessionCount);
+    if (status?.platform) setServerPlatform(status.platform);
   }
   return status;
 }
@@ -279,6 +282,26 @@ export async function answerRelayQuestion(questionId, answer, sdkSessionId = nul
     method: 'POST',
     body: JSON.stringify({ answer, sdk_session_id: sessionId || undefined }),
   });
+}
+
+export async function answerRelayQuestionStructured(questionId, structuredAnswer, sdkSessionId = null) {
+  const id = String(questionId || '').trim();
+  if (!id) return { ok: false, error: 'Missing question id' };
+  const sessionId = String(sdkSessionId || '').trim();
+  try {
+    const response = await fetch(`${BASE}/api/relay-question/${encodeURIComponent(id)}/answer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify({ structuredAnswer, sdk_session_id: sessionId || undefined }),
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok) {
+      return { ok: false, error: data?.error || `Request failed (${response.status})`, fields: data?.fields || null };
+    }
+    return { ok: true, question: data?.question || null };
+  } catch (error) {
+    return { ok: false, error: error?.message || 'Network error' };
+  }
 }
 
 export async function loadRelayBoards(status = 'pending') {
