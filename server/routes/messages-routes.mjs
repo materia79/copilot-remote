@@ -677,6 +677,7 @@ export async function dequeuePendingMessageForWorkerLoop({
   const supervisor = sessionWorkerSupervisor || null;
 
   if (routingWithWorker && typeof supervisor?.ensureWorker === 'function') {
+    supervisor?.clearRestartSchedule?.(requesterSid, { resetKilledMarker: true });
     const ensureResult = await supervisor.ensureWorker(requesterSid);
     if (!ensureResult?.ok) {
       const fallbackRestart = maybeTriggerWorkerFallbackRestart({
@@ -2634,6 +2635,7 @@ export function registerMessagesRoutes(app, deps) {
         const activeOwnerSessionId = normalizeSessionWorkerId(relayBridgeOwnerService?.getOwner?.()?.sessionId);
         const shouldPrimeWorker = ownerSessionId !== activeOwnerSessionId;
         if (shouldPrimeWorker && typeof sessionWorkerSupervisor?.ensureWorker === 'function') {
+          sessionWorkerSupervisor?.clearRestartSchedule?.(ownerSessionId, { resetKilledMarker: true });
           void sessionWorkerSupervisor.ensureWorker(ownerSessionId).then((result) => {
             if (!result?.ok) {
               emitSessionWorkerTelemetry('worker.prime.failed', {
@@ -3002,6 +3004,7 @@ export function registerMessagesRoutes(app, deps) {
       ) {
         strandedPrimeCooldownBySession.set(strandedSessionId, nowMs);
         try {
+          sessionWorkerSupervisor?.clearRestartSchedule?.(strandedSessionId, { resetKilledMarker: true });
           const primeResult = await sessionWorkerSupervisor.ensureWorker(strandedSessionId);
           const shouldTakeOver = shouldTakeOverStrandedPendingMessage({
             strandedRow: strandedOwner,
