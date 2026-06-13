@@ -305,6 +305,29 @@ function collectStructuredAnswer(question) {
   return answer;
 }
 
+function resolveSingleFieldStructuredAnswer(question, answerText) {
+  const fields = schemaFieldsFromQuestion(question);
+  if (fields.length !== 1) return null;
+  const field = fields[0];
+  const raw = String(answerText || '').trim();
+  if (!raw) return null;
+  if (!field.choices.length) {
+    return { [field.name]: raw };
+  }
+
+  const exact = field.choices.find((choice) => String(choice.value) === raw || String(choice.label) === raw);
+  if (exact) return { [field.name]: String(exact.value) };
+
+  const lowered = raw.toLowerCase();
+  const insensitive = field.choices.find((choice) => (
+    String(choice.value).toLowerCase() === lowered
+    || String(choice.label).toLowerCase() === lowered
+  ));
+  if (insensitive) return { [field.name]: String(insensitive.value) };
+
+  return { [field.name]: raw };
+}
+
 export async function submitRelayStructuredAnswer(questionId) {
   const question = relayQuestions.get(questionId) || null;
   if (!question) return;
@@ -357,7 +380,10 @@ export async function submitRelayQuestionAnswer(questionId, presetAnswer = null)
   try {
     const question = relayQuestions.get(questionId) || null;
     const sdkSessionId = String(question?.sdkSessionId || '').trim();
-    const r = await answerRelayQuestion(questionId, answer, sdkSessionId || null);
+    const singleFieldStructuredAnswer = resolveSingleFieldStructuredAnswer(question, answer);
+    const r = singleFieldStructuredAnswer
+      ? await answerRelayQuestionStructured(questionId, singleFieldStructuredAnswer, sdkSessionId || null)
+      : await answerRelayQuestion(questionId, answer, sdkSessionId || null);
     if (!r?.question) throw new Error('Failed to submit relay question answer');
     relayQuestionDrafts.delete(questionId);
     relayQuestions.set(questionId, r.question);
