@@ -3601,20 +3601,27 @@ function recoverProcessingOlderThan(cutoffIso, requeueAtIso) {
 }
 
 function fetchUsageSummary(cb) {
-  execFile('gh', ['auth', 'token'], (err, stdout) => {
-    if (err) return cb(new Error('gh auth token failed'));
-    const ghToken = stdout.trim();
+  const envToken = String(process.env.GH_TOKEN || process.env.GITHUB_TOKEN || '').trim();
+  const useToken = (token) => {
     fetch('https://api.github.com/copilot_internal/user', {
-      headers: { Authorization: `Bearer ${ghToken}`, Accept: 'application/json' },
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
     })
-      .then((r) => r.json())
+      .then(async (response) => {
+        if (!response.ok) {
+          const bodyText = await response.text().catch(() => '');
+          const compactBody = String(bodyText || '').replace(/\s+/g, ' ').trim().slice(0, 240);
+          const suffix = compactBody ? `: ${compactBody}` : '';
+          throw new Error(`GitHub usage API failed (${response.status})${suffix}`);
+        }
+        return response.json();
+      })
       .then((data) => {
-        const snap = data.quota_snapshots || {};
+        const snap = data?.quota_snapshots || {};
         const premium = snap.premium_interactions || {};
         const chat = snap.chat || {};
         cb(null, {
-          plan: data.copilot_plan,
-          resetDate: data.quota_reset_date,
+          plan: data?.copilot_plan,
+          resetDate: data?.quota_reset_date,
           chat: {
             unlimited: chat.unlimited ?? true,
             remaining: chat.remaining ?? null,
@@ -3628,7 +3635,23 @@ function fetchUsageSummary(cb) {
           },
         });
       })
-      .catch((e) => cb(new Error(e.message)));
+      .catch((e) => cb(new Error(e?.message || 'Failed to fetch usage data')));
+  };
+
+  if (envToken) {
+    useToken(envToken);
+    return;
+  }
+
+  execFile('gh', ['auth', 'token'], (err, stdout, stderr) => {
+    const ghToken = String(stdout || '').trim();
+    if (!err && ghToken) {
+      useToken(ghToken);
+      return;
+    }
+    const reason = String(stderr || stdout || '').trim();
+    const reasonSuffix = reason ? ` (${reason})` : '';
+    cb(new Error(`GitHub token unavailable: run gh auth login or set GH_TOKEN/GITHUB_TOKEN${reasonSuffix}`));
   });
 }
 
