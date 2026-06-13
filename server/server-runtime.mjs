@@ -1824,10 +1824,11 @@ async function spawnSessionWorkerCli(targetSessionId) {
     console.log(`${runtimeLogPrefix()}worker launcher: reused ${workerId} session=${normalizedTargetSessionId.slice(0, 8)} pid=${liveWorker.processId}`);
     return { workerId, pid: liveWorker.processId };
   }
+  const resolvedWorkspaceRoot = resolveLaunchWorkspaceRootForSession(normalizedTargetSessionId);
   const launched = await launchSessionCli({
     targetSessionId: normalizedTargetSessionId,
-    processCwd: REPO_ROOT,
-    workspaceRoot: resolveLaunchWorkspaceRootForSession(normalizedTargetSessionId),
+    processCwd: resolvedWorkspaceRoot,
+    workspaceRoot: resolvedWorkspaceRoot,
     env: sessionWorkerLaunchEnv,
     platform: process.platform,
     spawnImpl: spawn,

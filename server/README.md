@@ -429,6 +429,8 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 - The `/api/status` response includes a `platform` field (`win32`, `linux`, `darwin`, etc.) so the browser UI can adapt path handling accordingly.
 - Drive browsing is auth-protected; path traversal attacks and non-absolute paths are rejected on both platforms.
 - Traversal or non-file paths are rejected.
+- **Linux access scope** — on Linux the drives API currently allows any authenticated user to browse and read any path that the server process has OS-level read access to (i.e. the same permissions as the user running the relay). There is no additional allowlist restriction beyond requiring an absolute path.
+  > **TODO:** add an optional `drivesAllowList` config key (array of absolute path prefixes) so operators can restrict drive access to a set of directories (e.g. home folder or workspace root). When the list is non-empty, requests whose resolved path does not start with one of the listed prefixes should be rejected with `403`.
 - The web UI opens workspace mentions in an in-app preview dialog with **Preview / Raw** mode buttons.
 - Markdown preview supports optional embedded-HTML mode with script/event-handler stripping and a visible warning.
 - The floating **📁 Browse files** button opens the explorer with **Workspace** and **Drives** roots, tree navigation, list/icon folder views, and image thumbnails.

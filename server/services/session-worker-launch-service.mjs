@@ -105,7 +105,10 @@ export function buildTmuxWorkerShellCommand(targetSessionId, env = {}) {
     exports.push(`${key}=${shellQuote(value)}`);
   }
   const prefix = exports.length ? `${exports.join(' ')} ` : '';
-  return `${prefix}exec gh copilot -- --allow-all --session-id ${shellQuote(targetSessionId)}`;
+  // Use script to create a pseudo-TTY without GH_FORCE_TTY so the CLI routes
+  // ask_user requests through the SDK's onUserInputRequest handler instead of
+  // drawing terminal prompts.
+  return `${prefix}exec script -q -c ${shellQuote(`gh copilot -- --allow-all --session-id ${shellQuote(targetSessionId)}`)} /dev/null`;
 }
 
 function sleep(ms) {

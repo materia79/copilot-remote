@@ -12,6 +12,7 @@ import {
   parseQuestionFromText,
   shouldForceFallbackQuestionBridge,
 } from "./question-text.mjs";
+import { answerCliPromptViaTmux, declineCliPromptViaTmux } from "../utils/tmux-input-bridge.mjs";
 
 function isImageAttachment(att) {
   const type = String(att?.type || "").toLowerCase();
@@ -376,6 +377,7 @@ export function createPollingLoop({
   extractQuestionPrompt,
   extractQuestionChoices,
   handleControl,
+  getSessionId = () => null,
 }) {
   let stopRequested = false;
   let lastAbortControlCheckAt = 0;
@@ -769,6 +771,7 @@ export function createPollingLoop({
       };
       const sendWithoutStreaming = async (sendPayload) => {
         const turnPromise = Promise.resolve().then(() => sendAndWaitWithHardTimeout(sendPayload, sendTimeout));
+        let tmuxBridgeAttempted = false;
         while (true) {
           const outcome = await Promise.race([
             turnPromise.then((value) => ({ done: true, value })),
@@ -776,6 +779,82 @@ export function createPollingLoop({
           ]);
           if (outcome.done) return outcome.value;
           await inspectActiveWorkerLiveness();
+
+          // Check for pending ask_user that wasn't handled by onUserInputRequest
+          // This happens on Linux where the CLI shows its terminal prompt instead
+          const pendingReq = !tmuxBridgeAttempted ? getPendingAskUserRequest?.() : null;
+          if (pendingReq && !getLastAskUserBridge?.()) {
+            const sessionId = getSessionId?.();
+            if (sessionId) {
+              tmuxBridgeAttempted = true;
+              dbg("ask_user tmux bridge: detected pending request while sendAndWait blocked", `sessionId=${sessionId}`, `msgId=${message.id}`);
+              dbg("ask_user tmux bridge: pendingReq keys=", Object.keys(pendingReq || {}).join(","), "toolArgs=", JSON.stringify(pendingReq?.toolArgs)?.slice(0, 300));
+              try {
+                // Create relay question for web UI
+                const prompt = extractQuestionPrompt?.(pendingReq) || "Clarification needed";
+                const choices = extractQuestionChoices?.(pendingReq) || [];
+                dbg("ask_user tmux bridge: extracted prompt=", prompt?.slice(0, 100), "choices=", JSON.stringify(choices));
+                const created = await api("POST", "/api/relay-question", {
+                  queueId: message.id,
+                  messageId: message.id,
+                  conversationId: message.conversationId,
+                  mode: message.relayMode || "agent",
+                  prompt,
+                  choices,
+                  allowFreeform: true,
+                  timeout_ms: sendTimeout,
+                  context: {
+                    source: "tmux-bridge",
+                    rationale: "CLI showed terminal prompt instead of using SDK callback; bridging via tmux.",
+                    queueMessageId: message.id,
+                  },
+                });
+                const questionId = created?.question?.id;
+                if (questionId) {
+                  dbg("ask_user tmux bridge: question created", `questionId=${questionId}`, `msgId=${message.id}`);
+                  await api("POST", "/api/activity", {
+                    messageId: message.id,
+                    conversationId: message.conversationId,
+                    mode: message.relayMode || "agent",
+                    text: "Tool (ask_user): question posted via tmux bridge; waiting for web answer",
+                  }).catch(() => {});
+
+                  // Wait for answer from web UI
+                  const { answer, timedOut } = await waitForRelayQuestionAnswer(questionId, sendTimeout);
+                  dbg("ask_user tmux bridge: got answer", `questionId=${questionId}`, `answer="${String(answer || "").slice(0, 50)}"`, `timedOut=${timedOut}`);
+
+                  if (!timedOut && answer) {
+                    // Send answer to CLI via tmux
+                    const wasFreeform = !choices.some((c) => String(c || "").trim().toLowerCase() === String(answer || "").trim().toLowerCase());
+                    const sent = await answerCliPromptViaTmux({
+                      sessionName: sessionId,
+                      answer,
+                      choices,
+                      wasFreeform,
+                      dbg,
+                    });
+                    if (sent) {
+                      dbg("ask_user tmux bridge: answer sent to terminal", `sessionId=${sessionId}`);
+                      setLastAskUserBridge?.({ source: "tmux-bridge", at: Date.now(), messageId: message.id });
+                      await api("POST", "/api/activity", {
+                        messageId: message.id,
+                        conversationId: message.conversationId,
+                        mode: message.relayMode || "agent",
+                        text: `Tool (ask_user): user answered "${String(answer || "").slice(0, 60)}" (via tmux bridge)`,
+                      }).catch(() => {});
+                    }
+                  } else if (timedOut) {
+                    // Send Ctrl+D to decline the prompt
+                    dbg("ask_user tmux bridge: timeout, sending Ctrl+D to decline");
+                    await declineCliPromptViaTmux(sessionId, dbg).catch(() => {});
+                  }
+                  setPendingAskUserRequest?.(null);
+                }
+              } catch (bridgeErr) {
+                dbg("ask_user tmux bridge failed", `msgId=${message.id}`, bridgeErr?.message || String(bridgeErr));
+              }
+            }
+          }
         }
       };
       try {

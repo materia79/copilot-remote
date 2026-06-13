@@ -559,6 +559,7 @@ async function startPolling() {
       ensureSessionForConversation,
       extractQuestionPrompt,
       extractQuestionChoices,
+      getSessionId: () => session?.sessionId || null,
     });
   }
 
@@ -846,6 +847,7 @@ session = await joinSessionWithRetry({
   // session.registerUserInputHandler() and sends requestUserInput: true to the CLI runtime.
   // When inside hooks it is silently ignored, causing the CLI to show its own terminal prompt.
   onUserInputRequest: async (request) => {
+    dbg("onUserInputRequest CALLED!", "keys=", Object.keys(request || {}).join(","), "platform=", process.platform);
     return questionRoutingHooks.onUserInputRequest(request);
   },
   hooks: {
@@ -883,6 +885,7 @@ session = await joinSessionWithRetry({
 refreshSessionRegistry();
 dbg("copilot session id:", session?.sessionId || "(none)");
 dbg("joinSession resolved");
+dbg("platform:", process.platform, "onUserInputRequest handler registered at top level");
 try {
   reasoningStreamUnsubscribe = reasoningStreamHandlers.attach(session);
 } catch (e) {

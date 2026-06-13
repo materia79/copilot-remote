@@ -191,6 +191,9 @@ export function createQuestionRoutingHooks({
     }
 
     if (isAskUserTool(request) && activeMsg?.id) {
+      const extractedChoices = extractQuestionChoices(request);
+      dbg("onPreToolUse: detected ask_user tool", `msgId=${activeMsg.id}`, "waiting for onUserInputRequest callback...");
+      dbg("onPreToolUse: ask_user request keys=", Object.keys(request || {}).join(","), "toolArgs=", JSON.stringify(request?.toolArgs)?.slice(0, 300), "choices=", JSON.stringify(extractedChoices));
       setLastAskUserBridge(null);
       setPendingAskUserRequest?.(request);
       await api("POST", "/api/activity", {

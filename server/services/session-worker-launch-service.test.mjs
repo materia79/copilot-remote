@@ -25,7 +25,11 @@ test('buildTmuxWorkerShellCommand injects only relay env needed for workers', ()
   assert.match(command, /COPILOT_WEB_RELAY_SERVER_DIR='\/repo\/server'/);
   assert.match(command, /INIT_CWD='\/workspace'/);
   assert.doesNotMatch(command, /IGNORED_VAR/);
-  assert.match(command, /exec gh copilot -- --allow-all --session-id 'abc-123'/);
+  assert.match(command, /exec script -q -c/);
+  assert.match(command, /gh copilot -- --allow-all --session-id/);
+  assert.match(command, /abc-123/);
+  assert.match(command, /\/dev\/null/);
+  assert.doesNotMatch(command, /GH_FORCE_TTY/);
 });
 
 test('killTmuxSession returns false when tmux kill races after session exists', () => {
@@ -95,7 +99,13 @@ test('launchSessionCli uses tmux on posix and returns discovered worker pid', as
   assert.ok(calls.length >= 2);
   const newSessionCall = calls.find((call) => call[1] === 'new-session');
   assert.equal(newSessionCall?.[6], '/relay');
-  assert.deepEqual(newSessionCall?.slice(-3), ['sh', '-lc', "GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS='true' COPILOT_WORKSPACE_ROOT='/repo' INIT_CWD='/repo' exec gh copilot -- --allow-all --session-id 'abc-123'"]);
+  const shellCommand = newSessionCall?.slice(-1)?.[0] || '';
+  assert.match(shellCommand, /GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS='true'/);
+  assert.match(shellCommand, /COPILOT_WORKSPACE_ROOT='\/repo'/);
+  assert.match(shellCommand, /exec script -q -c/);
+  assert.match(shellCommand, /gh copilot -- --allow-all --session-id/);
+  assert.match(shellCommand, /abc-123/);
+  assert.doesNotMatch(shellCommand, /GH_FORCE_TTY/);
 });
 
 test('launchSessionCli falls back to detached spawn when tmux is unavailable', async () => {

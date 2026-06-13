@@ -121,6 +121,7 @@ export function registerAskUserRoutes(app, deps) {
 
   app.post('/api/relay-question', auth, (req, res) => {
     const { queueId, messageId, conversationId, mode, prompt, choices, request, context, allowFreeform } = req.body;
+    console.log(`[${ts()}] relay-question POST: ${choices?.length ?? 0} possible answer(s)`);
     const q = stmts.findQById.get(queueId || messageId);
     if (!q || q.status !== 'processing') {
       return res.status(409).json({ error: 'No active relay turn' });
