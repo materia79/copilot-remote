@@ -586,6 +586,12 @@
     font-size: 0.88rem;
     width: min(260px, 100%);
   }
+  .settings-row input[type="checkbox"] {
+    width: 18px;
+    height: 18px;
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
   .settings-row.settings-row-column {
     flex-direction: column;
     align-items: flex-start;
@@ -2533,6 +2539,17 @@
         <label for="font-scale-select">Text scaling</label>
         <select id="font-scale-select" onchange="updateFontScaleFromSelect(this.value)" aria-label="Text scaling"></select>
       </div>
+      <div class="settings-row" style="margin-top: 12px; margin-bottom: 0;">
+        <label for="show-suspend-host-toggle">Show Suspend host action</label>
+        <input
+          id="show-suspend-host-toggle"
+          type="checkbox"
+          onchange="updateShowSuspendHostSetting(this.checked)"
+          aria-label="Show Suspend host action"
+          checked
+        >
+      </div>
+      <div class="settings-help" style="margin-top: 6px;">Hide the menu action when host suspend is unsupported or not needed on this device.</div>
       <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
         <label for="pwa-app-name-input">Install app name</label>
         <input

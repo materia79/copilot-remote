@@ -317,6 +317,59 @@ export function linkifyWorkspaceMentionsInNode(root) {
   }
 }
 
+function shouldRewriteLocalAssetUrl(rawValue) {
+  const value = String(rawValue || '').trim();
+  if (!value) return false;
+  const lowered = value.toLowerCase();
+  if (
+    lowered.startsWith('http://')
+    || lowered.startsWith('https://')
+    || lowered.startsWith('data:')
+    || lowered.startsWith('blob:')
+    || lowered.startsWith('#')
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function resolveLocalAssetUrl(rawValue, { preferDrive = false } = {}) {
+  const value = String(rawValue || '').trim();
+  if (!shouldRewriteLocalAssetUrl(value)) return '';
+  const looksAbsolute = /^[\\/]/.test(value) || /^[A-Za-z]:[\\/]/.test(value);
+  if (preferDrive || looksAbsolute) {
+    const drivePath = normalizeDriveBrowserPath(value);
+    if (drivePath) return driveFileHrefFromPath(drivePath);
+  }
+  const workspacePath = normalizeWorkspaceMentionPath(value);
+  if (workspacePath) return workspaceFileHrefFromPath(workspacePath);
+  if (!looksAbsolute) {
+    const drivePath = normalizeDriveBrowserPath(value);
+    if (drivePath) return driveFileHrefFromPath(drivePath);
+  }
+  return '';
+}
+
+export function rewriteLocalAssetUrlsInNode(root, options = {}) {
+  if (!(root instanceof Element)) return;
+  const preferDrive = options?.preferDrive === true;
+  const images = Array.from(root.querySelectorAll('img[src]'));
+  for (const img of images) {
+    const rawSrc = img.getAttribute('src') || '';
+    const nextSrc = resolveLocalAssetUrl(rawSrc, { preferDrive });
+    if (nextSrc) img.setAttribute('src', nextSrc);
+  }
+  const anchors = Array.from(root.querySelectorAll('a[href]'));
+  for (const anchor of anchors) {
+    const rawHref = anchor.getAttribute('href') || '';
+    const nextHref = resolveLocalAssetUrl(rawHref, { preferDrive });
+    if (!nextHref) continue;
+    anchor.setAttribute('href', nextHref);
+    anchor.setAttribute('target', '_blank');
+    anchor.setAttribute('rel', 'noopener noreferrer');
+  }
+}
+
 export function renderLinkedPlainText(text) {
   const source = String(text || '');
   const regex = workspaceMentionRegex();
@@ -338,4 +391,3 @@ export function renderLinkedPlainText(text) {
   html += escHtml(source.slice(lastIndex));
   return html;
 }
-

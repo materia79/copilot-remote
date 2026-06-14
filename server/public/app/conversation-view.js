@@ -32,7 +32,7 @@ import {
   saveConversationLoadedMessageCount,
 } from './store.js';
 import { sendMessage as sendMessageApi, cancelConversationTurn, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi } from './api-client.js';
-import { linkifyWorkspaceMentionsInNode, renderMarkdownPreview } from './router.js';
+import { linkifyWorkspaceMentionsInNode, renderMarkdownPreview, rewriteLocalAssetUrlsInNode } from './router.js';
 import { renderAttachmentMarkup, clearAttachments, uploadAttachments, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { renderRelayQuestions } from './ask-user-view.js';
 import { renderRelayBoards } from './relay-board-view.js';
@@ -409,7 +409,9 @@ function createMessageNode(msg, msgId = null, force = false) {
     <div class="${bubbleClass}">${content}${attachmentHtml}${thoughtsHtml}${activityHtml}</div>
     <div class="msg-label">${label}${modelTag}${reasoningTag}${modeTag} · ${fmtDate(msg.timestamp)}</div>`;
 
-  linkifyWorkspaceMentionsInNode(div.querySelector('.msg-bubble'));
+  const bubble = div.querySelector('.msg-bubble');
+  rewriteLocalAssetUrlsInNode(bubble, { preferDrive: msg.role === 'assistant' });
+  linkifyWorkspaceMentionsInNode(bubble);
   div.querySelectorAll('pre code').forEach((b) => hljs.highlightElement(b));
   return div;
 }

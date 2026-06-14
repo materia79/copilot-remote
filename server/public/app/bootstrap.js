@@ -124,6 +124,7 @@ const PROVIDER_LABELS = {
 const CHAT_TITLE_MAX_LENGTH = 120;
 const FONT_SCALE_STORAGE_KEY = 'copilot_font_scale';
 const PWA_APP_NAME_STORAGE_KEY = 'copilot_pwa_app_name';
+const SHOW_SUSPEND_HOST_STORAGE_KEY = 'copilot_show_suspend_host';
 const PWA_APP_NAME_DEFAULT = 'Copilot Remote';
 const PWA_APP_NAME_MAX_LENGTH = 60;
 const FONT_SCALE_MIN = 0.5;
@@ -245,6 +246,37 @@ function syncQueueStatusMenuEntry(payload = null) {
     return;
   }
   chip.textContent = `Queue: ${statusText}`;
+}
+
+function readShowSuspendHostSetting() {
+  const stored = String(localStorage.getItem(SHOW_SUSPEND_HOST_STORAGE_KEY) || '').trim().toLowerCase();
+  if (!stored) return true;
+  return stored !== '0' && stored !== 'false';
+}
+
+function setShowSuspendHostSetting(show, { persist = true } = {}) {
+  const next = !!show;
+  if (persist) localStorage.setItem(SHOW_SUSPEND_HOST_STORAGE_KEY, next ? '1' : '0');
+  return next;
+}
+
+function isSuspendHostActionVisible() {
+  return readShowSuspendHostSetting();
+}
+
+function syncSuspendHostVisibility() {
+  const show = isSuspendHostActionVisible();
+  const menuBtn = document.getElementById('chat-menu-suspend-host');
+  const checkbox = document.getElementById('show-suspend-host-toggle');
+  if (menuBtn) {
+    menuBtn.hidden = !show;
+    menuBtn.disabled = !show;
+    menuBtn.tabIndex = show ? 0 : -1;
+    menuBtn.setAttribute('aria-hidden', show ? 'false' : 'true');
+  }
+  if (checkbox instanceof HTMLInputElement) {
+    checkbox.checked = show;
+  }
 }
 
 function splitVariantId(modelVariantId = '') {
@@ -1926,6 +1958,7 @@ function openEmptyQueueConfirmation() {
 }
 
 function openSuspendHostConfirmation() {
+  if (!isSuspendHostActionVisible()) return;
   lockChatActionsMenuShield(350);
   closeChatActionsMenu();
   openSummaryModal({
@@ -1954,6 +1987,7 @@ function openSuspendHostConfirmation() {
 }
 
 async function confirmSuspendHost() {
+  if (!isSuspendHostActionVisible()) return;
   if (suspendHostInFlight) return;
   suspendHostInFlight = true;
   setSummaryModalLoading(true);
@@ -2679,6 +2713,11 @@ function updateTheme(theme) {
   }
 }
 
+function updateShowSuspendHostSetting(next) {
+  setShowSuspendHostSetting(next, { persist: true });
+  syncSuspendHostVisibility();
+}
+
 function openSettingsModal() {
   closeChatActionsMenu();
   const modal = document.getElementById('settings-modal');
@@ -2686,6 +2725,7 @@ function openSettingsModal() {
   if (themeSelect) {
     themeSelect.value = localStorage.getItem(THEME_STORAGE_KEY) === 'light' ? 'light' : 'dark';
   }
+  syncSuspendHostVisibility();
   syncFontScaleSelect();
   syncPwaAppNameInput();
   modal?.classList.add('visible');
@@ -2701,6 +2741,7 @@ function closeSettingsModal() {
 window.updateTheme = updateTheme;
 window.updateFontScaleFromSelect = updateFontScaleFromSelect;
 window.updatePwaAppName = updatePwaAppName;
+window.updateShowSuspendHostSetting = updateShowSuspendHostSetting;
 window.openSettingsModal = openSettingsModal;
 window.closeSettingsModal = closeSettingsModal;
 
@@ -2715,6 +2756,7 @@ async function initApp() {
   clearLegacyKnownCwdHistoryStorage();
   syncPwaVersionMenuEntry();
   syncQueueStatusMenuEntry();
+  syncSuspendHostVisibility();
   setupViewportTracking();
   document.getElementById('auth-gate').style.display = 'none';
   document.getElementById('app').classList.add('visible');

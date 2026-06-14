@@ -187,6 +187,10 @@ You can rename the installed app label from **⚙️ Settings → Install app na
 The new label is stored per browser and used for future installs; some platforms may
 require reinstalling the app before the launcher label updates.
 
+You can also hide the **💤 Suspend host** action from **⚙️ Settings** with the
+**Show Suspend host action** checkbox. This only controls UI visibility; it does not
+change host suspend implementation behavior.
+
 If you host the relay behind a subpath, set `remotePath` in `server/config.json` to that public path prefix and open the URL with a trailing slash so the PWA scope matches correctly for install prompts.
 
 ## Model Selection
