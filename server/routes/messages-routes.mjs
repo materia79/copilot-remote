@@ -1250,17 +1250,34 @@ export function registerMessagesRoutes(app, deps) {
       ? stmts.listPendingQuestionsByMessage.all(targetMessageId)
       : [];
     if (!pendingRows.length) return 0;
+    
+    // Get the message start time to determine which questions are "stale"
+    const queueRow = stmts.findQById?.get(targetMessageId) || null;
+    const messageStartedAt = queueRow?.created_at || null;
+    
+    // Only cancel questions that were created BEFORE this turn started (stale orphans)
+    // Keep questions created during the turn - they might still be waiting for answers
     const now = new Date().toISOString();
-    const result = stmts.cancelPendingQuestionsByMessage.run(now, targetMessageId);
-    if ((result?.changes || 0) > 0) {
-      for (const row of pendingRows) {
-        const updated = stmts.getQuestion?.get(row.id) || null;
-        if (updated && typeof deps.formatQuestionRow === 'function') {
-          io.emit('relay_question_updated', { question: deps.formatQuestionRow(updated) });
+    let cancelledCount = 0;
+    
+    for (const row of pendingRows) {
+      const questionCreatedAt = row.created_at || null;
+      const isStale = messageStartedAt && questionCreatedAt && questionCreatedAt < messageStartedAt;
+      
+      if (isStale) {
+        // This is an orphaned question from a previous attempt - cancel it
+        const result = db.prepare(`UPDATE relay_questions SET status = 'cancelled', answered_at = ? WHERE id = ? AND status = 'pending'`).run(now, row.id);
+        if ((result?.changes || 0) > 0) {
+          cancelledCount++;
+          const updated = stmts.getQuestion?.get(row.id) || null;
+          if (updated && typeof deps.formatQuestionRow === 'function') {
+            io.emit('relay_question_updated', { question: deps.formatQuestionRow(updated) });
+          }
         }
       }
     }
-    return result?.changes || 0;
+    
+    return cancelledCount;
   }
 
   const strandedPrimeCooldownBySession = new Map();
