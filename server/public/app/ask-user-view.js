@@ -8,7 +8,7 @@ import {
 } from './store.js';
 import { loadRelayQuestions as loadRelayQuestionsApi, answerRelayQuestion, answerRelayQuestionStructured } from './api-client.js';
 import { renderLinkedPlainText } from './router.js';
-import { schemaFieldsFromQuestion, isMultiFieldQuestion } from './question-schema-view.mjs';
+import { schemaFieldsFromQuestion } from './question-schema-view.mjs';
 
 let relayQuestionRenderHash = '';
 
@@ -150,10 +150,11 @@ export function renderRelayQuestions() {
     const modeTag = question.mode ? ` <span class="msg-mode">${escHtml(question.mode)}</span>` : '';
     const contextText = String(question?.context?.rationale || '').trim();
     const contextHtml = contextText ? `<div class="relay-question-context">${renderLinkedPlainText(contextText)}</div>` : '';
-    const multiField = isMultiFieldQuestion(question);
+    const fields = schemaFieldsFromQuestion(question);
+    const structuredQuestion = fields.length > 0;
 
     let interactiveHtml = '';
-    if (multiField) {
+    if (structuredQuestion) {
       interactiveHtml = renderMultiFieldForm(question);
     } else {
       const choices = Array.isArray(question.choices) ? question.choices : [];
@@ -406,4 +407,3 @@ export function handleRelayQuestionKey(e, questionId) {
     submitRelayQuestionAnswer(questionId);
   }
 }
-

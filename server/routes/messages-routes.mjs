@@ -1189,6 +1189,7 @@ export function registerMessagesRoutes(app, deps) {
       },
     });
     io.emit('message_status', { messageId, conversationId, status: 'failed' });
+    cancelPendingRelayQuestionsForMessage(messageId);
     const ownerSessionId = isSessionWorkerRoutingEnabled(featureFlags)
       ? normalizeSessionWorkerId(queueRow?.owner_sdk_session_id)
       : null;
@@ -1240,6 +1241,26 @@ export function registerMessagesRoutes(app, deps) {
       }
     }
     return { responseId, now };
+  }
+
+  function cancelPendingRelayQuestionsForMessage(messageId) {
+    const targetMessageId = String(messageId || '').trim();
+    if (!targetMessageId || typeof stmts.cancelPendingQuestionsByMessage?.run !== 'function') return 0;
+    const pendingRows = typeof stmts.listPendingQuestionsByMessage?.all === 'function'
+      ? stmts.listPendingQuestionsByMessage.all(targetMessageId)
+      : [];
+    if (!pendingRows.length) return 0;
+    const now = new Date().toISOString();
+    const result = stmts.cancelPendingQuestionsByMessage.run(now, targetMessageId);
+    if ((result?.changes || 0) > 0) {
+      for (const row of pendingRows) {
+        const updated = stmts.getQuestion?.get(row.id) || null;
+        if (updated && typeof deps.formatQuestionRow === 'function') {
+          io.emit('relay_question_updated', { question: deps.formatQuestionRow(updated) });
+        }
+      }
+    }
+    return result?.changes || 0;
   }
 
   const strandedPrimeCooldownBySession = new Map();
@@ -3462,6 +3483,7 @@ export function registerMessagesRoutes(app, deps) {
       },
     });
     io.emit('message_status', { messageId, conversationId: targetConversationId, status: 'done' });
+    cancelPendingRelayQuestionsForMessage(messageId);
     res.json({ ok: true });
   });
 

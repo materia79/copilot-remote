@@ -6,9 +6,11 @@ export function createQuestionRepository(db) {
         insertQuestion: db.prepare(`INSERT INTO relay_questions (id, queue_id, conversation_id, message_id, relay_mode, prompt, choices, request, request_schema, status, answer, structured_answer, sdk_session_id, owner_worker_id, continuation_id, continuation_question_id, created_at, answered_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?, ?, ?, ?, NULL, ?)`),
         getQuestion:    db.prepare(`SELECT * FROM relay_questions WHERE id = ?`),
         findPendingQuestionByMessage: db.prepare(`SELECT * FROM relay_questions WHERE message_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1`),
+        listPendingQuestionsByMessage: db.prepare(`SELECT * FROM relay_questions WHERE message_id = ? AND status = 'pending' ORDER BY created_at ASC`),
         findRecentlyAnsweredQuestionByMessage: db.prepare(`SELECT * FROM relay_questions WHERE message_id = ? AND status = 'answered' AND answered_at >= ? ORDER BY answered_at DESC LIMIT 1`),
         listQuestions:  db.prepare(`SELECT * FROM relay_questions WHERE status = ? AND (? IS NULL OR conversation_id = ?) ORDER BY created_at ASC`),
         timeoutQuestion:db.prepare(`UPDATE relay_questions SET status = 'timed_out' WHERE id = ? AND status = 'pending'`),
+        cancelPendingQuestionsByMessage: db.prepare(`UPDATE relay_questions SET status = 'cancelled', answered_at = COALESCE(answered_at, ?) WHERE message_id = ? AND status = 'pending'`),
         deleteConvQuestions: db.prepare(`DELETE FROM relay_questions WHERE conversation_id = ?`),
         expireQuestions: db.prepare(`UPDATE relay_questions SET status = 'timed_out' WHERE status = 'pending' AND expires_at < ?`),
 
