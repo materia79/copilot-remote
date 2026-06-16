@@ -321,6 +321,14 @@ function shouldRewriteLocalAssetUrl(rawValue) {
   const value = String(rawValue || '').trim();
   if (!value) return false;
   const lowered = value.toLowerCase();
+  const normalizedBase = String(BASE || '').trim().replace(/\/+$/, '').toLowerCase();
+  if (
+    lowered.startsWith('/api/')
+    || lowered.startsWith('api/')
+    || (normalizedBase && lowered.startsWith(`${normalizedBase}/api/`))
+  ) {
+    return false;
+  }
   if (
     lowered.startsWith('http://')
     || lowered.startsWith('https://')
