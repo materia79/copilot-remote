@@ -130,7 +130,9 @@ const PWA_APP_NAME_MAX_LENGTH = 60;
 const FONT_SCALE_MIN = 0.5;
 const FONT_SCALE_MAX = 1.5;
 const FONT_SCALE_DEFAULT = 1;
-const FONT_SCALE_WHEEL_STEP_BASE = 0.05;
+const FONT_SCALE_WHEEL_STEP_MIN = 0.01;
+const FONT_SCALE_WHEEL_STEP_MAX = 0.2;
+const FONT_SCALE_PILL_VISIBLE_MS = 900;
 
 let socket = null;
 let relayQuestionPollTimer = null;
@@ -175,6 +177,7 @@ let latestQueueStatus = {
   parkedCount: 0,
 };
 let fontScaleValue = FONT_SCALE_DEFAULT;
+let fontScaleIndicatorTimer = null;
 let fontScalePinchState = {
   active: false,
   startDistance: 0,
@@ -2610,6 +2613,23 @@ function setFontScale(nextScale, { persist = true, preserveMessageAnchor = true 
   return normalized;
 }
 
+function showFontScaleIndicator(scaleValue) {
+  const indicator = document.getElementById('font-scale-indicator');
+  if (!indicator) return;
+  const normalized = clampFontScale(scaleValue);
+  indicator.textContent = `${Math.round(normalized * 100)}%`;
+  indicator.hidden = false;
+  indicator.classList.add('visible');
+  if (fontScaleIndicatorTimer) clearTimeout(fontScaleIndicatorTimer);
+  fontScaleIndicatorTimer = setTimeout(() => {
+    indicator.classList.remove('visible');
+    window.setTimeout(() => {
+      if (!indicator.classList.contains('visible')) indicator.hidden = true;
+    }, 180);
+    fontScaleIndicatorTimer = null;
+  }, FONT_SCALE_PILL_VISIBLE_MS);
+}
+
 function isImageZoomGestureTarget(target) {
   if (!(target instanceof Element)) return false;
   return !!target.closest('#file-preview-body.image-zoom-mode');
@@ -2619,15 +2639,29 @@ function pinchDistance(touchA, touchB) {
   return Math.hypot(touchA.clientX - touchB.clientX, touchA.clientY - touchB.clientY);
 }
 
+function normalizeWheelDeltaPixels(event) {
+  const deltaY = Number(event?.deltaY);
+  if (!Number.isFinite(deltaY) || deltaY === 0) return 0;
+  const deltaMode = Number(event?.deltaMode || 0);
+  if (deltaMode === 1) return deltaY * 16; // lines -> approx pixels
+  if (deltaMode === 2) return deltaY * (window.innerHeight || 800); // pages -> pixels
+  return deltaY; // already pixels
+}
+
 function onGlobalFontScaleWheel(event) {
   if (!(event.ctrlKey || event.metaKey)) return;
   if (isImageZoomGestureTarget(event.target)) return;
   event.preventDefault();
-  const deltaY = Number(event.deltaY);
-  if (!Number.isFinite(deltaY) || deltaY === 0) return;
-  const direction = deltaY < 0 ? 1 : -1;
-  const magnitude = Math.min(0.2, Math.max(FONT_SCALE_WHEEL_STEP_BASE, Math.abs(deltaY) / 400));
-  setFontScale(fontScaleValue + (direction * magnitude), { persist: true, preserveMessageAnchor: true });
+  const deltaPixels = normalizeWheelDeltaPixels(event);
+  if (!Number.isFinite(deltaPixels) || deltaPixels === 0) return;
+  const direction = deltaPixels < 0 ? 1 : -1;
+  // Slow wheel gestures move by 1%, while faster spins accelerate.
+  const magnitude = Math.min(
+    FONT_SCALE_WHEEL_STEP_MAX,
+    Math.max(FONT_SCALE_WHEEL_STEP_MIN, Math.abs(deltaPixels) / 10_000),
+  );
+  const nextScale = setFontScale(fontScaleValue + (direction * magnitude), { persist: true, preserveMessageAnchor: true });
+  showFontScaleIndicator(nextScale);
 }
 
 function onGlobalFontScaleTouchStart(event) {
@@ -2663,7 +2697,8 @@ function onGlobalFontScaleTouchMove(event) {
   if (!fontScalePinchState.startDistance || !Number.isFinite(distance) || distance <= 0) return;
   const ratio = distance / fontScalePinchState.startDistance;
   const nextScale = fontScalePinchState.startScale * ratio;
-  setFontScale(nextScale, { persist: true, preserveMessageAnchor: true });
+  const appliedScale = setFontScale(nextScale, { persist: true, preserveMessageAnchor: true });
+  showFontScaleIndicator(appliedScale);
 }
 
 function onGlobalFontScaleTouchEnd(event) {
