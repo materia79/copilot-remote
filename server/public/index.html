@@ -102,6 +102,11 @@
     --fs-core-chat-title: clamp(0.96rem, calc(0.9rem + 0.18vw), 1.05rem);
     --fs-core-chat-bubble: clamp(0.95rem, calc(0.9rem + 0.2vw), 1.06rem);
     --fs-core-composer: clamp(0.94rem, calc(0.88rem + 0.2vw), 1.02rem);
+    --fs-meta-xs: clamp(0.72rem, calc(0.68rem + 0.12vw), 0.8rem);
+    --fs-meta-sm: clamp(0.78rem, calc(0.73rem + 0.14vw), 0.86rem);
+    --fs-meta-md: clamp(0.84rem, calc(0.78rem + 0.16vw), 0.92rem);
+    --fs-ui-icon: clamp(0.95rem, calc(0.9rem + 0.14vw), 1.02rem);
+    --fs-ui-chip: clamp(0.7rem, calc(0.66rem + 0.12vw), 0.78rem);
   }
 
   :root[data-theme="light"] {
@@ -275,7 +280,7 @@
     color: var(--text);
     cursor: pointer;
     padding: 0;
-    font-size: 0.98rem;
+    font-size: var(--fs-ui-icon);
     line-height: 1;
     flex-shrink: 0;
   }
@@ -307,7 +312,7 @@
 
   #new-conv-btn {
     margin: 12px; padding: 10px 14px; background: var(--accent); color: #000;
-    border: none; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 0.9rem;
+    border: none; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: var(--fs-meta-md);
   }
   #new-conv-btn:hover { opacity: 0.85; }
 
@@ -315,7 +320,7 @@
   .conv-list-footer {
     padding: 10px 12px 6px;
     color: var(--muted);
-    font-size: 0.74rem;
+    font-size: var(--fs-meta-xs);
     text-align: center;
   }
   .conv-item {
@@ -324,8 +329,8 @@
   }
   .conv-item:hover { background: var(--bg3); }
   .conv-item.active { background: var(--bg3); border-color: var(--border); }
-  .conv-title { font-size: 0.9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-right: 24px; }
-  .conv-meta  { font-size: 0.75rem; color: var(--muted); margin-top: 2px; padding-right: 24px; }
+  .conv-title { font-size: var(--fs-meta-md); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-right: 24px; }
+  .conv-meta  { font-size: var(--fs-meta-xs); color: var(--muted); margin-top: 2px; padding-right: 24px; }
   .conv-item.worker-ui-offline .conv-title,
   #chat-title[data-ui-state="offline"] { color: var(--conversation-title-offline); }
   .conv-item.worker-ui-ready .conv-title,
@@ -354,7 +359,7 @@
     border: 1px solid rgba(88, 166, 255, 0.45);
     background: rgba(88, 166, 255, 0.12);
     color: var(--accent);
-    font-size: 0.68rem;
+    font-size: var(--fs-ui-chip);
     font-weight: 600;
     vertical-align: middle;
   }
@@ -397,7 +402,7 @@
   #chat-title-cwd {
     display: block;
     margin-top: 2px;
-    font-size: 0.7rem;
+    font-size: var(--fs-meta-xs);
     color: var(--muted);
     overflow: hidden;
     white-space: nowrap;
@@ -691,7 +696,7 @@
     padding: 6px 12px;
     background: var(--bg2);
     color: var(--text);
-    font-size: 0.8rem;
+    font-size: var(--fs-meta-sm);
     cursor: pointer;
     transition: border-color 0.15s ease, color 0.15s ease, opacity 0.15s ease;
   }
@@ -709,8 +714,8 @@
     color: var(--muted); text-align: center; padding: 24px;
   }
   .empty-state .icon { font-size: 3rem; margin-bottom: 12px; }
-  .empty-state h3 { font-size: 1.1rem; margin-bottom: 8px; color: var(--text); }
-  .empty-state p { font-size: 0.9rem; line-height: 1.5; }
+  .empty-state h3 { font-size: var(--fs-core-chat-title); margin-bottom: 8px; color: var(--text); }
+  .empty-state p { font-size: var(--fs-meta-md); line-height: 1.5; }
 
   .msg {
     display: flex;
@@ -726,15 +731,15 @@
     box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.2);
   }
 
-  .msg-label { font-size: 0.72rem; color: var(--muted); margin-top: 4px; padding: 0 4px; }
+  .msg-label { font-size: var(--fs-meta-xs); color: var(--muted); margin-top: 4px; padding: 0 4px; }
   .msg.user .msg-label { color: #b9c5d4; }
   .msg-model {
-    display: inline-block; font-size: 0.68rem; background: var(--bg3);
+    display: inline-block; font-size: var(--fs-ui-chip); background: var(--bg3);
     border: 1px solid var(--border); border-radius: 4px; padding: 0 5px;
     color: var(--accent); margin-left: 4px; vertical-align: middle;
   }
   .msg-reasoning {
-    display: inline-block; font-size: 0.68rem; background: var(--bg3);
+    display: inline-block; font-size: var(--fs-ui-chip); background: var(--bg3);
     border: 1px solid var(--border); border-radius: 4px; padding: 0 5px;
     color: var(--warn); margin-left: 4px; vertical-align: middle;
   }
@@ -786,7 +791,7 @@
     cursor: pointer;
   }
   .msg-attachment-meta {
-    padding: 6px 10px; font-size: 0.75rem; color: var(--muted);
+    padding: 6px 10px; font-size: var(--fs-meta-xs); color: var(--muted);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
 
@@ -994,7 +999,7 @@
     width: 100%; height: 88px; display: block; object-fit: cover;
   }
   .attachment-preview-meta {
-    padding: 6px 8px; font-size: 0.72rem; color: var(--muted); white-space: nowrap;
+    padding: 6px 8px; font-size: var(--fs-meta-xs); color: var(--muted); white-space: nowrap;
     overflow: hidden; text-overflow: ellipsis;
   }
   .attachment-preview-remove {
@@ -1004,7 +1009,7 @@
   }
   #offline-banner {
     display: none; background: #2d1a00; border: 1px solid var(--warn); color: var(--warn);
-    border-radius: 8px; padding: 8px 14px; margin-bottom: 10px; font-size: 0.85rem; text-align: center;
+    border-radius: 8px; padding: 8px 14px; margin-bottom: 10px; font-size: var(--fs-meta-sm); text-align: center;
   }
   #offline-banner.visible { display: block; }
   #model-banner {
@@ -1015,7 +1020,7 @@
     border-radius: 8px;
     padding: 6px 10px;
     margin-bottom: 10px;
-    font-size: 0.8rem;
+    font-size: var(--fs-meta-sm);
     text-align: center;
   }
   #model-banner.visible { display: block; }
@@ -1911,7 +1916,7 @@
   }
 
   .msg-mode {
-    display: inline-block; font-size: 0.68rem; background: var(--bg3);
+    display: inline-block; font-size: var(--fs-ui-chip); background: var(--bg3);
     border: 1px solid var(--border); border-radius: 4px; padding: 0 5px;
     color: var(--success); margin-left: 4px; vertical-align: middle;
   }
@@ -1933,7 +1938,7 @@
     align-items: center;
     gap: 8px;
     color: var(--muted);
-    font-size: 0.75rem;
+    font-size: var(--fs-meta-xs);
   }
   .relay-question-body {
     line-height: 1.5;
@@ -1945,7 +1950,7 @@
     border: 1px dashed var(--border);
     border-radius: 10px;
     padding: 8px 10px;
-    font-size: 0.78rem;
+    font-size: var(--fs-meta-sm);
     color: var(--muted);
     background: rgba(255,255,255,0.02);
     white-space: pre-wrap;
