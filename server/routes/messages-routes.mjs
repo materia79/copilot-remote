@@ -973,6 +973,7 @@ export function registerMessagesRoutes(app, deps) {
   } = deps;
 
   const ttyConsoleActive = runtimeState?.ttyConsoleActive === true;
+  const conversationDraftPersistenceEnabled = featureFlags?.CONVERSATION_DRAFT_PERSISTENCE_ENABLED === true;
 
   function isAbnormalWorkerTelemetry(payload = {}, level = 'log') {
     const normalizedLevel = String(level || 'log').trim().toLowerCase();
@@ -2625,6 +2626,24 @@ export function registerMessagesRoutes(app, deps) {
     stmts.insertMsg.run(msgId, convId, 'user', trimmedText, requestedModelVariantId, requestedRelayMode, attachments.length ? JSON.stringify(attachments) : null, now);
     linkUploadReferences(convId, msgId, attachments);
     stmts.updateConvTime.run(now, convId);
+    if (conversationDraftPersistenceEnabled) {
+      if (typeof stmts.updateConvDraft?.run === 'function') {
+        stmts.updateConvDraft.run(null, now, sessionId || null, convId);
+      } else {
+        db.prepare(`
+          UPDATE conversations
+          SET draft_text = NULL, draft_updated_at = ?, draft_updated_by_client_id = ?
+          WHERE id = ?
+        `).run(now, sessionId || null, convId);
+      }
+      io.emit('conversation_draft_updated', {
+        conversationId: convId,
+        draftText: '',
+        draftUpdatedAt: now,
+        draftUpdatedByClientId: sessionId || null,
+        senderClientId: sessionId || null,
+      });
+    }
     const conversationPreferences = persistConversationModeModelPreference(
       convId,
       requestedRelayMode,

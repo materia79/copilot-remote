@@ -24,7 +24,7 @@ import {
   deleteConversation as deleteConversationApi,
   scheduleContextUsageRefresh,
 } from './api-client.js';
-import { renderMessages, restoreInFlightThinking, focusConversationMessageById } from './conversation-view.js';
+import { renderMessages, restoreInFlightThinking, focusConversationMessageById, flushConversationDraft, hydrateConversationDraft } from './conversation-view.js';
 import { loadRelayQuestions, getPendingQuestionCountsByConversation } from './ask-user-view.js';
 import { loadRelayBoards } from './relay-board-view.js';
 import { clearAttachments, setRepoBrowserSessionInfo, loadRepoBrowserTree } from './attachments-view.js';
@@ -293,6 +293,11 @@ export function applyLoadedConversationState(id, response, { restoreScroll = fal
     void loadRepoBrowserTree();
   }
   renderMessages(response.messages, !restoreScroll, response);
+  hydrateConversationDraft(id, {
+    draftText: response.draftText,
+    draftUpdatedAt: response.draftUpdatedAt,
+    draftUpdatedByClientId: response.draftUpdatedByClientId,
+  });
   restoreInFlightThinking(response.inFlight || null);
   updateSessionPill(conversations[id], response.runtimeSession || null);
   window.syncChatTitleControls?.();
@@ -309,6 +314,11 @@ export function applyLoadedConversationState(id, response, { restoreScroll = fal
 }
 
 export async function openConversation(id, options = {}) {
+  const previousConversationId = String(currentConvId || '').trim();
+  const nextConversationId = String(id || '').trim();
+  if (previousConversationId && nextConversationId && previousConversationId !== nextConversationId) {
+    await flushConversationDraft(previousConversationId);
+  }
   const capturedVersion = ++openConversationVersion;
   setCurrentConv(id);
   if (repoBrowserState.activeRoot === 'workspace') {
@@ -388,6 +398,10 @@ export async function openConversation(id, options = {}) {
 }
 
 export async function newConversation() {
+  const previousConversationId = String(currentConvId || '').trim();
+  if (previousConversationId) {
+    await flushConversationDraft(previousConversationId);
+  }
   setCurrentConv(null);
   closeSidebar();
   clearAttachments();

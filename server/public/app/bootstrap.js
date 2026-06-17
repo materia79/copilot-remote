@@ -86,7 +86,7 @@ import {
 } from './ask-user-view.js';
 import { openPendingQuestionFromBanner, submitRelayQuestionChoice, submitRelayQuestionAnswer, submitRelayStructuredAnswer, onRelayQuestionDraftInput, handleRelayQuestionKey } from './ask-user-view.js';
 import { loadRelayBoards, renderRelayBoards, upsertRelayBoard, submitRelayBoardAction } from './relay-board-view.js';
-import { showThinking, removeThinking, renderThinkingActivities, appendThinkingActivity, appendThinkingThought, applyRelayStreamEvent, clearRelayStreamStateForMessage, restoreInFlightThinking, applyConversationTurnStatus, renderMessages, appendMessage, compactCurrentConversation, sendMessage, handleKey, getConversationLoadedMessageCount, loadOlderConversationMessages, syncComposerControlState, getRenderedConversationMessageFingerprints, initConversationHistoryLazyLoading,
+import { showThinking, removeThinking, renderThinkingActivities, appendThinkingActivity, appendThinkingThought, applyRelayStreamEvent, clearRelayStreamStateForMessage, restoreInFlightThinking, applyConversationTurnStatus, renderMessages, appendMessage, compactCurrentConversation, sendMessage, handleKey, getConversationLoadedMessageCount, loadOlderConversationMessages, syncComposerControlState, setConversationDraftPersistenceEnabled, applyIncomingConversationDraftUpdate, flushConversationDraft, getRenderedConversationMessageFingerprints, initConversationHistoryLazyLoading,
 } from './conversation-view.js';
 import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { handleAttachmentInput, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
@@ -1105,6 +1105,7 @@ function startRelayBoardPolling() {
 async function refreshSessionWorkerStatus() {
   const status = await refreshWorkspaceRootHints();
   if (!status) return;
+  setConversationDraftPersistenceEnabled(status?.features?.CONVERSATION_DRAFT_PERSISTENCE_ENABLED === true);
   syncQueueStatusMenuEntry(status);
   if (setSessionWorkerStatesFromStatusPayload(status.sessionWorker)) {
     renderConvList();
@@ -1142,6 +1143,7 @@ function setupViewportTracking() {
     input.addEventListener('blur', () => {
       document.body.classList.remove('keyboard-open');
       syncViewportMetrics();
+      void flushConversationDraft(currentConvId);
     }, { passive: true });
   }
 }
@@ -2269,6 +2271,9 @@ async function connectSocket() {
       });
     }
   });
+  socket.on('conversation_draft_updated', (payload = {}) => {
+    applyIncomingConversationDraftUpdate(payload || {});
+  });
   socket.on('conversation_session_bound', async ({ conversationId, sdkSessionId, runtimeSessionId }) => {
     const id = String(conversationId || '').trim();
     if (!id) return;
@@ -2758,6 +2763,9 @@ async function initApp() {
   syncQueueStatusMenuEntry();
   syncSuspendHostVisibility();
   setupViewportTracking();
+  window.addEventListener('pagehide', () => {
+    void flushConversationDraft(currentConvId);
+  });
   document.getElementById('auth-gate').style.display = 'none';
   document.getElementById('app').classList.add('visible');
   initSidebarLayout();

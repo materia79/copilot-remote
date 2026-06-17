@@ -1240,6 +1240,9 @@ db.exec(`
     compacted_from TEXT,
     summary_seed TEXT,
     seed_pending INTEGER NOT NULL DEFAULT 0,
+    draft_text TEXT,
+    draft_updated_at TEXT,
+    draft_updated_by_client_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
@@ -1667,6 +1670,15 @@ if (!conversationColumns.includes('status')) {
 }
 if (!conversationColumns.includes('title_source')) {
   db.exec(`ALTER TABLE conversations ADD COLUMN title_source TEXT NOT NULL DEFAULT 'auto'`);
+}
+if (!conversationColumns.includes('draft_text')) {
+  db.exec(`ALTER TABLE conversations ADD COLUMN draft_text TEXT`);
+}
+if (!conversationColumns.includes('draft_updated_at')) {
+  db.exec(`ALTER TABLE conversations ADD COLUMN draft_updated_at TEXT`);
+}
+if (!conversationColumns.includes('draft_updated_by_client_id')) {
+  db.exec(`ALTER TABLE conversations ADD COLUMN draft_updated_by_client_id TEXT`);
 }
 
 db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_sessions_sdk_session_id ON runtime_sessions(sdk_session_id) WHERE sdk_session_id IS NOT NULL AND sdk_session_id != ''`);

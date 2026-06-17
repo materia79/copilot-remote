@@ -202,6 +202,15 @@ export async function updateConversationPreferences(id, preferences = {}) {
   });
 }
 
+export async function updateConversationDraft(id, draft = {}) {
+  const convId = String(id || '').trim();
+  if (!convId) return null;
+  return apiFetch(`/api/conversation/${convId}/draft`, {
+    method: 'PATCH',
+    body: JSON.stringify(draft || {}),
+  });
+}
+
 export async function compactConversation(id) {
   const convId = String(id || '').trim();
   if (!convId) return null;

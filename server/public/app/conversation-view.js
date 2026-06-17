@@ -31,7 +31,7 @@ import {
   repoBrowserState,
   saveConversationLoadedMessageCount,
 } from './store.js';
-import { sendMessage as sendMessageApi, cancelConversationTurn, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi } from './api-client.js';
+import { sendMessage as sendMessageApi, cancelConversationTurn, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi, updateConversationDraft as updateConversationDraftApi } from './api-client.js';
 import { linkifyWorkspaceMentionsInNode, renderMarkdownPreview, rewriteLocalAssetUrlsInNode } from './router.js';
 import { renderAttachmentMarkup, clearAttachments, uploadAttachments, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { renderRelayQuestions } from './ask-user-view.js';
@@ -52,6 +52,10 @@ let thinkingText = '';
 const relayStreamStateByMessageId = new Map();
 const completedMessageIds = new Set();
 let sendInFlight = false;
+const COMPOSER_DRAFT_DEBOUNCE_MS = 500;
+let conversationDraftPersistenceEnabled = false;
+const draftSaveTimerByConversation = new Map();
+const draftSavePromiseByConversation = new Map();
 const activeTurnsByConversation = new Map();
 let conversationHistoryState = {
   conversationId: '',
@@ -227,6 +231,164 @@ function syncSendButtonState() {
 }
 
 export function syncComposerControlState() {
+  syncSendButtonState();
+  void scheduleConversationDraftSave({
+    conversationId: currentConvId,
+    draftText: document.getElementById('msg-input')?.value || '',
+  });
+}
+
+function clearDraftTimerForConversation(conversationId) {
+  const id = String(conversationId || '').trim();
+  if (!id) return;
+  const timer = draftSaveTimerByConversation.get(id);
+  if (!timer) return;
+  clearTimeout(timer);
+  draftSaveTimerByConversation.delete(id);
+}
+
+function normalizeDraftTimestampMs(value) {
+  const parsed = Date.parse(String(value || '').trim());
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function upsertConversationDraftState(conversationId, {
+  draftText = '',
+  draftUpdatedAt = null,
+  draftUpdatedByClientId = null,
+} = {}) {
+  const id = String(conversationId || '').trim();
+  if (!id || !conversations[id]) return;
+  const existing = conversations[id];
+  conversations[id] = {
+    ...existing,
+    draftText: String(draftText || ''),
+    draftUpdatedAt: draftUpdatedAt || null,
+    draftUpdatedByClientId: draftUpdatedByClientId || null,
+  };
+}
+
+async function persistConversationDraft(conversationId, draftText) {
+  if (!conversationDraftPersistenceEnabled) return null;
+  const id = String(conversationId || '').trim();
+  if (!id) return null;
+  const text = String(draftText || '');
+  const runPersist = async () => {
+    const response = await updateConversationDraftApi(id, {
+      draftText: text,
+      clientId: CLIENT_ID,
+    });
+    if (!response?.ok) return response || null;
+    upsertConversationDraftState(id, {
+      draftText: response.draftText,
+      draftUpdatedAt: response.draftUpdatedAt || response.updatedAt || null,
+      draftUpdatedByClientId: response.draftUpdatedByClientId || response.senderClientId || null,
+    });
+    return response;
+  };
+  const previous = draftSavePromiseByConversation.get(id) || Promise.resolve();
+  const next = previous
+    .catch(() => null)
+    .then(runPersist)
+    .finally(() => {
+      if (draftSavePromiseByConversation.get(id) === next) {
+        draftSavePromiseByConversation.delete(id);
+      }
+    });
+  draftSavePromiseByConversation.set(id, next);
+  return next;
+}
+
+async function scheduleConversationDraftSave({
+  conversationId,
+  draftText,
+  immediate = false,
+} = {}) {
+  if (!conversationDraftPersistenceEnabled) return null;
+  const id = String(conversationId || '').trim();
+  if (!id) return null;
+  const text = String(draftText || '');
+  upsertConversationDraftState(id, { draftText: text });
+  clearDraftTimerForConversation(id);
+  if (immediate) {
+    return persistConversationDraft(id, text);
+  }
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      draftSaveTimerByConversation.delete(id);
+      persistConversationDraft(id, text).then(resolve).catch(() => resolve(null));
+    }, COMPOSER_DRAFT_DEBOUNCE_MS);
+    draftSaveTimerByConversation.set(id, timer);
+  });
+}
+
+export function setConversationDraftPersistenceEnabled(enabled) {
+  conversationDraftPersistenceEnabled = enabled === true;
+}
+
+export async function flushConversationDraft(conversationId = currentConvId) {
+  const id = String(conversationId || '').trim();
+  if (!id) return null;
+  const input = document.getElementById('msg-input');
+  const draftText = String((id === String(currentConvId || '').trim() && input) ? input.value : (conversations[id]?.draftText || ''));
+  return scheduleConversationDraftSave({
+    conversationId: id,
+    draftText,
+    immediate: true,
+  });
+}
+
+export function hydrateConversationDraft(conversationId, {
+  draftText = '',
+  draftUpdatedAt = null,
+  draftUpdatedByClientId = null,
+} = {}) {
+  const id = String(conversationId || '').trim();
+  if (!id) return;
+  const normalizedDraftText = String(draftText || '');
+  upsertConversationDraftState(id, {
+    draftText: normalizedDraftText,
+    draftUpdatedAt,
+    draftUpdatedByClientId,
+  });
+  if (String(currentConvId || '').trim() !== id) return;
+  const input = document.getElementById('msg-input');
+  if (!input) return;
+  if (input.value !== normalizedDraftText) {
+    input.value = normalizedDraftText;
+    autoResize(input);
+  }
+  syncSendButtonState();
+}
+
+export function applyIncomingConversationDraftUpdate({
+  conversationId,
+  draftText = '',
+  draftUpdatedAt = null,
+  draftUpdatedByClientId = null,
+  senderClientId = null,
+} = {}) {
+  const id = String(conversationId || '').trim();
+  if (!id || !conversations[id]) return;
+  if (senderClientId && senderClientId === CLIENT_ID) return;
+  const incomingDraftText = String(draftText || '');
+  const existingMs = normalizeDraftTimestampMs(conversations[id]?.draftUpdatedAt);
+  const incomingMs = normalizeDraftTimestampMs(draftUpdatedAt);
+  if (incomingMs && existingMs && incomingMs < existingMs) return;
+  upsertConversationDraftState(id, {
+    draftText: incomingDraftText,
+    draftUpdatedAt,
+    draftUpdatedByClientId: draftUpdatedByClientId || senderClientId || null,
+  });
+  if (String(currentConvId || '').trim() !== id) return;
+  const input = document.getElementById('msg-input');
+  if (!input) return;
+  const isFocused = document.activeElement === input;
+  if (isFocused && input.value && input.value !== incomingDraftText) return;
+  if (input.value !== incomingDraftText) {
+    input.value = incomingDraftText;
+    autoResize(input);
+  }
   syncSendButtonState();
 }
 
@@ -1003,7 +1165,8 @@ export function compactCurrentConversation() {
 
 export async function sendMessage() {
   const input = document.getElementById('msg-input');
-  const text = input.value.trim();
+  const originalComposerText = String(input?.value || '');
+  const text = originalComposerText.trim();
   const mobileSend = isMobileComposerViewport();
   const activeTurn = getActiveTurnForConversation(currentConvId);
   const hasDraft = hasComposerDraft({ text, attachmentCount: selectedAttachments.length });
@@ -1073,6 +1236,13 @@ export async function sendMessage() {
       pendingNode?.remove();
       pendingUserMessageIds.delete(clientMessageId);
       seenMessageIds.delete(clientMessageId);
+      input.value = originalComposerText;
+      autoResize(input);
+      void scheduleConversationDraftSave({
+        conversationId: targetConversationId,
+        draftText: originalComposerText,
+        immediate: true,
+      });
       if (!mobileSend) input.focus();
       setModelBanner('⚠️ Message could not be sent. Please try again.');
       return;
@@ -1129,6 +1299,14 @@ export async function sendMessage() {
       applyContextUsageBar(null);
       scheduleContextUsageRefresh(r.conversationId, 0);
     }
+    const persistedConversationId = String(r.conversationId || targetConversationId || '').trim();
+    if (persistedConversationId) {
+      upsertConversationDraftState(persistedConversationId, {
+        draftText: '',
+        draftUpdatedAt: new Date().toISOString(),
+        draftUpdatedByClientId: CLIENT_ID,
+      });
+    }
     if (cliOnline) showThinking(r.messageId || null);
 
     clearAttachments();
@@ -1142,6 +1320,13 @@ export async function sendMessage() {
       pendingUserMessageIds.delete(clientMessageId);
       seenMessageIds.delete(clientMessageId);
     }
+    input.value = originalComposerText;
+    autoResize(input);
+    void scheduleConversationDraftSave({
+      conversationId: String(currentConvId || '').trim(),
+      draftText: originalComposerText,
+      immediate: true,
+    });
     alert(e.message || 'Failed to send message');
   } finally {
     setSendInFlight(false);

@@ -246,6 +246,15 @@ export function normalizePreferredModelsByMode(value, {
   return normalized;
 }
 
+const MAX_CONVERSATION_DRAFT_LENGTH = 20_000;
+
+function normalizeConversationDraftText(value, { maxLength = MAX_CONVERSATION_DRAFT_LENGTH } = {}) {
+  const text = String(value ?? '');
+  if (!text.trim()) return '';
+  if (text.length <= maxLength) return text;
+  return text.slice(0, maxLength);
+}
+
 function resolveConversationPreferences(row, {
   supportedRelayModes = [],
   defaultRelayMode = FALLBACK_RELAY_MODE,
@@ -1082,6 +1091,7 @@ export function registerSessionsRoutes(app, deps) {
     sessionWorkerRegistry,
     resolveSessionStateRoot,
   } = deps;
+  const conversationDraftPersistenceEnabled = featureFlags?.CONVERSATION_DRAFT_PERSISTENCE_ENABLED === true;
   const sdkSessionSyncService = createSdkSessionSyncService(db);
   const SDK_DELETE_WAIT_TIMEOUT_MS = 12_000;
   const SDK_DELETE_POLL_MS = 200;
@@ -1266,6 +1276,9 @@ export function registerSessionsRoutes(app, deps) {
         messageCount: resolveMessageCount(r.sdk_session_id, r.message_count),
         preferredRelayMode: preferences.preferredRelayMode,
         preferredModelsByMode: preferences.preferredModelsByMode,
+        draftText: conversationDraftPersistenceEnabled ? String(r.draft_text || '') : '',
+        draftUpdatedAt: conversationDraftPersistenceEnabled ? (r.draft_updated_at || null) : null,
+        draftUpdatedByClientId: conversationDraftPersistenceEnabled ? (r.draft_updated_by_client_id || null) : null,
       };
     });
 
@@ -1324,6 +1337,9 @@ export function registerSessionsRoutes(app, deps) {
             fallbackMode: DEFAULT_RELAY_MODE,
           }),
           preferredModelsByMode: {},
+          draftText: '',
+          draftUpdatedAt: null,
+          draftUpdatedByClientId: null,
         };
         conversations.push(syntheticConversation);
         knownConversationIds.add(sdkSessionId);
@@ -1803,6 +1819,9 @@ export function registerSessionsRoutes(app, deps) {
           fallbackMode: DEFAULT_RELAY_MODE,
         }),
         preferredModelsByMode: {},
+        draftText: '',
+        draftUpdatedAt: null,
+        draftUpdatedByClientId: null,
         messages: history.messages,
         pageInfo: history.pageInfo,
       });
@@ -1913,6 +1932,9 @@ export function registerSessionsRoutes(app, deps) {
       inFlight,
       preferredRelayMode: preferences.preferredRelayMode,
       preferredModelsByMode: preferences.preferredModelsByMode,
+      draftText: conversationDraftPersistenceEnabled ? String(conv.draft_text || '') : '',
+      draftUpdatedAt: conversationDraftPersistenceEnabled ? (conv.draft_updated_at || null) : null,
+      draftUpdatedByClientId: conversationDraftPersistenceEnabled ? (conv.draft_updated_by_client_id || null) : null,
       messages: history.messages,
       pageInfo: history.pageInfo,
     });
@@ -1985,6 +2007,43 @@ export function registerSessionsRoutes(app, deps) {
       updatedAt: persisted.updatedAt,
       created: persisted.created,
       senderClientId,
+    });
+  });
+
+  app.patch('/api/conversation/:id/draft', auth, (req, res) => {
+    if (!conversationDraftPersistenceEnabled) {
+      return res.status(404).json({ error: 'Conversation draft persistence is disabled' });
+    }
+    const conversationId = String(req.params.id || '').trim();
+    if (!conversationId) return res.status(400).json({ error: 'Missing conversation id' });
+    const senderClientId = String(req.body?.clientId || '').trim() || null;
+    const existing = stmts.getConvAnyStatus.get(conversationId);
+    if (!existing || String(existing.status || '').trim() === 'deleted') {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+    const now = new Date().toISOString();
+    const draftText = normalizeConversationDraftText(req.body?.draftText ?? req.body?.text);
+    const persistedDraftText = draftText || null;
+    if (typeof stmts.updateConvDraft?.run === 'function') {
+      stmts.updateConvDraft.run(persistedDraftText, now, senderClientId, conversationId);
+    } else {
+      db.prepare(`
+        UPDATE conversations
+        SET draft_text = ?, draft_updated_at = ?, draft_updated_by_client_id = ?
+        WHERE id = ?
+      `).run(persistedDraftText, now, senderClientId, conversationId);
+    }
+    const payload = {
+      conversationId,
+      draftText: persistedDraftText || '',
+      draftUpdatedAt: now,
+      draftUpdatedByClientId: senderClientId,
+      senderClientId,
+    };
+    io.emit('conversation_draft_updated', payload);
+    return res.json({
+      ok: true,
+      ...payload,
     });
   });
 
