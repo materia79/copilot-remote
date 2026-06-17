@@ -96,6 +96,12 @@
     --msg-attachment-max-width: min(360px, calc(var(--messages-width, 100vw) * 0.35));
     --font-scale: 1;
     --font-scale-percent: 100%;
+    --fs-core-title: clamp(1.2rem, calc(1.08rem + 0.45vw), 1.5rem);
+    --fs-core-subtitle: clamp(0.95rem, calc(0.88rem + 0.22vw), 1.1rem);
+    --fs-core-control: clamp(0.92rem, calc(0.86rem + 0.18vw), 1rem);
+    --fs-core-chat-title: clamp(0.96rem, calc(0.9rem + 0.18vw), 1.05rem);
+    --fs-core-chat-bubble: clamp(0.95rem, calc(0.9rem + 0.2vw), 1.06rem);
+    --fs-core-composer: clamp(0.94rem, calc(0.88rem + 0.2vw), 1.02rem);
   }
 
   :root[data-theme="light"] {
@@ -176,16 +182,21 @@
     background: var(--bg2); border: 1px solid var(--border); border-radius: 12px;
     padding: 40px 32px; width: 100%; max-width: 400px; text-align: center;
   }
-  .auth-box h1 { font-size: 1.5rem; margin-bottom: 8px; }
-  .auth-box p  { color: var(--muted); margin-bottom: 24px; font-size: 0.9rem; }
+  .auth-box h1 { font-size: var(--fs-core-title); margin-bottom: 8px; }
+  .auth-box p  {
+    color: var(--muted);
+    margin-bottom: 24px;
+    font-size: var(--fs-core-subtitle);
+    line-height: 1.4;
+  }
   .auth-box input {
-    width: 100%; padding: 12px 16px; font-size: 1rem;
+    width: 100%; padding: 12px 16px; font-size: var(--fs-core-control);
     background: var(--bg3); border: 1px solid var(--border); border-radius: 8px;
     color: var(--text); margin-bottom: 12px; outline: none;
   }
   .auth-box input:focus { border-color: var(--accent); }
   .auth-box button {
-    width: 100%; padding: 12px; font-size: 1rem; font-weight: 600;
+    width: 100%; padding: 12px; font-size: var(--fs-core-control); font-weight: 600;
     background: var(--accent); color: #000; border: none; border-radius: 8px; cursor: pointer;
   }
   .auth-error { color: var(--danger); font-size: 0.85rem; margin-top: 8px; }
@@ -382,7 +393,7 @@
     white-space: nowrap;
     text-overflow: ellipsis;
   }
-  #chat-title { font-weight: 600; font-size: 1rem; display: inline; }
+  #chat-title { font-weight: 600; font-size: var(--fs-core-chat-title); display: inline; }
   #chat-title-cwd {
     display: block;
     margin-top: 2px;
@@ -422,7 +433,7 @@
     border: 1px solid var(--border);
     border-radius: 8px;
     color: var(--text);
-    font-size: 0.92rem;
+    font-size: var(--fs-core-control);
     outline: none;
   }
   #chat-title-input:focus { border-color: var(--accent); }
@@ -434,7 +445,7 @@
     height: 32px;
     padding: 0 10px;
     cursor: pointer;
-    font-size: 0.8rem;
+    font-size: var(--fs-core-control);
     flex-shrink: 0;
   }
   .chat-title-action-btn:hover { border-color: var(--accent); color: var(--accent); }
@@ -730,7 +741,7 @@
 
   .msg-bubble {
     display: inline-block; width: fit-content;
-    padding: 12px 16px; border-radius: 16px; line-height: 1.5;
+    padding: 12px 16px; border-radius: 16px; line-height: 1.5; font-size: var(--fs-core-chat-bubble);
     max-width: 100%; min-width: 0; overflow-wrap: anywhere; word-break: break-word;
   }
   .msg-bubble.msg-bubble-media-only {
@@ -1061,7 +1072,7 @@
     border-color: var(--accent);
   }
   #msg-input {
-    flex: 1; padding: 12px 16px; font-size: 0.95rem;
+    flex: 1; padding: 12px 16px; font-size: var(--fs-core-composer);
     background: var(--bg3); border: 1px solid var(--border); border-radius: 12px;
     color: var(--text); resize: none; outline: none; min-height: 46px; max-height: 132px;
     line-height: 1.4; font-family: inherit;
@@ -1069,18 +1080,18 @@
   #msg-input:focus { border-color: var(--accent); }
   #send-btn {
     padding: 12px 20px; background: var(--accent); color: #000;
-    border: none; border-radius: 12px; cursor: pointer; font-weight: 700; font-size: 0.95rem;
+    border: none; border-radius: 12px; cursor: pointer; font-weight: 700; font-size: var(--fs-core-composer);
     flex-shrink: 0; height: 46px;
   }
   #model-select {
     background: var(--bg3); border: 1px solid var(--border); color: var(--text);
-    border-radius: 12px; height: 46px; padding: 0 12px; font-size: 0.9rem;
+    border-radius: 12px; height: 46px; padding: 0 12px; font-size: var(--fs-core-control);
     min-width: 140px; outline: none;
   }
   #model-select:focus { border-color: var(--accent); }
   #mode-select {
     background: var(--bg3); border: 1px solid var(--border); color: var(--text);
-    border-radius: 12px; height: 46px; padding: 0 12px; font-size: 0.9rem;
+    border-radius: 12px; height: 46px; padding: 0 12px; font-size: var(--fs-core-control);
     min-width: 120px; outline: none;
   }
   #mode-select:focus { border-color: var(--accent); }
