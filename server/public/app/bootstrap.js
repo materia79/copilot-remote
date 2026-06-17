@@ -130,7 +130,8 @@ const PWA_APP_NAME_MAX_LENGTH = 60;
 const FONT_SCALE_MIN = 0.5;
 const FONT_SCALE_MAX = 1.5;
 const FONT_SCALE_DEFAULT = 1;
-const FONT_SCALE_WHEEL_STEP_BASE = 0.05;
+const FONT_SCALE_WHEEL_STEP_MIN = 0.01;
+const FONT_SCALE_WHEEL_STEP_MAX = 0.2;
 const FONT_SCALE_PILL_VISIBLE_MS = 900;
 
 let socket = null;
@@ -2638,14 +2639,27 @@ function pinchDistance(touchA, touchB) {
   return Math.hypot(touchA.clientX - touchB.clientX, touchA.clientY - touchB.clientY);
 }
 
+function normalizeWheelDeltaPixels(event) {
+  const deltaY = Number(event?.deltaY);
+  if (!Number.isFinite(deltaY) || deltaY === 0) return 0;
+  const deltaMode = Number(event?.deltaMode || 0);
+  if (deltaMode === 1) return deltaY * 16; // lines -> approx pixels
+  if (deltaMode === 2) return deltaY * (window.innerHeight || 800); // pages -> pixels
+  return deltaY; // already pixels
+}
+
 function onGlobalFontScaleWheel(event) {
   if (!(event.ctrlKey || event.metaKey)) return;
   if (isImageZoomGestureTarget(event.target)) return;
   event.preventDefault();
-  const deltaY = Number(event.deltaY);
-  if (!Number.isFinite(deltaY) || deltaY === 0) return;
-  const direction = deltaY < 0 ? 1 : -1;
-  const magnitude = Math.min(0.2, Math.max(FONT_SCALE_WHEEL_STEP_BASE, Math.abs(deltaY) / 400));
+  const deltaPixels = normalizeWheelDeltaPixels(event);
+  if (!Number.isFinite(deltaPixels) || deltaPixels === 0) return;
+  const direction = deltaPixels < 0 ? 1 : -1;
+  // Slow wheel gestures move by 1%, while faster spins accelerate.
+  const magnitude = Math.min(
+    FONT_SCALE_WHEEL_STEP_MAX,
+    Math.max(FONT_SCALE_WHEEL_STEP_MIN, Math.abs(deltaPixels) / 10_000),
+  );
   const nextScale = setFontScale(fontScaleValue + (direction * magnitude), { persist: true, preserveMessageAnchor: true });
   showFontScaleIndicator(nextScale);
 }
