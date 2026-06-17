@@ -685,6 +685,32 @@
     font-size: var(--fs-meta-sm);
   }
 
+  #font-scale-indicator {
+    position: fixed;
+    top: calc(var(--header-safe-top, 0px) + 10px);
+    left: 50%;
+    transform: translateX(-50%) translateY(-8px);
+    z-index: 12500;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 30px;
+    padding: 4px 12px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--bg2);
+    color: var(--text);
+    font-size: var(--fs-meta-sm);
+    font-weight: 600;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.16s ease, transform 0.16s ease;
+  }
+  #font-scale-indicator.visible {
+    opacity: 0.98;
+    transform: translateX(-50%) translateY(0);
+  }
+
   #history-load-more {
     display: flex;
     justify-content: center;
@@ -2414,6 +2440,7 @@
 <!-- Sidebar overlay (mobile) -->
 <div id="sidebar-overlay" onclick="closeSidebar()"></div>
 <div id="chat-actions-menu-backdrop" onclick="window.closeChatActionsMenu && window.closeChatActionsMenu()"></div>
+<div id="font-scale-indicator" aria-live="polite" aria-atomic="true" hidden>100%</div>
 
 <!-- Main App -->
   <div id="app">
