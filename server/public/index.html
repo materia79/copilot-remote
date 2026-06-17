@@ -841,6 +841,9 @@
   }
   .msg-bubble code:not(pre code) {
     background: var(--inline-code-bg); padding: 2px 6px; border-radius: 4px; font-size: 0.875em;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
   }
   .msg-bubble a { color: var(--accent); }
   .msg.user .msg-bubble code:not(pre code) {
@@ -857,9 +860,9 @@
   .msg-bubble th { background: var(--bg3); }
   .msg-bubble * { max-width: 100%; overflow-wrap: anywhere; word-break: break-word; }
   .msg-bubble pre,
-  .msg-bubble code,
   .msg-bubble pre *,
-  .msg-bubble code * {
+  .msg-bubble pre code,
+  .msg-bubble pre code * {
     overflow-wrap: normal;
     word-break: normal;
   }
