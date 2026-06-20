@@ -219,6 +219,10 @@ test('replaceRetrievableHistory swaps messages atomically', () => {
   const stmts = makeStmts(db);
   db.prepare(`INSERT INTO conversations (id, title, sdk_session_id, created_at, updated_at) VALUES ('conv-5', 'Five', 'conv-5', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`).run();
   db.prepare(`INSERT INTO messages (id, conversation_id, role, text, timestamp) VALUES ('old', 'conv-5', 'user', 'old text', '2026-01-01T00:00:01Z')`).run();
+  db.prepare(`
+    INSERT INTO relay_thought (queue_message_id, response_message_id, conversation_id, relay_mode, reasoning_id, seq, text, done, created_at)
+    VALUES ('q-5', 'old-a', 'conv-5', 'agent', 'reason-5', 1, 'preserve me', 1, '2026-01-01T00:00:01Z')
+  `).run();
   const service = createSessionHistoryRefreshService({ db, stmts });
   assert.equal(service.countRetrievableMessages('conv-5'), 1);
 
@@ -245,6 +249,12 @@ test('replaceRetrievableHistory swaps messages atomically', () => {
     ORDER BY id ASC
   `).get();
   assert.deepEqual(activityRow, { text: 'Tool (rg): scan', subagent_run_id: 'sub-9' });
+  const thoughtCount = Number(db.prepare(`
+    SELECT COUNT(*) AS cnt
+    FROM relay_thought
+    WHERE conversation_id = 'conv-5'
+  `).get()?.cnt || 0);
+  assert.equal(thoughtCount, 1);
 });
 
 test('countRetrievableMessages reports stored message count', () => {

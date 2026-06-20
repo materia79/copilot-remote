@@ -54,6 +54,7 @@ import { maybeStartTtyConsole } from './tty-console-bootstrap.mjs';
 import { FEATURES, normalizeFeatureFlags } from './features.mjs';
 import { RELAY_RESTART_EXIT_CODE } from './relay-exit-codes.mjs';
 import { DEFAULT_QUESTION_TIMEOUT_MS } from '../shared/question-timeout.mjs';
+import { normalizeRelayThoughtList } from './public/app/relay-thoughts.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
@@ -1839,6 +1840,27 @@ const relayThoughtColumns = db.prepare(`PRAGMA table_info(relay_thought)`).all()
 if (relayThoughtColumns.length && !relayThoughtColumns.includes('subagent_run_id')) {
   db.exec(`ALTER TABLE relay_thought ADD COLUMN subagent_run_id TEXT`);
 }
+db.exec(`
+  DELETE FROM relay_thought
+  WHERE id IN (
+    SELECT older.id
+    FROM relay_thought AS older
+    JOIN relay_thought AS newer
+      ON older.queue_message_id = newer.queue_message_id
+     AND older.reasoning_id = newer.reasoning_id
+     AND older.reasoning_id IS NOT NULL
+     AND older.reasoning_id != ''
+     AND (
+       older.seq < newer.seq
+       OR (older.seq = newer.seq AND older.id < newer.id)
+     )
+  )
+`);
+db.exec(`
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_relay_thought_queue_reasoning
+    ON relay_thought(queue_message_id, reasoning_id)
+    WHERE reasoning_id IS NOT NULL AND reasoning_id != ''
+`);
 const relayStreamEventColumns = db.prepare(`PRAGMA table_info(relay_stream_events)`).all().map((c) => c.name);
 if (relayStreamEventColumns.length && !relayStreamEventColumns.includes('subagent_run_id')) {
   db.exec(`ALTER TABLE relay_stream_events ADD COLUMN subagent_run_id TEXT`);
@@ -3707,12 +3729,12 @@ function mapRelayThoughtRow(row) {
 
 function relayThoughtsForResponse(responseMessageId) {
   const rows = stmts.listThoughtsByResponse?.all(responseMessageId) || [];
-  return rows.map(mapRelayThoughtRow).slice(0, 5000);
+  return normalizeRelayThoughtList(rows.map(mapRelayThoughtRow)).slice(0, 5000);
 }
 
 function relayThoughtsForQueueMessage(queueMessageId) {
   const rows = stmts.listThoughtsByQueueMessage?.all(queueMessageId) || [];
-  return rows.map(mapRelayThoughtRow).slice(0, 5000);
+  return normalizeRelayThoughtList(rows.map(mapRelayThoughtRow)).slice(0, 5000);
 }
 
 function mapSubagentRunRow(row) {

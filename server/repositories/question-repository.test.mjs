@@ -124,3 +124,49 @@ test('cancelPendingQuestionsByMessage only closes pending rows for the target me
     { id: 'q-pending-2', status: 'cancelled', answered_at: '2026-01-01T02:00:00Z' },
   ]);
 });
+
+test('updateThoughtByQueueAndReasoning updates snapshot without changing seq', () => {
+  const db = makeDb();
+  const repo = createQuestionRepository(db);
+  repo.insertThought.run(
+    'msg-1',
+    null,
+    'conv-1',
+    'agent',
+    'reason-1',
+    1,
+    'first',
+    0,
+    '2026-01-01T00:00:00Z',
+    'sub-1',
+  );
+
+  const thoughtBefore = repo.getThoughtByQueueAndReasoning.get('msg-1', 'reason-1');
+  assert.equal(Number(thoughtBefore?.seq || 0), 1);
+
+  repo.updateThoughtByQueueAndReasoning.run(
+    'resp-1',
+    'conv-1',
+    'agent',
+    'second',
+    1,
+    '2026-01-01T00:00:01Z',
+    null,
+    'msg-1',
+    'reason-1',
+  );
+
+  const row = db.prepare(`
+    SELECT response_message_id, seq, text, done, created_at, subagent_run_id
+    FROM relay_thought
+    WHERE queue_message_id = 'msg-1' AND reasoning_id = 'reason-1'
+  `).get();
+  assert.deepEqual(row, {
+    response_message_id: 'resp-1',
+    seq: 1,
+    text: 'second',
+    done: 1,
+    created_at: '2026-01-01T00:00:01Z',
+    subagent_run_id: 'sub-1',
+  });
+});

@@ -4046,8 +4046,9 @@ export function registerMessagesRoutes(app, deps) {
   });
 
   // POST /api/thought — relay sends in-flight agent reasoning ("thoughts").
-  // Mirrors /api/stream but preserves full text (no 200-char cap). Only completed blocks
-  // (done:true) are persisted (one row per reasoning block); all updates are emitted live.
+  // Mirrors /api/stream but preserves full text (no 200-char cap). Events with reasoningId
+  // are persisted as coalesced snapshots (done false/true). Events without reasoningId are
+  // persisted only for terminal blocks (done:true). All updates are emitted live.
   app.post('/api/thought', auth, (req, res) => {
     touchCli();
     const { messageId, conversationId, text, mode, reasoningId, done, subagentRunId } = req.body || {};
@@ -4071,13 +4072,14 @@ export function registerMessagesRoutes(app, deps) {
     const relayMode = normalizeRelayMode(mode) || DEFAULT_RELAY_MODE;
     const normalizedReasoningId = String(reasoningId || '').trim() || null;
     let seq = null;
-    if (done) {
+    const shouldPersistThought = !!done || !!normalizedReasoningId;
+    if (shouldPersistThought) {
       const isThoughtSeqConstraintError = (error) => {
         const message = String(error?.message || '').toLowerCase();
         return message.includes('unique constraint failed')
           && message.includes('relay_thought')
           && message.includes('queue_message_id')
-          && message.includes('seq');
+          && (message.includes('seq') || message.includes('reasoning_id'));
       };
       try {
         const insertThoughtTx = db.transaction(() => {
@@ -4089,18 +4091,36 @@ export function registerMessagesRoutes(app, deps) {
             throw error;
           }
           const responseMessageId = q?.response_message_id || null;
+          if (normalizedReasoningId) {
+            const existingThought = stmts.getThoughtByQueueAndReasoning?.get(messageId, normalizedReasoningId) || null;
+            if (existingThought) {
+              const existingSeq = Math.max(0, Number(existingThought.seq || 0));
+              stmts.updateThoughtByQueueAndReasoning?.run(
+                responseMessageId,
+                requestedConversationId,
+                relayMode,
+                thoughtText,
+                done ? 1 : 0,
+                now,
+                normalizedSubagentRunId,
+                messageId,
+                normalizedReasoningId,
+              );
+              return existingSeq;
+            }
+          }
           const row = stmts.getLastThoughtSeqByQueueMessage?.get(messageId);
           const maxSeq = Math.max(0, Number(row?.max_seq || 0));
           const nextSeq = maxSeq + 1;
           stmts.insertThought?.run(
             messageId,
             responseMessageId,
-            conversationId,
+            requestedConversationId,
             relayMode,
             normalizedReasoningId,
             nextSeq,
             thoughtText,
-            1,
+            done ? 1 : 0,
             now,
             normalizedSubagentRunId,
           );

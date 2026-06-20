@@ -55,6 +55,7 @@ import { loadRepoBrowserTree } from './attachments-view.js';
 import { clearMessageSearchRuntimeState } from './message-search-view.js';
 import { stripRelayPromptContext } from './relay-prompt-sanitizer.mjs';
 import { isLikelyLiveDuplicateMessage } from './live-message-dedupe.mjs';
+import { mergeRelayThoughts } from './relay-thoughts.mjs';
 
 const FALLBACK_MODE = 'agent';
 
@@ -186,10 +187,12 @@ export async function connectSocket(overrideDeps) {
       const cached = relayActivities.get(sourceMessageId) || [];
       if (cached.length) message.activities = cached.slice(0, 48);
     }
-    if ((!message?.thoughts || !message.thoughts.length) && sourceMessageId) {
+    if (sourceMessageId) {
+      const persistedThoughts = Array.isArray(message?.thoughts) ? message.thoughts : [];
       const cachedThoughts = relayThoughts.get(sourceMessageId);
-      if (cachedThoughts && cachedThoughts.size) {
-        message.thoughts = Array.from(cachedThoughts.values());
+      const mergedThoughts = mergeRelayThoughts(persistedThoughts, cachedThoughts);
+      if (mergedThoughts.length) {
+        message.thoughts = mergedThoughts;
       }
     }
     if (messageId && seenMessageIds?.has(messageId)) return;

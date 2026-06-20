@@ -120,7 +120,6 @@ export function createSessionHistoryRefreshService({
   const replaceRetrievableHistoryTx = db.transaction((conversationId, messages = []) => {
     deleteConversationMessages.run(conversationId);
     deleteConversationActivity.run(conversationId);
-    deleteConversationThoughts.run(conversationId);
     deleteConversationStreamEvents.run(conversationId);
     deleteConversationSubagentRuns.run(conversationId);
     insertRebuiltMessages(conversationId, messages);

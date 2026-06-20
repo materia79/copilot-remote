@@ -39,6 +39,40 @@ function capThought(text) {
   return value.slice(0, MAX_THOUGHT_CHARS);
 }
 
+function fnv1a32(value) {
+  const text = String(value || "");
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16);
+}
+
+function shouldSkipCompleteReasoning(nextText, previousText) {
+  const next = String(nextText || "");
+  const previous = String(previousText || "");
+  if (!next) return true;
+  if (!previous) return false;
+  if (next === previous) return true;
+  if (!next.startsWith(previous)) return false;
+  const growth = next.length - previous.length;
+  return growth >= 0 && growth < REASONING_DELTA_MIN_CHARS;
+}
+
+function toolThoughtReasoningId(messageId, phase, toolRequests, messageContent) {
+  const tools = (Array.isArray(toolRequests) ? toolRequests : []).map((request) => ({
+    id: String(request?.id || request?.toolCallId || "").trim() || null,
+    name: String(request?.name || request?.toolName || request?.tool || "").trim() || null,
+  }));
+  const fingerprintInput = JSON.stringify({
+    phase: String(phase || "").trim().toLowerCase(),
+    tools,
+    content: String(messageContent || "").trim(),
+  });
+  return `message:${messageId}:tool:${fnv1a32(fingerprintInput)}`;
+}
+
 export function createReasoningStreamHandlers({
   api,
   dbg = () => {},
@@ -113,10 +147,15 @@ export function createReasoningStreamHandlers({
     if (subagentRunId) await notifySubagentAgentId?.(subagentRunId);
     const reasoningId = reasoningIdFor(event);
     const text = String(event?.data?.content ?? event?.data?.text ?? "");
+    if (!text) return;
+    const lastSent = reasoningLastSent.get(reasoningId) || "";
+    if (shouldSkipCompleteReasoning(text, lastSent)) {
+      reasoningAccum.delete(reasoningId);
+      return;
+    }
     // The complete block is authoritative — clear delta bookkeeping for this id.
     reasoningAccum.delete(reasoningId);
-    reasoningLastSent.delete(reasoningId);
-    if (!text) return;
+    reasoningLastSent.set(reasoningId, text);
     noteReadableReasoning(text);
     await postThought(activeMsg, { reasoningId, text, done: true, subagentRunId });
   }
@@ -157,7 +196,7 @@ export function createReasoningStreamHandlers({
       messageReasoningLastSent.set(messageId, messageContent);
       noteReadableReasoning(messageContent);
       await postThought(activeMsg, {
-        reasoningId: `message:${messageId}`,
+        reasoningId: toolThoughtReasoningId(messageId, phase, toolRequests, messageContent),
         text: messageContent,
         done: true,
         subagentRunId,
