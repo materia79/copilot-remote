@@ -540,11 +540,27 @@ export function createSessionWorkerSupervisor({
     }
 
     const inFlight = pendingStarts.get(sessionId);
-    if (inFlight) {
-      return inFlight;
+    if (inFlight?.promise) {
+      return inFlight.promise;
     }
 
+    const startToken = Symbol(`start-${sessionId}`);
+    const isStartActive = () => pendingStarts.get(sessionId)?.token === startToken;
+    const buildStartBlockedResult = () => {
+      const lifecycle = getOrCreateLifecycle(sessionId);
+      const blockedError = isKillBlocked(sessionId) ? 'session-killed' : 'start-cancelled';
+      return {
+        ok: false,
+        error: blockedError,
+        worker: registry.getWorker(sessionId) || null,
+        lifecycle: toLifecycleSnapshot(sessionId, lifecycle),
+      };
+    };
+
     const startPromise = Promise.resolve().then(async () => {
+      if (!isStartActive() || isKillBlocked(sessionId)) {
+        return buildStartBlockedResult();
+      }
       const lifecycle = getOrCreateLifecycle(sessionId);
       const startingState = setWorkerState(sessionId, {
         sdkSessionId: sessionId,
@@ -555,7 +571,13 @@ export function createSessionWorkerSupervisor({
 
       try {
         if (typeof spawnWorker === 'function') {
+          if (!isStartActive() || isKillBlocked(sessionId)) {
+            return buildStartBlockedResult();
+          }
           const spawned = await spawnWorker(sessionId);
+          if (!isStartActive() || isKillBlocked(sessionId)) {
+            return buildStartBlockedResult();
+          }
           const readyState = setWorkerState(sessionId, {
             ...startingState,
             workerId: String(spawned?.workerId || startingState.workerId || `worker-${sessionId.slice(0, 8)}`).trim(),
@@ -604,12 +626,38 @@ export function createSessionWorkerSupervisor({
           lifecycle: toLifecycleSnapshot(sessionId),
         };
       } finally {
-        pendingStarts.delete(sessionId);
+        if (isStartActive()) {
+          pendingStarts.delete(sessionId);
+        }
       }
     });
 
-    pendingStarts.set(sessionId, startPromise);
+    pendingStarts.set(sessionId, {
+      token: startToken,
+      promise: startPromise,
+    });
     return startPromise;
+  }
+
+  async function cancelPendingStart(sdkSessionId, { wait = false } = {}) {
+    const sessionId = normalizeSessionId(sdkSessionId);
+    if (!sessionId) {
+      return { cancelled: false, hadPending: false, waited: false };
+    }
+    const pending = pendingStarts.get(sessionId);
+    if (!pending?.promise) {
+      return { cancelled: true, hadPending: false, waited: false };
+    }
+    pendingStarts.delete(sessionId);
+    if (!wait) {
+      return { cancelled: true, hadPending: true, waited: false };
+    }
+    try {
+      await pending.promise;
+    } catch {
+      // Ignore start promise errors while cancelling in-flight starts.
+    }
+    return { cancelled: true, hadPending: true, waited: true };
   }
 
   function markProcessing(sdkSessionId, queueDepth = 0) {
@@ -817,11 +865,17 @@ export function createSessionWorkerSupervisor({
       if (!sessionId) return null;
       return clearRestartSchedule(sessionId, options);
     },
+    isKillBlocked: (sdkSessionId) => {
+      const sessionId = normalizeSessionId(sdkSessionId);
+      if (!sessionId) return false;
+      return isKillBlocked(sessionId);
+    },
     markKilled: (sdkSessionId) => {
       const sessionId = normalizeSessionId(sdkSessionId);
       if (!sessionId) return null;
       return markKilled(sessionId);
     },
+    cancelPendingStart,
     getLifecycleState,
     canAttemptRestart: (sdkSessionId) => {
       const sessionId = normalizeSessionId(sdkSessionId);

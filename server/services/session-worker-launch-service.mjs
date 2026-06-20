@@ -248,6 +248,23 @@ export async function launchSessionCli({
   });
   child.unref?.();
   if (platform === 'win32') {
+    const attempts = Math.max(1, Number(detachedPollAttempts) || 1);
+    for (let index = 0; index < attempts; index += 1) {
+      await sleep(Math.max(50, Number(detachedPollDelayMs) || 200));
+      const processMatch = typeof processInspector?.findProcessForSession === 'function'
+        ? processInspector.findProcessForSession(target)
+        : null;
+      const processPid = parsePositiveInt(processMatch?.processId);
+      if (processPid && isPidAlive(processPid)) {
+        return {
+          pid: processPid,
+          reused: false,
+          launchMode: 'console',
+          tmuxSessionName: null,
+          child,
+        };
+      }
+    }
     return {
       pid: null,
       reused: false,

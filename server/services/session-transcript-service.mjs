@@ -156,47 +156,13 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
     return '';
   }
 
-  function readSessionTranscriptMessages(sessionId, options = {}) {
-    const sid = String(sessionId || '').trim();
-    if (!sid) return [];
-    const root = resolveSessionStateRoot();
-    const eventsPath = path.join(root, sid, 'events.jsonl');
-    if (!fs.existsSync(eventsPath)) return [];
-    let stat = null;
-    try {
-      stat = fs.statSync(eventsPath);
-    } catch {
-      return [];
-    }
-
-    const mtimeMs = Number(stat?.mtimeMs || 0);
-    const sizeBytes = Number(stat?.size || 0);
-    const cached = transcriptCache.get(sid);
-    if (cached && cached.mtimeMs === mtimeMs && cached.sizeBytes === sizeBytes) {
-      cached.cachedAt = Date.now();
-      const windowed = sliceMessages(cached.messages, options);
-      return options.withMeta === true ? windowed : windowed.messages;
-    }
-
-    let content = '';
-    try {
-      content = fs.readFileSync(eventsPath, 'utf8');
-    } catch {
-      return [];
-    }
-
+  function parseSessionEventsToMessages(events = []) {
     const messages = [];
     const toolNameByCallId = new Map();
     const toolArgsByCallId = new Map();
     const turnActivities = new Map();
-    const lines = String(content || '').split(/\r?\n/).filter(Boolean);
-    for (const line of lines) {
-      let event = null;
-      try {
-        event = JSON.parse(line);
-      } catch {
-        continue;
-      }
+    const sourceEvents = Array.isArray(events) ? events : [];
+    for (const event of sourceEvents) {
       const data = event?.data && typeof event.data === 'object' ? event.data : null;
       if (!data) continue;
       const timestamp = String(event?.timestamp || '').trim() || new Date().toISOString();
@@ -266,6 +232,50 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
         });
       }
     }
+    return messages;
+  }
+
+  function readSessionTranscriptMessages(sessionId, options = {}) {
+    const sid = String(sessionId || '').trim();
+    if (!sid) return [];
+    const root = resolveSessionStateRoot();
+    const eventsPath = path.join(root, sid, 'events.jsonl');
+    if (!fs.existsSync(eventsPath)) return [];
+    let stat = null;
+    try {
+      stat = fs.statSync(eventsPath);
+    } catch {
+      return [];
+    }
+
+    const mtimeMs = Number(stat?.mtimeMs || 0);
+    const sizeBytes = Number(stat?.size || 0);
+    const cached = transcriptCache.get(sid);
+    if (cached && cached.mtimeMs === mtimeMs && cached.sizeBytes === sizeBytes) {
+      cached.cachedAt = Date.now();
+      const windowed = sliceMessages(cached.messages, options);
+      return options.withMeta === true ? windowed : windowed.messages;
+    }
+
+    let content = '';
+    try {
+      content = fs.readFileSync(eventsPath, 'utf8');
+    } catch {
+      return [];
+    }
+
+    const events = [];
+    const lines = String(content || '').split(/\r?\n/).filter(Boolean);
+    for (const line of lines) {
+      let event = null;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      events.push(event);
+    }
+    const messages = parseSessionEventsToMessages(events);
 
     cacheTranscript(sid, {
       mtimeMs,
@@ -278,6 +288,7 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
   }
 
   return {
+    parseSessionEventsToMessages,
     readSessionTranscriptMessages,
   };
 }

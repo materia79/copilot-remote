@@ -44,6 +44,7 @@ export function createReasoningStreamHandlers({
   dbg = () => {},
   getRelayTurnActive,
   getActiveMessage,
+  notifySubagentAgentId,
 } = {}) {
   // reasoningId -> accumulated reasoning text (for delta coalescing)
   const reasoningAccum = new Map();
@@ -63,10 +64,13 @@ export function createReasoningStreamHandlers({
     return activeMsg;
   }
 
-  // Drop sub-agent reasoning to start (root-agent thoughts only). TODO: optionally include
-  // sub-agent thoughts behind a flag.
+  function extractAgentId(event) {
+    const agentId = event?.agentId || event?.data?.agentId || null;
+    return agentId ? String(agentId).trim() : null;
+  }
+
   function isRootAgentEvent(event) {
-    return !event?.agentId && !event?.data?.agentId;
+    return !extractAgentId(event);
   }
 
   function reasoningIdFor(event) {
@@ -86,7 +90,7 @@ export function createReasoningStreamHandlers({
     return model.includes("claude");
   }
 
-  async function postThought(activeMsg, { reasoningId, text, done }) {
+  async function postThought(activeMsg, { reasoningId, text, done, subagentRunId = null }) {
     try {
       await api("POST", "/api/thought", {
         messageId: activeMsg.id,
@@ -95,6 +99,7 @@ export function createReasoningStreamHandlers({
         reasoningId,
         text: capThought(text),
         done: !!done,
+        subagentRunId: subagentRunId || undefined,
       });
     } catch (error) {
       dbg("relay thought publish failed", `msgId=${activeMsg.id}`, `reasoningId=${reasoningId}`, error?.message || String(error));
@@ -103,7 +108,9 @@ export function createReasoningStreamHandlers({
 
   async function onReasoning(event) {
     const activeMsg = relayContext();
-    if (!activeMsg || !isRootAgentEvent(event)) return;
+    if (!activeMsg) return;
+    const subagentRunId = extractAgentId(event);
+    if (subagentRunId) await notifySubagentAgentId?.(subagentRunId);
     const reasoningId = reasoningIdFor(event);
     const text = String(event?.data?.content ?? event?.data?.text ?? "");
     // The complete block is authoritative — clear delta bookkeeping for this id.
@@ -111,12 +118,14 @@ export function createReasoningStreamHandlers({
     reasoningLastSent.delete(reasoningId);
     if (!text) return;
     noteReadableReasoning(text);
-    await postThought(activeMsg, { reasoningId, text, done: true });
+    await postThought(activeMsg, { reasoningId, text, done: true, subagentRunId });
   }
 
   async function onReasoningDelta(event) {
     const activeMsg = relayContext();
-    if (!activeMsg || !isRootAgentEvent(event)) return;
+    if (!activeMsg) return;
+    const subagentRunId = extractAgentId(event);
+    if (subagentRunId) await notifySubagentAgentId?.(subagentRunId);
     const reasoningId = reasoningIdFor(event);
     const deltaContent = String(event?.data?.deltaContent ?? event?.data?.delta ?? "");
     if (!deltaContent) return;
@@ -126,12 +135,14 @@ export function createReasoningStreamHandlers({
     if (!shouldEmitDelta(accumulated, lastSent)) return;
     reasoningLastSent.set(reasoningId, accumulated);
     noteReadableReasoning(accumulated);
-    await postThought(activeMsg, { reasoningId, text: accumulated, done: false });
+    await postThought(activeMsg, { reasoningId, text: accumulated, done: false, subagentRunId });
   }
 
   async function onMessage(event) {
     const activeMsg = relayContext();
-    if (!activeMsg || !isRootAgentEvent(event)) return;
+    if (!activeMsg) return;
+    const subagentRunId = extractAgentId(event);
+    if (subagentRunId) await notifySubagentAgentId?.(subagentRunId);
     const messageId = String(event?.data?.messageId || event?.messageId || "").trim();
     const phase = String(event?.data?.phase || event?.phase || "").trim().toLowerCase();
     const toolRequests = Array.isArray(event?.data?.toolRequests) ? event.data.toolRequests : [];
@@ -149,6 +160,7 @@ export function createReasoningStreamHandlers({
         reasoningId: `message:${messageId}`,
         text: messageContent,
         done: true,
+        subagentRunId,
       });
       return;
     }
@@ -168,12 +180,15 @@ export function createReasoningStreamHandlers({
       reasoningId: `message:${messageId}`,
       text: reasoningText,
       done: true,
+      subagentRunId,
     });
   }
 
   async function onMessageDelta(event) {
     const activeMsg = relayContext();
-    if (!activeMsg || !isRootAgentEvent(event)) return;
+    if (!activeMsg) return;
+    const subagentRunId = extractAgentId(event);
+    if (subagentRunId) await notifySubagentAgentId?.(subagentRunId);
     const deltaContent = String(event?.data?.deltaContent ?? event?.data?.delta ?? "");
     if (!deltaContent) return;
     messageTextAccum += deltaContent;
@@ -186,6 +201,7 @@ export function createReasoningStreamHandlers({
         mode: activeMsg.relayMode || "agent",
         text: messageTextAccum,
         done: false,
+        subagentRunId: subagentRunId || undefined,
       });
     } catch (error) {
       dbg("relay stream (message_delta) publish failed", `msgId=${activeMsg.id}`, error?.message || String(error));

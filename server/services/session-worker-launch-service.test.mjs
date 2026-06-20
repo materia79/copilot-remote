@@ -163,6 +163,8 @@ test('launchSessionCli opens a visible detached console on windows', async () =>
         return null;
       },
     },
+    detachedPollAttempts: 1,
+    detachedPollDelayMs: 1,
     spawnImpl(command, args, options) {
       spawnCalls.push({ command, args, options });
       return {
@@ -212,6 +214,8 @@ test('launchSessionCli returns unknown pid when windows console spawn has no pid
         return null;
       },
     },
+    detachedPollAttempts: 1,
+    detachedPollDelayMs: 1,
     spawnImpl() {
       return {
         pid: null,
@@ -222,6 +226,38 @@ test('launchSessionCli returns unknown pid when windows console spawn has no pid
 
   assert.equal(launched.launchMode, 'console');
   assert.equal(launched.pid, null);
+});
+
+test('launchSessionCli captures worker pid from windows process polling', async () => {
+  let inspections = 0;
+  const launched = await launchSessionCli({
+    targetSessionId: 'abc-123',
+    processCwd: 'C:\\relay',
+    workspaceRoot: 'C:\\repo',
+    env: {
+      PATH: process.env.PATH || '',
+      ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+    },
+    platform: 'win32',
+    processInspector: {
+      findProcessForSession() {
+        inspections += 1;
+        if (inspections < 2) return null;
+        return { processId: process.pid, commandLine: 'gh copilot -- --session-id abc-123' };
+      },
+    },
+    detachedPollAttempts: 2,
+    detachedPollDelayMs: 1,
+    spawnImpl() {
+      return {
+        pid: null,
+        unref() {},
+      };
+    },
+  });
+
+  assert.equal(launched.launchMode, 'console');
+  assert.equal(launched.pid, process.pid);
 });
 
 test('launchSessionCli reuses a live existing process before launching', async () => {

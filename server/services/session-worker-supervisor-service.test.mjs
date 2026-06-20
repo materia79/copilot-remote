@@ -231,3 +231,56 @@ test('markKilled prevents respawn even when registry entry is re-inserted with n
   assert.equal(blocked.error, 'session-killed');
   assert.equal(spawnCount, 1, 'kill block must win over identity-less re-insertion');
 });
+
+test('cancelPendingStart prevents in-flight spawn from becoming ready', async () => {
+  const registry = createSessionWorkerRegistry();
+  let resolveSpawn = null;
+  const spawnGate = new Promise((resolve) => {
+    resolveSpawn = resolve;
+  });
+  let spawnCount = 0;
+  const supervisor = createSessionWorkerSupervisor({
+    registry,
+    killBlockGraceMs: 30_000,
+    spawnWorker: async () => {
+      spawnCount += 1;
+      await spawnGate;
+      return { workerId: `worker-cancelled-${spawnCount}`, pid: null };
+    },
+  });
+
+  const pendingEnsure = supervisor.ensureWorker('cancel-in-flight');
+  supervisor.markKilled('cancel-in-flight');
+  const cancelResult = await supervisor.cancelPendingStart('cancel-in-flight');
+  assert.equal(cancelResult.cancelled, true);
+  assert.equal(cancelResult.hadPending, true);
+  resolveSpawn();
+
+  const blocked = await pendingEnsure;
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.error, 'session-killed');
+  assert.ok(spawnCount <= 1, 'spawn should not continue past cancellation');
+  assert.notEqual(supervisor.getWorkerState('cancel-in-flight')?.status, 'ready');
+});
+
+test('ensureWorker re-checks kill block before spawn begins', async () => {
+  const registry = createSessionWorkerRegistry();
+  let spawnCalled = false;
+  const supervisor = createSessionWorkerSupervisor({
+    registry,
+    killBlockGraceMs: 30_000,
+    spawnWorker: async () => {
+      spawnCalled = true;
+      return { workerId: 'worker-should-not-spawn', pid: null };
+    },
+  });
+
+  const pendingEnsure = supervisor.ensureWorker('kill-before-start');
+  supervisor.markKilled('kill-before-start');
+  await supervisor.cancelPendingStart('kill-before-start');
+  const blocked = await pendingEnsure;
+
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.error, 'session-killed');
+  assert.equal(spawnCalled, false);
+});

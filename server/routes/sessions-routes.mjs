@@ -3,8 +3,10 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { randomUUID } from 'crypto';
 import { spawn } from 'child_process';
 import { createSdkSessionSyncService } from '../services/sdk-session-sync-service.mjs';
+import { createSessionHistoryRefreshService } from '../services/session-history-refresh-service.mjs';
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 import { persistConversationPreferences } from '../services/conversation-preferences-service.mjs';
 
@@ -20,6 +22,47 @@ function toSafeNonNegativeInt(value, fallback = 0) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return fallback;
   return Math.max(0, Math.trunc(numeric));
+}
+
+export function resolveBootstrapModelSelection({
+  requestedModel = '',
+  modelState = null,
+  defaultModel = 'gpt-5.4-mini',
+} = {}) {
+  const availableModels = Array.isArray(modelState?.models)
+    ? modelState.models.map((value) => String(value || '').trim()).filter(Boolean)
+    : [];
+  const requested = String(requestedModel || '').trim();
+  if (requested && availableModels.includes(requested)) return requested;
+  return String(modelState?.currentModel || modelState?.defaultModel || defaultModel).trim() || defaultModel;
+}
+
+export function parseDefaultSessionWorkspaceRootUpdateRequest(body = {}) {
+  const payload = body && typeof body === 'object' ? body : {};
+  const hasBodyValue = (
+    Object.prototype.hasOwnProperty.call(payload, 'rootPath')
+    || Object.prototype.hasOwnProperty.call(payload, 'workspaceRootPath')
+    || Object.prototype.hasOwnProperty.call(payload, 'defaultSessionWorkspaceRootPath')
+    || Object.prototype.hasOwnProperty.call(payload, 'default_session_workspace_root_path')
+  );
+  const clearRequested = payload.clear === true;
+  if (!hasBodyValue && !clearRequested) {
+    return { ok: false, error: 'Missing rootPath' };
+  }
+  const rootPath = clearRequested
+    ? ''
+    : String(
+      payload.rootPath
+      ?? payload.workspaceRootPath
+      ?? payload.defaultSessionWorkspaceRootPath
+      ?? payload.default_session_workspace_root_path
+      ?? '',
+    ).trim();
+  return {
+    ok: true,
+    clearRequested,
+    rootPath,
+  };
 }
 
 function runHostSuspendToRam() {
@@ -253,6 +296,23 @@ function normalizeConversationDraftText(value, { maxLength = MAX_CONVERSATION_DR
   if (!text.trim()) return '';
   if (text.length <= maxLength) return text;
   return text.slice(0, maxLength);
+}
+
+export function normalizeOptionalIsoTimestamp(value) {
+  const text = String(value ?? '').trim();
+  if (!text) return null;
+  const parsed = Date.parse(text);
+  if (!Number.isFinite(parsed)) return null;
+  return new Date(parsed).toISOString();
+}
+
+export function hasConversationDraftVersionConflict({
+  existingDraftUpdatedAt = null,
+  baseDraftUpdatedAt = null,
+  compareEnabled = false,
+} = {}) {
+  if (!compareEnabled) return false;
+  return normalizeOptionalIsoTimestamp(existingDraftUpdatedAt) !== normalizeOptionalIsoTimestamp(baseDraftUpdatedAt);
 }
 
 function resolveConversationPreferences(row, {
@@ -516,10 +576,16 @@ function mergeUniqueActivityTexts(primary = [], secondary = []) {
   const merged = [];
   const seen = new Set();
   for (const value of [...(Array.isArray(primary) ? primary : []), ...(Array.isArray(secondary) ? secondary : [])]) {
-    const text = String(value || '').trim();
-    if (!text || seen.has(text)) continue;
-    seen.add(text);
-    merged.push(text);
+    const text = value && typeof value === 'object'
+      ? String(value.text || '').trim()
+      : String(value || '').trim();
+    const subagentRunId = value && typeof value === 'object' && value.subagentRunId
+      ? String(value.subagentRunId).trim()
+      : '';
+    const key = `${subagentRunId}::${text}`;
+    if (!text || seen.has(key)) continue;
+    seen.add(key);
+    merged.push(value && typeof value === 'object' ? { ...value, text } : text);
   }
   return merged;
 }
@@ -1060,6 +1126,7 @@ export function registerSessionsRoutes(app, deps) {
     buildRelayReadyBannerData,
     workspaceRootPayload,
     setWorkspaceRoot,
+    setDefaultSessionWorkspaceRootPath,
     resolveConversationWorkspaceState,
     updateConversationConfiguredWorkspaceRoot,
     learnConversationWorkspaceRoot,
@@ -1074,6 +1141,7 @@ export function registerSessionsRoutes(app, deps) {
     fetchUsageSummary,
     discoverSessionStateConversations,
     readSessionTranscriptMessages,
+    parseSessionEventsToMessages,
     ensureRuntimeSessionBinding,
     bootstrapRuntimeSessionBindings,
     configuredConversationSessionMode,
@@ -1096,6 +1164,9 @@ export function registerSessionsRoutes(app, deps) {
   const SDK_DELETE_WAIT_TIMEOUT_MS = 12_000;
   const SDK_DELETE_POLL_MS = 200;
   const SDK_DELETE_STALE_PROCESSING_MS = 60_000;
+  const SDK_HISTORY_FETCH_WAIT_TIMEOUT_MS = 12_000;
+  const SDK_HISTORY_FETCH_POLL_MS = 200;
+  const SDK_HISTORY_FETCH_STALE_PROCESSING_MS = 60_000;
   const markConversationDeleted = db.prepare(`UPDATE conversations SET status = 'deleted', updated_at = ? WHERE id = ?`);
   const listSessionWorkerQueueRows = db.prepare(`
     SELECT id, conversation_id, runtime_session_id, owner_sdk_session_id, status
@@ -1135,6 +1206,13 @@ export function registerSessionsRoutes(app, deps) {
     db.prepare(`DELETE FROM messages WHERE conversation_id = ?`).run(conversationId);
     db.prepare(`DELETE FROM runtime_sessions WHERE conversation_id = ?`).run(conversationId);
     db.prepare(`DELETE FROM conversations WHERE id = ?`).run(conversationId);
+  });
+  const sessionHistoryRefreshService = createSessionHistoryRefreshService({
+    db,
+    stmts,
+    parseSessionEventsToMessages,
+    discoverSessionStateConversations,
+    inFlightStateForConversation,
   });
 
   function sleep(ms) {
@@ -1178,6 +1256,15 @@ export function registerSessionsRoutes(app, deps) {
     return true;
   }
 
+  function enqueueSdkHistoryFetchRequest(sdkSessionId, conversationId = null) {
+    const sid = String(sdkSessionId || '').trim();
+    if (!sid) return false;
+    const nowIso = new Date().toISOString();
+    const convId = String(conversationId || '').trim() || null;
+    stmts.upsertSdkHistoryFetchRequest.run(sid, convId, nowIso, nowIso);
+    return true;
+  }
+
   async function waitForSdkDeleteCompletion(sdkSessionId, timeoutMs = SDK_DELETE_WAIT_TIMEOUT_MS) {
     const sid = String(sdkSessionId || '').trim();
     if (!sid) return { completed: false };
@@ -1188,6 +1275,45 @@ export function registerSessionsRoutes(app, deps) {
       await sleep(SDK_DELETE_POLL_MS);
     }
     return { completed: false };
+  }
+
+  async function waitForSdkHistoryFetchCompletion(sdkSessionId, timeoutMs = SDK_HISTORY_FETCH_WAIT_TIMEOUT_MS) {
+    const sid = String(sdkSessionId || '').trim();
+    if (!sid) return { completed: false, events: null, error: 'missing-session-id' };
+    const startedAt = Date.now();
+    while ((Date.now() - startedAt) < timeoutMs) {
+      const row = stmts.getSdkHistoryFetchRequestBySessionId.get(sid);
+      if (!row) return { completed: false, events: null, error: 'request-missing' };
+      const status = String(row?.status || '').trim().toLowerCase();
+      if (status === 'completed') {
+        let events = null;
+        const raw = String(row?.result_json || '').trim();
+        if (raw) {
+          try {
+            const parsed = JSON.parse(raw);
+            events = Array.isArray(parsed)
+              ? parsed
+              : (Array.isArray(parsed?.events) ? parsed.events : null);
+          } catch (error) {
+            return {
+              completed: false,
+              events: null,
+              error: `invalid-result-json: ${error?.message || 'parse-failed'}`,
+            };
+          }
+        }
+        return { completed: true, events, error: null };
+      }
+      if (status === 'failed') {
+        return {
+          completed: false,
+          events: null,
+          error: String(row?.last_error || '').trim() || 'history-fetch-failed',
+        };
+      }
+      await sleep(SDK_HISTORY_FETCH_POLL_MS);
+    }
+    return { completed: false, events: null, error: 'timeout' };
   }
 
   function finalizeDeletedConversationsForSdkSession(sdkSessionId) {
@@ -1429,6 +1555,50 @@ export function registerSessionsRoutes(app, deps) {
       error: errorText,
     });
     return res.json({ ok: true, pending: true, retryCount: nextRetryCount, nextAttemptAt });
+  });
+
+  // GET /api/sdk-history-fetch/pending — relay extension fetches next pending SDK history request
+  app.get('/api/sdk-history-fetch/pending', auth, (_req, res) => {
+    touchCli();
+    const nowIso = new Date().toISOString();
+    const staleCutoff = new Date(Date.now() - SDK_HISTORY_FETCH_STALE_PROCESSING_MS).toISOString();
+    stmts.resetStaleSdkHistoryFetchProcessing.run(nowIso, staleCutoff);
+    const dequeue = db.transaction(() => {
+      const next = stmts.dequeueSdkHistoryFetchRequest.get();
+      if (!next?.sdk_session_id) return null;
+      const claimed = stmts.setSdkHistoryFetchRequestProcessing.run(nowIso, nowIso, next.sdk_session_id);
+      if (claimed.changes === 0) return null;
+      return {
+        sdkSessionId: next.sdk_session_id,
+        conversationId: next.conversation_id || null,
+        requestedAt: next.requested_at || nowIso,
+      };
+    });
+    const request = dequeue();
+    return res.json({ request });
+  });
+
+  // POST /api/sdk-history-fetch/result — relay extension reports SDK history fetch result
+  app.post('/api/sdk-history-fetch/result', auth, (req, res) => {
+    touchCli();
+    const sdkSessionId = String(req.body?.sdk_session_id || '').trim();
+    const ok = req.body?.ok === true;
+    if (!sdkSessionId) return res.status(400).json({ error: 'Missing sdk_session_id' });
+    const row = stmts.getSdkHistoryFetchRequestBySessionId.get(sdkSessionId);
+    if (!row) return res.json({ ok: true, ignored: 'request_missing' });
+    const nowIso = new Date().toISOString();
+    if (ok) {
+      const rawEvents = req.body?.events;
+      const normalizedEvents = Array.isArray(rawEvents)
+        ? rawEvents
+        : (Array.isArray(rawEvents?.events) ? rawEvents.events : []);
+      const encoded = JSON.stringify({ events: normalizedEvents });
+      stmts.setSdkHistoryFetchRequestCompleted.run(encoded, nowIso, sdkSessionId);
+      return res.json({ ok: true, eventCount: normalizedEvents.length });
+    }
+    const errorText = String(req.body?.error || '').trim() || 'Unknown SDK history fetch failure';
+    stmts.setSdkHistoryFetchRequestFailed.run(nowIso, errorText, sdkSessionId);
+    return res.json({ ok: true, error: errorText });
   });
 
   app.post('/api/session-sync', auth, (req, res) => {
@@ -1746,6 +1916,181 @@ export function registerSessionsRoutes(app, deps) {
     });
   });
 
+  // POST /api/conversation/:id/refresh-history — clear retrievable history and rebuild from SDK events
+  app.post('/api/conversation/:id/refresh-history', auth, async (req, res) => {
+    const requestedId = String(req.params.id || '').trim();
+    const limit = normalizeConversationHistoryLimit(req.query.limit, 20);
+    const beforeMessageId = String(req.query.beforeMessageId || '').trim();
+    const beforeTimestamp = String(req.query.beforeTimestamp || '').trim();
+    const afterMessageId = String(req.query.afterMessageId || '').trim();
+    const afterTimestamp = String(req.query.afterTimestamp || '').trim();
+    const aroundMessageId = String(req.query.aroundMessageId || '').trim();
+    if (stmts.getDeletedSdkSession.get(requestedId)) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+
+    const ensured = sessionHistoryRefreshService.ensureConversationForRefresh(requestedId);
+    if (!ensured?.ok) {
+      return res.status(Number(ensured?.statusCode || 404)).json({ error: ensured?.error || 'Conversation not found' });
+    }
+    const conversationId = String(ensured?.conversation?.id || requestedId).trim();
+    const sdkSessionId = String(ensured?.conversation?.sdk_session_id || requestedId).trim();
+
+    const idleState = sessionHistoryRefreshService.evaluateRefreshIdleState(conversationId);
+    if (!idleState?.idle) {
+      return res.status(409).json({
+        error: 'Conversation is busy',
+        code: String(idleState?.reason || 'conversation-busy'),
+      });
+    }
+
+    let rebuiltMessages = [];
+    const existingMessageCount = sessionHistoryRefreshService.countRetrievableMessages(conversationId);
+    try {
+      enqueueSdkHistoryFetchRequest(sdkSessionId, conversationId);
+      const sdkFetchResult = await waitForSdkHistoryFetchCompletion(sdkSessionId);
+      if (sdkFetchResult?.completed && Array.isArray(sdkFetchResult?.events)) {
+        rebuiltMessages = sessionHistoryRefreshService.mapSdkEventsToMessages(sdkFetchResult.events);
+      }
+      if (!Array.isArray(rebuiltMessages) || rebuiltMessages.length === 0) {
+        rebuiltMessages = readSessionTranscriptMessages(sdkSessionId, { limit: Number.POSITIVE_INFINITY });
+      }
+      if ((!Array.isArray(rebuiltMessages) || rebuiltMessages.length === 0) && existingMessageCount > 0) {
+        return res.status(502).json({
+          error: 'Could not rebuild conversation history from SDK sources',
+          code: 'history-rebuild-empty',
+          preserved: true,
+        });
+      }
+      sessionHistoryRefreshService.replaceRetrievableHistory(conversationId, rebuiltMessages);
+      stmts.updateConvTime.run(new Date().toISOString(), conversationId);
+    } catch (error) {
+      return res.status(500).json({
+        error: error?.message || 'Failed to refresh conversation history',
+      });
+    } finally {
+      stmts.deleteSdkHistoryFetchRequest.run(sdkSessionId);
+    }
+
+    const conv = stmts.getConv.get(conversationId);
+    if (!conv) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+    const runtimeSession = stmts.getRuntimeSessionByConversation.get(conversationId) || null;
+    const discoveredSessionState = (() => {
+      const sid = String(conv.sdk_session_id || '').trim();
+      if (!sid) return null;
+      const discovered = discoverSessionStateConversations(400);
+      return discovered.find((item) => String(item?.sdkSessionId || '').trim() === sid) || null;
+    })();
+    const discoveredTitle = String(discoveredSessionState?.title || '').trim() || null;
+    const resolvedTitle = resolveConversationTitle({
+      title: conv.title,
+      titleSource: conv.title_source,
+      discoveredTitle,
+    });
+    const preferences = resolveConversationPreferences(conv, {
+      supportedRelayModes: SUPPORTED_RELAY_MODES,
+      defaultRelayMode: DEFAULT_RELAY_MODE,
+    });
+    const inFlight = inFlightStateForConversation(conversationId);
+    const transcriptMessages = readSessionTranscriptMessages(String(conv.sdk_session_id || conversationId || '').trim(), { limit: Number.POSITIVE_INFINITY });
+    const sessionRoot = buildConversationSessionRootPayload({
+      conversationId,
+      sdkSessionId: conv.sdk_session_id || conversationId,
+      title: resolvedTitle,
+      resolveSessionStateRoot,
+    });
+    const workspaceState = typeof resolveConversationWorkspaceState === 'function'
+      ? resolveConversationWorkspaceState({
+        conversationId,
+        sdkSessionId: conv.sdk_session_id || conversationId,
+        discoveredWorkspaceRootPath: discoveredSessionState?.workspaceRootPath || '',
+      })
+      : null;
+    const dbMessages = stmts.getMessages.all(conversationId);
+    const queueRows = db.prepare(`
+      SELECT id, response_message_id, text, timestamp, retry_count, reasoning_effort
+      FROM queue
+      WHERE conversation_id = ?
+    `).all(conversationId);
+    const responseMessageToSourceId = new Map(
+      queueRows
+        .map((row) => [String(row?.response_message_id || '').trim(), String(row?.id || '').trim()])
+        .filter(([responseMessageId, sourceMessageId]) => !!responseMessageId && !!sourceMessageId),
+    );
+    const relayActivitiesByMessageId = new Map(
+      dbMessages
+        .filter((m) => m.role === 'assistant')
+        .map((m) => [m.id, relayActivityForResponse(m.id)]),
+    );
+    const relayThoughtsByMessageId = new Map(
+      dbMessages
+        .filter((m) => m.role === 'assistant')
+        .map((m) => [m.id, relayThoughtsForResponse ? relayThoughtsForResponse(m.id) : []]),
+    );
+    let messages = buildConversationMessages({
+      dbMessages: dbMessages.map((message) => ({
+        ...message,
+        attachments: parseAttachments(message.attachments).map(hydrateAttachment).filter(Boolean),
+      })),
+      transcriptMessages,
+      relayActivitiesByMessageId,
+      relayThoughtsByMessageId,
+      responseMessageToSourceId,
+      queueRows,
+    });
+    messages = messages.map((message) => {
+      if (message.role !== 'assistant') return message;
+      const sourceMessageId = responseMessageToSourceId.get(String(message.id || '').trim()) || message.sourceMessageId || undefined;
+      return sourceMessageId ? { ...message, sourceMessageId } : message;
+    });
+    const history = selectConversationHistoryPage(messages, {
+      limit,
+      beforeMessageId,
+      beforeTimestamp,
+      afterMessageId,
+      afterTimestamp,
+      aroundMessageId,
+    });
+    return res.json({
+      id: conv.id,
+      sdkSessionId: conv.sdk_session_id || null,
+      title: resolvedTitle,
+      sessionRootPath: sessionRoot?.sessionRootPath || null,
+      sessionRootName: sessionRoot?.sessionRootName || resolvedTitle || 'Session',
+      configuredWorkspaceRootPath: workspaceState?.configuredWorkspaceRootPath || null,
+      configuredWorkspaceRootName: workspaceState?.configuredWorkspaceRootName || null,
+      runtimeWorkspaceRootPath: workspaceState?.runtimeWorkspaceRootPath || null,
+      runtimeWorkspaceRootName: workspaceState?.runtimeWorkspaceRootName || null,
+      currentWorkspaceRootPath: workspaceState?.currentWorkspaceRootPath || null,
+      currentWorkspaceRootName: workspaceState?.currentWorkspaceRootName || null,
+      archived: Number(conv.archived || 0) === 1,
+      compactedInto: conv.compacted_into || null,
+      compactedFrom: conv.compacted_from || null,
+      runtimeSession: runtimeSession ? {
+        id: runtimeSession.id,
+        sdkSessionId: runtimeSession.sdk_session_id || conv.sdk_session_id || conv.id,
+        strategy: runtimeSession.strategy || null,
+        status: runtimeSession.status || null,
+        model: runtimeSession.model || null,
+        createdAt: runtimeSession.created_at || null,
+        lastUsedAt: runtimeSession.last_used_at || null,
+      } : null,
+      createdAt: conv.created_at,
+      updatedAt: conv.updated_at,
+      inFlight,
+      preferredRelayMode: preferences.preferredRelayMode,
+      preferredModelsByMode: preferences.preferredModelsByMode,
+      draftText: conversationDraftPersistenceEnabled ? String(conv.draft_text || '') : '',
+      draftUpdatedAt: conversationDraftPersistenceEnabled ? (conv.draft_updated_at || null) : null,
+      draftUpdatedByClientId: conversationDraftPersistenceEnabled ? (conv.draft_updated_by_client_id || null) : null,
+      messages: history.messages,
+      pageInfo: history.pageInfo,
+      refreshed: true,
+    });
+  });
+
   // GET /api/conversation/:id — get paginated conversation history
   app.get('/api/conversation/:id', auth, (req, res) => {
     const requestedId = String(req.params.id || '').trim();
@@ -2021,6 +2366,30 @@ export function registerSessionsRoutes(app, deps) {
     if (!existing || String(existing.status || '').trim() === 'deleted') {
       return res.status(404).json({ error: 'Conversation not found' });
     }
+    const baseDraftUpdatedAtValue = req.body?.baseDraftUpdatedAt ?? req.body?.base_draft_updated_at;
+    const comparesDraftVersion = baseDraftUpdatedAtValue !== undefined;
+    const normalizedBaseDraftUpdatedAt = normalizeOptionalIsoTimestamp(baseDraftUpdatedAtValue);
+    const suppliedBaseTimestamp = String(baseDraftUpdatedAtValue ?? '').trim();
+    if (comparesDraftVersion && suppliedBaseTimestamp && !normalizedBaseDraftUpdatedAt) {
+      return res.status(400).json({ error: 'Invalid baseDraftUpdatedAt timestamp' });
+    }
+    const existingDraftUpdatedAt = normalizeOptionalIsoTimestamp(existing.draft_updated_at);
+    if (hasConversationDraftVersionConflict({
+      existingDraftUpdatedAt,
+      baseDraftUpdatedAt: normalizedBaseDraftUpdatedAt,
+      compareEnabled: comparesDraftVersion,
+    })) {
+      return res.status(409).json({
+        ok: false,
+        error: 'Draft version conflict',
+        code: 'draft-version-conflict',
+        conflict: true,
+        conversationId,
+        draftText: String(existing.draft_text || ''),
+        draftUpdatedAt: existingDraftUpdatedAt,
+        draftUpdatedByClientId: existing.draft_updated_by_client_id || null,
+      });
+    }
     const now = new Date().toISOString();
     const draftText = normalizeConversationDraftText(req.body?.draftText ?? req.body?.text);
     const persistedDraftText = draftText || null;
@@ -2179,6 +2548,96 @@ export function registerSessionsRoutes(app, deps) {
     }
   });
 
+  app.post('/api/conversation/bootstrap', auth, async (req, res) => {
+    ensureSessionId(req, res);
+    const now = new Date().toISOString();
+    let conversationId = '';
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const candidate = randomUUID();
+      if (!stmts.getConvAnyStatus.get(candidate)) {
+        conversationId = candidate;
+        break;
+      }
+    }
+    if (!conversationId) {
+      return res.status(500).json({ ok: false, error: 'Failed to allocate conversation id' });
+    }
+
+    const requestedTitle = String(req.body?.title || '').trim();
+    const title = (requestedTitle || 'New Conversation').slice(0, 80);
+    const modelState = getModelCatalogState();
+    const selectedModel = resolveBootstrapModelSelection({
+      requestedModel: req.body?.model,
+      modelState,
+      defaultModel: DEFAULT_MODEL,
+    });
+
+    try {
+      stmts.insertConv.run(conversationId, title, now, now);
+      const runtimeSession = ensureRuntimeSessionBinding(conversationId, selectedModel, now, conversationId);
+      const routingEnabled = featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true;
+      const ownerSessionId = routingEnabled ? conversationId : null;
+      if (ownerSessionId && typeof sessionWorkerSupervisor?.ensureWorker === 'function') {
+        sessionWorkerSupervisor?.clearRestartSchedule?.(ownerSessionId, { resetKilledMarker: true });
+        const ensureResult = await sessionWorkerSupervisor.ensureWorker(ownerSessionId);
+        if (!ensureResult?.ok) {
+          return res.status(409).json({
+            ok: false,
+            error: ensureResult?.error || 'worker-bootstrap-failed',
+            conversationId,
+            runtimeSessionId: runtimeSession?.id || null,
+            ownerSessionId,
+            worker: ensureResult?.worker || null,
+            lifecycle: ensureResult?.lifecycle || null,
+            ...workspaceRootPayload(),
+          });
+        }
+        const workerState = ensureResult.worker || sessionWorkerSupervisor?.getWorkerState?.(ownerSessionId) || null;
+        sessionWorkerRegistry?.upsertWorker?.({
+          ...(workerState || {}),
+          sdkSessionId: ownerSessionId,
+          conversationId,
+          runtimeSessionId: runtimeSession?.id || null,
+          status: workerState?.status || 'ready',
+        });
+        const pendingDepth = Number(queueCounts?.().pendingCount || 0);
+        sessionWorkerSupervisor?.markIdle?.(ownerSessionId, pendingDepth);
+      } else if (ownerSessionId) {
+        return res.status(500).json({
+          ok: false,
+          error: 'session-worker-launcher-unavailable',
+          conversationId,
+          runtimeSessionId: runtimeSession?.id || null,
+          ownerSessionId,
+          ...workspaceRootPayload(),
+        });
+      }
+
+      const conversation = stmts.getConvAnyStatus.get(conversationId) || null;
+      const ownerWorker = ownerSessionId
+        ? (sessionWorkerSupervisor?.getWorkerState?.(ownerSessionId) || sessionWorkerRegistry?.getWorker?.(ownerSessionId) || null)
+        : null;
+      return res.json({
+        ok: true,
+        conversationId,
+        conversation,
+        runtimeSessionId: runtimeSession?.id || null,
+        ownerSessionId,
+        worker: ownerWorker,
+        lifecycle: ownerSessionId ? (sessionWorkerSupervisor?.getLifecycleState?.(ownerSessionId) || null) : null,
+        selectedModel,
+        warning: routingEnabled ? null : 'Session worker routing is disabled; worker prestart skipped.',
+        ...workspaceRootPayload(),
+      });
+    } catch (error) {
+      console.warn(`[bootstrap] conversation bootstrap failed: ${error?.message || error}`);
+      return res.status(500).json({
+        ok: false,
+        error: 'Failed to bootstrap conversation session',
+      });
+    }
+  });
+
   // GET /api/status — overall status
   app.get('/api/status', auth, (req, res) => {
     ensureSessionId(req, res);
@@ -2240,6 +2699,30 @@ export function registerSessionsRoutes(app, deps) {
         supervisorSnapshot: sessionWorkerSupervisor?.snapshot?.({ pendingQuestionSessionIds }) || null,
         queueRows: listSessionWorkerQueueRows.all(...SESSION_WORKER_STATUS_QUEUE_STATES),
       }),
+    });
+  });
+
+  app.post('/api/settings/default-session-workspace-root', auth, (req, res) => {
+    const parsedRequest = parseDefaultSessionWorkspaceRootUpdateRequest(req.body);
+    if (!parsedRequest.ok) {
+      return res.status(400).json({ error: parsedRequest.error || 'Missing rootPath' });
+    }
+    const nextRootPath = parsedRequest.rootPath;
+    if (typeof setDefaultSessionWorkspaceRootPath !== 'function') {
+      return res.status(500).json({ error: 'Default session workspace updates are unavailable' });
+    }
+    const result = setDefaultSessionWorkspaceRootPath(nextRootPath, { allowClear: true });
+    if (!result?.ok) {
+      return res.status(400).json({ error: result?.error || 'Failed to update default session workspace root' });
+    }
+    const payload = workspaceRootPayload();
+    io.emit('workspace_root_changed', payload);
+    return res.json({
+      ok: true,
+      changed: !!result?.changed,
+      defaultSessionWorkspaceRootPath: payload.defaultSessionWorkspaceRootPath || null,
+      defaultSessionWorkspaceRootWarning: payload.defaultSessionWorkspaceRootWarning || null,
+      recentWorkspaceRoots: Array.isArray(payload.recentWorkspaceRoots) ? payload.recentWorkspaceRoots : [],
     });
   });
 

@@ -12,6 +12,8 @@ import {
   relayThoughts,
   repoBrowserState,
   workspaceRootPath,
+  defaultSessionWorkspaceRootPath,
+  defaultSessionWorkspaceRootWarning,
   getConversationWorkspaceState,
   getConversationCurrentWorkspaceRootPath,
   pendingUserMessageIds,
@@ -34,6 +36,8 @@ import {
   scrollBottom,
   setPullRefreshIndicator,
   resetPullRefreshIndicator,
+  setHistoryRefreshInFlight,
+  isHistoryRefreshInFlight,
   setSummaryModalLoading,
   renderSummaryModalContent,
   openSummaryModal,
@@ -50,9 +54,15 @@ import {
   loadConversationScrollTop,
   loadConversationLoadedMessageCount,
   saveConversationScrollTop,
+  isMessagesNearBottom,
   getRecentWorkspaceRoots,
   getSessionWorkerState,
   resolveConversationUiState,
+  upsertSubagentRun,
+  addSubagentActivity,
+  addSubagentThought,
+  clearSubagentCancelInFlight,
+  clearSubagentRunsForConversation,
 } from './store.js';
 import {
   verifyExistingSession,
@@ -65,6 +75,7 @@ import {
   refreshModelVariantCatalog,
   saveEnabledModelVariants,
   loadConversation,
+  refreshConversationHistory,
   updateConversationTitle,
   updateConversationPreferences,
   killSessionWorker,
@@ -72,6 +83,7 @@ import {
   requestHostSuspend,
   requestQueueEmpty,
   updateWorkspaceRoot,
+  updateDefaultSessionWorkspaceRoot,
   launchSessionWorker,
   scheduleContextUsageRefresh,
 } from './api-client.js';
@@ -86,7 +98,7 @@ import {
 } from './ask-user-view.js';
 import { openPendingQuestionFromBanner, submitRelayQuestionChoice, submitRelayQuestionAnswer, submitRelayStructuredAnswer, onRelayQuestionDraftInput, handleRelayQuestionKey } from './ask-user-view.js';
 import { loadRelayBoards, renderRelayBoards, upsertRelayBoard, submitRelayBoardAction } from './relay-board-view.js';
-import { showThinking, removeThinking, renderThinkingActivities, appendThinkingActivity, appendThinkingThought, applyRelayStreamEvent, clearRelayStreamStateForMessage, restoreInFlightThinking, applyConversationTurnStatus, renderMessages, appendMessage, compactCurrentConversation, sendMessage, handleKey, getConversationLoadedMessageCount, loadOlderConversationMessages, syncComposerControlState, setConversationDraftPersistenceEnabled, applyIncomingConversationDraftUpdate, flushConversationDraft, getRenderedConversationMessageFingerprints, initConversationHistoryLazyLoading,
+import { showThinking, removeThinking, renderThinkingActivities, appendThinkingActivity, appendThinkingThought, applyRelayStreamEvent, clearRelayStreamStateForMessage, restoreInFlightThinking, applyConversationTurnStatus, renderMessages, appendMessage, compactCurrentConversation, sendMessage, handleKey, getConversationLoadedMessageCount, loadOlderConversationMessages, syncComposerControlState, setConversationDraftPersistenceEnabled, applyIncomingConversationDraftUpdate, flushConversationDraft, getRenderedConversationMessageFingerprints, initConversationHistoryLazyLoading, initBubbleActionHandlers, clearBubbleCancelState, removeUserBubbleCancelButton, updateSubagentBubbleFromStatus, isSendInFlight,
 } from './conversation-view.js';
 import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { handleAttachmentInput, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
@@ -122,6 +134,7 @@ const PROVIDER_LABELS = {
   other: 'Other',
 };
 const CHAT_TITLE_MAX_LENGTH = 120;
+const LOCAL_PROCESSING_STALE_MS = 5 * 60 * 1000;
 const FONT_SCALE_STORAGE_KEY = 'copilot_font_scale';
 const PWA_APP_NAME_STORAGE_KEY = 'copilot_pwa_app_name';
 const SHOW_SUSPEND_HOST_STORAGE_KEY = 'copilot_show_suspend_host';
@@ -145,6 +158,7 @@ const INSTALLED_DISPLAY_MODE_QUERIES = ['(display-mode: standalone)', '(display-
 let pendingInstalledFullscreenGesture = false;
 let relayQuestionRenderHash = '';
 let changeCwdInFlight = false;
+let defaultSessionWorkspaceRootUpdateInFlight = false;
 let modelCatalogState = {
   models: [FALLBACK_MODEL],
   currentModel: FALLBACK_MODEL,
@@ -1208,6 +1222,58 @@ function onMessagesTouchMove(event) {
   if (delta > 6) event.preventDefault();
 }
 
+async function runConversationHistoryRefresh({ source = 'menu' } = {}) {
+  const currentId = String(currentConvId || '').trim();
+  if (!currentId) {
+    if (source !== 'pull') showTransientRelayNotice('Select a conversation first.');
+    return false;
+  }
+  const eligibility = canRefreshConversationHistory(currentId);
+  if (!eligibility.ok) {
+    showTransientRelayNotice(eligibility.reason);
+    return false;
+  }
+
+  const messagesEl = document.getElementById('messages');
+  const scrollTop = messagesEl?.scrollTop || 0;
+  const savedLoadedCount = loadConversationLoadedMessageCount(currentId);
+  const requestLimit = Math.max(20, getConversationLoadedMessageCount() || 0, savedLoadedCount || 0);
+
+  setHistoryRefreshInFlight(true);
+  syncRefreshHistoryMenuState();
+  try {
+    const refreshed = await refreshConversationHistory(currentId, { limit: requestLimit });
+    if (!refreshed) {
+      throw new Error('History refresh request failed.');
+    }
+    if (String(currentConvId || '').trim() === currentId) {
+      applyLoadedConversationState(currentId, refreshed, { restoreScroll: false });
+    }
+    await refreshConversations();
+    await loadRelayQuestions(currentId);
+    await loadRelayBoards();
+    scheduleContextUsageRefresh(currentId, 0);
+
+    if (messagesEl && String(currentConvId || '').trim() === currentId) {
+      const savedScrollTop = loadConversationScrollTop(currentId);
+      const nextScrollTop = Number.isFinite(savedScrollTop) ? savedScrollTop : scrollTop;
+      messagesEl.scrollTop = nextScrollTop;
+      if (Number.isFinite(nextScrollTop) && nextScrollTop >= 0) {
+        saveConversationScrollTop(currentId, nextScrollTop);
+      }
+    }
+    showTransientRelayNotice('Conversation history refreshed.');
+    return true;
+  } catch (error) {
+    const message = String(error?.message || '').trim() || 'Could not refresh conversation history.';
+    showTransientRelayNotice(message);
+    return false;
+  } finally {
+    setHistoryRefreshInFlight(false);
+    syncRefreshHistoryMenuState();
+  }
+}
+
 async function onMessagesTouchEnd() {
   if (!pullRefreshState.active) return;
   const shouldRefresh = pullRefreshState.ready && !pullRefreshState.refreshing;
@@ -1220,7 +1286,10 @@ async function onMessagesTouchEnd() {
   pullRefreshState.refreshing = true;
   setPullRefreshIndicator(72, 'Refreshing…', true);
   try {
-    await refreshCurrentView();
+    const refreshed = await runConversationHistoryRefresh({ source: 'pull' });
+    if (!refreshed) {
+      await refreshCurrentView();
+    }
   } finally {
     pullRefreshState.refreshing = false;
     resetPullRefreshIndicator();
@@ -1242,6 +1311,7 @@ async function refreshCurrentView() {
     renderMessages([]);
     restoreInFlightThinking(null);
     scheduleContextUsageRefresh(null);
+    syncRefreshHistoryMenuState();
     return;
   }
 
@@ -1267,6 +1337,7 @@ async function refreshCurrentView() {
       saveConversationScrollTop(currentId, nextScrollTop);
     }
   }
+  syncRefreshHistoryMenuState();
 }
 
 async function copyTextToClipboard(text) {
@@ -1342,9 +1413,59 @@ function toggleChatActionsMenu() {
   const menu = document.getElementById('chat-actions-menu');
   const trigger = document.getElementById('chat-actions-menu-btn');
   if (!menu || !trigger || trigger.hidden || trigger.disabled) return;
+  syncRefreshHistoryMenuState();
   const willOpen = !!menu.hidden;
   menu.hidden = !willOpen;
   trigger.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+}
+
+function isConversationLocallyProcessing(conversation) {
+  if (!conversation || typeof conversation !== 'object') return false;
+  const localTurnStatus = String(conversation?.localTurnStatus || '').trim().toLowerCase();
+  if (localTurnStatus === 'processing') {
+    const updatedAtMs = Number(conversation?.localTurnStatusUpdatedAt || 0);
+    if (!Number.isFinite(updatedAtMs) || updatedAtMs <= 0 || (Date.now() - updatedAtMs) < LOCAL_PROCESSING_STALE_MS) {
+      return true;
+    }
+  }
+  const runtimeStatus = String(
+    conversation?.runtimeSessionStatus
+    || conversation?.runtime_session_status
+    || conversation?.status
+    || '',
+  ).trim().toLowerCase();
+  return runtimeStatus === 'processing';
+}
+
+function canRefreshConversationHistory(conversationId) {
+  const currentId = String(conversationId || '').trim();
+  if (!currentId) {
+    return { ok: false, reason: 'Select a conversation first.' };
+  }
+  if (isHistoryRefreshInFlight()) {
+    return { ok: false, reason: 'History refresh is already running.' };
+  }
+  if (isSendInFlight()) {
+    return { ok: false, reason: 'Wait for the current send to finish before refreshing history.' };
+  }
+  const conversation = conversations[currentId] || null;
+  if (isConversationLocallyProcessing(conversation)) {
+    return { ok: false, reason: 'Wait for the current turn to finish before refreshing history.' };
+  }
+  return { ok: true };
+}
+
+function syncRefreshHistoryMenuState() {
+  const button = document.getElementById('chat-menu-refresh-history');
+  if (!button) return;
+  if (isHistoryRefreshInFlight()) {
+    button.disabled = true;
+    button.title = 'Refreshing conversation history';
+    return;
+  }
+  const eligibility = canRefreshConversationHistory(currentConvId);
+  button.disabled = !eligibility.ok;
+  button.title = eligibility.ok ? 'Rebuild this conversation history from SDK events.' : eligibility.reason;
 }
 
 function lockChatActionsMenuShield(ms = 300) {
@@ -1368,6 +1489,51 @@ function normalizeKnownCwdPath(value) {
   // server's remembered CWD for drive D, not the drive root.
   if (/^[A-Za-z]:$/.test(stripped)) return `${stripped}\\`;
   return stripped;
+}
+
+function syncDefaultSessionWorkspaceRootInput() {
+  const input = document.getElementById('default-session-workspace-root-input');
+  if (!input) return;
+  input.value = normalizeKnownCwdPath(defaultSessionWorkspaceRootPath || '');
+  if (defaultSessionWorkspaceRootWarning) {
+    input.title = defaultSessionWorkspaceRootWarning;
+  } else {
+    input.removeAttribute('title');
+  }
+}
+
+async function updateDefaultSessionWorkspaceRootSetting(rawValue) {
+  if (defaultSessionWorkspaceRootUpdateInFlight) {
+    syncDefaultSessionWorkspaceRootInput();
+    return;
+  }
+  const normalizedPath = normalizeKnownCwdPath(rawValue);
+  defaultSessionWorkspaceRootUpdateInFlight = true;
+  try {
+    const result = await updateDefaultSessionWorkspaceRoot(normalizedPath, {
+      clear: !normalizedPath,
+    });
+    if (!result) {
+      alert('Failed to update the default CWD for new sessions.');
+      syncDefaultSessionWorkspaceRootInput();
+      return;
+    }
+    syncDefaultSessionWorkspaceRootInput();
+    if (result.defaultSessionWorkspaceRootWarning) {
+      showTransientRelayNotice(String(result.defaultSessionWorkspaceRootWarning), 7000);
+    }
+    if (normalizedPath) {
+      const savedPath = String(result.defaultSessionWorkspaceRootPath || normalizedPath).trim();
+      showTransientRelayNotice(`Default CWD for new sessions saved as ${savedPath}.`);
+    } else {
+      showTransientRelayNotice('Default CWD reset. New sessions will use relay workspace root.');
+    }
+  } catch (error) {
+    alert(error?.message || 'Failed to update the default CWD for new sessions.');
+    syncDefaultSessionWorkspaceRootInput();
+  } finally {
+    defaultSessionWorkspaceRootUpdateInFlight = false;
+  }
 }
 
 function clearLegacyKnownCwdHistoryStorage() {
@@ -2187,6 +2353,8 @@ async function connectSocket() {
     }
   });
   socket.on('assistant_message', ({ conversationId, message, messageId, sourceMessageId }) => {
+    const isCurrentConversation = conversationId === currentConvId;
+    const autoScroll = isCurrentConversation ? isMessagesNearBottom() : false;
     removeThinking();
     if ((!message?.activities || !message.activities.length) && sourceMessageId) {
       const cached = relayActivities.get(sourceMessageId) || [];
@@ -2199,8 +2367,8 @@ async function connectSocket() {
       }
     }
     if (messageId && seenMessageIds?.has(messageId)) return;
-    if (conversationId === currentConvId) {
-      appendMessage(message, true, messageId || null, false, sourceMessageId || null);
+    if (isCurrentConversation) {
+      appendMessage(message, autoScroll, messageId || null, false, sourceMessageId || null);
       scheduleContextUsageRefresh(conversationId, 120);
     }
     if (sourceMessageId) relayActivities.delete(sourceMessageId);
@@ -2218,31 +2386,70 @@ async function connectSocket() {
   socket.on('relay_board_changed', () => {
     loadRelayBoards();
   });
-  socket.on('relay_activity', ({ conversationId, messageId, text }) => {
+  socket.on('relay_activity', ({ conversationId, messageId, text, subagentRunId }) => {
     if (!messageId || !text) return;
+    const entry = {
+      text: String(text || '').trim(),
+      subagentRunId: subagentRunId ? String(subagentRunId).trim() : null,
+    };
+    if (!entry.text) return;
     const items = relayActivities.get(messageId) || [];
     const last = items[items.length - 1];
-    if (last !== text) relayActivities.set(messageId, items.concat(text).slice(-24));
-    if (conversationId === currentConvId) appendThinkingActivity(text);
+    const lastText = typeof last === 'string' ? last : String(last?.text || '');
+    const lastSubagentRunId = typeof last === 'object' && last ? (last.subagentRunId || null) : null;
+    if (lastText !== entry.text || lastSubagentRunId !== entry.subagentRunId) {
+      relayActivities.set(messageId, items.concat(entry).slice(-24));
+    }
+    if (entry.subagentRunId) {
+      upsertSubagentRun({ subagentRunId: entry.subagentRunId, messageId, conversationId });
+      addSubagentActivity(entry.subagentRunId, entry.text);
+    }
+    if (conversationId === currentConvId) {
+      const autoScroll = isMessagesNearBottom();
+      appendThinkingActivity(entry.text, entry.subagentRunId, autoScroll);
+    }
   });
   socket.on('relay_stream', ({ conversationId, messageId, text, done, seq }) => {
     if (!messageId) return;
     if (conversationId !== currentConvId) return;
+    const autoScroll = isMessagesNearBottom();
     applyRelayStreamEvent({
       messageId,
       text: String(text || ''),
       done: !!done,
       seq,
+      autoScroll,
     });
   });
-  socket.on('relay_thought', ({ conversationId, messageId, reasoningId, text, done }) => {
+  socket.on('relay_thought', ({ conversationId, messageId, reasoningId, text, done, subagentRunId }) => {
     if (!messageId) return;
     const key = String(reasoningId || 'reasoning');
     const thoughtMap = relayThoughts.get(messageId) || new Map();
-    thoughtMap.set(key, { reasoningId: key, text: String(text || ''), done: !!done });
+    thoughtMap.set(key, { reasoningId: key, text: String(text || ''), done: !!done, subagentRunId: subagentRunId || null });
     relayThoughts.set(messageId, thoughtMap);
+    if (subagentRunId) {
+      upsertSubagentRun({ subagentRunId, messageId, conversationId });
+      addSubagentThought(subagentRunId, { reasoningId: key, text: String(text || ''), done: !!done });
+    }
     if (conversationId === currentConvId) {
-      appendThinkingThought(key, String(text || ''), !!done);
+      const autoScroll = isMessagesNearBottom();
+      appendThinkingThought(key, String(text || ''), !!done, subagentRunId, autoScroll);
+    }
+  });
+  socket.on('subagent_status', ({ conversationId, messageId, subagentRunId, parentSubagentId, displayName, status, timestamp }) => {
+    if (!messageId || !subagentRunId) return;
+    upsertSubagentRun({
+      subagentRunId,
+      messageId,
+      conversationId,
+      parentSubagentId,
+      displayName,
+      status,
+      timestamp,
+    });
+    clearSubagentCancelInFlight(subagentRunId);
+    if (conversationId === currentConvId) {
+      updateSubagentBubbleFromStatus(subagentRunId, status);
     }
   });
   socket.on('conversation_compacted', async ({ sourceConversationId, targetConversationId }) => {
@@ -2313,12 +2520,16 @@ async function connectSocket() {
       }
     }
     if (conversationId === currentConvId && normalizedStatus === 'processing') {
-      showThinking(messageId || null);
+      const autoScroll = isMessagesNearBottom();
+      showThinking(messageId || null, autoScroll);
       renderThinkingActivities();
+      if (messageId) removeUserBubbleCancelButton(messageId);
     }
     if (clearsProcessingStatus) {
       clearPendingUserMessage(messageId);
       if (messageId) clearRelayStreamStateForMessage(messageId);
+      if (messageId) clearBubbleCancelState(messageId);
+      if (messageId) removeUserBubbleCancelButton(messageId);
     }
     if (conversationId === currentConvId && clearsProcessingStatus) {
       removeThinking();
@@ -2768,6 +2979,7 @@ function openSettingsModal() {
   syncSuspendHostVisibility();
   syncFontScaleSelect();
   syncPwaAppNameInput();
+  syncDefaultSessionWorkspaceRootInput();
   modal?.classList.add('visible');
   modal?.setAttribute('aria-hidden', 'false');
 }
@@ -2781,6 +2993,7 @@ function closeSettingsModal() {
 window.updateTheme = updateTheme;
 window.updateFontScaleFromSelect = updateFontScaleFromSelect;
 window.updatePwaAppName = updatePwaAppName;
+window.updateDefaultSessionWorkspaceRootSetting = updateDefaultSessionWorkspaceRootSetting;
 window.updateShowSuspendHostSetting = updateShowSuspendHostSetting;
 window.openSettingsModal = openSettingsModal;
 window.closeSettingsModal = closeSettingsModal;
@@ -2837,6 +3050,14 @@ async function initApp() {
     compactCurrentConversation().catch((error) => {
       alert(error?.message || 'Failed to compact conversation');
     });
+  });
+  const chatMenuRefreshHistoryBtn = document.getElementById('chat-menu-refresh-history');
+  bindMenuAction(chatMenuRefreshHistoryBtn, (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    lockChatActionsMenuShield(350);
+    closeChatActionsMenu();
+    runConversationHistoryRefresh({ source: 'menu' }).catch(() => {});
   });
   const chatMenuSelectModelsBtn = document.getElementById('chat-menu-select-models');
   bindMenuAction(chatMenuSelectModelsBtn, (event) => {
@@ -2943,10 +3164,12 @@ async function initApp() {
   initFullscreenButton();
   initInstallButton();
   initPullToRefresh();
+  syncRefreshHistoryMenuState();
   initChatTitleCopy();
   initEmojiPicker();
   initConversationListLazyLoading();
   initConversationHistoryLazyLoading();
+  initBubbleActionHandlers();
   initMessageScrollPersistence();
   initMessageSearchView({ openConversation });
   syncChatTitleControls();

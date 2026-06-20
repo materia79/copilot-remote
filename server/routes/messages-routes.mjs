@@ -540,6 +540,37 @@ export function resolveInitialQueueOwnerSessionId({
   );
 }
 
+export function validateSubagentRunBinding({
+  queueRow = null,
+  messageId = '',
+  conversationId = '',
+  existingRun = null,
+} = {}) {
+  const normalizedMessageId = String(messageId || '').trim();
+  const normalizedConversationId = String(conversationId || '').trim();
+  if (!queueRow || typeof queueRow !== 'object') {
+    return { ok: false, statusCode: 404, error: 'Queue message not found' };
+  }
+  const queueConversationId = String(queueRow.conversation_id || '').trim();
+  if (!queueConversationId) {
+    return { ok: false, statusCode: 409, error: 'Queue message is missing conversation binding' };
+  }
+  if (normalizedConversationId && queueConversationId !== normalizedConversationId) {
+    return { ok: false, statusCode: 409, error: 'Queue message conversation mismatch' };
+  }
+  if (existingRun && typeof existingRun === 'object') {
+    const runConversationId = String(existingRun.conversation_id || '').trim();
+    const runMessageId = String(existingRun.queue_message_id || '').trim();
+    if (runConversationId && runConversationId !== queueConversationId) {
+      return { ok: false, statusCode: 409, error: 'Subagent run conversation mismatch' };
+    }
+    if (runMessageId && normalizedMessageId && runMessageId !== normalizedMessageId) {
+      return { ok: false, statusCode: 409, error: 'Subagent run message mismatch' };
+    }
+  }
+  return { ok: true, conversationId: queueConversationId };
+}
+
 export function shouldAutoPrimeStrandedSession({
   strandedRow = null,
   requesterSessionId = null,
@@ -677,7 +708,38 @@ export async function dequeuePendingMessageForWorkerLoop({
   const supervisor = sessionWorkerSupervisor || null;
 
   if (routingWithWorker && typeof supervisor?.ensureWorker === 'function') {
-    supervisor?.clearRestartSchedule?.(requesterSid, { resetKilledMarker: true });
+    const killBlocked = supervisor?.isKillBlocked?.(requesterSid) === true;
+    if (killBlocked) {
+      const lifecycle = supervisor?.getLifecycleState?.(requesterSid) || null;
+      const fallbackRestart = maybeTriggerWorkerFallbackRestart({
+        enabled: false,
+        failureClass: 'session-killed',
+        requesterSessionId: requesterSid,
+        relayRestartOrchestrator,
+        inFlightProcessingCount,
+      });
+      emitWorkerLoopTelemetry(telemetry, {
+        event: 'worker.ensure.blocked',
+        sessionId: requesterSid,
+        workerId: supervisor?.getWorkerState?.(requesterSid)?.workerId || null,
+        conversationId: supervisor?.getWorkerState?.(requesterSid)?.conversationId || null,
+        messageId: null,
+        continuationId: null,
+        state: supervisor?.getWorkerState?.(requesterSid)?.status || 'error',
+        retry: lifecycle?.retryCount || 0,
+        pid: supervisor?.getWorkerState?.(requesterSid)?.pid || null,
+        blockedReason: 'session-killed',
+        queue: null,
+      });
+      return {
+        message: null,
+        blockedReason: 'session-killed',
+        worker: supervisor?.getWorkerState?.(requesterSid) || null,
+        lifecycle,
+        fallbackRestart,
+        attempts: 0,
+      };
+    }
     const ensureResult = await supervisor.ensureWorker(requesterSid);
     if (!ensureResult?.ok) {
       const fallbackRestart = maybeTriggerWorkerFallbackRestart({
@@ -1395,6 +1457,16 @@ export function registerMessagesRoutes(app, deps) {
     ORDER BY created_at DESC
     LIMIT 1
   `);
+  const findActiveRelaySubagentControlByRunId = db.prepare(`
+    SELECT *
+    FROM relay_control_requests
+    WHERE queue_message_id = ?
+      AND type = 'abort_subagent'
+      AND status IN ('pending', 'processing')
+      AND json_extract(request, '$.subagentRunId') = ?
+    ORDER BY created_at DESC
+    LIMIT 1
+  `);
   const insertRelayControlRequest = db.prepare(`
     INSERT INTO relay_control_requests (
       id,
@@ -1466,6 +1538,17 @@ export function registerMessagesRoutes(app, deps) {
         completed_at = ?
     WHERE queue_message_id = ?
       AND type = 'abort_turn'
+      AND status IN ('pending', 'processing')
+  `);
+  const settleRelaySubagentControlsForQueueMessage = db.prepare(`
+    UPDATE relay_control_requests
+    SET status = ?,
+        result = ?,
+        error = ?,
+        updated_at = ?,
+        completed_at = ?
+    WHERE queue_message_id = ?
+      AND type = 'abort_subagent'
       AND status IN ('pending', 'processing')
   `);
 
@@ -1545,6 +1628,33 @@ export function registerMessagesRoutes(app, deps) {
     return Number(settled?.changes || 0);
   }
 
+  function settleRelaySubagentAbortControlsForQueueMessage(queueMessageId, { ok = true, note = null, error = null } = {}) {
+    const id = String(queueMessageId || '').trim();
+    if (!id) return 0;
+    const now = new Date().toISOString();
+    const result = ok
+      ? JSON.stringify({ source: 'relay-runtime', note: String(note || '').trim() || null })
+      : null;
+    const settled = settleRelaySubagentControlsForQueueMessage.run(
+      ok ? 'done' : 'failed',
+      result,
+      ok ? null : String(error || 'stale-control').trim() || 'stale-control',
+      now,
+      now,
+      id,
+    );
+    return Number(settled?.changes || 0);
+  }
+
+  function relayControlRequestPayload(row) {
+    return parseJsonObject(row?.request) || null;
+  }
+
+  function relayControlSubagentRunId(row) {
+    const requestPayload = relayControlRequestPayload(row);
+    return String(requestPayload?.subagentRunId || '').trim() || null;
+  }
+
   function recoverOwnedProcessingRowsForSession(
     sdkSessionId,
     {
@@ -1596,6 +1706,10 @@ export function registerMessagesRoutes(app, deps) {
         ok: false,
         error: reason,
       });
+      settleRelaySubagentAbortControlsForQueueMessage(row.id, {
+        ok: false,
+        error: reason,
+      });
       io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'pending' });
     }
     for (const row of rowsToFail) {
@@ -1618,6 +1732,10 @@ export function registerMessagesRoutes(app, deps) {
           ok: false,
           error: failureRecord.code,
         });
+        settleRelaySubagentAbortControlsForQueueMessage(row.id, {
+          ok: false,
+          error: failureRecord.code,
+        });
       }
     }
     if (rowsToRecover.length || rowsToFail.length) {
@@ -1635,6 +1753,12 @@ export function registerMessagesRoutes(app, deps) {
     if (!sdkSessionId) return res.status(400).json({ error: 'Missing session worker id' });
 
     const currentWorker = sessionWorkerRegistry?.getWorker?.(sdkSessionId) || null;
+    sessionWorkerSupervisor?.markKilled?.(sdkSessionId);
+    try {
+      await sessionWorkerSupervisor?.cancelPendingStart?.(sdkSessionId);
+    } catch {
+      // If cancellation fails, keep going with the process kill cleanup.
+    }
 
     // Collect ALL matching PIDs (not just first)
     const discoveredProcesses = process.platform === 'win32'
@@ -1701,7 +1825,6 @@ export function registerMessagesRoutes(app, deps) {
     sessionWorkerRegistry?.removeWorker?.(sdkSessionId);
     sessionWorkerSupervisor?.clearRestartSchedule?.(sdkSessionId);
     sessionWorkerSupervisor?.resetHealth?.(sdkSessionId, { clearFailureCount: false });
-    sessionWorkerSupervisor?.markKilled?.(sdkSessionId);
 
     // Drain ALL owned processing rows, not just first
     const queueRows = findAllProcessingOwnedBySession.all(sdkSessionId) || [];
@@ -1756,11 +1879,6 @@ export function registerMessagesRoutes(app, deps) {
       const released = clearNonProcessingOwnedBySession.run(sdkSessionId);
       releasedOwnedCount = Number(released?.changes || 0);
     }
-
-    sessionWorkerRegistry?.removeWorker?.(sdkSessionId);
-    sessionWorkerSupervisor?.clearRestartSchedule?.(sdkSessionId);
-    sessionWorkerSupervisor?.resetHealth?.(sdkSessionId, { clearFailureCount: false });
-    sessionWorkerSupervisor?.markKilled?.(sdkSessionId);
 
     const conversationId = queueRows[0]?.conversation_id || currentWorker?.conversationId || null;
 
@@ -1872,6 +1990,194 @@ export function registerMessagesRoutes(app, deps) {
     });
   });
 
+  app.post('/api/conversation/:conversationId/subagent/:subagentRunId/cancel', auth, (req, res) => {
+    const conversationId = String(req.params.conversationId || '').trim();
+    const subagentRunId = String(req.params.subagentRunId || '').trim();
+    const parentMessageId = String(req.body?.parentMessageId || '').trim();
+    const sessionState = getConversationSessionState(conversationId);
+    if (!sessionState.ok) {
+      return rejectSessionBinding(res, sessionState.status, sessionState.error);
+    }
+    if (!subagentRunId) {
+      return res.status(400).json({ error: 'Missing subagentRunId' });
+    }
+
+    const subagentRun = stmts.getSubagentRun?.get(subagentRunId) || null;
+    if (!subagentRun) {
+      return res.json({
+        ok: true,
+        queued: false,
+        acknowledgement: 'not-found',
+        subagentRunId,
+      });
+    }
+
+    const runConversationId = String(subagentRun.conversation_id || '').trim();
+    if (!runConversationId || runConversationId !== conversationId) {
+      return res.json({
+        ok: true,
+        queued: false,
+        acknowledgement: 'not-found',
+        subagentRunId,
+      });
+    }
+
+    const authoritativeMessageId = String(subagentRun.queue_message_id || '').trim();
+    if (parentMessageId && authoritativeMessageId && parentMessageId !== authoritativeMessageId) {
+      return res.json({
+        ok: true,
+        queued: false,
+        acknowledgement: 'message-mismatch',
+        subagentRunId,
+        parentMessageId,
+        authoritativeMessageId,
+      });
+    }
+
+    const status = String(subagentRun.status || '').trim().toLowerCase();
+    if (status === 'cancelled') {
+      return res.json({
+        ok: true,
+        queued: false,
+        acknowledgement: 'already-cancelled',
+        subagentRunId,
+        status,
+      });
+    }
+    if (!['pending', 'processing', 'running'].includes(status)) {
+      return res.json({
+        ok: true,
+        queued: false,
+        acknowledgement: 'already-finished',
+        subagentRunId,
+        status,
+      });
+    }
+
+    const queueRow = authoritativeMessageId ? (stmts.findQById.get(authoritativeMessageId) || null) : null;
+    const sdkSessionId = normalizeSessionWorkerId(
+      queueRow?.owner_sdk_session_id
+      || sessionState.runtimeSessionSdkSessionId
+      || sessionState.conversationSdkSessionId,
+    );
+    if (!sdkSessionId) {
+      return res.json({
+        ok: true,
+        queued: false,
+        acknowledgement: 'already-finished',
+        subagentRunId,
+        status,
+      });
+    }
+
+    const existing = findActiveRelaySubagentControlByRunId.get(authoritativeMessageId, subagentRunId) || null;
+    if (existing) {
+      return res.json({
+        ok: true,
+        queued: true,
+        duplicate: true,
+        acknowledgement: 'cancelled',
+        subagentRunId,
+        control: formatRelayControlResponse(existing),
+      });
+    }
+
+    const now = new Date().toISOString();
+    const controlId = uuidv4();
+    const requestPayload = JSON.stringify({
+      source: 'relay-ui',
+      requestedByClientId: String(req.body?.clientId || '').trim() || null,
+      subagentRunId,
+      parentMessageId: authoritativeMessageId || null,
+    });
+    insertRelayControlRequest.run(
+      controlId,
+      'abort_subagent',
+      conversationId,
+      authoritativeMessageId || null,
+      sdkSessionId,
+      requestPayload,
+      now,
+      now,
+    );
+    const control = getRelayControlRequestById.get(controlId) || null;
+    return res.json({
+      ok: true,
+      queued: true,
+      acknowledgement: 'cancelled',
+      subagentRunId,
+      control: formatRelayControlResponse(control),
+    });
+  });
+
+  app.post('/api/conversation/:conversationId/cancel-queued-turn', auth, (req, res) => {
+    const conversationId = String(req.params.conversationId || '').trim();
+    const requestedMessageId = String(req.body?.messageId || '').trim();
+    if (!conversationId) {
+      return res.status(400).json({ error: 'Missing conversationId' });
+    }
+    if (!requestedMessageId) {
+      return res.status(400).json({ error: 'Missing messageId' });
+    }
+
+    const queueRow = stmts.findQById.get(requestedMessageId) || null;
+    if (!queueRow) {
+      return res.json({
+        ok: true,
+        cancelled: false,
+        acknowledgement: 'not-found',
+        requestedMessageId,
+      });
+    }
+
+    const rowConversationId = String(queueRow.conversation_id || '').trim();
+    if (rowConversationId !== conversationId) {
+      return res.json({
+        ok: true,
+        cancelled: false,
+        acknowledgement: 'conversation-mismatch',
+        requestedMessageId,
+        actualConversationId: rowConversationId || null,
+      });
+    }
+
+    const currentStatus = String(queueRow.status || '').trim().toLowerCase();
+    if (currentStatus === 'processing') {
+      return res.json({
+        ok: true,
+        cancelled: false,
+        acknowledgement: 'already-processing',
+        requestedMessageId,
+        status: currentStatus,
+      });
+    }
+    if (!['pending', 'parked'].includes(currentStatus)) {
+      return res.json({
+        ok: true,
+        cancelled: false,
+        acknowledgement: 'already-finished',
+        requestedMessageId,
+        status: currentStatus,
+      });
+    }
+
+    const cancelQueuedTurn = db.transaction(() => {
+      stmts.deleteQueueById.run(requestedMessageId);
+      cancelPendingRelayQuestionsForMessage(requestedMessageId);
+    });
+    cancelQueuedTurn();
+
+    io.emit('message_status', { messageId: requestedMessageId, conversationId, status: 'cancelled' });
+
+    return res.json({
+      ok: true,
+      cancelled: true,
+      acknowledgement: 'cancelled',
+      requestedMessageId,
+      previousStatus: currentStatus,
+    });
+  });
+
   app.get('/api/control/active', auth, (req, res) => {
     const bridgeIdentity = readBridgeIdentity(req);
     const sdkSessionId = normalizeSessionWorkerId(req.query?.sdkSessionId || bridgeIdentity?.sessionId);
@@ -1886,15 +2192,37 @@ export function registerMessagesRoutes(app, deps) {
     if (!pending) {
       return res.json({ ok: true, control: null });
     }
-    if (String(pending.type || '').trim() === 'abort_turn') {
+    const pendingType = String(pending.type || '').trim();
+    if (pendingType === 'abort_turn') {
       const targetMessageId = String(pending.queue_message_id || '').trim();
       const targetRow = targetMessageId ? (stmts.findQById.get(targetMessageId) || null) : null;
       const targetOwnerSessionId = normalizeSessionWorkerId(targetRow?.owner_sdk_session_id);
       if (!targetRow || String(targetRow.status || '').trim().toLowerCase() !== 'processing' || targetOwnerSessionId !== sdkSessionId) {
-        settleRelayAbortControlsForQueueMessage(targetMessageId || pending.queue_message_id, {
-          ok: false,
-          error: 'stale-control',
-        });
+        const now = new Date().toISOString();
+        failRelayControlRequest.run('stale-control', now, now, pending.id);
+        return res.json({ ok: true, control: null });
+      }
+    }
+    if (pendingType === 'abort_subagent') {
+      const targetMessageId = String(pending.queue_message_id || '').trim();
+      const targetRow = targetMessageId ? (stmts.findQById.get(targetMessageId) || null) : null;
+      const targetOwnerSessionId = normalizeSessionWorkerId(targetRow?.owner_sdk_session_id);
+      const targetSubagentRunId = relayControlSubagentRunId(pending);
+      const targetSubagentRun = targetSubagentRunId ? (stmts.getSubagentRun?.get(targetSubagentRunId) || null) : null;
+      const targetSubagentStatus = String(targetSubagentRun?.status || '').trim().toLowerCase();
+      const cancellableSubagentStatus = ['running', 'pending', 'processing'];
+      const stale = (
+        !targetRow
+        || String(targetRow.status || '').trim().toLowerCase() !== 'processing'
+        || targetOwnerSessionId !== sdkSessionId
+        || !targetSubagentRun
+        || String(targetSubagentRun.queue_message_id || '').trim() !== targetMessageId
+        || String(targetSubagentRun.conversation_id || '').trim() !== String(pending.conversation_id || '').trim()
+        || !cancellableSubagentStatus.includes(targetSubagentStatus)
+      );
+      if (stale) {
+        const now = new Date().toISOString();
+        failRelayControlRequest.run('stale-control', now, now, pending.id);
         return res.json({ ok: true, control: null });
       }
     }
@@ -1925,6 +2253,36 @@ export function registerMessagesRoutes(app, deps) {
     if (!ok) {
       const errorText = String(req.body?.error || 'relay control failed').trim() || 'relay control failed';
       failRelayControlRequest.run(errorText, now, now, controlId);
+      if (String(control.type || '').trim() === 'abort_subagent') {
+        const targetSubagentRunId = relayControlSubagentRunId(control);
+        const targetRun = targetSubagentRunId ? (stmts.getSubagentRun?.get(targetSubagentRunId) || null) : null;
+        if (targetRun) {
+          const messageId = String(targetRun.queue_message_id || control.queue_message_id || '').trim();
+          const conversationId = String(targetRun.conversation_id || control.conversation_id || '').trim();
+          const parentSubagentId = targetRun.parent_subagent_id ? String(targetRun.parent_subagent_id).trim() : null;
+          const displayName = targetRun.display_name ? String(targetRun.display_name).trim() : null;
+          const status = String(targetRun.status || 'running').trim().toLowerCase() || 'running';
+          io.emit('subagent_status', {
+            messageId: messageId || null,
+            conversationId: conversationId || null,
+            subagentRunId: targetSubagentRunId,
+            parentSubagentId: parentSubagentId || undefined,
+            displayName: displayName || undefined,
+            status,
+            timestamp: now,
+          });
+          if (messageId && conversationId) {
+            io.emit('relay_activity', {
+              messageId,
+              conversationId,
+              mode: 'agent',
+              text: `System note: Could not stop this subagent (${errorText}).`,
+              timestamp: now,
+              subagentRunId: targetSubagentRunId || undefined,
+            });
+          }
+        }
+      }
       return res.json({ ok: true, control: formatRelayControlResponse(getRelayControlRequestById.get(controlId) || control) });
     }
 
@@ -1948,6 +2306,26 @@ export function registerMessagesRoutes(app, deps) {
           responseText: buildTerminalFailureTextForChat(failureRecord),
           failureRecord,
           markWorkerError: false,
+        });
+      }
+    }
+    if (String(control.type || '').trim() === 'abort_subagent') {
+      const targetSubagentRunId = relayControlSubagentRunId(control);
+      const targetRun = targetSubagentRunId ? (stmts.getSubagentRun?.get(targetSubagentRunId) || null) : null;
+      if (targetRun) {
+        const messageId = String(targetRun.queue_message_id || control.queue_message_id || '').trim();
+        const conversationId = String(targetRun.conversation_id || control.conversation_id || '').trim();
+        const parentSubagentId = targetRun.parent_subagent_id ? String(targetRun.parent_subagent_id).trim() : null;
+        const displayName = targetRun.display_name ? String(targetRun.display_name).trim() : null;
+        stmts.updateSubagentRunStatus?.run('cancelled', now, now, targetSubagentRunId);
+        io.emit('subagent_status', {
+          messageId: messageId || null,
+          conversationId: conversationId || null,
+          subagentRunId: targetSubagentRunId,
+          parentSubagentId: parentSubagentId || undefined,
+          displayName: displayName || undefined,
+          status: 'cancelled',
+          timestamp: now,
         });
       }
     }
@@ -2846,6 +3224,20 @@ export function registerMessagesRoutes(app, deps) {
       });
     }
     if (sessionWorkerRoutingEnabled && requesterSessionId) {
+      const requesterKillBlocked = sessionWorkerSupervisor?.isKillBlocked?.(requesterSessionId) === true;
+      if (requesterKillBlocked) {
+        return res.json({
+          message: null,
+          routing: {
+            enabled: true,
+            requesterSessionId,
+            blockedReason: 'session-killed',
+            lifecycle: sessionWorkerSupervisor?.getLifecycleState?.(requesterSessionId) || null,
+            fallbackRestart: null,
+          },
+          restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
+        });
+      }
       sessionWorkerSupervisor?.noteSessionHeartbeat?.(requesterSessionId);
     }
     if (runtimeState.relayPaused) return res.json({ message: null, paused: true });
@@ -3058,10 +3450,10 @@ export function registerMessagesRoutes(app, deps) {
         })
         && !shouldSkipPrime
         && typeof sessionWorkerSupervisor?.ensureWorker === 'function'
+        && sessionWorkerSupervisor?.isKillBlocked?.(strandedSessionId) !== true
       ) {
         strandedPrimeCooldownBySession.set(strandedSessionId, nowMs);
         try {
-          sessionWorkerSupervisor?.clearRestartSchedule?.(strandedSessionId, { resetKilledMarker: true });
           const primeResult = await sessionWorkerSupervisor.ensureWorker(strandedSessionId);
           const shouldTakeOver = shouldTakeOverStrandedPendingMessage({
             strandedRow: strandedOwner,
@@ -3395,6 +3787,10 @@ export function registerMessagesRoutes(app, deps) {
         ok: false,
         error: 'queue-terminal-failure',
       });
+      settleRelaySubagentAbortControlsForQueueMessage(messageId, {
+        ok: false,
+        error: 'queue-terminal-failure',
+      });
       console.warn(
         `[${ts()}] FAILED    ${messageId?.slice(0,8)} conv=${targetConversationId?.slice(0,8)} code=${terminalFailure.stableCode}`
         + `${terminalFailure.functionCallId ? ` call=${terminalFailure.functionCallId}` : ''}`
@@ -3462,6 +3858,10 @@ export function registerMessagesRoutes(app, deps) {
       ok: true,
       note: 'queue message completed before stop control was applied',
     });
+    settleRelaySubagentAbortControlsForQueueMessage(messageId, {
+      ok: false,
+      error: 'queue-message-completed',
+    });
     if (q?.runtime_session_id) {
       const nowIso = new Date().toISOString();
       const existing = stmts.getRuntimeSessionById.get(q.runtime_session_id);
@@ -3526,7 +3926,7 @@ export function registerMessagesRoutes(app, deps) {
   // POST /api/activity — relay sends in-flight activity updates (tool/search sections)
   app.post('/api/activity', auth, (req, res) => {
     touchCli();
-    const { messageId, conversationId, text, mode } = req.body || {};
+    const { messageId, conversationId, text, mode, subagentRunId } = req.body || {};
     const activityText = sanitizeActivityText(text);
     if (!messageId || !conversationId || !activityText) {
       return res.status(400).json({ error: 'Missing activity payload' });
@@ -3534,6 +3934,7 @@ export function registerMessagesRoutes(app, deps) {
 
     const q = stmts.findQById.get(messageId);
     const responseMessageId = q?.response_message_id || null;
+    const normalizedSubagentRunId = subagentRunId ? String(subagentRunId).trim() : null;
     stmts.insertActivity.run(
       messageId,
       responseMessageId,
@@ -3541,6 +3942,7 @@ export function registerMessagesRoutes(app, deps) {
       normalizeRelayMode(mode) || DEFAULT_RELAY_MODE,
       activityText,
       new Date().toISOString(),
+      normalizedSubagentRunId,
     );
 
     io.emit('relay_activity', {
@@ -3549,6 +3951,7 @@ export function registerMessagesRoutes(app, deps) {
       mode: normalizeRelayMode(mode) || DEFAULT_RELAY_MODE,
       text: activityText,
       timestamp: new Date().toISOString(),
+      subagentRunId: normalizedSubagentRunId || undefined,
     });
     res.json({ ok: true });
   });
@@ -3556,8 +3959,9 @@ export function registerMessagesRoutes(app, deps) {
   // POST /api/stream — relay sends in-flight assistant text stream updates
   app.post('/api/stream', auth, (req, res) => {
     touchCli();
-    const { messageId, conversationId, text, mode, done } = req.body || {};
+    const { messageId, conversationId, text, mode, done, subagentRunId } = req.body || {};
     const streamText = String(text || '');
+    const normalizedSubagentRunId = subagentRunId ? String(subagentRunId).trim() : null;
     if (!messageId || !conversationId) {
       return res.status(400).json({ error: 'Missing stream payload' });
     }
@@ -3604,6 +4008,7 @@ export function registerMessagesRoutes(app, deps) {
           streamText,
           done ? 1 : 0,
           now,
+          normalizedSubagentRunId,
         );
         return nextSeq;
       });
@@ -3635,6 +4040,7 @@ export function registerMessagesRoutes(app, deps) {
       done: !!done,
       seq,
       timestamp: now,
+      subagentRunId: normalizedSubagentRunId || undefined,
     });
     res.json({ ok: true, seq });
   });
@@ -3644,8 +4050,9 @@ export function registerMessagesRoutes(app, deps) {
   // (done:true) are persisted (one row per reasoning block); all updates are emitted live.
   app.post('/api/thought', auth, (req, res) => {
     touchCli();
-    const { messageId, conversationId, text, mode, reasoningId, done } = req.body || {};
+    const { messageId, conversationId, text, mode, reasoningId, done, subagentRunId } = req.body || {};
     const thoughtText = String(text || '');
+    const normalizedSubagentRunId = subagentRunId ? String(subagentRunId).trim() : null;
     if (!messageId || !conversationId) {
       return res.status(400).json({ error: 'Missing thought payload' });
     }
@@ -3695,6 +4102,7 @@ export function registerMessagesRoutes(app, deps) {
             thoughtText,
             1,
             now,
+            normalizedSubagentRunId,
           );
           return nextSeq;
         });
@@ -3728,8 +4136,71 @@ export function registerMessagesRoutes(app, deps) {
       done: !!done,
       seq,
       timestamp: now,
+      subagentRunId: normalizedSubagentRunId || undefined,
     });
     res.json({ ok: true, seq });
+  });
+
+  // POST /api/subagent-run — relay notifies about subagent lifecycle events
+  app.post('/api/subagent-run', auth, (req, res) => {
+    touchCli();
+    const { messageId, conversationId, subagentRunId, parentSubagentId, displayName, status } = req.body || {};
+    const normalizedSubagentRunId = subagentRunId ? String(subagentRunId).trim() : null;
+    const normalizedParentSubagentId = parentSubagentId ? String(parentSubagentId).trim() : null;
+    const normalizedDisplayName = displayName ? String(displayName).trim() : null;
+    const normalizedStatus = status ? String(status).trim() : 'running';
+
+    if (!messageId || !conversationId || !normalizedSubagentRunId) {
+      return res.status(400).json({ error: 'Missing required subagent-run fields: messageId, conversationId, subagentRunId' });
+    }
+
+    const q = stmts.findQById.get(messageId);
+    const existingRun = stmts.getSubagentRun?.get(normalizedSubagentRunId);
+    const binding = validateSubagentRunBinding({
+      queueRow: q,
+      messageId,
+      conversationId,
+      existingRun,
+    });
+    if (!binding.ok) {
+      return res.status(binding.statusCode || 409).json({ error: binding.error || 'Subagent run binding mismatch' });
+    }
+    const authoritativeConversationId = String(binding.conversationId || conversationId || '').trim();
+
+    const now = new Date().toISOString();
+
+    if (existingRun) {
+      const isTerminal = normalizedStatus === 'completed' || normalizedStatus === 'failed' || normalizedStatus === 'cancelled';
+      stmts.updateSubagentRunStatus?.run(
+        normalizedStatus,
+        now,
+        isTerminal ? now : null,
+        normalizedSubagentRunId,
+      );
+    } else {
+      stmts.insertSubagentRun?.run(
+        normalizedSubagentRunId,
+        messageId,
+        authoritativeConversationId,
+        normalizedParentSubagentId,
+        normalizedDisplayName,
+        normalizedStatus,
+        now,
+        now,
+      );
+    }
+
+    io.emit('subagent_status', {
+      messageId,
+      conversationId: authoritativeConversationId,
+      subagentRunId: normalizedSubagentRunId,
+      parentSubagentId: normalizedParentSubagentId || undefined,
+      displayName: normalizedDisplayName || undefined,
+      status: normalizedStatus,
+      timestamp: now,
+    });
+
+    res.json({ ok: true });
   });
 
   // POST /api/requeue — relay re-queues a message it failed to process
@@ -3767,6 +4238,10 @@ export function registerMessagesRoutes(app, deps) {
       });
       if (failed) {
         settleRelayAbortControlsForQueueMessage(messageId, {
+          ok: false,
+          error: 'queue-terminal-failure',
+        });
+        settleRelaySubagentAbortControlsForQueueMessage(messageId, {
           ok: false,
           error: 'queue-terminal-failure',
         });
@@ -3827,6 +4302,10 @@ export function registerMessagesRoutes(app, deps) {
         );
         if (result.changes > 0) {
           settleRelayAbortControlsForQueueMessage(messageId, {
+            ok: false,
+            error: parkForRestart ? 'queue-parked' : 'queue-requeued',
+          });
+          settleRelaySubagentAbortControlsForQueueMessage(messageId, {
             ok: false,
             error: parkForRestart ? 'queue-parked' : 'queue-requeued',
           });

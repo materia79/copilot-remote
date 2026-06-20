@@ -15,27 +15,47 @@ export function createQuestionRepository(db) {
         expireQuestions: db.prepare(`UPDATE relay_questions SET status = 'timed_out' WHERE status = 'pending' AND expires_at < ?`),
 
         // relay activity
-        insertActivity: db.prepare(`INSERT INTO relay_activity (queue_message_id, response_message_id, conversation_id, relay_mode, text, created_at) VALUES (?, ?, ?, ?, ?, ?)`),
+        insertActivity: db.prepare(`INSERT INTO relay_activity (queue_message_id, response_message_id, conversation_id, relay_mode, text, created_at, subagent_run_id) VALUES (?, ?, ?, ?, ?, ?, ?)`),
         linkActivityToResponse: db.prepare(`UPDATE relay_activity SET response_message_id = ? WHERE queue_message_id = ? AND response_message_id IS NULL`),
-        listActivityByResponse: db.prepare(`SELECT text FROM relay_activity WHERE response_message_id = ? ORDER BY id ASC`),
-        listActivityByQueueMessage: db.prepare(`SELECT text FROM relay_activity WHERE queue_message_id = ? ORDER BY id ASC`),
+        listActivityByResponse: db.prepare(`SELECT text, subagent_run_id FROM relay_activity WHERE response_message_id = ? ORDER BY id ASC`),
+        listActivityByQueueMessage: db.prepare(`SELECT text, subagent_run_id FROM relay_activity WHERE queue_message_id = ? ORDER BY id ASC`),
         deleteConvActivity: db.prepare(`DELETE FROM relay_activity WHERE conversation_id = ?`),
 
         // relay stream events
         getLastStreamSeqByQueueMessage: db.prepare(`SELECT COALESCE(MAX(seq), 0) AS max_seq FROM relay_stream_events WHERE queue_message_id = ?`),
-        insertStreamEvent: db.prepare(`INSERT INTO relay_stream_events (queue_message_id, response_message_id, conversation_id, relay_mode, seq, text, done, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`),
+        insertStreamEvent: db.prepare(`INSERT INTO relay_stream_events (queue_message_id, response_message_id, conversation_id, relay_mode, seq, text, done, created_at, subagent_run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`),
         linkStreamEventsToResponse: db.prepare(`UPDATE relay_stream_events SET response_message_id = ? WHERE queue_message_id = ? AND response_message_id IS NULL`),
-        listStreamEventsByResponse: db.prepare(`SELECT seq, text, done, created_at FROM relay_stream_events WHERE response_message_id = ? ORDER BY seq ASC, id ASC`),
-        listStreamEventsByQueueMessage: db.prepare(`SELECT seq, text, done, created_at FROM relay_stream_events WHERE queue_message_id = ? ORDER BY seq ASC, id ASC`),
+        listStreamEventsByResponse: db.prepare(`SELECT seq, text, done, created_at, subagent_run_id FROM relay_stream_events WHERE response_message_id = ? ORDER BY seq ASC, id ASC`),
+        listStreamEventsByQueueMessage: db.prepare(`SELECT seq, text, done, created_at, subagent_run_id FROM relay_stream_events WHERE queue_message_id = ? ORDER BY seq ASC, id ASC`),
         deleteConvStreamEvents: db.prepare(`DELETE FROM relay_stream_events WHERE conversation_id = ?`),
 
         // relay thoughts (agent reasoning)
         getLastThoughtSeqByQueueMessage: db.prepare(`SELECT COALESCE(MAX(seq), 0) AS max_seq FROM relay_thought WHERE queue_message_id = ?`),
-        insertThought: db.prepare(`INSERT INTO relay_thought (queue_message_id, response_message_id, conversation_id, relay_mode, reasoning_id, seq, text, done, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+        insertThought: db.prepare(`INSERT INTO relay_thought (queue_message_id, response_message_id, conversation_id, relay_mode, reasoning_id, seq, text, done, created_at, subagent_run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
         linkThoughtsToResponse: db.prepare(`UPDATE relay_thought SET response_message_id = ? WHERE queue_message_id = ? AND response_message_id IS NULL`),
-        listThoughtsByResponse: db.prepare(`SELECT reasoning_id, seq, text, done, created_at FROM relay_thought WHERE response_message_id = ? ORDER BY seq ASC, id ASC`),
-        listThoughtsByQueueMessage: db.prepare(`SELECT reasoning_id, seq, text, done, created_at FROM relay_thought WHERE queue_message_id = ? ORDER BY seq ASC, id ASC`),
+        listThoughtsByResponse: db.prepare(`SELECT reasoning_id, seq, text, done, created_at, subagent_run_id FROM relay_thought WHERE response_message_id = ? ORDER BY seq ASC, id ASC`),
+        listThoughtsByQueueMessage: db.prepare(`SELECT reasoning_id, seq, text, done, created_at, subagent_run_id FROM relay_thought WHERE queue_message_id = ? ORDER BY seq ASC, id ASC`),
         deleteConvThoughts: db.prepare(`DELETE FROM relay_thought WHERE conversation_id = ?`),
+
+        // subagent runs
+        insertSubagentRun: db.prepare(`
+          INSERT INTO subagent_runs (
+            id, queue_message_id, conversation_id, parent_subagent_id, display_name, status, started_at, updated_at, completed_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+        `),
+        getSubagentRun: db.prepare(`SELECT * FROM subagent_runs WHERE id = ?`),
+        updateSubagentRunStatus: db.prepare(`
+          UPDATE subagent_runs
+          SET status = ?, updated_at = ?, completed_at = COALESCE(?, completed_at)
+          WHERE id = ?
+        `),
+        listSubagentRunsByQueueMessage: db.prepare(`
+          SELECT id, queue_message_id, conversation_id, parent_subagent_id, display_name, status, started_at, updated_at, completed_at
+          FROM subagent_runs
+          WHERE queue_message_id = ?
+          ORDER BY started_at ASC, id ASC
+        `),
+        deleteConvSubagentRuns: db.prepare(`DELETE FROM subagent_runs WHERE conversation_id = ?`),
 
         // relay boards
         insertBoard: db.prepare(`INSERT INTO relay_boards (id, queue_id, conversation_id, message_id, board_type, relay_mode, title, body, actions_json, recommended_action, context_json, status, selected_action, acted_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?)`),

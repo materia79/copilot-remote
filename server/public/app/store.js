@@ -38,6 +38,8 @@ export const WORKSPACE_FILE_EXTENSIONS = new Set([
 export let serverPlatform = '';
 export let workspaceRootName = '';
 export let workspaceRootPath = '';
+export let defaultSessionWorkspaceRootPath = '';
+export let defaultSessionWorkspaceRootWarning = '';
 export let workspaceRootEntrySet = new Set([
   '.github',
   'server',
@@ -52,6 +54,8 @@ export let relayBoards = new Map();
 export let relayActivities = new Map();
 export let relayThoughts = new Map();
 export let sessionWorkerStates = new Map();
+export let subagentRuns = new Map();
+export const subagentCancelInFlight = new Set();
 export let thinkingMessageId = null;
 export let relayQuestionPollTimer = null;
 export let relayQuestionRenderHash = '';
@@ -105,6 +109,7 @@ export let pullRefreshState = {
   startY: 0,
   refreshing: false,
 };
+export let historyRefreshInFlight = false;
 const SIDEBAR_WIDTH_PERCENT_MIN = 10;
 const SIDEBAR_WIDTH_PERCENT_MAX = 50;
 const SIDEBAR_WIDTH_PERCENT_FALLBACK = 24;
@@ -330,6 +335,22 @@ export function updateWorkspaceRootHints(payload) {
   if (Object.prototype.hasOwnProperty.call(normalizedPayload, 'workspaceRootPath')) {
     workspaceRootPath = String(normalizedPayload.workspaceRootPath || '').trim();
   }
+  if (Object.prototype.hasOwnProperty.call(normalizedPayload, 'defaultSessionWorkspaceRootPath')
+      || Object.prototype.hasOwnProperty.call(normalizedPayload, 'default_session_workspace_root_path')) {
+    defaultSessionWorkspaceRootPath = String(
+      normalizedPayload.defaultSessionWorkspaceRootPath
+      ?? normalizedPayload.default_session_workspace_root_path
+      ?? '',
+    ).trim();
+  }
+  if (Object.prototype.hasOwnProperty.call(normalizedPayload, 'defaultSessionWorkspaceRootWarning')
+      || Object.prototype.hasOwnProperty.call(normalizedPayload, 'default_session_workspace_root_warning')) {
+    defaultSessionWorkspaceRootWarning = String(
+      normalizedPayload.defaultSessionWorkspaceRootWarning
+      ?? normalizedPayload.default_session_workspace_root_warning
+      ?? '',
+    ).trim();
+  }
   if (Object.prototype.hasOwnProperty.call(normalizedPayload, 'workspaceRootEntries')) {
     const entries = Array.isArray(normalizedPayload.workspaceRootEntries) ? normalizedPayload.workspaceRootEntries : [];
     workspaceRootEntrySet = new Set(entries.map((entry) => String(entry || '').trim().toLowerCase()).filter(Boolean));
@@ -469,6 +490,29 @@ export function scrollBottom() {
   if (!el) return;
   el.scrollTop = el.scrollHeight;
   saveConversationScrollTop(currentConvId, el.scrollTop);
+}
+
+export function getMessagesDistanceFromBottom() {
+  const el = document.getElementById('messages');
+  if (!el) return null;
+  return Math.max(0, el.scrollHeight - el.clientHeight - el.scrollTop);
+}
+
+function resolveMessagesNearBottomThreshold(el, thresholdPx = null) {
+  if (Number.isFinite(Number(thresholdPx)) && Number(thresholdPx) >= 0) {
+    return Math.trunc(Number(thresholdPx));
+  }
+  const viewportHeight = Number(el?.clientHeight || 0);
+  if (!Number.isFinite(viewportHeight) || viewportHeight <= 0) return 0;
+  return Math.max(0, Math.floor(viewportHeight * 0.5));
+}
+
+export function isMessagesNearBottom(thresholdPx = null) {
+  const el = document.getElementById('messages');
+  if (!el) return true;
+  const distance = Math.max(0, el.scrollHeight - el.clientHeight - el.scrollTop);
+  const threshold = resolveMessagesNearBottomThreshold(el, thresholdPx);
+  return distance <= threshold;
 }
 
 export function scrollBottomAfterSend() {
@@ -915,6 +959,19 @@ export function isCompactInFlight() {
   return compactInFlight;
 }
 
+export function setHistoryRefreshInFlight(value) {
+  historyRefreshInFlight = !!value;
+  const refreshBtn = document.getElementById('chat-menu-refresh-history');
+  if (refreshBtn) {
+    refreshBtn.disabled = historyRefreshInFlight;
+    refreshBtn.textContent = historyRefreshInFlight ? '🔄️ Refreshing…' : '🔄️ Refresh history';
+  }
+}
+
+export function isHistoryRefreshInFlight() {
+  return historyRefreshInFlight;
+}
+
 export function setModelBanner(message) {
   const el = document.getElementById('model-banner');
   if (!el) return;
@@ -1054,4 +1111,155 @@ export async function refreshSummaryModal() {
   } finally {
     setSummaryModalLoading(false);
   }
+}
+
+export function normalizeSubagentRunId(value) {
+  return String(value || '').trim() || null;
+}
+
+export function normalizeSubagentStatus(value) {
+  const text = String(value || '').trim().toLowerCase();
+  if (['pending', 'processing', 'running', 'completed', 'failed', 'cancelled'].includes(text)) return text;
+  return 'running';
+}
+
+export function markSubagentCancelInFlight(subagentRunId) {
+  const id = normalizeSubagentRunId(subagentRunId);
+  if (!id) return false;
+  subagentCancelInFlight.add(id);
+  return true;
+}
+
+export function clearSubagentCancelInFlight(subagentRunId) {
+  const id = normalizeSubagentRunId(subagentRunId);
+  if (!id) return false;
+  return subagentCancelInFlight.delete(id);
+}
+
+export function isSubagentCancelInFlight(subagentRunId) {
+  const id = normalizeSubagentRunId(subagentRunId);
+  return id ? subagentCancelInFlight.has(id) : false;
+}
+
+export function upsertSubagentRun(payload) {
+  const subagentRunId = normalizeSubagentRunId(payload?.subagentRunId);
+  if (!subagentRunId) return null;
+
+  const existing = subagentRuns.get(subagentRunId);
+  const now = new Date().toISOString();
+  const entry = {
+    subagentRunId,
+    messageId: String(payload?.messageId || existing?.messageId || '').trim() || null,
+    conversationId: String(payload?.conversationId || existing?.conversationId || '').trim() || null,
+    parentSubagentId: normalizeSubagentRunId(payload?.parentSubagentId) || existing?.parentSubagentId || null,
+    displayName: String(payload?.displayName || existing?.displayName || '').trim() || null,
+    status: normalizeSubagentStatus(payload?.status) || existing?.status || 'running',
+    startedAt: existing?.startedAt || payload?.timestamp || now,
+    updatedAt: payload?.timestamp || now,
+    activities: existing?.activities || [],
+    thoughts: existing?.thoughts || [],
+  };
+
+  subagentRuns.set(subagentRunId, entry);
+  return entry;
+}
+
+export function getSubagentRun(subagentRunId) {
+  const id = normalizeSubagentRunId(subagentRunId);
+  return id ? subagentRuns.get(id) || null : null;
+}
+
+export function getSubagentRunsByMessage(messageId) {
+  const id = String(messageId || '').trim();
+  if (!id) return [];
+  const results = [];
+  for (const entry of subagentRuns.values()) {
+    if (entry.messageId === id) results.push(entry);
+  }
+  return results.sort((a, b) => {
+    const aTime = parseTimestampMs(a.startedAt);
+    const bTime = parseTimestampMs(b.startedAt);
+    return aTime - bTime;
+  });
+}
+
+export function getChildSubagentRuns(parentSubagentId) {
+  const id = normalizeSubagentRunId(parentSubagentId);
+  if (!id) return [];
+  const results = [];
+  for (const entry of subagentRuns.values()) {
+    if (entry.parentSubagentId === id) results.push(entry);
+  }
+  return results.sort((a, b) => {
+    const aTime = parseTimestampMs(a.startedAt);
+    const bTime = parseTimestampMs(b.startedAt);
+    return aTime - bTime;
+  });
+}
+
+export function getRootSubagentRunsByMessage(messageId) {
+  const id = String(messageId || '').trim();
+  if (!id) return [];
+  const results = [];
+  for (const entry of subagentRuns.values()) {
+    if (entry.messageId === id && !entry.parentSubagentId) {
+      results.push(entry);
+    }
+  }
+  return results.sort((a, b) => {
+    const aTime = parseTimestampMs(a.startedAt);
+    const bTime = parseTimestampMs(b.startedAt);
+    return aTime - bTime;
+  });
+}
+
+export function addSubagentActivity(subagentRunId, activityText) {
+  const entry = getSubagentRun(subagentRunId);
+  if (!entry) return false;
+  const text = String(activityText || '').trim();
+  if (!text) return false;
+  entry.activities.push({ text, timestamp: new Date().toISOString() });
+  return true;
+}
+
+export function addSubagentThought(subagentRunId, thoughtPayload) {
+  const entry = getSubagentRun(subagentRunId);
+  if (!entry) return false;
+  const text = String(thoughtPayload?.text || '').trim();
+  if (!text) return false;
+  entry.thoughts.push({
+    reasoningId: String(thoughtPayload?.reasoningId || '').trim() || null,
+    text,
+    done: !!thoughtPayload?.done,
+    timestamp: thoughtPayload?.timestamp || new Date().toISOString(),
+  });
+  return true;
+}
+
+export function clearSubagentRunsForMessage(messageId) {
+  const id = String(messageId || '').trim();
+  if (!id) return 0;
+  let cleared = 0;
+  for (const [runId, entry] of subagentRuns.entries()) {
+    if (entry.messageId === id) {
+      subagentRuns.delete(runId);
+      subagentCancelInFlight.delete(runId);
+      cleared += 1;
+    }
+  }
+  return cleared;
+}
+
+export function clearSubagentRunsForConversation(conversationId) {
+  const id = String(conversationId || '').trim();
+  if (!id) return 0;
+  let cleared = 0;
+  for (const [runId, entry] of subagentRuns.entries()) {
+    if (entry.conversationId === id) {
+      subagentRuns.delete(runId);
+      subagentCancelInFlight.delete(runId);
+      cleared += 1;
+    }
+  }
+  return cleared;
 }

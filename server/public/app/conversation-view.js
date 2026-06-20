@@ -30,18 +30,27 @@ import {
   showTransientRelayNotice,
   repoBrowserState,
   saveConversationLoadedMessageCount,
+  getSubagentRun,
+  upsertSubagentRun,
+  clearSubagentRunsForMessage,
+  getRootSubagentRunsByMessage,
+  getChildSubagentRuns,
+  markSubagentCancelInFlight,
+  clearSubagentCancelInFlight,
+  isSubagentCancelInFlight,
 } from './store.js';
-import { sendMessage as sendMessageApi, cancelConversationTurn, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi, updateConversationDraft as updateConversationDraftApi } from './api-client.js';
+import { sendMessage as sendMessageApi, cancelConversationTurn, cancelQueuedConversationTurn, cancelSubagentRun, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi, updateConversationDraft as updateConversationDraftApi } from './api-client.js';
 import { linkifyWorkspaceMentionsInNode, renderMarkdownPreview, rewriteLocalAssetUrlsInNode } from './router.js';
 import { renderAttachmentMarkup, clearAttachments, uploadAttachments, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { renderRelayQuestions } from './ask-user-view.js';
 import { renderRelayBoards } from './relay-board-view.js';
 import { getMessageThreadAnchor, sortConversationMessages } from './thread-order.mjs';
 import { normalizeStreamSeq, deriveLatestInFlightStreamEvent, computeNextRelayStreamState } from './stream-state.mjs';
-import { mergeRelayActivityTexts } from './activity-replay-state.mjs';
+import { mergeRelayActivityTexts, normalizeRelayActivityEntry, relayActivityEntryText } from './activity-replay-state.mjs';
 import { deriveComposerControlState, hasComposerDraft } from './composer-control-state.mjs';
 import { buildLiveMessageFingerprint } from './live-message-dedupe.mjs';
 import { createInfiniteLoader } from './infinite-loader.js';
+import { normalizeDraftTimestampMs, isIncomingDraftTimestampStale } from './conversation-draft-timestamp-utils.mjs';
 
 const CONVERSATION_HISTORY_PAGE_SIZE = 20;
 const HISTORY_LOAD_MORE_ID = 'history-load-more';
@@ -51,6 +60,8 @@ let thinkingMessageId = null;
 let thinkingText = '';
 const relayStreamStateByMessageId = new Map();
 const completedMessageIds = new Set();
+const bubbleCancelInFlight = new Set();
+const SUBAGENT_TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'dropped', 'done']);
 let sendInFlight = false;
 const COMPOSER_DRAFT_DEBOUNCE_MS = 500;
 let conversationDraftPersistenceEnabled = false;
@@ -238,6 +249,10 @@ export function syncComposerControlState() {
   });
 }
 
+export function isSendInFlight() {
+  return sendInFlight;
+}
+
 function clearDraftTimerForConversation(conversationId) {
   const id = String(conversationId || '').trim();
   if (!id) return;
@@ -245,11 +260,6 @@ function clearDraftTimerForConversation(conversationId) {
   if (!timer) return;
   clearTimeout(timer);
   draftSaveTimerByConversation.delete(id);
-}
-
-function normalizeDraftTimestampMs(value) {
-  const parsed = Date.parse(String(value || '').trim());
-  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 function upsertConversationDraftState(conversationId, {
@@ -274,11 +284,23 @@ async function persistConversationDraft(conversationId, draftText) {
   if (!id) return null;
   const text = String(draftText || '');
   const runPersist = async () => {
+    const baseDraftUpdatedAt = conversations[id]?.draftUpdatedAt || null;
     const response = await updateConversationDraftApi(id, {
       draftText: text,
       clientId: CLIENT_ID,
+      baseDraftUpdatedAt,
     });
-    if (!response?.ok) return response || null;
+    if (!response?.ok) {
+      if (response?.conflict === true || response?.code === 'draft-version-conflict') {
+        applyIncomingConversationDraftUpdate({
+          conversationId: id,
+          draftText: response.draftText || '',
+          draftUpdatedAt: response.draftUpdatedAt || null,
+          draftUpdatedByClientId: response.draftUpdatedByClientId || null,
+        });
+      }
+      return response || null;
+    }
     upsertConversationDraftState(id, {
       draftText: response.draftText,
       draftUpdatedAt: response.draftUpdatedAt || response.updatedAt || null,
@@ -346,6 +368,9 @@ export function hydrateConversationDraft(conversationId, {
   const id = String(conversationId || '').trim();
   if (!id) return;
   const normalizedDraftText = String(draftText || '');
+  const existingMs = normalizeDraftTimestampMs(conversations[id]?.draftUpdatedAt);
+  const incomingMs = normalizeDraftTimestampMs(draftUpdatedAt);
+  if (isIncomingDraftTimestampStale({ existingMs, incomingMs })) return;
   upsertConversationDraftState(id, {
     draftText: normalizedDraftText,
     draftUpdatedAt,
@@ -374,7 +399,7 @@ export function applyIncomingConversationDraftUpdate({
   const incomingDraftText = String(draftText || '');
   const existingMs = normalizeDraftTimestampMs(conversations[id]?.draftUpdatedAt);
   const incomingMs = normalizeDraftTimestampMs(draftUpdatedAt);
-  if (incomingMs && existingMs && incomingMs < existingMs) return;
+  if (isIncomingDraftTimestampStale({ existingMs, incomingMs })) return;
   upsertConversationDraftState(id, {
     draftText: incomingDraftText,
     draftUpdatedAt,
@@ -567,8 +592,14 @@ function createMessageNode(msg, msgId = null, force = false) {
     ? 'msg-bubble msg-bubble-media-only'
     : 'msg-bubble';
 
+  const isQueuedUserMessage = msg.role === 'user' && msgId && pendingUserMessageIds.has(msgId);
+  const isCancelInFlight = isQueuedUserMessage && bubbleCancelInFlight.has(msgId);
+  const userBubbleActionsHtml = isQueuedUserMessage
+    ? `<div class="msg-bubble-actions"><button type="button" class="bubble-action-btn${isCancelInFlight ? ' stopping' : ''}" data-action="cancel-queued" data-message-id="${escHtml(msgId)}"${isCancelInFlight ? ' disabled' : ''}>${isCancelInFlight ? 'Cancelling…' : 'Cancel'}</button></div>`
+    : '';
+
   div.innerHTML = `
-    <div class="${bubbleClass}">${content}${attachmentHtml}${thoughtsHtml}${activityHtml}</div>
+    <div class="${bubbleClass}">${content}${attachmentHtml}${thoughtsHtml}${activityHtml}${userBubbleActionsHtml}</div>
     <div class="msg-label">${label}${modelTag}${reasoningTag}${modeTag} · ${fmtDate(msg.timestamp)}</div>`;
 
   const bubble = div.querySelector('.msg-bubble');
@@ -670,22 +701,22 @@ export function renderThoughtsMarkup(thoughts) {
 }
 
 export function renderActivityMarkup(activities) {
-  const progress = activities.filter((item) => String(item || '').trim().startsWith('● '));
-  const tools = activities.filter((item) => !String(item || '').trim().startsWith('● '));
+  const progress = activities.filter((item) => relayActivityEntryText(item).startsWith('● '));
+  const tools = activities.filter((item) => !relayActivityEntryText(item).startsWith('● '));
   const progressHtml = progress.length
-    ? `<div class="msg-activity-list">${progress.map((item) => `<div class="msg-activity-item">${escHtml(decorateActivityText(item))}</div>`).join('')}</div>`
+    ? `<div class="msg-activity-list">${progress.map((item) => `<div class="msg-activity-item">${escHtml(decorateActivityText(relayActivityEntryText(item)))}</div>`).join('')}</div>`
     : '';
   const toolsHtml = tools.length
     ? `
       <details class="msg-activity">
         <summary>🔧 Tool activity (${tools.length})</summary>
-        <div class="msg-activity-list">${tools.map((item) => `<div class="msg-activity-item">${escHtml(decorateActivityText(item))}</div>`).join('')}</div>
+        <div class="msg-activity-list">${tools.map((item) => `<div class="msg-activity-item">${escHtml(decorateActivityText(relayActivityEntryText(item)))}</div>`).join('')}</div>
       </details>`
     : '';
   return `${progressHtml}${toolsHtml}`;
 }
 
-export function showThinking(messageId = null) {
+export function showThinking(messageId = null, autoScroll = true) {
   const nextMessageId = String(messageId || '').trim();
   const shouldResetText = !nextMessageId || thinkingMessageId !== nextMessageId;
   if (shouldResetText) thinkingText = '';
@@ -696,11 +727,17 @@ export function showThinking(messageId = null) {
   div.className = 'msg assistant';
   div.id = 'thinking-indicator';
   if (nextMessageId) div.dataset.messageId = nextMessageId;
+  const isCancelInFlight = nextMessageId && bubbleCancelInFlight.has(nextMessageId);
+  const stopBtnHtml = nextMessageId
+    ? `<button type="button" class="bubble-action-btn${isCancelInFlight ? ' stopping' : ''}" data-action="stop-turn" data-message-id="${escHtml(nextMessageId)}"${isCancelInFlight ? ' disabled' : ''}>${isCancelInFlight ? 'Stopping…' : 'Stop'}</button>`
+    : '';
   div.innerHTML = `
     <div class="thinking-bubble">
+      <div class="thinking-bubble-header">${stopBtnHtml}</div>
       <div id="thinking-text" class="thinking-text"></div>
       <div class="dots"><span></span><span></span><span></span></div>
       <div id="thinking-activity" class="thinking-activity"></div>
+      <div id="subagent-bubbles-root" class="subagent-bubbles-container"></div>
     </div>
     <div class="msg-label">Copilot</div>`;
   const target = nextMessageId ? el.querySelector(`[data-message-id="${nextMessageId}"]`) : null;
@@ -712,7 +749,7 @@ export function showThinking(messageId = null) {
     el.appendChild(div);
   }
   renderThinkingText(thinkingText);
-  scrollBottom();
+  if (autoScroll) scrollBottom();
 }
 
 export function removeThinking() {
@@ -761,7 +798,11 @@ export function renderThinkingActivities() {
   const box = document.getElementById('thinking-activity');
   if (!box) return;
   box.innerHTML = '';
-  for (const item of items) appendThinkingActivity(item, false);
+  for (const item of items) {
+    const entry = normalizeRelayActivityEntry(item);
+    if (!entry) continue;
+    appendThinkingActivity(entry.text, entry.subagentRunId, false);
+  }
 }
 
 export function restoreInFlightThinking(inFlight) {
@@ -785,14 +826,37 @@ export function restoreInFlightThinking(inFlight) {
     const thoughtMap = relayThoughts.get(messageId) || new Map();
     for (const entry of inFlightThoughts) {
       const key = String(entry?.reasoningId || `seq-${entry?.seq || thoughtMap.size}`);
-      thoughtMap.set(key, { reasoningId: key, text: String(entry?.text || ''), done: !!entry?.done });
+      thoughtMap.set(key, { reasoningId: key, text: String(entry?.text || ''), done: !!entry?.done, subagentRunId: entry?.subagentRunId || null });
     }
     relayThoughts.set(messageId, thoughtMap);
+  }
+  const inFlightSubagentRuns = Array.isArray(inFlight.subagentRuns) ? inFlight.subagentRuns : [];
+  clearSubagentRunsForMessage(messageId);
+  for (const entry of inFlightSubagentRuns) {
+    upsertSubagentRun({
+      subagentRunId: entry?.subagentRunId,
+      messageId: entry?.messageId || messageId,
+      conversationId: entry?.conversationId || currentConvId,
+      parentSubagentId: entry?.parentSubagentId || null,
+      displayName: entry?.displayName || null,
+      status: entry?.status || 'running',
+      timestamp: entry?.updatedAt || entry?.startedAt || null,
+    });
+  }
+  for (const item of activities) {
+    const entry = normalizeRelayActivityEntry(item);
+    if (!entry?.subagentRunId) continue;
+    upsertSubagentRun({
+      subagentRunId: entry.subagentRunId,
+      messageId,
+      conversationId: currentConvId,
+    });
   }
   thinkingText = '';
   showThinking(messageId);
   renderThinkingActivities();
   renderThinkingThoughts();
+  renderRestoredSubagentBubbles(messageId);
   const streamState = deriveLatestInFlightStreamEvent(inFlight);
   if (streamState) {
     rememberRelayStreamState(messageId, streamState.seq, streamState.done || !!inFlight?.streamDone);
@@ -807,17 +871,226 @@ export function restoreInFlightThinking(inFlight) {
   }
 }
 
-export function appendThinkingActivity(text, autoScroll = true) {
-  const box = document.getElementById('thinking-activity');
-  if (!box || !text) return;
-  const last = box.lastElementChild?.textContent || '';
+export function appendThinkingActivity(text, subagentRunId = null, autoScroll = true) {
+  if (!text) return;
   const decorated = decorateActivityText(text);
+
+  if (subagentRunId) {
+    const subagentBubble = ensureSubagentBubble(subagentRunId);
+    if (subagentBubble) {
+      const activityBox = subagentBubble.querySelector('.subagent-activity');
+      if (activityBox) {
+        const lastItem = activityBox.lastElementChild?.textContent || '';
+        if (lastItem !== decorated) {
+          const row = document.createElement('div');
+          row.className = 'subagent-activity-item';
+          row.textContent = decorated;
+          activityBox.appendChild(row);
+        }
+      }
+      if (autoScroll) scrollBottom();
+      return;
+    }
+  }
+
+  const box = document.getElementById('thinking-activity');
+  if (!box) return;
+  const last = box.lastElementChild?.textContent || '';
   if (last === decorated) return;
   const row = document.createElement('div');
   row.className = 'thinking-activity-item';
+  if (subagentRunId) row.dataset.subagentRunId = subagentRunId;
   row.textContent = decorated;
   box.appendChild(row);
   if (autoScroll) scrollBottom();
+}
+
+function getSubagentDisplayName(subagentRunId) {
+  const entry = typeof getSubagentRun === 'function' ? getSubagentRun(subagentRunId) : null;
+  if (entry?.displayName) return entry.displayName;
+  const id = String(subagentRunId || '').trim();
+  if (!id) return 'Subagent';
+  const short = id.length > 12 ? `${id.slice(0, 8)}…` : id;
+  return `Subagent ${short}`;
+}
+
+function getSubagentStatus(subagentRunId) {
+  const entry = typeof getSubagentRun === 'function' ? getSubagentRun(subagentRunId) : null;
+  return entry?.status || 'running';
+}
+
+function normalizeSubagentBubbleStatus(status) {
+  const normalized = String(status || 'running').trim().toLowerCase() || 'running';
+  if (normalized === 'processing') return 'running';
+  return normalized;
+}
+
+function isSubagentTerminalStatus(status) {
+  return SUBAGENT_TERMINAL_STATUSES.has(normalizeSubagentBubbleStatus(status));
+}
+
+function getSubagentParentId(subagentRunId) {
+  const entry = typeof getSubagentRun === 'function' ? getSubagentRun(subagentRunId) : null;
+  return entry?.parentSubagentId || null;
+}
+
+function findSubagentBubbleContainer(parentSubagentId) {
+  if (!parentSubagentId) {
+    return document.getElementById('subagent-bubbles-root');
+  }
+  const parentBubble = document.querySelector(`.subagent-bubble[data-subagent-run-id="${CSS.escape(parentSubagentId)}"]`);
+  if (!parentBubble) return null;
+  let container = parentBubble.querySelector(':scope > .subagent-bubbles-container');
+  if (!container) {
+    container = document.createElement('div');
+    container.className = 'subagent-bubbles-container';
+    parentBubble.appendChild(container);
+  }
+  return container;
+}
+
+function ensureSubagentBubble(subagentRunId) {
+  const id = String(subagentRunId || '').trim();
+  if (!id) return null;
+
+  let bubble = document.querySelector(`.subagent-bubble[data-subagent-run-id="${CSS.escape(id)}"]`);
+  if (bubble) {
+    const status = getSubagentStatus(id);
+    updateSubagentBubbleStatus(bubble, status);
+    updateSubagentStopButton(id, isSubagentCancelInFlight(id), status);
+    return bubble;
+  }
+
+  const parentSubagentId = getSubagentParentId(id);
+  const container = findSubagentBubbleContainer(parentSubagentId);
+  if (!container) return null;
+
+  bubble = document.createElement('div');
+  bubble.className = 'subagent-bubble';
+  bubble.dataset.subagentRunId = id;
+
+  const header = document.createElement('div');
+  header.className = 'subagent-bubble-header';
+
+  const nameSpan = document.createElement('span');
+  nameSpan.className = 'subagent-bubble-name';
+  nameSpan.textContent = getSubagentDisplayName(id);
+
+  const statusSpan = document.createElement('span');
+  statusSpan.className = 'subagent-bubble-status';
+  const status = getSubagentStatus(id);
+  statusSpan.dataset.status = normalizeSubagentBubbleStatus(status);
+  statusSpan.textContent = normalizeSubagentBubbleStatus(status) === 'running'
+    ? '● Running'
+    : normalizeSubagentBubbleStatus(status).charAt(0).toUpperCase() + normalizeSubagentBubbleStatus(status).slice(1);
+
+  const controls = document.createElement('div');
+  controls.className = 'subagent-bubble-controls';
+  controls.appendChild(statusSpan);
+
+  const stopBtn = document.createElement('button');
+  stopBtn.type = 'button';
+  stopBtn.className = 'bubble-action-btn subagent-stop-btn';
+  stopBtn.dataset.action = 'stop-subagent';
+  stopBtn.dataset.subagentRunId = id;
+  controls.appendChild(stopBtn);
+
+  header.appendChild(nameSpan);
+  header.appendChild(controls);
+
+  const activityBox = document.createElement('div');
+  activityBox.className = 'subagent-activity';
+
+  const thoughtsBox = document.createElement('div');
+  thoughtsBox.className = 'subagent-thoughts';
+
+  bubble.appendChild(header);
+  bubble.appendChild(thoughtsBox);
+  bubble.appendChild(activityBox);
+  container.appendChild(bubble);
+  updateSubagentStopButton(id, isSubagentCancelInFlight(id), status);
+
+  const entry = getSubagentRun(id);
+  if (entry?.thoughts?.length) {
+    for (const item of entry.thoughts) {
+      appendThinkingThought(
+        item?.reasoningId || `restored-${thoughtsBox.childElementCount}`,
+        String(item?.text || ''),
+        !!item?.done,
+        id,
+        false,
+      );
+    }
+  }
+  if (entry?.activities?.length) {
+    for (const item of entry.activities) {
+      const text = typeof item === 'string' ? item : String(item?.text || '').trim();
+      if (!text) continue;
+      const decorated = decorateActivityText(text);
+      const lastItem = activityBox.lastElementChild?.textContent || '';
+      if (lastItem === decorated) continue;
+      const row = document.createElement('div');
+      row.className = 'subagent-activity-item';
+      row.textContent = decorated;
+      activityBox.appendChild(row);
+    }
+  }
+
+  return bubble;
+}
+
+function updateSubagentBubbleStatus(bubble, status) {
+  if (!bubble) return;
+  const statusSpan = bubble.querySelector('.subagent-bubble-status');
+  if (!statusSpan) return;
+  const normalized = normalizeSubagentBubbleStatus(status);
+  statusSpan.dataset.status = normalized;
+  statusSpan.textContent = normalized === 'running' ? '● Running' : normalized.charAt(0).toUpperCase() + normalized.slice(1);
+}
+
+function updateSubagentStopButton(subagentRunId, isStopping = false, statusOverride = null) {
+  const id = String(subagentRunId || '').trim();
+  if (!id) return;
+  const btn = document.querySelector(`.subagent-stop-btn[data-action="stop-subagent"][data-subagent-run-id="${CSS.escape(id)}"]`);
+  if (!btn) return;
+  const status = normalizeSubagentBubbleStatus(statusOverride || getSubagentStatus(id));
+  const terminal = isSubagentTerminalStatus(status);
+  const stopping = !!isStopping;
+  btn.disabled = terminal || stopping;
+  btn.textContent = stopping ? 'Stopping…' : 'Stop';
+  btn.classList.toggle('stopping', stopping);
+}
+
+export function updateSubagentBubbleFromStatus(subagentRunId, status) {
+  const id = String(subagentRunId || '').trim();
+  if (!id) return;
+  ensureSubagentBubble(id);
+  const bubble = document.querySelector(`.subagent-bubble[data-subagent-run-id="${CSS.escape(id)}"]`);
+  if (bubble) {
+    updateSubagentBubbleStatus(bubble, status);
+  }
+  if (isSubagentTerminalStatus(status)) {
+    clearSubagentCancelInFlight(id);
+  }
+  updateSubagentStopButton(id, isSubagentCancelInFlight(id), status);
+}
+
+function renderSubagentBubbleRecursive(entry) {
+  if (!entry?.subagentRunId) return;
+  ensureSubagentBubble(entry.subagentRunId);
+  const children = getChildSubagentRuns(entry.subagentRunId);
+  for (const child of children) {
+    renderSubagentBubbleRecursive(child);
+  }
+}
+
+function renderRestoredSubagentBubbles(messageId) {
+  const id = String(messageId || '').trim();
+  if (!id) return;
+  const rootRuns = getRootSubagentRunsByMessage(id);
+  for (const entry of rootRuns) {
+    renderSubagentBubbleRecursive(entry);
+  }
 }
 
 function thoughtSummaryText(text) {
@@ -826,16 +1099,52 @@ function thoughtSummaryText(text) {
   return value.length > 80 ? `${value.slice(0, 80)}…` : value;
 }
 
-export function appendThinkingThought(reasoningId, text, done = false, autoScroll = true) {
-  const box = document.getElementById('thinking-activity');
-  if (!box) return;
+export function appendThinkingThought(reasoningId, text, done = false, subagentRunId = null, autoScroll = true) {
   const key = String(reasoningId || 'reasoning');
   const value = String(text || '');
+
+  if (subagentRunId) {
+    const subagentBubble = ensureSubagentBubble(subagentRunId);
+    if (subagentBubble) {
+      let thoughtsBox = subagentBubble.querySelector('.subagent-thoughts');
+      if (!thoughtsBox) {
+        thoughtsBox = document.createElement('div');
+        thoughtsBox.className = 'subagent-thoughts';
+        const activityBox = subagentBubble.querySelector('.subagent-activity');
+        if (activityBox) subagentBubble.insertBefore(thoughtsBox, activityBox);
+        else subagentBubble.appendChild(thoughtsBox);
+      }
+      let row = thoughtsBox.querySelector(`.thinking-thought[data-reasoning-id="${CSS.escape(key)}"]`);
+      if (!row) {
+        row = document.createElement('details');
+        row.className = 'thinking-thought';
+        row.dataset.reasoningId = key;
+        row.dataset.subagentRunId = subagentRunId;
+        const summary = document.createElement('summary');
+        const body = document.createElement('div');
+        body.className = 'thinking-thought-body';
+        row.appendChild(summary);
+        row.appendChild(body);
+        thoughtsBox.appendChild(row);
+      }
+      const summaryEl = row.querySelector('summary');
+      const bodyEl = row.querySelector('.thinking-thought-body');
+      if (summaryEl) summaryEl.textContent = `💭 ${thoughtSummaryText(value)}`;
+      if (bodyEl) bodyEl.innerHTML = `<p>${escHtml(value).replace(/\n/g, '<br>')}</p>`;
+      row.dataset.done = done ? '1' : '0';
+      if (autoScroll) scrollBottom();
+      return;
+    }
+  }
+
+  const box = document.getElementById('thinking-activity');
+  if (!box) return;
   let row = box.querySelector(`.thinking-thought[data-reasoning-id="${CSS.escape(key)}"]`);
   if (!row) {
     row = document.createElement('details');
     row.className = 'thinking-thought';
     row.dataset.reasoningId = key;
+    if (subagentRunId) row.dataset.subagentRunId = subagentRunId;
     const summary = document.createElement('summary');
     const body = document.createElement('div');
     body.className = 'thinking-thought-body';
@@ -857,18 +1166,18 @@ export function renderThinkingThoughts() {
   const thoughtMap = thinkingMessageId ? relayThoughts.get(thinkingMessageId) : null;
   if (!thoughtMap || !thoughtMap.size) return;
   for (const entry of thoughtMap.values()) {
-    appendThinkingThought(entry.reasoningId, entry.text, entry.done, false);
+    appendThinkingThought(entry.reasoningId, entry.text, entry.done, entry.subagentRunId || null, false);
   }
 }
 
-export function updateThinkingText(text, messageId = null, done = false) {
+export function updateThinkingText(text, messageId = null, done = false, autoScroll = true) {
   if (messageId) {
     if (thinkingMessageId && thinkingMessageId !== messageId) return;
     thinkingMessageId = messageId;
   }
   if (!document.getElementById('thinking-indicator')) {
     if (done) return;
-    showThinking(thinkingMessageId);
+    showThinking(thinkingMessageId, autoScroll);
   }
   thinkingText = String(text || '');
   renderThinkingText(thinkingText);
@@ -876,10 +1185,10 @@ export function updateThinkingText(text, messageId = null, done = false) {
     const dots = document.querySelector('#thinking-indicator .dots');
     if (dots) dots.style.display = 'none';
   }
-  scrollBottom();
+  if (autoScroll) scrollBottom();
 }
 
-export function applyRelayStreamEvent({ messageId, text, done = false, seq = null } = {}) {
+export function applyRelayStreamEvent({ messageId, text, done = false, seq = null, autoScroll = true } = {}) {
   const id = String(messageId || '').trim();
   if (!id) return false;
   if (completedMessageIds.has(id)) return false;
@@ -888,7 +1197,7 @@ export function applyRelayStreamEvent({ messageId, text, done = false, seq = nul
   if (!transition.accept) return false;
   rememberRelayStreamState(id, transition.state.seq, transition.state.done);
   if (isOpaqueRelayText(text)) return true;
-  updateThinkingText(String(text || ''), id, !!done);
+  updateThinkingText(String(text || ''), id, !!done, autoScroll);
   return true;
 }
 
@@ -980,6 +1289,249 @@ async function stopCurrentConversationTurn(conversationId) {
     return;
   }
   showTransientRelayNotice('Stopping the current turn…');
+}
+
+async function stopTurnByMessageId(conversationId, messageId) {
+  const conversationKey = String(conversationId || '').trim();
+  const targetMessageId = String(messageId || '').trim();
+  if (!conversationKey || !targetMessageId) return;
+  if (bubbleCancelInFlight.has(targetMessageId)) return;
+
+  bubbleCancelInFlight.add(targetMessageId);
+  updateBubbleStopButton(targetMessageId, true);
+
+  const activeTurn = getActiveTurnForConversation(conversationKey);
+  if (activeTurn?.messageId === targetMessageId) {
+    setConversationTurnState(conversationKey, {
+      messageId: targetMessageId,
+      status: activeTurn.status || 'processing',
+      cancelRequested: true,
+    });
+  }
+
+  const result = await cancelConversationTurn(conversationKey, {
+    clientId: CLIENT_ID,
+    messageId: targetMessageId,
+  });
+
+  if (!result?.ok) {
+    bubbleCancelInFlight.delete(targetMessageId);
+    updateBubbleStopButton(targetMessageId, false);
+    if (activeTurn?.messageId === targetMessageId) {
+      setConversationTurnState(conversationKey, {
+        messageId: targetMessageId,
+        status: activeTurn.status || 'processing',
+        cancelRequested: false,
+      });
+    }
+    showTransientRelayNotice('Could not stop the turn.');
+    return;
+  }
+
+  if (
+    result.acknowledgement === 'already-finished'
+    || result.acknowledgement === 'no-active-turn'
+    || result.acknowledgement === 'message-mismatch'
+  ) {
+    bubbleCancelInFlight.delete(targetMessageId);
+    const latestTurn = getActiveTurnForConversation(conversationKey);
+    if (latestTurn?.messageId === targetMessageId) {
+      setConversationTurnState(conversationKey, null);
+    }
+    showTransientRelayNotice('That turn already finished.');
+    return;
+  }
+
+  if (result.acknowledgement === 'active-turn-unbound') {
+    bubbleCancelInFlight.delete(targetMessageId);
+    updateBubbleStopButton(targetMessageId, false);
+    const latestTurn = getActiveTurnForConversation(conversationKey);
+    if (latestTurn?.messageId === targetMessageId) {
+      setConversationTurnState(conversationKey, {
+        messageId: targetMessageId,
+        status: activeTurn?.status || 'processing',
+        cancelRequested: false,
+      });
+    }
+    showTransientRelayNotice('The turn is not bound to a live SDK session.');
+    return;
+  }
+
+  showTransientRelayNotice('Stopping the turn…');
+}
+
+function updateBubbleStopButton(messageId, isStopping) {
+  const btn = document.querySelector(`.bubble-action-btn[data-message-id="${messageId}"][data-action="stop-turn"]`);
+  if (!btn) return;
+  btn.disabled = isStopping;
+  btn.textContent = isStopping ? 'Stopping…' : 'Stop';
+  btn.classList.toggle('stopping', isStopping);
+}
+
+function updateUserBubbleCancelButton(messageId, isCancelling) {
+  const btn = document.querySelector(`.bubble-action-btn[data-message-id="${messageId}"][data-action="cancel-queued"]`);
+  if (!btn) return;
+  btn.disabled = isCancelling;
+  btn.textContent = isCancelling ? 'Cancelling…' : 'Cancel';
+  btn.classList.toggle('stopping', isCancelling);
+}
+
+export function removeUserBubbleCancelButton(messageId) {
+  const id = String(messageId || '').trim();
+  if (!id) return;
+  const actionsContainer = document.querySelector(`.msg.user[data-message-id="${id}"] .msg-bubble-actions`);
+  if (actionsContainer) actionsContainer.remove();
+}
+
+export function clearBubbleCancelState(messageId) {
+  const id = String(messageId || '').trim();
+  if (!id) return;
+  bubbleCancelInFlight.delete(id);
+}
+
+async function cancelQueuedTurnByMessageId(conversationId, messageId) {
+  const conversationKey = String(conversationId || '').trim();
+  const targetMessageId = String(messageId || '').trim();
+  if (!conversationKey || !targetMessageId) return;
+  if (bubbleCancelInFlight.has(targetMessageId)) return;
+
+  bubbleCancelInFlight.add(targetMessageId);
+  updateUserBubbleCancelButton(targetMessageId, true);
+
+  const result = await cancelQueuedConversationTurn(conversationKey, {
+    clientId: CLIENT_ID,
+    messageId: targetMessageId,
+  });
+
+  if (!result?.ok) {
+    bubbleCancelInFlight.delete(targetMessageId);
+    updateUserBubbleCancelButton(targetMessageId, false);
+    showTransientRelayNotice('Could not cancel the queued message.');
+    return;
+  }
+
+  if (result.acknowledgement === 'not-found' || result.acknowledgement === 'conversation-mismatch') {
+    bubbleCancelInFlight.delete(targetMessageId);
+    removeUserBubbleCancelButton(targetMessageId);
+    showTransientRelayNotice('Message not found in queue.');
+    return;
+  }
+
+  if (result.acknowledgement === 'already-processing') {
+    bubbleCancelInFlight.delete(targetMessageId);
+    removeUserBubbleCancelButton(targetMessageId);
+    showTransientRelayNotice('Message is already being processed. Use Stop on the thinking bubble instead.');
+    return;
+  }
+
+  if (result.acknowledgement === 'already-finished') {
+    bubbleCancelInFlight.delete(targetMessageId);
+    removeUserBubbleCancelButton(targetMessageId);
+    showTransientRelayNotice('Message already finished.');
+    return;
+  }
+
+  if (result.acknowledgement === 'cancelled') {
+    bubbleCancelInFlight.delete(targetMessageId);
+    removeUserBubbleCancelButton(targetMessageId);
+    showTransientRelayNotice('Queued message cancelled.');
+    return;
+  }
+
+  bubbleCancelInFlight.delete(targetMessageId);
+  updateUserBubbleCancelButton(targetMessageId, false);
+}
+
+async function cancelSubagentByRunId(conversationId, subagentRunId) {
+  const conversationKey = String(conversationId || '').trim();
+  const targetSubagentRunId = String(subagentRunId || '').trim();
+  if (!conversationKey || !targetSubagentRunId) return;
+  if (isSubagentCancelInFlight(targetSubagentRunId)) return;
+
+  markSubagentCancelInFlight(targetSubagentRunId);
+  updateSubagentStopButton(targetSubagentRunId, true);
+
+  const runEntry = getSubagentRun(targetSubagentRunId);
+  const parentMessageId = String(runEntry?.messageId || '').trim() || null;
+  const result = await cancelSubagentRun(conversationKey, targetSubagentRunId, {
+    clientId: CLIENT_ID,
+    parentMessageId,
+  });
+
+  if (!result?.ok) {
+    clearSubagentCancelInFlight(targetSubagentRunId);
+    updateSubagentStopButton(targetSubagentRunId, false);
+    showTransientRelayNotice('Could not stop that subagent.');
+    return;
+  }
+
+  if (result.acknowledgement === 'already-finished') {
+    clearSubagentCancelInFlight(targetSubagentRunId);
+    updateSubagentStopButton(targetSubagentRunId, false);
+    showTransientRelayNotice('That subagent already finished.');
+    return;
+  }
+
+  if (result.acknowledgement === 'already-cancelled') {
+    clearSubagentCancelInFlight(targetSubagentRunId);
+    updateSubagentBubbleFromStatus(targetSubagentRunId, 'cancelled');
+    showTransientRelayNotice('That subagent is already cancelled.');
+    return;
+  }
+
+  if (result.acknowledgement === 'not-found') {
+    clearSubagentCancelInFlight(targetSubagentRunId);
+    updateSubagentStopButton(targetSubagentRunId, false);
+    showTransientRelayNotice('Subagent run not found.');
+    return;
+  }
+
+  if (result.acknowledgement === 'message-mismatch') {
+    clearSubagentCancelInFlight(targetSubagentRunId);
+    updateSubagentStopButton(targetSubagentRunId, false);
+    showTransientRelayNotice('Could not stop subagent due to message mismatch.');
+    return;
+  }
+
+  if (result.acknowledgement === 'cancelled') {
+    showTransientRelayNotice('Stopping subagent…');
+    return;
+  }
+
+  clearSubagentCancelInFlight(targetSubagentRunId);
+  updateSubagentStopButton(targetSubagentRunId, false);
+}
+
+function handleBubbleActionClick(event) {
+  const btn = event.target.closest('.bubble-action-btn');
+  if (!btn) return;
+  const action = btn.dataset.action;
+  const messageId = btn.dataset.messageId;
+  const subagentRunId = btn.dataset.subagentRunId;
+
+  if (action === 'stop-turn' && messageId) {
+    event.preventDefault();
+    event.stopPropagation();
+    void stopTurnByMessageId(currentConvId, messageId);
+  }
+
+  if (action === 'cancel-queued' && messageId) {
+    event.preventDefault();
+    event.stopPropagation();
+    void cancelQueuedTurnByMessageId(currentConvId, messageId);
+  }
+
+  if (action === 'stop-subagent' && subagentRunId) {
+    event.preventDefault();
+    event.stopPropagation();
+    void cancelSubagentByRunId(currentConvId, subagentRunId);
+  }
+}
+
+export function initBubbleActionHandlers() {
+  const messagesEl = document.getElementById('messages');
+  if (!messagesEl) return;
+  messagesEl.addEventListener('click', handleBubbleActionClick);
 }
 
 export function appendMessage(msg, scroll = true, msgId = null, force = false, insertAfterId = null, trackHistory = true) {
@@ -1174,10 +1726,6 @@ export async function sendMessage() {
     showTransientRelayNotice('Please wait for the current message to finish sending.');
     return;
   }
-  if (activeTurn?.messageId && !hasDraft) {
-    await stopCurrentConversationTurn(currentConvId);
-    return;
-  }
   if (!hasDraft) return;
 
   if (text.toLowerCase() === '/compact' && selectedAttachments.length === 0) {
@@ -1196,6 +1744,9 @@ export async function sendMessage() {
   if (hasPendingUserMessageDuplicate(targetConversationId, text)) {
     showTransientRelayNotice('That message is already pending.');
     return;
+  }
+  if (targetConversationId) {
+    clearDraftTimerForConversation(targetConversationId);
   }
 
   setSendInFlight(true);
@@ -1301,6 +1852,11 @@ export async function sendMessage() {
     }
     const persistedConversationId = String(r.conversationId || targetConversationId || '').trim();
     if (persistedConversationId) {
+      await scheduleConversationDraftSave({
+        conversationId: persistedConversationId,
+        draftText: '',
+        immediate: true,
+      });
       upsertConversationDraftState(persistedConversationId, {
         draftText: '',
         draftUpdatedAt: new Date().toISOString(),

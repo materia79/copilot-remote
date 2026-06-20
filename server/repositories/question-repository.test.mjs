@@ -35,7 +35,8 @@ function makeDb() {
       conversation_id TEXT,
       relay_mode TEXT,
       text TEXT,
-      created_at TEXT
+      created_at TEXT,
+      subagent_run_id TEXT
     );
     CREATE TABLE relay_stream_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,7 +47,8 @@ function makeDb() {
       seq INTEGER,
       text TEXT,
       done INTEGER,
-      created_at TEXT
+      created_at TEXT,
+      subagent_run_id TEXT
     );
     CREATE TABLE relay_thought (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,7 +60,19 @@ function makeDb() {
       seq INTEGER,
       text TEXT,
       done INTEGER,
-      created_at TEXT
+      created_at TEXT,
+      subagent_run_id TEXT
+    );
+    CREATE TABLE subagent_runs (
+      id TEXT PRIMARY KEY,
+      queue_message_id TEXT NOT NULL,
+      conversation_id TEXT NOT NULL,
+      parent_subagent_id TEXT,
+      display_name TEXT,
+      status TEXT NOT NULL DEFAULT 'running',
+      started_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      completed_at TEXT
     );
     CREATE TABLE relay_boards (
       id TEXT PRIMARY KEY,

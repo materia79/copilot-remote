@@ -561,6 +561,61 @@ export function createPollingLoop({
     return true;
   }
 
+  async function processPendingSdkHistoryFetches() {
+    const status = await api("GET", "/api/status").catch(() => null);
+    if (status?.relayPaused) return false;
+    const pending = await api("GET", "/api/sdk-history-fetch/pending").catch(() => null);
+    const request = pending?.request || null;
+    const sdkSessionId = String(request?.sdkSessionId || "").trim();
+    if (!sdkSessionId) return false;
+
+    let ok = false;
+    let errorText = "";
+    let events = [];
+    try {
+      const conversationId = String(request?.conversationId || "").trim();
+      if (conversationId && typeof ensureSessionForConversation === "function") {
+        const ensured = await ensureSessionForConversation(conversationId, "sdk-history-fetch");
+        if (!ensured?.ok) {
+          throw new Error(ensured?.message || ensured?.reason || "session-ensure-failed");
+        }
+      }
+
+      if (!session || typeof session.getEvents !== "function") {
+        throw new Error("SDK getEvents() is unavailable in this CLI runtime");
+      }
+      const rawEvents = await session.getEvents();
+      const normalizedEvents = Array.isArray(rawEvents)
+        ? rawEvents
+        : (Array.isArray(rawEvents?.events) ? rawEvents.events : []);
+      events = normalizedEvents;
+      ok = true;
+      await session.log(
+        `🧾 Fetched ${normalizedEvents.length} SDK event(s) for ${sdkSessionId.slice(0, 8)}`,
+        { ephemeral: true },
+      );
+    } catch (error) {
+      ok = false;
+      errorText = String(error?.message || error || "unknown sdk history fetch failure").trim()
+        || "unknown sdk history fetch failure";
+      dbg("sdk history fetch failed", `session=${sdkSessionId}`, errorText);
+      await session?.log?.(
+        `⚠️ SDK history fetch failed (${sdkSessionId.slice(0, 8)}): ${errorText}`,
+        { level: "warn" },
+      );
+    }
+
+    await api("POST", "/api/sdk-history-fetch/result", {
+      sdk_session_id: sdkSessionId,
+      conversation_id: request?.conversationId || undefined,
+      ok,
+      events: ok ? events : undefined,
+      error: ok ? undefined : errorText,
+    }).catch(() => {});
+
+    return true;
+  }
+
   async function checkActiveAbortControl(message, { force = false } = {}) {
     const ownerSessionId = String(message?.ownerSessionId || "").trim();
     if (!ownerSessionId || !getWaitingForAI()) return false;
@@ -570,7 +625,63 @@ export function createPollingLoop({
     const queueMessageId = String(message?.id || "").trim();
     const pending = await api("GET", `/api/control/active?sdkSessionId=${encodeURIComponent(ownerSessionId)}&queueMessageId=${encodeURIComponent(queueMessageId)}`).catch(() => null);
     const control = pending?.control || null;
-    if (!control || String(control.type || "").trim() !== "abort_turn") return false;
+    const controlType = String(control?.type || "").trim();
+    if (!control || !controlType) return false;
+
+    if (controlType === "abort_subagent") {
+      const targetRunId = String(control?.request?.subagentRunId || "").trim();
+      if (!targetRunId) {
+        await api("POST", `/api/control/${encodeURIComponent(control.id)}/result`, {
+          ok: false,
+          error: "invalid-subagent-control-request",
+        }).catch(() => {});
+        return false;
+      }
+
+      const tryAbortSubagent = async () => {
+        if (!session) return { ok: false, error: "SDK session is unavailable in this CLI runtime" };
+        const candidates = [
+          () => (typeof session.abortSubagentRun === "function" ? session.abortSubagentRun(targetRunId) : null),
+          () => (typeof session.abortSubagent === "function" ? session.abortSubagent(targetRunId) : null),
+          () => (typeof session.abortAgent === "function" ? session.abortAgent(targetRunId) : null),
+          () => (typeof session.abort === "function" && Number(session.abort.length || 0) > 0 ? session.abort({ subagentRunId: targetRunId }) : null),
+          () => (typeof session.abort === "function" && Number(session.abort.length || 0) > 0 ? session.abort({ agentId: targetRunId }) : null),
+          () => (typeof session.abort === "function" && Number(session.abort.length || 0) > 0 ? session.abort(targetRunId) : null),
+        ];
+        for (const invoke of candidates) {
+          try {
+            const result = invoke();
+            if (result && typeof result.then === "function") await result;
+            else if (result === null) continue;
+            return { ok: true };
+          } catch (error) {
+            const messageText = String(error?.message || error || "subagent abort failed").trim() || "subagent abort failed";
+            if (/is not a function/i.test(messageText)) continue;
+            return { ok: false, error: messageText };
+          }
+        }
+        return { ok: false, error: "Targeted subagent cancellation is not supported by this runtime." };
+      };
+
+      const abortResult = await tryAbortSubagent();
+      if (!abortResult.ok) {
+        await api("POST", `/api/control/${encodeURIComponent(control.id)}/result`, {
+          ok: false,
+          error: abortResult.error,
+        }).catch(() => {});
+        await session?.log?.(`⚠️ Subagent stop request could not be executed (${targetRunId.slice(0, 8)}): ${abortResult.error}`, { level: "warn" });
+        return false;
+      }
+
+      await session?.log?.(`⛔ Stop requested for subagent ${targetRunId.slice(0, 8)}`, { ephemeral: true });
+      await api("POST", `/api/control/${encodeURIComponent(control.id)}/result`, {
+        ok: true,
+        note: `targeted subagent abort completed (${targetRunId})`,
+      }).catch(() => {});
+      return false;
+    }
+
+    if (controlType !== "abort_turn") return false;
 
     if (!session || typeof session.abort !== "function") {
       const error = "SDK abort() is unavailable in this CLI runtime";
@@ -1076,6 +1187,7 @@ export function createPollingLoop({
         // Keep SDK-session-delete maintenance best-effort only; never starve
         // user turn dequeue when delete requests are backlogged/retrying.
         await processPendingSdkSessionDeletes();
+        await processPendingSdkHistoryFetches();
         if (!shouldFetchPending()) return;
 
         const pending = await api("GET", "/api/pending");

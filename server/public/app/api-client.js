@@ -82,6 +82,20 @@ export async function updateWorkspaceRoot(rootPath, conversationId = null) {
   return response;
 }
 
+export async function updateDefaultSessionWorkspaceRoot(rootPath, options = {}) {
+  const clear = options?.clear === true;
+  const pathValue = String(rootPath || '').trim();
+  const response = await apiFetch('/api/settings/default-session-workspace-root', {
+    method: 'POST',
+    body: JSON.stringify({
+      rootPath: clear ? '' : pathValue,
+      clear,
+    }),
+  });
+  if (response) updateWorkspaceRootHints(response);
+  return response;
+}
+
 export async function launchSessionWorker(sdkSessionId) {
   const sessionId = String(sdkSessionId || '').trim();
   if (!sessionId) return null;
@@ -166,6 +180,18 @@ export async function loadConversation(id, options = {}) {
   return apiFetch(`/api/conversation/${convId}${query ? `?${query}` : ''}`);
 }
 
+export async function refreshConversationHistory(id, options = {}) {
+  const convId = String(id || '').trim();
+  if (!convId) return null;
+  const params = new URLSearchParams();
+  const limit = Math.max(1, Math.trunc(Number(options.limit) || 0));
+  if (limit) params.set('limit', String(limit));
+  const query = params.toString();
+  return apiFetch(`/api/conversation/${convId}/refresh-history${query ? `?${query}` : ''}`, {
+    method: 'POST',
+  });
+}
+
 export async function searchMessages(options = {}) {
   const query = String(options.query || options.q || '').trim();
   if (!query) return null;
@@ -205,10 +231,26 @@ export async function updateConversationPreferences(id, preferences = {}) {
 export async function updateConversationDraft(id, draft = {}) {
   const convId = String(id || '').trim();
   if (!convId) return null;
-  return apiFetch(`/api/conversation/${convId}/draft`, {
-    method: 'PATCH',
-    body: JSON.stringify(draft || {}),
-  });
+  try {
+    const response = await fetch(`${BASE}/api/conversation/${convId}/draft`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders(),
+      },
+      body: JSON.stringify(draft || {}),
+    });
+    const payload = await response.json().catch(() => null);
+    if (response.ok) return payload;
+    return {
+      ok: false,
+      status: response.status,
+      ...(payload && typeof payload === 'object' ? payload : {}),
+    };
+  } catch (error) {
+    console.error('Fetch error', error);
+    return { ok: false, error: error?.message || 'Network error' };
+  }
 }
 
 export async function compactConversation(id) {
@@ -264,10 +306,36 @@ export async function sendMessage(body) {
   return apiFetch('/api/message', { method: 'POST', body: JSON.stringify(body) });
 }
 
+export async function bootstrapConversationSession(body = {}) {
+  return apiFetch('/api/conversation/bootstrap', {
+    method: 'POST',
+    body: JSON.stringify(body || {}),
+  });
+}
+
 export async function cancelConversationTurn(conversationId, body = {}) {
   const convId = String(conversationId || '').trim();
   if (!convId) return null;
   return apiFetch(`/api/conversation/${encodeURIComponent(convId)}/cancel-turn`, {
+    method: 'POST',
+    body: JSON.stringify(body || {}),
+  });
+}
+
+export async function cancelQueuedConversationTurn(conversationId, body = {}) {
+  const convId = String(conversationId || '').trim();
+  if (!convId) return null;
+  return apiFetch(`/api/conversation/${encodeURIComponent(convId)}/cancel-queued-turn`, {
+    method: 'POST',
+    body: JSON.stringify(body || {}),
+  });
+}
+
+export async function cancelSubagentRun(conversationId, subagentRunId, body = {}) {
+  const convId = String(conversationId || '').trim();
+  const runId = String(subagentRunId || '').trim();
+  if (!convId || !runId) return null;
+  return apiFetch(`/api/conversation/${encodeURIComponent(convId)}/subagent/${encodeURIComponent(runId)}/cancel`, {
     method: 'POST',
     body: JSON.stringify(body || {}),
   });

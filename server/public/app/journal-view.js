@@ -8,6 +8,7 @@ import {
   getSessionWorkerState,
   resolveConversationUiState,
   setCurrentConv,
+  showTransientRelayNotice,
   updateSessionPill,
   updateCompactButton,
   closeSidebar,
@@ -22,6 +23,7 @@ import {
   loadConversations as loadConversationsApi,
   loadConversation,
   deleteConversation as deleteConversationApi,
+  bootstrapConversationSession,
   scheduleContextUsageRefresh,
 } from './api-client.js';
 import { renderMessages, restoreInFlightThinking, focusConversationMessageById, flushConversationDraft, hydrateConversationDraft } from './conversation-view.js';
@@ -38,6 +40,7 @@ const CONVERSATION_LIST_PAGE_SIZE = 40;
 let processingDotFrame = 0;
 let processingDotTimer = null;
 let openConversationVersion = 0;
+let newConversationInFlight = false;
 let conversationListBoundaryCheckFrame = 0;
 let conversationListAutoLoadBlockedUntil = 0;
 let conversationListPaginationState = {
@@ -398,24 +401,32 @@ export async function openConversation(id, options = {}) {
 }
 
 export async function newConversation() {
-  const previousConversationId = String(currentConvId || '').trim();
-  if (previousConversationId) {
-    await flushConversationDraft(previousConversationId);
+  if (newConversationInFlight) return;
+  newConversationInFlight = true;
+  try {
+    const selectedModel = String(document.getElementById('model-select')?.value || '').trim();
+    const result = await bootstrapConversationSession({
+      model: selectedModel || undefined,
+      title: 'New Conversation',
+    });
+    const nextConversationId = String(result?.conversationId || '').trim();
+    if (!nextConversationId) {
+      showTransientRelayNotice('Could not start a new conversation session. Please try again.');
+      return;
+    }
+    await refreshConversations();
+    await openConversation(nextConversationId);
+    if (result?.warning) {
+      showTransientRelayNotice(String(result.warning), 6000);
+    }
+    if (result?.defaultSessionWorkspaceRootWarning) {
+      showTransientRelayNotice(String(result.defaultSessionWorkspaceRootWarning), 7000);
+    }
+  } catch (error) {
+    showTransientRelayNotice(error?.message || 'Could not start a new conversation session.');
+  } finally {
+    newConversationInFlight = false;
   }
-  setCurrentConv(null);
-  closeSidebar();
-  clearAttachments();
-  setRepoBrowserSessionInfo('', '');
-  document.getElementById('chat-title').textContent = 'New Conversation';
-  window.syncChatTitleControls?.();
-  updateSessionPill(null, null);
-  updateCompactButton();
-  restoreInFlightThinking(null);
-  renderMessages([]);
-  renderConvList();
-  scheduleContextUsageRefresh(null);
-  window.applyConversationPreferences?.(null, null);
-  document.getElementById('msg-input').focus();
 }
 
 export function initConversationListLazyLoading() {

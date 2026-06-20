@@ -873,6 +873,59 @@
     max-width: 100%;
     min-width: 0;
   }
+  .thinking-bubble-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 4px;
+  }
+  .thinking-bubble-header:empty { display: none; margin-bottom: 0; }
+  .bubble-action-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 10px;
+    font-size: var(--fs-meta-sm);
+    font-weight: 500;
+    color: var(--danger);
+    background: transparent;
+    border: 1px solid var(--danger);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.15s, opacity 0.15s;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .bubble-action-btn:hover:not(:disabled) {
+    background: rgba(248, 81, 73, 0.12);
+  }
+  .bubble-action-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .bubble-action-btn.stopping {
+    color: var(--muted);
+    border-color: var(--muted);
+    cursor: wait;
+  }
+  .msg-bubble-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px dashed var(--border);
+  }
+  .msg-bubble-actions:empty { display: none; }
+  .msg.user .bubble-action-btn {
+    color: var(--user-bubble-fg);
+    border-color: var(--user-bubble-border);
+    background: rgba(255, 255, 255, 0.08);
+  }
+  .msg.user .bubble-action-btn:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.18);
+  }
   .thinking-text {
     display: none;
     margin-bottom: 8px;
@@ -896,6 +949,79 @@
     white-space: normal;
     overflow-wrap: anywhere;
     word-break: break-word;
+  }
+  /* ── Live subagent bubbles (nested under parent agent during active turn) ── */
+  .subagent-bubbles-container {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 10px;
+    padding-left: 12px;
+    border-left: 2px solid rgba(139, 148, 158, 0.25);
+  }
+  .subagent-bubbles-container:empty { display: none; }
+  .subagent-bubble {
+    background: rgba(139, 148, 158, 0.08);
+    border-radius: 8px;
+    padding: 10px 12px;
+    position: relative;
+  }
+  .subagent-bubble-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 6px;
+    font-size: var(--fs-meta-sm);
+  }
+  .subagent-bubble-name {
+    font-weight: 600;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+    min-width: 0;
+  }
+  .subagent-bubble-status {
+    color: var(--muted);
+    font-size: var(--fs-meta-sm);
+    flex-shrink: 0;
+  }
+  .subagent-bubble-controls {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+  .subagent-stop-btn {
+    padding: 3px 8px;
+    font-size: var(--fs-meta-sm);
+    min-height: 24px;
+    line-height: 1.2;
+  }
+  .subagent-bubble-status[data-status="running"] { color: var(--accent-color); }
+  .subagent-bubble-status[data-status="completed"] { color: var(--success); }
+  .subagent-bubble-status[data-status="failed"],
+  .subagent-bubble-status[data-status="cancelled"] { color: var(--error); }
+  .subagent-activity {
+    font-size: var(--fs-meta-sm);
+    color: var(--muted);
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .subagent-activity:empty { display: none; }
+  .subagent-activity-item {
+    min-width: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  .subagent-bubble .subagent-bubbles-container {
+    margin-top: 8px;
+    padding-left: 10px;
+    border-left-width: 2px;
   }
   .msg-activity {
     margin-top: 10px; border-top: 1px dashed var(--border); padding-top: 8px;
@@ -2181,6 +2307,12 @@
       white-space: nowrap;
       -webkit-overflow-scrolling: touch;
     }
+    .bubble-action-btn {
+      padding: 6px 12px;
+      font-size: var(--fs-meta-md);
+      min-height: 36px;
+    }
+    .thinking-bubble-header { margin-bottom: 6px; }
     .sidebar-header { padding: var(--sidebar-header-top-pad-mobile) 12px 12px; gap: 8px; }
     #new-conv-btn { margin: 10px; padding: 9px 12px; border-radius: 8px; font-size: var(--fs-meta-md); }
     #conv-list { padding: 0 5px 8px; }
@@ -2557,6 +2689,7 @@
             <button id="chat-menu-edit-title" class="chat-actions-menu-item" type="button" role="menuitem">✍️ Edit conversation title</button>
             <button id="chat-menu-usage" class="chat-actions-menu-item" type="button" role="menuitem">📊 Check Usage</button>
             <button id="chat-menu-compact" class="chat-actions-menu-item" type="button" role="menuitem">🗜️ Compact</button>
+            <button id="chat-menu-refresh-history" class="chat-actions-menu-item" type="button" role="menuitem">🔄️ Refresh history</button>
             <button id="chat-menu-select-models" class="chat-actions-menu-item" type="button" role="menuitem">🤗 Select Models</button>
             <button id="chat-menu-change-cwd" class="chat-actions-menu-item" type="button" role="menuitem">🗂️ Change CWD</button>
             <button id="chat-menu-settings" class="chat-actions-menu-item" type="button" role="menuitem">⚙️ Settings</button>
@@ -2683,6 +2816,17 @@
           onchange="updatePwaAppName(this.value)"
         >
         <div class="settings-help">Used for the installed PWA app label. Some platforms may require reinstalling the app after a rename.</div>
+      </div>
+      <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+        <label for="default-session-workspace-root-input">Default CWD for new sessions</label>
+        <input
+          id="default-session-workspace-root-input"
+          type="text"
+          placeholder="Leave empty to use relay workspace root"
+          aria-label="Default CWD for new sessions"
+          onchange="updateDefaultSessionWorkspaceRootSetting(this.value)"
+        >
+        <div class="settings-help">Applies to newly created sessions. Leave blank to fallback to the relay workspace root.</div>
       </div>
     </div>
   </div>

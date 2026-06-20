@@ -27,6 +27,7 @@ import { buildPromptWithMode } from "./skills/prompt-context.mjs";
 import { createQuestionBridge } from "./skills/question-bridge.mjs";
 import { createQuestionRoutingHooks } from "./skills/question-routing-hooks.mjs";
 import { createReasoningStreamHandlers } from "./skills/reasoning-stream.mjs";
+import { createSubagentLifecycleHandlers } from "./skills/subagent-lifecycle.mjs";
 import { createHeartbeatController } from "./polling/heartbeat.mjs";
 import { createPollingLoop } from "./polling/polling-loop.mjs";
 import { createManagedServerLifecycle } from "./server-lifecycle/managed-server.mjs";
@@ -174,6 +175,7 @@ let restartControlGraceUntilMs = 0;
 let deferredSessionEnd = false;
 let workerWebSocketLink = null;
 let reasoningStreamUnsubscribe = null;
+let subagentLifecycleUnsubscribe = null;
 
 function getCurrentConversationId() {
   const conversationId = String(activeMsg?.conversationId || "").trim();
@@ -545,6 +547,9 @@ async function startPolling() {
           ensureRelayScopeState(activeRelayScopeKey);
         } else {
           activeRelayScopeKey = null;
+          void subagentLifecycleHandlers.finalizeTurn(message || activeMsg).finally(() => {
+            subagentLifecycleHandlers.reset();
+          });
           reasoningStreamHandlers.reset();
           flushDeferredSessionEnd();
         }
@@ -589,6 +594,13 @@ async function forwardRelayQuestion(request) {
   return questionBridge.forwardRelayQuestion(request);
 }
 
+const subagentLifecycleHandlers = createSubagentLifecycleHandlers({
+  api,
+  dbg,
+  getRelayTurnActive: () => relayTurnActive,
+  getActiveMessage: () => activeMsg,
+});
+
 const questionRoutingHooks = createQuestionRoutingHooks({
   api,
   dbg,
@@ -617,6 +629,7 @@ const reasoningStreamHandlers = createReasoningStreamHandlers({
   dbg,
   getRelayTurnActive: () => relayTurnActive,
   getActiveMessage: () => activeMsg,
+  notifySubagentAgentId: (agentId) => subagentLifecycleHandlers.ensureFromAgentId(agentId),
 });
 
 async function requeueActiveMessage(reason) {
@@ -653,6 +666,12 @@ async function gracefulShutdown(reason) {
     dbg("reasoning-stream unsubscribe failed:", e?.message || String(e));
   }
   reasoningStreamUnsubscribe = null;
+  try {
+    subagentLifecycleUnsubscribe?.();
+  } catch (e) {
+    dbg("subagent-lifecycle unsubscribe failed:", e?.message || String(e));
+  }
+  subagentLifecycleUnsubscribe = null;
   workerWebSocketLink?.stop?.();
   workerWebSocketLink = null;
   sessionReady = false;
@@ -879,7 +898,11 @@ session = await joinSessionWithRetry({
       } catch (e) { dbg("session.log error:", e.message); }
     },
     onPreToolUse: async (request) => {
+      await subagentLifecycleHandlers.onPreToolUse(request);
       return questionRoutingHooks.onPreToolUse(request);
+    },
+    onPostToolUse: async (request, result) => {
+      await subagentLifecycleHandlers.onPostToolUse(request, result);
     },
     onSessionEnd: async () => {
       dbg("onSessionEnd fired");
@@ -895,6 +918,7 @@ dbg("joinSession resolved");
 dbg("platform:", process.platform, "onUserInputRequest handler registered at top level");
 try {
   reasoningStreamUnsubscribe = reasoningStreamHandlers.attach(session);
+  subagentLifecycleUnsubscribe = subagentLifecycleHandlers.attach(session);
 } catch (e) {
   dbg("reasoning-stream attach failed:", e?.message || String(e));
 }

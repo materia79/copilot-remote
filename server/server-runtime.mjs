@@ -46,6 +46,10 @@ import { createSessionWorkerProcessInspector } from './services/session-worker-p
 import { launchSessionCli } from './services/session-worker-launch-service.mjs';
 import { createSshTunnelManager } from './services/ssh-tunnel-manager-service.mjs';
 import { createSessionWorkerWebSocketService } from './services/session-worker-websocket-service.mjs';
+import {
+  resolveDefaultSessionWorkspaceRootState as resolveDefaultSessionWorkspaceRootStateFromService,
+  resolveLaunchWorkspaceRootPath,
+} from './services/workspace-root-defaults-service.mjs';
 import { maybeStartTtyConsole } from './tty-console-bootstrap.mjs';
 import { FEATURES, normalizeFeatureFlags } from './features.mjs';
 import { RELAY_RESTART_EXIT_CODE } from './relay-exit-codes.mjs';
@@ -98,6 +102,7 @@ const MAX_UPLOAD_ATTACHMENTS = 6;
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 const MAX_IMAGE_DATA_URL_LENGTH = 12 * 1024 * 1024;
 const MAX_REFERENCE_IMAGE_ATTACHMENT_BYTES = 1 * 1024 * 1024;
+const DEFAULT_SESSION_WORKSPACE_ROOT_KEY = 'default_session_workspace_root_path';
 const REFERENCE_TOKEN_PATTERN_BACKTICK = /`@(file|folder):([^`]+)`/gi;
 const REFERENCE_TOKEN_PATTERN_PLAIN = /(^|[\s(])@(file|folder):([^\s`]+)/gi;
 const WORKSPACE_META_CACHE_TTL_MS = 2_000;
@@ -383,11 +388,14 @@ function currentWorkspaceRootName() {
 }
 
 function workspaceRootPayload() {
+  const defaultSessionWorkspaceRootState = resolveDefaultSessionWorkspaceRootState();
   return {
     workspaceRootName: currentWorkspaceRootName(),
     workspaceRootPath: currentWorkspaceRootPath(),
     workspaceRootEntries: listWorkspaceRootEntries(),
     recentWorkspaceRoots: listRecentWorkspaceRoots(),
+    defaultSessionWorkspaceRootPath: defaultSessionWorkspaceRootState.path,
+    defaultSessionWorkspaceRootWarning: defaultSessionWorkspaceRootState.warning,
   };
 }
 
@@ -451,6 +459,62 @@ function rememberRecentWorkspaceRoot(rootPath) {
   stmts.upsertRecentWorkspaceRoot.run(normalized, nowIso);
   stmts.pruneRecentWorkspaceRoots.run(MAX_RECENT_WORKSPACE_ROOTS);
   return normalized;
+}
+
+function readAppSettingValue(key) {
+  const normalizedKey = String(key || '').trim();
+  if (!normalizedKey || typeof stmts?.getAppSetting?.get !== 'function') return '';
+  return String(stmts.getAppSetting.get(normalizedKey)?.value || '').trim();
+}
+
+function resolveDefaultSessionWorkspaceRootState() {
+  return resolveDefaultSessionWorkspaceRootStateFromService({
+    storedPath: readAppSettingValue(DEFAULT_SESSION_WORKSPACE_ROOT_KEY),
+    normalizePath: (candidatePath) => normalizeConversationWorkspaceRootPath(candidatePath),
+  });
+}
+
+function getDefaultSessionWorkspaceRootPath({ validate = true } = {}) {
+  if (!validate) {
+    const stored = readAppSettingValue(DEFAULT_SESSION_WORKSPACE_ROOT_KEY);
+    return stored || null;
+  }
+  return resolveDefaultSessionWorkspaceRootState().path;
+}
+
+function setDefaultSessionWorkspaceRootPath(nextRootPath, { allowClear = true } = {}) {
+  if (typeof stmts?.upsertAppSetting?.run !== 'function' || typeof stmts?.deleteAppSetting?.run !== 'function') {
+    return { ok: false, changed: false, error: 'Default session workspace setting is unavailable' };
+  }
+  const rawValue = String(nextRootPath || '').trim();
+  const existing = getDefaultSessionWorkspaceRootPath({ validate: false });
+  if (!rawValue) {
+    if (!allowClear) return { ok: false, changed: false, error: 'Missing rootPath' };
+    stmts.deleteAppSetting.run(DEFAULT_SESSION_WORKSPACE_ROOT_KEY);
+    return {
+      ok: true,
+      changed: !!existing,
+      rootPath: null,
+      rootName: null,
+    };
+  }
+  const normalized = normalizeWorkspaceRootPath(rawValue);
+  if (!normalized) {
+    return {
+      ok: false,
+      changed: false,
+      error: `Directory not found: ${rawValue || '(empty path)'}`,
+    };
+  }
+  const nowIso = new Date().toISOString();
+  stmts.upsertAppSetting.run(DEFAULT_SESSION_WORKSPACE_ROOT_KEY, normalized, nowIso);
+  rememberRecentWorkspaceRoot(normalized);
+  return {
+    ok: true,
+    changed: String(existing || '').trim().toLowerCase() !== normalized.toLowerCase(),
+    rootPath: normalized,
+    rootName: workspaceRootDisplayName(normalized),
+  };
 }
 
 function resolveConversationRecord({ conversationId = '', sdkSessionId = '' } = {}) {
@@ -576,9 +640,13 @@ function resolveLaunchWorkspaceRootForSession(sdkSessionId) {
   // the server-wide workspace root, so manually-started sessions with no DB-bound
   // conversation still launch in the directory where the CLI was originally started.
   const sid = String(sdkSessionId || '').trim();
-  return state?.configuredWorkspaceRootPath
-    || (sid ? getPendingSessionCwd(sid) : null)
-    || currentWorkspaceRootPath();
+  const defaultSessionWorkspaceRootPath = getDefaultSessionWorkspaceRootPath();
+  return resolveLaunchWorkspaceRootPath({
+    configuredWorkspaceRootPath: state?.configuredWorkspaceRootPath || '',
+    pendingSessionWorkspaceRootPath: sid ? (getPendingSessionCwd(sid) || '') : '',
+    defaultSessionWorkspaceRootPath: defaultSessionWorkspaceRootPath || '',
+    workspaceRootPath: currentWorkspaceRootPath(),
+  });
 }
 
 function normalizeWorkspaceRootPath(candidatePath) {
@@ -1328,6 +1396,20 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_sdk_delete_requests_status
     ON sdk_delete_requests(status, requested_at, next_attempt_at);
 
+  CREATE TABLE IF NOT EXISTS sdk_history_fetch_requests (
+    sdk_session_id TEXT PRIMARY KEY,
+    conversation_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    requested_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    processing_at TEXT,
+    result_json TEXT,
+    last_error TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_sdk_history_fetch_requests_status
+    ON sdk_history_fetch_requests(status, requested_at);
+
   CREATE TABLE IF NOT EXISTS recent_workspace_roots (
     path         TEXT PRIMARY KEY,
     last_seen_at TEXT NOT NULL
@@ -1335,6 +1417,12 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_recent_workspace_roots_last_seen
     ON recent_workspace_roots(last_seen_at DESC);
+
+  CREATE TABLE IF NOT EXISTS app_settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT,
+    updated_at TEXT NOT NULL
+  );
 
   CREATE TABLE IF NOT EXISTS model_selector_state (
     id           INTEGER PRIMARY KEY CHECK (id = 1),
@@ -1483,6 +1571,24 @@ db.exec(`
     ON relay_thought(queue_message_id, seq);
   CREATE INDEX IF NOT EXISTS idx_relay_thought_response
     ON relay_thought(response_message_id, seq);
+
+  CREATE TABLE IF NOT EXISTS subagent_runs (
+    id                  TEXT PRIMARY KEY,
+    queue_message_id    TEXT NOT NULL,
+    conversation_id     TEXT NOT NULL,
+    parent_subagent_id  TEXT,
+    display_name        TEXT,
+    status              TEXT NOT NULL DEFAULT 'running',
+    started_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    completed_at        TEXT,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_subagent_runs_queue
+    ON subagent_runs(queue_message_id, started_at);
+  CREATE INDEX IF NOT EXISTS idx_subagent_runs_conversation
+    ON subagent_runs(conversation_id, status);
 
   CREATE TABLE IF NOT EXISTS uploaded_files (
     sha256        TEXT PRIMARY KEY,
@@ -1705,6 +1811,38 @@ if (relayQuestionColumns.length && !relayQuestionColumns.includes('request_schem
   db.exec(`ALTER TABLE relay_questions ADD COLUMN request_schema TEXT`);
 }
 db.exec(`CREATE INDEX IF NOT EXISTS idx_relay_questions_continuation ON relay_questions(continuation_id, continuation_question_id, status, created_at)`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS subagent_runs (
+    id                  TEXT PRIMARY KEY,
+    queue_message_id    TEXT NOT NULL,
+    conversation_id     TEXT NOT NULL,
+    parent_subagent_id  TEXT,
+    display_name        TEXT,
+    status              TEXT NOT NULL DEFAULT 'running',
+    started_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    completed_at        TEXT,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_subagent_runs_queue
+    ON subagent_runs(queue_message_id, started_at);
+  CREATE INDEX IF NOT EXISTS idx_subagent_runs_conversation
+    ON subagent_runs(conversation_id, status);
+`);
+
+const relayActivityColumns = db.prepare(`PRAGMA table_info(relay_activity)`).all().map((c) => c.name);
+if (relayActivityColumns.length && !relayActivityColumns.includes('subagent_run_id')) {
+  db.exec(`ALTER TABLE relay_activity ADD COLUMN subagent_run_id TEXT`);
+}
+const relayThoughtColumns = db.prepare(`PRAGMA table_info(relay_thought)`).all().map((c) => c.name);
+if (relayThoughtColumns.length && !relayThoughtColumns.includes('subagent_run_id')) {
+  db.exec(`ALTER TABLE relay_thought ADD COLUMN subagent_run_id TEXT`);
+}
+const relayStreamEventColumns = db.prepare(`PRAGMA table_info(relay_stream_events)`).all().map((c) => c.name);
+if (relayStreamEventColumns.length && !relayStreamEventColumns.includes('subagent_run_id')) {
+  db.exec(`ALTER TABLE relay_stream_events ADD COLUMN subagent_run_id TEXT`);
+}
 
 // ─── Prepared Statements ──────────────────────────────────────────────────────
 const stmts = {
@@ -3512,10 +3650,20 @@ function sanitizeActivityText(value) {
   return text.slice(0, 200);
 }
 
+function mapRelayActivityRow(row) {
+  const text = sanitizeActivityText(row?.text);
+  if (!text) return null;
+  const subagentRunId = row?.subagent_run_id ? String(row.subagent_run_id).trim() : null;
+  return {
+    text,
+    subagentRunId: subagentRunId || null,
+  };
+}
+
 function relayActivityForResponse(responseMessageId) {
   return stmts.listActivityByResponse
     .all(responseMessageId)
-    .map((row) => sanitizeActivityText(row.text))
+    .map(mapRelayActivityRow)
     .filter(Boolean)
     .slice(0, 48);
 }
@@ -3523,7 +3671,7 @@ function relayActivityForResponse(responseMessageId) {
 function relayActivityForQueueMessage(queueMessageId) {
   return stmts.listActivityByQueueMessage
     .all(queueMessageId)
-    .map((row) => sanitizeActivityText(row.text))
+    .map(mapRelayActivityRow)
     .filter(Boolean)
     .slice(0, 48);
 }
@@ -3546,12 +3694,14 @@ function relayStreamEventsForQueueMessage(queueMessageId) {
 
 function mapRelayThoughtRow(row) {
   const seq = Math.max(0, Math.trunc(Number(row?.seq || 0)));
+  const subagentRunId = row?.subagent_run_id ? String(row.subagent_run_id).trim() : null;
   return {
     reasoningId: row?.reasoning_id ? String(row.reasoning_id) : null,
     seq,
     text: String(row?.text || ''),
     done: Number(row?.done || 0) === 1,
     timestamp: row?.created_at || null,
+    subagentRunId: subagentRunId || null,
   };
 }
 
@@ -3565,11 +3715,27 @@ function relayThoughtsForQueueMessage(queueMessageId) {
   return rows.map(mapRelayThoughtRow).slice(0, 5000);
 }
 
+function mapSubagentRunRow(row) {
+  const subagentRunId = String(row?.id || '').trim();
+  if (!subagentRunId) return null;
+  return {
+    subagentRunId,
+    messageId: String(row?.queue_message_id || '').trim() || null,
+    conversationId: String(row?.conversation_id || '').trim() || null,
+    parentSubagentId: row?.parent_subagent_id ? String(row.parent_subagent_id).trim() : null,
+    displayName: row?.display_name ? String(row.display_name).trim() : null,
+    status: String(row?.status || 'running').trim().toLowerCase() || 'running',
+    startedAt: row?.started_at || null,
+    updatedAt: row?.updated_at || null,
+  };
+}
+
 function inFlightStateForConversation(conversationId) {
   const row = stmts.getLatestProcessingQueueByConversation.get(conversationId);
   if (!row) return null;
   const streamEvents = relayStreamEventsForQueueMessage(row.id);
   const lastStreamEvent = streamEvents.length ? streamEvents[streamEvents.length - 1] : null;
+  const subagentRunRows = stmts.listSubagentRunsByQueueMessage?.all(row.id) || [];
   return {
     messageId: row.id,
     status: 'processing',
@@ -3581,6 +3747,7 @@ function inFlightStateForConversation(conversationId) {
     streamEvents,
     streamDone: !!lastStreamEvent?.done,
     lastStreamSeq: lastStreamEvent?.seq || 0,
+    subagentRuns: subagentRunRows.map(mapSubagentRunRow).filter(Boolean),
   };
 }
 
@@ -3597,7 +3764,7 @@ function recoverProcessingOlderThan(cutoffIso, requeueAtIso) {
           updated_at = ?,
           completed_at = ?
       WHERE queue_message_id = ?
-        AND type = 'abort_turn'
+        AND type IN ('abort_turn', 'abort_subagent')
         AND status IN ('pending', 'processing')
     `);
     const now = new Date().toISOString();
@@ -3782,6 +3949,7 @@ const sessionTranscriptService = createSessionTranscriptService({
   resolveSessionStateRoot,
 });
 const readSessionTranscriptMessages = sessionTranscriptService.readSessionTranscriptMessages;
+const parseSessionEventsToMessages = sessionTranscriptService.parseSessionEventsToMessages;
 const contextSnapshotService = createContextSnapshotService({
   fs,
   path,
@@ -3806,6 +3974,19 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
   const sessionWorkerRoutingEnabled = featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true;
   if (!sessionWorkerRoutingEnabled) {
     return { message: null, paused: true, reason: 'session_worker_routing_disabled' };
+  }
+  if (sessionWorkerSupervisor?.isKillBlocked?.(requesterSessionId) === true) {
+    return {
+      message: null,
+      routing: {
+        enabled: true,
+        requesterSessionId,
+        blockedReason: 'session-killed',
+        lifecycle: sessionWorkerSupervisor?.getLifecycleState?.(requesterSessionId) || null,
+        fallbackRestart: null,
+      },
+      restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
+    };
   }
   sessionWorkerSupervisor?.noteSessionHeartbeat?.(requesterSessionId);
   if (runtimeState.relayPaused) {
@@ -4022,6 +4203,7 @@ const sharedRouteDeps = {
   maybeApplyWorkspaceRootFromMessage,
   updateConversationConfiguredWorkspaceRoot,
   setWorkspaceRoot: applyWorkspaceRoot,
+  setDefaultSessionWorkspaceRootPath,
   getOrCreateConversation,
   ensureRuntimeSessionBinding,
   linkUploadReferences,
@@ -4078,6 +4260,7 @@ const sharedRouteDeps = {
   readContextFromSessionEvents,
   discoverSessionStateConversations,
   readSessionTranscriptMessages,
+  parseSessionEventsToMessages,
   collectOrphanedUploadsFromConversation,
   deleteOrphanedUploads,
   fs,
