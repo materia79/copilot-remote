@@ -1,22 +1,12 @@
 import {
-  BASE,
-  TOKEN,
   CLIENT_ID,
   currentConvId,
   conversations,
-  seenMessageIds,
-  relayQuestions,
-  relayBoards,
-  relayQuestionDrafts,
-  relayActivities,
-  relayThoughts,
   repoBrowserState,
   workspaceRootPath,
   defaultSessionWorkspaceRootPath,
   defaultSessionWorkspaceRootWarning,
   getConversationWorkspaceState,
-  getConversationCurrentWorkspaceRootPath,
-  pendingUserMessageIds,
   escHtml,
   setToken,
   setCliOnline,
@@ -47,22 +37,13 @@ import {
   isMobileComposerViewport,
   releaseComposerFocusAfterSend,
   autoResize,
-  clearPendingUserMessage,
-  hasPendingUserMessageDuplicate,
   initSidebarLayout,
   toggleSidebar,
   loadConversationScrollTop,
   loadConversationLoadedMessageCount,
   saveConversationScrollTop,
-  isMessagesNearBottom,
-  getRecentWorkspaceRoots,
   getSessionWorkerState,
   resolveConversationUiState,
-  upsertSubagentRun,
-  addSubagentActivity,
-  addSubagentThought,
-  clearSubagentCancelInFlight,
-  clearSubagentRunsForConversation,
 } from './store.js';
 import {
   verifyExistingSession,
@@ -78,54 +59,96 @@ import {
   refreshConversationHistory,
   updateConversationTitle,
   updateConversationPreferences,
-  killSessionWorker,
-  requestRelayRestart,
-  requestHostSuspend,
-  requestQueueEmpty,
-  updateWorkspaceRoot,
   updateDefaultSessionWorkspaceRoot,
-  launchSessionWorker,
   scheduleContextUsageRefresh,
 } from './api-client.js';
 import { loadConversations, refreshConversations, openConversation, renderConvList, applyLoadedConversationState, initConversationListLazyLoading } from './journal-view.js';
 import { newConversation, deleteConv } from './journal-view.js';
 import {
   loadRelayQuestions,
-  renderRelayQuestions,
-  upsertRelayQuestion,
-  updatePendingQuestionBanner,
   getPendingQuestionCountsByConversation,
 } from './ask-user-view.js';
 import { openPendingQuestionFromBanner, submitRelayQuestionChoice, submitRelayQuestionAnswer, submitRelayStructuredAnswer, onRelayQuestionDraftInput, handleRelayQuestionKey } from './ask-user-view.js';
-import { loadRelayBoards, renderRelayBoards, upsertRelayBoard, submitRelayBoardAction } from './relay-board-view.js';
-import { showThinking, removeThinking, renderThinkingActivities, appendThinkingActivity, appendThinkingThought, applyRelayStreamEvent, clearRelayStreamStateForMessage, restoreInFlightThinking, applyConversationTurnStatus, renderMessages, appendMessage, compactCurrentConversation, sendMessage, handleKey, getConversationLoadedMessageCount, loadOlderConversationMessages, syncComposerControlState, setConversationDraftPersistenceEnabled, applyIncomingConversationDraftUpdate, flushConversationDraft, getRenderedConversationMessageFingerprints, initConversationHistoryLazyLoading, initBubbleActionHandlers, clearBubbleCancelState, removeUserBubbleCancelButton, updateSubagentBubbleFromStatus, isSendInFlight,
+import { loadRelayBoards, submitRelayBoardAction } from './relay-board-view.js';
+import {
+  restoreInFlightThinking,
+  renderMessages,
+  appendMessage,
+  compactCurrentConversation,
+  sendMessage,
+  handleKey,
+  getConversationLoadedMessageCount,
+  loadOlderConversationMessages,
+  syncComposerControlState,
+  setConversationDraftPersistenceEnabled,
+  flushConversationDraft,
+  initConversationHistoryLazyLoading,
+  initBubbleActionHandlers,
+  isSendInFlight,
 } from './conversation-view.js';
 import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { handleAttachmentInput, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
-import { getRepoBrowserLaunchCwdPath } from './attachments-view.js';
 import { initEmojiPicker, toggleEmojiPicker } from './emoji-view.js';
 import {
   resolveConversationComposerSelection,
   withUpdatedModelPreference,
   normalizePreferredModelsByMode,
 } from './conversation-preferences.mjs';
-import { isLikelyLiveDuplicateMessage } from './live-message-dedupe.mjs';
-import { stripRelayPromptContext } from './relay-prompt-sanitizer.mjs';
 import {
   initMessageSearchView,
   openMessageSearchModal,
   closeMessageSearchModal,
-  clearMessageSearchRuntimeState,
 } from './message-search-view.js';
+
+import { initSocketHandlers, connectSocket } from './socket-handlers.js';
+import {
+  initInstallButton,
+  initFullscreenButton,
+  promptInstallApp,
+  toggleFullscreen,
+  applyPwaManifestFromSettings,
+  registerPwaShell,
+  updatePwaAppName,
+} from './pwa-install.js';
+import { initFontScaling, updateFontScaleFromSelect } from './font-scaling.js';
+import {
+  initCwdPicker,
+  openChangeCwdModal,
+  confirmChangeCwd,
+  confirmChangeCwdAndLaunch,
+  syncChatHeaderWorkspaceLabel,
+  normalizeKnownCwdPath,
+  clearLegacyKnownCwdHistoryStorage,
+  bindTapAction,
+  bindMenuAction,
+} from './cwd-picker.js';
+import {
+  initTheme,
+  updateTheme,
+  openSettingsModal,
+  closeSettingsModal,
+  syncSuspendHostVisibility,
+  updateShowSuspendHostSetting,
+  syncDefaultSessionWorkspaceRootInput,
+  updateDefaultSessionWorkspaceRootSetting,
+} from './settings-modal.js';
+import {
+  initActionConfirmations,
+  openKillSessionConfirmation,
+  confirmKillCurrentSession,
+  openRestartRelayConfirmation,
+  confirmRestartWebRelay,
+  openEmptyQueueConfirmation,
+  confirmEmptyQueue,
+  openSuspendHostConfirmation,
+  confirmSuspendHost,
+} from './action-confirmations.js';
 
 const MODEL_STORAGE_KEY = 'copilot_selected_model';
 const MODE_STORAGE_KEY = 'copilot_selected_mode';
 const MODELS_BY_MODE_STORAGE_KEY = 'copilot_selected_models_by_mode';
 const FALLBACK_MODEL = 'gpt-5.4-mini';
 const FALLBACK_MODE = 'agent';
-const THEME_COLOR_BASE = '#0d1117';
-const THEME_COLOR_IMMERSIVE = '#161b22';
-const LEGACY_KNOWN_CWD_HISTORY_KEY = 'copilot_known_cwds';
 const PROVIDER_LABELS = {
   openai: 'OpenAI',
   anthropic: 'Anthropic',
@@ -135,30 +158,13 @@ const PROVIDER_LABELS = {
 };
 const CHAT_TITLE_MAX_LENGTH = 120;
 const LOCAL_PROCESSING_STALE_MS = 5 * 60 * 1000;
-const FONT_SCALE_STORAGE_KEY = 'copilot_font_scale';
-const PWA_APP_NAME_STORAGE_KEY = 'copilot_pwa_app_name';
-const SHOW_SUSPEND_HOST_STORAGE_KEY = 'copilot_show_suspend_host';
-const PWA_APP_NAME_DEFAULT = 'Copilot Remote';
-const PWA_APP_NAME_MAX_LENGTH = 60;
-const FONT_SCALE_MIN = 0.5;
-const FONT_SCALE_MAX = 1.5;
-const FONT_SCALE_DEFAULT = 1;
-const FONT_SCALE_WHEEL_STEP_MIN = 0.01;
-const FONT_SCALE_WHEEL_STEP_MAX = 0.2;
-const FONT_SCALE_PILL_VISIBLE_MS = 900;
 
-let socket = null;
 let relayQuestionPollTimer = null;
 let relayBoardPollTimer = null;
 let sessionWorkerStatusPollTimer = null;
 let viewportBaseHeight = window.innerHeight || document.documentElement.clientHeight || 0;
-let deferredInstallPrompt = null;
 let chatTitleEditingConversationId = null;
-const INSTALLED_DISPLAY_MODE_QUERIES = ['(display-mode: standalone)', '(display-mode: fullscreen)'];
-let pendingInstalledFullscreenGesture = false;
 let relayQuestionRenderHash = '';
-let changeCwdInFlight = false;
-let defaultSessionWorkspaceRootUpdateInFlight = false;
 let modelCatalogState = {
   models: [FALLBACK_MODEL],
   currentModel: FALLBACK_MODEL,
@@ -190,15 +196,6 @@ let latestQueueStatus = {
   processingCount: 0,
   parkedCount: 0,
 };
-let fontScaleValue = FONT_SCALE_DEFAULT;
-let fontScaleIndicatorTimer = null;
-let fontScalePinchState = {
-  active: false,
-  startDistance: 0,
-  startScale: FONT_SCALE_DEFAULT,
-};
-let manifestTemplateCache = null;
-let customManifestUrl = null;
 
 function getTokenFromUrl() {
   return new URLSearchParams(window.location.search).get('token');
@@ -265,36 +262,6 @@ function syncQueueStatusMenuEntry(payload = null) {
   chip.textContent = `Queue: ${statusText}`;
 }
 
-function readShowSuspendHostSetting() {
-  const stored = String(localStorage.getItem(SHOW_SUSPEND_HOST_STORAGE_KEY) || '').trim().toLowerCase();
-  if (!stored) return true;
-  return stored !== '0' && stored !== 'false';
-}
-
-function setShowSuspendHostSetting(show, { persist = true } = {}) {
-  const next = !!show;
-  if (persist) localStorage.setItem(SHOW_SUSPEND_HOST_STORAGE_KEY, next ? '1' : '0');
-  return next;
-}
-
-function isSuspendHostActionVisible() {
-  return readShowSuspendHostSetting();
-}
-
-function syncSuspendHostVisibility() {
-  const show = isSuspendHostActionVisible();
-  const menuBtn = document.getElementById('chat-menu-suspend-host');
-  const checkbox = document.getElementById('show-suspend-host-toggle');
-  if (menuBtn) {
-    menuBtn.hidden = !show;
-    menuBtn.disabled = !show;
-    menuBtn.tabIndex = show ? 0 : -1;
-    menuBtn.setAttribute('aria-hidden', show ? 'false' : 'true');
-  }
-  if (checkbox instanceof HTMLInputElement) {
-    checkbox.checked = show;
-  }
-}
 
 function splitVariantId(modelVariantId = '') {
   const value = String(modelVariantId || '').trim();
@@ -847,264 +814,6 @@ function renderSessionInstructionDocs(docs) {
 }
 
 
-function matchesDisplayMode(query) {
-  try {
-    return !!window.matchMedia(query).matches;
-  } catch {
-    return false;
-  }
-}
-
-function isInstalledAppMode() {
-  const standalone = matchesDisplayMode('(display-mode: standalone)');
-  const minimalUi = matchesDisplayMode('(display-mode: minimal-ui)');
-  const launchedFromAndroidApp = String(document.referrer || '').startsWith('android-app://');
-  return (
-    window.navigator.standalone === true
-    || launchedFromAndroidApp
-    || standalone
-    || minimalUi
-  );
-}
-
-function isDisplayModeFullscreen() {
-  return matchesDisplayMode('(display-mode: fullscreen)');
-}
-
-function isBrowserFullscreenMode() {
-  return !!document.fullscreenElement;
-}
-
-function shouldUseImmersiveTopLayout() {
-  return isDisplayModeFullscreen() || isBrowserFullscreenMode();
-}
-
-function syncThemeColor(immersive) {
-  const meta = document.querySelector('meta[name="theme-color"]');
-  if (!meta) return;
-  meta.setAttribute('content', immersive ? THEME_COLOR_IMMERSIVE : THEME_COLOR_BASE);
-}
-
-function syncInstalledAppUiState() {
-  const installed = isInstalledAppMode();
-  const immersive = shouldUseImmersiveTopLayout();
-  document.body.classList.toggle('installed-app', installed);
-  document.body.classList.toggle('immersive-top', immersive);
-  syncThemeColor(immersive);
-}
-
-function canToggleFullscreen() {
-  return !!document.documentElement.requestFullscreen || !!document.fullscreenElement;
-}
-
-async function ensureInstalledAppFullscreen(options = {}) {
-  syncInstalledAppUiState();
-  if (!isInstalledAppMode()) {
-    return false;
-  }
-  if (isDisplayModeFullscreen() || document.fullscreenElement) {
-    return true;
-  }
-  if (!canToggleFullscreen()) return false;
-  if (!options.userGesture) return false;
-  try {
-    await document.documentElement.requestFullscreen();
-    return true;
-  } catch {
-    return false;
-  } finally {
-    updateInstallButton();
-    updateFullscreenButton();
-  }
-}
-
-function shouldQueueInstalledFullscreen() {
-  return isInstalledAppMode()
-    && window.matchMedia('(max-width: 680px)').matches
-    && canToggleFullscreen()
-    && !document.fullscreenElement;
-}
-
-function queueInstalledFullscreenGesture() {
-  pendingInstalledFullscreenGesture = shouldQueueInstalledFullscreen();
-}
-
-function consumeInstalledFullscreenGesture() {
-  if (!pendingInstalledFullscreenGesture || !shouldQueueInstalledFullscreen()) return;
-  pendingInstalledFullscreenGesture = false;
-  ensureInstalledAppFullscreen({ userGesture: true }).catch(() => {
-    pendingInstalledFullscreenGesture = true;
-  });
-}
-
-function initInstalledFullscreenGestureBridge() {
-  if (window.__installedFullscreenGestureBridgeBound) return;
-  window.__installedFullscreenGestureBridgeBound = true;
-  const consume = () => consumeInstalledFullscreenGesture();
-  document.addEventListener('pointerdown', consume, true);
-  document.addEventListener('keydown', consume, true);
-  window.addEventListener('pageshow', () => {
-    queueInstalledFullscreenGesture();
-  });
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') {
-      queueInstalledFullscreenGesture();
-    }
-  });
-}
-
-function getInstallHelpMessage() {
-  const ua = String(navigator.userAgent || '').toLowerCase();
-  if (/iphone|ipad|ipod/.test(ua)) {
-    return 'To install on iPhone/iPad: open this page in Safari, tap Share, then choose "Add to Home Screen".';
-  }
-  if (/android/.test(ua)) {
-    return 'To install on Android: open the browser menu (⋮) and choose "Install app" or "Add to Home screen". If Chrome says the app is already installed, open it from your launcher or uninstall the old copy first.';
-  }
-  return 'To install: open your browser menu and choose "Install app" or "Add to Home screen".';
-}
-
-function updateInstallButton() {
-  const btn = document.getElementById('install-btn');
-  if (!btn) return;
-  syncInstalledAppUiState();
-
-  if (isInstalledAppMode()) {
-    btn.style.display = 'none';
-    return;
-  }
-
-  const title = deferredInstallPrompt ? 'Install app to home screen' : 'Show install instructions';
-  btn.textContent = '⬇';
-  btn.style.display = 'inline-flex';
-  btn.title = title;
-}
-
-async function promptInstallApp() {
-  if (!deferredInstallPrompt) {
-    await new Promise((resolve) => setTimeout(resolve, 350));
-  }
-  if (deferredInstallPrompt) {
-    try {
-      deferredInstallPrompt.prompt();
-      const choice = await deferredInstallPrompt.userChoice.catch(() => null);
-      if (choice?.outcome === 'accepted') {
-        showTransientRelayNotice('Install accepted. The app will appear on your home screen.');
-      }
-    } finally {
-      deferredInstallPrompt = null;
-      updateInstallButton();
-    }
-    return;
-  }
-
-  alert(getInstallHelpMessage());
-}
-
-function initInstallButton() {
-  if (window.__installButtonBound) {
-    updateInstallButton();
-    initInstalledFullscreenGestureBridge();
-    queueInstalledFullscreenGesture();
-    ensureInstalledAppFullscreen().catch(() => {});
-    return;
-  }
-  window.__installButtonBound = true;
-  initInstalledFullscreenGestureBridge();
-
-  window.addEventListener('beforeinstallprompt', (event) => {
-    event.preventDefault();
-    deferredInstallPrompt = event;
-    updateInstallButton();
-    updateFullscreenButton();
-  });
-
-  window.addEventListener('appinstalled', () => {
-    deferredInstallPrompt = null;
-    updateInstallButton();
-    updateFullscreenButton();
-    queueInstalledFullscreenGesture();
-    ensureInstalledAppFullscreen().catch(() => {});
-    showTransientRelayNotice('App installed.');
-  });
-
-  window.addEventListener('resize', () => {
-    updateInstallButton();
-    updateFullscreenButton();
-  }, { passive: true });
-
-  for (const query of INSTALLED_DISPLAY_MODE_QUERIES) {
-    const media = window.matchMedia(query);
-    if (media && typeof media.addEventListener === 'function') {
-      media.addEventListener('change', () => {
-        updateInstallButton();
-        updateFullscreenButton();
-        queueInstalledFullscreenGesture();
-        ensureInstalledAppFullscreen().catch(() => {});
-      });
-    }
-  }
-
-  updateInstallButton();
-  updateFullscreenButton();
-  queueInstalledFullscreenGesture();
-  ensureInstalledAppFullscreen().catch(() => {});
-}
-
-async function toggleFullscreen() {
-  if (isInstalledAppMode()) {
-    if (document.fullscreenElement) {
-      document.exitFullscreen().catch(() => {});
-    } else {
-      ensureInstalledAppFullscreen({ userGesture: true }).catch(() => {});
-    }
-    return;
-  }
-  if (!canToggleFullscreen()) return;
-  try {
-    if (document.fullscreenElement) {
-      await document.exitFullscreen();
-    } else {
-      await document.documentElement.requestFullscreen();
-    }
-  } catch {
-  } finally {
-    updateInstallButton();
-    updateFullscreenButton();
-  }
-}
-
-function updateFullscreenButton() {
-  const btn = document.getElementById('fullscreen-btn');
-  if (!btn) return;
-  syncInstalledAppUiState();
-  if (isInstalledAppMode() || isDisplayModeFullscreen()) {
-    btn.style.display = 'none';
-    return;
-  }
-
-  const mobile = window.matchMedia('(max-width: 680px)').matches;
-  if (!mobile) {
-    btn.style.display = 'none';
-    return;
-  }
-
-  const full = !!document.fullscreenElement;
-  const supported = canToggleFullscreen();
-  btn.style.display = 'inline-flex';
-  btn.disabled = !supported;
-
-  if (full) {
-    btn.textContent = '⤢';
-    btn.title = 'Exit fullscreen';
-  } else {
-    btn.textContent = '⛶';
-    btn.title = isInstalledAppMode()
-      ? (supported ? 'Enter fullscreen (recommended for installed app)' : 'Fullscreen not supported on this browser')
-      : (supported ? 'Enter fullscreen' : 'Fullscreen not supported on this browser');
-  }
-}
-
 function startRelayQuestionPolling() {
   if (relayQuestionPollTimer) return;
   relayQuestionPollTimer = setInterval(() => {
@@ -1482,417 +1191,6 @@ function lockChatActionsMenuShield(ms = 300) {
   }, Math.max(150, Number(ms) || 300));
 }
 
-function normalizeKnownCwdPath(value) {
-  const stripped = String(value || '').trim().replace(/[\\/]+$/, '');
-  // Always restore the trailing backslash for Windows drive roots ("D:" → "D:\").
-  // Without it, sending "D:" to the server causes path.resolve("D:") to return the
-  // server's remembered CWD for drive D, not the drive root.
-  if (/^[A-Za-z]:$/.test(stripped)) return `${stripped}\\`;
-  return stripped;
-}
-
-function syncDefaultSessionWorkspaceRootInput() {
-  const input = document.getElementById('default-session-workspace-root-input');
-  if (!input) return;
-  input.value = normalizeKnownCwdPath(defaultSessionWorkspaceRootPath || '');
-  if (defaultSessionWorkspaceRootWarning) {
-    input.title = defaultSessionWorkspaceRootWarning;
-  } else {
-    input.removeAttribute('title');
-  }
-}
-
-async function updateDefaultSessionWorkspaceRootSetting(rawValue) {
-  if (defaultSessionWorkspaceRootUpdateInFlight) {
-    syncDefaultSessionWorkspaceRootInput();
-    return;
-  }
-  const normalizedPath = normalizeKnownCwdPath(rawValue);
-  defaultSessionWorkspaceRootUpdateInFlight = true;
-  try {
-    const result = await updateDefaultSessionWorkspaceRoot(normalizedPath, {
-      clear: !normalizedPath,
-    });
-    if (!result) {
-      alert('Failed to update the default CWD for new sessions.');
-      syncDefaultSessionWorkspaceRootInput();
-      return;
-    }
-    syncDefaultSessionWorkspaceRootInput();
-    if (result.defaultSessionWorkspaceRootWarning) {
-      showTransientRelayNotice(String(result.defaultSessionWorkspaceRootWarning), 7000);
-    }
-    if (normalizedPath) {
-      const savedPath = String(result.defaultSessionWorkspaceRootPath || normalizedPath).trim();
-      showTransientRelayNotice(`Default CWD for new sessions saved as ${savedPath}.`);
-    } else {
-      showTransientRelayNotice('Default CWD reset. New sessions will use relay workspace root.');
-    }
-  } catch (error) {
-    alert(error?.message || 'Failed to update the default CWD for new sessions.');
-    syncDefaultSessionWorkspaceRootInput();
-  } finally {
-    defaultSessionWorkspaceRootUpdateInFlight = false;
-  }
-}
-
-function clearLegacyKnownCwdHistoryStorage() {
-  localStorage.removeItem(LEGACY_KNOWN_CWD_HISTORY_KEY);
-}
-
-function buildKnownCwdOptions() {
-  const options = [];
-  const seen = new Set();
-  const add = (label, value, note = '') => {
-    const pathValue = normalizeKnownCwdPath(value);
-    if (!pathValue) return;
-    const key = pathValue.toLowerCase();
-    if (seen.has(key)) return;
-    seen.add(key);
-    options.push({ label, path: pathValue, note });
-  };
-
-  const selectedCurrentCwd = getSelectedConversationCurrentCwd();
-  add('Current session CWD', selectedCurrentCwd, 'Selected session');
-  add('Relay workspace', workspaceRootPath, 'Relay host cwd');
-  const browserCwd = normalizeKnownCwdPath(getRepoBrowserLaunchCwdPath());
-  if (browserCwd && browserCwd.toLowerCase() !== normalizeKnownCwdPath(selectedCurrentCwd).toLowerCase()) {
-    add('Current browser folder', browserCwd, 'From file explorer');
-  }
-  const history = getRecentWorkspaceRoots();
-  history.forEach((pathValue, index) => {
-    add(`Recent CWD ${index + 1}`, pathValue, 'Relay history');
-  });
-  return options;
-}
-
-function renderKnownCwdMenuItems(options, selectedPath) {
-  if (!options.length) {
-    return '<div class="change-cwd-menu-empty">No known CWDs available</div>';
-  }
-  const selectedKey = normalizeKnownCwdPath(selectedPath).toLowerCase();
-  return options.map((option) => {
-    const optionPath = normalizeKnownCwdPath(option.path);
-    const selected = optionPath.toLowerCase() === selectedKey;
-    return `
-      <button class="change-cwd-menu-item${selected ? ' selected' : ''}" type="button" role="menuitemradio" aria-checked="${selected ? 'true' : 'false'}" data-path="${escHtml(optionPath)}" data-label="${escHtml(option.label || '')}" data-note="${escHtml(option.note || '')}" title="${escHtml(optionPath)}">
-        <span class="change-cwd-menu-item-primary">${escHtml(option.label || 'Known CWD')}</span>
-        <span class="change-cwd-menu-item-secondary">${escHtml(optionPath)}</span>
-      </button>
-    `;
-  }).join('');
-}
-
-function getSelectedChangeCwdPath() {
-  const input = document.getElementById('change-cwd-selected-path');
-  return normalizeKnownCwdPath(input?.value || '');
-}
-
-function getManualChangeCwdPath() {
-  const input = document.getElementById('change-cwd-manual-path');
-  return normalizeKnownCwdPath(input?.value || '');
-}
-
-function getEffectiveChangeCwdPath() {
-  return getManualChangeCwdPath() || getSelectedChangeCwdPath();
-}
-
-function closeChangeCwdMenu() {
-  const menu = document.getElementById('change-cwd-menu');
-  const trigger = document.getElementById('change-cwd-menu-trigger');
-  if (menu) menu.hidden = true;
-  if (trigger) trigger.setAttribute('aria-expanded', 'false');
-}
-
-function syncChangeCwdPickerView() {
-  const trigger = document.getElementById('change-cwd-menu-trigger');
-  const details = document.getElementById('change-cwd-details');
-  const menu = document.getElementById('change-cwd-menu');
-  const manualPath = getManualChangeCwdPath();
-  const selectedPath = getSelectedChangeCwdPath();
-  const itemNodes = Array.from(menu?.querySelectorAll('.change-cwd-menu-item[data-path]') || []);
-  let selectedItem = null;
-  for (const item of itemNodes) {
-    const itemPath = normalizeKnownCwdPath(item.getAttribute('data-path') || '');
-    const selected = itemPath && itemPath.toLowerCase() === selectedPath.toLowerCase();
-    item.classList.toggle('selected', selected);
-    item.setAttribute('aria-checked', selected ? 'true' : 'false');
-    if (selected) selectedItem = item;
-  }
-  if (trigger) {
-    if (selectedPath) {
-      trigger.textContent = selectedPath;
-      trigger.title = selectedPath;
-    } else {
-      trigger.textContent = 'Select a known CWD';
-      trigger.title = 'Select a known CWD';
-    }
-  }
-  if (details) {
-    const label = String(selectedItem?.getAttribute('data-label') || '').trim();
-    const note = String(selectedItem?.getAttribute('data-note') || '').trim();
-    if (manualPath) {
-      details.textContent = `Manual path: ${manualPath}`;
-      return;
-    }
-    if (!selectedPath) {
-      details.textContent = 'No known CWDs are available yet.';
-      return;
-    }
-    const labelPrefix = label ? `${label}: ` : '';
-    const noteSuffix = note ? ` (${note})` : '';
-    details.textContent = `${labelPrefix}${selectedPath}${noteSuffix}`;
-  }
-}
-
-function bindChangeCwdPicker() {
-  const modalBody = document.getElementById('summary-modal-body');
-  const manualInput = document.getElementById('change-cwd-manual-path');
-  const trigger = document.getElementById('change-cwd-menu-trigger');
-  const menu = document.getElementById('change-cwd-menu');
-  const selectionInput = document.getElementById('change-cwd-selected-path');
-  if (!modalBody || !trigger || !menu || !selectionInput) return;
-  if (modalBody.dataset.changeCwdPickerModalBound !== '1') {
-    modalBody.dataset.changeCwdPickerModalBound = '1';
-    modalBody.addEventListener('click', (event) => {
-      const picker = document.getElementById('change-cwd-picker');
-      if (!picker || picker.contains(event.target)) return;
-      closeChangeCwdMenu();
-    });
-    modalBody.addEventListener('keydown', (event) => {
-      if (event.key !== 'Escape') return;
-      const activeMenu = document.getElementById('change-cwd-menu');
-      if (!activeMenu || activeMenu.hidden) return;
-      event.preventDefault();
-      event.stopPropagation();
-      closeChangeCwdMenu();
-    });
-  }
-  bindTapAction(trigger, (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    const willOpen = !!menu.hidden;
-    menu.hidden = !willOpen;
-    trigger.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
-  });
-  for (const item of menu.querySelectorAll('.change-cwd-menu-item[data-path]')) {
-    bindMenuAction(item, (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      const pathValue = normalizeKnownCwdPath(item.getAttribute('data-path') || '');
-      selectionInput.value = pathValue;
-      syncChangeCwdPickerView();
-      closeChangeCwdMenu();
-    });
-  }
-  if (manualInput && manualInput.dataset.changeCwdInputBound !== '1') {
-    manualInput.dataset.changeCwdInputBound = '1';
-    manualInput.addEventListener('input', () => {
-      syncChangeCwdPickerView();
-    });
-  }
-  syncChangeCwdPickerView();
-}
-
-function getSelectedConversationWorkspaceState() {
-  return getConversationWorkspaceState(currentConvId) || null;
-}
-
-function getSelectedConversationCurrentCwd() {
-  return normalizeKnownCwdPath(getConversationCurrentWorkspaceRootPath(currentConvId) || '');
-}
-
-function syncChatHeaderWorkspaceLabel() {
-  const labelEl = document.getElementById('chat-title-cwd');
-  if (!labelEl) return;
-  const convId = String(currentConvId || '').trim();
-  const cwd = getSelectedConversationCurrentCwd();
-  if (!convId || !cwd) {
-    labelEl.hidden = true;
-    labelEl.textContent = '';
-    labelEl.removeAttribute('title');
-    return;
-  }
-  labelEl.hidden = false;
-  labelEl.textContent = cwd;
-  labelEl.title = cwd;
-}
-
-function getCurrentLaunchableSessionId() {
-  const conversation = conversations?.[currentConvId] || null;
-  return String(conversation?.sdkSessionId || conversation?.sdk_session_id || '').trim();
-}
-
-function isSelectedSessionRunning() {
-  const conversation = conversations?.[currentConvId] || null;
-  const status = String(conversation?.runtimeSessionStatus || conversation?.runtime_session_status || '').trim().toLowerCase();
-  return ['starting', 'ready', 'processing'].includes(status);
-}
-
-function openChangeCwdModal() {
-  const options = buildKnownCwdOptions();
-  const workspaceState = getSelectedConversationWorkspaceState();
-  const currentCwd = normalizeKnownCwdPath(workspaceState?.currentWorkspaceRootPath || '');
-  const nextLaunchCwd = normalizeKnownCwdPath(workspaceState?.configuredWorkspaceRootPath || '');
-  const defaultPath = nextLaunchCwd || normalizeKnownCwdPath(getRepoBrowserLaunchCwdPath()) || currentCwd || normalizeKnownCwdPath(workspaceRootPath) || options[0]?.path || '';
-  const menuItemsHtml = renderKnownCwdMenuItems(options, defaultPath);
-  const launchableSessionId = getCurrentLaunchableSessionId();
-  const launchDisabledReason = !launchableSessionId
-    ? 'Open a conversation with a bound session before launching.'
-    : (isSelectedSessionRunning() ? 'Selected CLI is already running.' : '');
-  openSummaryModal({
-    title: 'Change CWD',
-    subtitle: 'Select a known launch directory',
-    kind: 'change-cwd',
-    bodyHtml: `
-      <p style="margin-bottom:10px;color:var(--muted);line-height:1.45">
-        Pick the selected session's persisted next-launch directory. Running CLIs keep their current CWD until the next launch.
-      </p>
-      <div style="display:grid;gap:4px;margin-bottom:10px;font-size:0.78rem;color:var(--muted)">
-        <div><strong style="color:var(--text)">Current CWD:</strong> ${escHtml(currentCwd || 'Unknown')}</div>
-        <div><strong style="color:var(--text)">Next launch:</strong> ${escHtml(nextLaunchCwd || currentCwd || 'Unknown')}</div>
-      </div>
-      <label class="change-cwd-picker" style="margin-bottom:10px;font-size:0.84rem;color:var(--muted)">
-        <span>Manual path</span>
-        <input id="change-cwd-manual-path" class="change-cwd-manual-input" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Manual path">
-      </label>
-      <label id="change-cwd-picker" class="change-cwd-picker" style="font-size:0.84rem;color:var(--muted)">
-        <span>Known CWDs</span>
-        <input id="change-cwd-selected-path" type="hidden" value="${escHtml(defaultPath)}">
-        <button id="change-cwd-menu-trigger" class="change-cwd-menu-trigger" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="change-cwd-menu">Select a known CWD</button>
-        <div id="change-cwd-menu" class="change-cwd-menu-panel" role="menu" hidden>
-          ${menuItemsHtml}
-        </div>
-      </label>
-      <div id="change-cwd-details" style="margin-top:10px;font-size:0.78rem;color:var(--muted);line-height:1.45;word-break:break-word"></div>
-      <div class="summary-modal-actions" id="change-cwd-actions">
-        <button class="summary-btn" type="button" onclick="confirmChangeCwd()">🗂️ Save next-launch CWD</button>
-        <button class="summary-btn" type="button" ${launchableSessionId ? 'onclick="confirmChangeCwdAndLaunch()"' : 'disabled'} title="${escHtml(launchDisabledReason || 'Set the CWD and launch the current session worker')}">🚀 Set new CWD and launch</button>
-        <button class="summary-close" type="button" onclick="closeSummaryModal()">Cancel</button>
-      </div>
-    `,
-  });
-  // Shield the action buttons from stray click events that arrive just after the
-  // modal opens (e.g. click fires after pointerup-triggered modal in some browsers,
-  // or the 300ms synthetic touch-click lands on a button at the same coordinates).
-  const cwdActionsEl = document.getElementById('change-cwd-actions');
-  if (cwdActionsEl) cwdActionsEl.style.pointerEvents = 'none';
-  window.setTimeout(() => {
-    bindChangeCwdPicker();
-    const el = document.getElementById('change-cwd-actions');
-    if (el) el.style.pointerEvents = '';
-  }, 350);
-}
-
-async function confirmChangeCwd() {
-  await submitChangeCwd(false);
-}
-
-async function confirmChangeCwdAndLaunch() {
-  await submitChangeCwd(true);
-}
-
-async function submitChangeCwd(launchAfterChange = false) {
-  if (changeCwdInFlight) return;
-  const targetPath = getEffectiveChangeCwdPath();
-  if (!targetPath) {
-    alert('Enter a manual path or select a known CWD first.');
-    return;
-  }
-  const launchableSessionId = launchAfterChange ? getCurrentLaunchableSessionId() : '';
-  if (launchAfterChange && !launchableSessionId) {
-    alert('Open a conversation with a bound session before launching.');
-    return;
-  }
-  if (launchAfterChange && isSelectedSessionRunning()) {
-    alert('Selected CLI is already running.');
-    return;
-  }
-  changeCwdInFlight = true;
-  setSummaryModalLoading(true);
-  try {
-    const result = await updateWorkspaceRoot(targetPath, currentConvId);
-    if (!result) {
-      alert('Failed to update the launch CWD');
-      return;
-    }
-    applyConversationWorkspaceRootUpdate({
-      conversationId: currentConvId,
-      ...result,
-    });
-    const updatedPath = result.configuredWorkspaceRootPath || result.currentWorkspaceRootPath || result.workspaceRootPath || targetPath;
-    if (launchAfterChange) {
-      const launchResult = await launchSessionWorker(launchableSessionId);
-      if (!launchResult) {
-        alert('Launch CWD updated, but the CLI launch request failed.');
-        return;
-      }
-      closeSummaryModal();
-      showTransientRelayNotice(`Next launch CWD saved as ${updatedPath} and CLI launch requested.`);
-      await refreshSessionWorkerStatus().catch(() => {});
-      return;
-    }
-    closeSummaryModal();
-    showTransientRelayNotice(isSelectedSessionRunning()
-      ? `Next launch CWD saved as ${updatedPath}. The running CLI keeps its current CWD.`
-      : `Next launch CWD saved as ${updatedPath}.`);
-  } catch (error) {
-    alert(error?.message || 'Failed to update the launch CWD');
-  } finally {
-    changeCwdInFlight = false;
-    setSummaryModalLoading(false);
-  }
-}
-
-function bindTapAction(element, handler) {
-  if (!element || element.dataset.tapBound === '1') return;
-  element.dataset.tapBound = '1';
-  let suppressClickUntil = 0;
-  const markSuppressed = (ms = 450) => {
-    suppressClickUntil = Date.now() + Math.max(200, Number(ms) || 450);
-  };
-  element.addEventListener('pointerup', (event) => {
-    if (event.pointerType === 'mouse' && event.button !== 0) return;
-    event.preventDefault();
-    event.stopPropagation();
-    markSuppressed();
-    handler(event);
-  });
-  element.addEventListener('click', (event) => {
-    if (Date.now() < suppressClickUntil) {
-      event.preventDefault();
-      event.stopPropagation();
-      return;
-    }
-    handler(event);
-  });
-}
-
-function bindMenuAction(element, handler) {
-  if (!element || element.dataset.menuTapBound === '1') return;
-  element.dataset.menuTapBound = '1';
-  let suppressClickUntil = 0;
-  const markSuppressed = (ms = 450) => {
-    suppressClickUntil = Date.now() + Math.max(200, Number(ms) || 450);
-  };
-  element.addEventListener('pointerup', (event) => {
-    if (event.pointerType === 'mouse' && event.button !== 0) return;
-    event.preventDefault();
-    event.stopPropagation();
-    event.stopImmediatePropagation();
-    markSuppressed();
-    handler(event);
-  }, true);
-  element.addEventListener('click', (event) => {
-    if (Date.now() < suppressClickUntil) {
-      event.preventDefault();
-      event.stopPropagation();
-      event.stopImmediatePropagation();
-      return;
-    }
-    handler(event);
-  }, true);
-}
 
 function syncChatTitleControls() {
   const { title, editBtn, editor, input } = getChatTitleElements();
@@ -2022,225 +1320,6 @@ function applyConversationWorkspaceRootUpdate(payload = {}) {
   }
 }
 
-function getCurrentConversationSessionInfo() {
-  const convId = String(currentConvId || '').trim();
-  if (!convId) return null;
-  const conversation = conversations[convId] || {};
-  const sdkSessionId = String(conversation.sdkSessionId || '').trim();
-  if (!sdkSessionId) return null;
-  const title = String(conversation.title || document.getElementById('chat-title')?.textContent || convId).trim() || convId;
-  return {
-    conversationId: convId,
-    sdkSessionId,
-    title,
-  };
-}
-
-function openKillSessionConfirmation() {
-  const info = getCurrentConversationSessionInfo();
-  if (!info) {
-    showTransientRelayNotice('No active session is bound to this conversation.');
-    return;
-  }
-  const escapedTitle = escHtml(info.title);
-  openSummaryModal({
-    title: 'Kill session',
-    subtitle: info.sdkSessionId,
-    kind: 'kill-session',
-    bodyHtml: `
-      <p>Kill the session for <strong>${escapedTitle}</strong>?</p>
-      <p>This stops the current worker and any active turn will need a manual retry or a new message.</p>
-      <div class="summary-modal-actions">
-        <button class="chat-title-action-btn danger-btn" type="button" onclick="confirmKillCurrentSession()">☠️ Kill session</button>
-        <button class="chat-title-action-btn" type="button" onclick="closeSummaryModal()">Cancel</button>
-      </div>
-    `,
-  });
-}
-
-let killSessionInFlight = false;
-let restartRelayInFlight = false;
-let suspendHostInFlight = false;
-let emptyQueueInFlight = false;
-
-async function confirmKillCurrentSession() {
-  if (killSessionInFlight) return;
-  const info = getCurrentConversationSessionInfo();
-  if (!info) {
-    closeSummaryModal();
-    showTransientRelayNotice('No active session is bound to this conversation.');
-    return;
-  }
-  killSessionInFlight = true;
-  setSummaryModalLoading(true);
-  try {
-    const result = await killSessionWorker(info.sdkSessionId, {
-      conversationId: info.conversationId,
-      title: info.title,
-    });
-    closeSummaryModal();
-    if (!result?.ok) {
-      alert('Failed to kill session');
-      return;
-    }
-    const statusText = result.processStatus === 'killed'
-      ? 'Session killed.'
-      : 'Session state cleared; no live worker process was found.';
-    showTransientRelayNotice(statusText);
-    await refreshSessionWorkerStatus().catch(() => {});
-  } finally {
-    killSessionInFlight = false;
-    setSummaryModalLoading(false);
-  }
-}
-
-function openRestartRelayConfirmation() {
-  openSummaryModal({
-    title: 'Restart web relay',
-    subtitle: 'Queues restart via /api/relay/shutdown',
-    kind: 'restart-relay',
-    bodyHtml: `
-      <p>Queue a manual relay restart now?</p>
-      <p>The restart waits until the current turn is idle, so it does not interrupt an in-flight turn immediately.</p>
-      <div class="summary-modal-actions">
-        <button class="chat-title-action-btn" type="button" onclick="confirmRestartWebRelay()">🌄 Restart web relay</button>
-        <button class="chat-title-action-btn" type="button" onclick="closeSummaryModal()">Cancel</button>
-      </div>
-    `,
-  });
-}
-
-function openEmptyQueueConfirmation() {
-  lockChatActionsMenuShield(350);
-  closeChatActionsMenu();
-  openSummaryModal({
-    title: 'Empty queue',
-    subtitle: 'Calls localhost /api/queue/empty',
-    kind: 'empty-queue',
-    bodyHtml: `
-      <p>Drop all queue rows in pending, processing, and parked states?</p>
-      <p>This is a local maintenance action and cannot be undone.</p>
-      <div class="summary-modal-actions">
-        <button class="chat-title-action-btn danger-btn" type="button" onclick="confirmEmptyQueue()">🚮 Empty queue</button>
-        <button class="chat-title-action-btn" type="button" onclick="closeSummaryModal()">Cancel</button>
-      </div>
-    `,
-  });
-}
-
-function openSuspendHostConfirmation() {
-  if (!isSuspendHostActionVisible()) return;
-  lockChatActionsMenuShield(350);
-  closeChatActionsMenu();
-  openSummaryModal({
-    title: 'Suspend host',
-    subtitle: 'Requests suspend-to-RAM',
-    kind: 'suspend-host',
-    bodyHtml: `
-      <p>Put this PC to sleep now?</p>
-      <p>This requests suspend-to-RAM immediately.</p>
-      <div class="summary-modal-actions">
-        <button class="chat-title-action-btn" type="button" onclick="confirmSuspendHost()">💤 Suspend host</button>
-        <button class="chat-title-action-btn" type="button" onclick="closeSummaryModal()">Cancel</button>
-      </div>
-    `,
-  });
-  window.setTimeout(() => {
-    const modal = document.getElementById('summary-modal');
-    const classVisible = !!modal?.classList?.contains('visible');
-    const ariaVisible = String(modal?.getAttribute('aria-hidden') || 'true') === 'false';
-    const displayVisible = modal ? window.getComputedStyle(modal).display !== 'none' : false;
-    if (classVisible && ariaVisible && displayVisible) return;
-    const confirmed = window.confirm('Put this PC to sleep now?\n\nThis requests suspend-to-RAM.');
-    if (!confirmed) return;
-    confirmSuspendHost().catch(() => {});
-  }, 90);
-}
-
-async function confirmSuspendHost() {
-  if (!isSuspendHostActionVisible()) return;
-  if (suspendHostInFlight) return;
-  suspendHostInFlight = true;
-  setSummaryModalLoading(true);
-  try {
-    const result = await requestHostSuspend({
-      reason: 'manual-suspend',
-      requestedBy: 'localhost-api',
-    });
-    closeSummaryModal();
-    if (!result?.ok) {
-      alert('Failed to suspend host');
-      return;
-    }
-  } finally {
-    suspendHostInFlight = false;
-    setSummaryModalLoading(false);
-  }
-}
-
-async function confirmEmptyQueue() {
-  if (emptyQueueInFlight) return;
-  emptyQueueInFlight = true;
-  setSummaryModalLoading(true);
-  try {
-    const result = await requestQueueEmpty({
-      reason: 'manual-empty-queue',
-      requestedBy: 'localhost-api',
-    });
-    closeSummaryModal();
-    if (!result?.ok) {
-      alert('Failed to empty queue');
-      return;
-    }
-    const droppedCount = Number(result.droppedCount || 0);
-    if (droppedCount <= 0) {
-      showTransientRelayNotice('Queue is already empty.');
-    } else {
-      showTransientRelayNotice(`Queue emptied: dropped ${droppedCount} row${droppedCount === 1 ? '' : 's'}.`, 6000);
-    }
-    const status = await refreshWorkspaceRootHints();
-    syncQueueStatusMenuEntry(status);
-  } finally {
-    emptyQueueInFlight = false;
-    setSummaryModalLoading(false);
-  }
-}
-
-async function confirmRestartWebRelay() {
-  if (restartRelayInFlight) return;
-  restartRelayInFlight = true;
-  setSummaryModalLoading(true);
-  try {
-    const result = await requestRelayRestart({
-      reason: 'manual-restart',
-      requestedBy: 'localhost-api',
-      restart: true,
-    });
-    closeSummaryModal();
-    // Restart can close the connection before the browser receives JSON.
-    if (!result) {
-      showTransientRelayNotice('Relay restart requested. Connection may briefly drop while it restarts.', 7000);
-      return;
-    }
-    if (!result.ok) {
-      alert('Failed to queue relay restart');
-      return;
-    }
-    if (result.accepted === false) {
-      showTransientRelayNotice('Relay is already shutting down/restarting.', 7000);
-      return;
-    }
-    const queue = result.queue || {};
-    showTransientRelayNotice(
-      `Relay restart queued (pending=${Number(queue.pendingCount || 0)}, processing=${Number(queue.processingCount || 0)}).`,
-      7000,
-    );
-  } finally {
-    restartRelayInFlight = false;
-    setSummaryModalLoading(false);
-  }
-}
-
 async function submitChatTitleEditor() {
   const convId = String(chatTitleEditingConversationId || currentConvId || '').trim();
   if (!convId) return;
@@ -2267,736 +1346,30 @@ async function submitChatTitleEditor() {
   closeChatTitleEditor();
 }
 
-function initFullscreenButton() {
-  const syncFullscreenUi = () => {
-    updateInstallButton();
-    updateFullscreenButton();
-  };
-  document.addEventListener('fullscreenchange', syncFullscreenUi);
-  window.addEventListener('resize', syncFullscreenUi);
-  for (const query of INSTALLED_DISPLAY_MODE_QUERIES) {
-    const media = window.matchMedia(query);
-    if (media && typeof media.addEventListener === 'function') {
-      media.addEventListener('change', syncFullscreenUi);
-    }
-  }
-  updateFullscreenButton();
-}
 
-async function connectSocket() {
-  socket = io({ path: `${BASE}/socket.io/`, auth: TOKEN ? { token: TOKEN, clientId: CLIENT_ID } : { clientId: CLIENT_ID } });
+initSocketHandlers({
+  refreshCurrentView,
+  refreshSessionWorkerStatus,
+  refreshModelCatalog,
+  updateModelCatalogState,
+  applyConversationWorkspaceRootUpdate,
+  applyConversationTitleUpdate,
+  syncChatTitleControls,
+  applyConversationPreferencesForConversation,
+});
 
-  socket.on('connect', () => {
-    console.log('Socket connected');
-    clearMessageSearchRuntimeState();
-    setRelayOnline(true);
-    setCliOnline(true);
-    renderConvList();
-    refreshCurrentView().catch(() => {});
-    refreshSessionWorkerStatus().catch(() => {});
-    refreshModelCatalog().catch(() => {});
-  });
-  socket.on('connect_error', (e) => {
-    setRelayOnline(false);
-    console.error('Socket error:', e.message);
-  });
-  socket.on('disconnect', () => {
-    setRelayOnline(false);
-  });
-  socket.on('cli_status', ({ online }) => {
-    setCliOnline(online);
-    renderConvList();
-    if (online) refreshCurrentView().catch(() => {});
-    refreshSessionWorkerStatus().catch(() => {});
-    if (online) refreshModelCatalog().catch(() => {});
-  });
-  socket.on('models_updated', (payload) => {
-    updateModelCatalogState(payload || {});
-  });
-  socket.on('workspace_root_changed', (payload) => {
-    updateWorkspaceRootHints(payload || {});
-    if (repoBrowserState.activeRoot !== 'workspace') return;
-    repoBrowserState.currentPath = '';
-    if (repoBrowserState.open) {
-      void loadRepoBrowserTree();
-    }
-  });
-  socket.on('conversation_workspace_root_updated', (payload) => {
-    updateWorkspaceRootHints(payload || {});
-    applyConversationWorkspaceRootUpdate(payload || {});
-  });
-  socket.on('user_message', ({ conversationId, messageId, senderClientId, message }) => {
-    const normalizedMessage = {
-      ...(message && typeof message === 'object' ? message : {}),
-      text: stripRelayPromptContext(message?.text, message?.mode),
-    };
-    if (senderClientId && senderClientId === CLIENT_ID) {
-      pendingUserMessageIds.delete(messageId);
-      return;
-    }
-    if (messageId && (pendingUserMessageIds.has(messageId) || seenMessageIds?.has(messageId))) {
-      pendingUserMessageIds.delete(messageId);
-      return;
-    }
-    if (conversationId === currentConvId) {
-      const renderedMessages = getRenderedConversationMessageFingerprints(24);
-      const hasPendingTextMatch = hasPendingUserMessageDuplicate(conversationId, normalizedMessage.text);
-      if (isLikelyLiveDuplicateMessage({
-        incomingMessageId: messageId,
-        incomingMessage: normalizedMessage,
-        existingMessages: renderedMessages,
-        hasPendingTextMatch,
-      })) {
-        return;
-      }
-      appendMessage(normalizedMessage, true, messageId);
-    }
-  });
-  socket.on('assistant_message', ({ conversationId, message, messageId, sourceMessageId }) => {
-    const isCurrentConversation = conversationId === currentConvId;
-    const autoScroll = isCurrentConversation ? isMessagesNearBottom() : false;
-    removeThinking();
-    if ((!message?.activities || !message.activities.length) && sourceMessageId) {
-      const cached = relayActivities.get(sourceMessageId) || [];
-      if (cached.length) message.activities = cached.slice(0, 48);
-    }
-    if ((!message?.thoughts || !message.thoughts.length) && sourceMessageId) {
-      const cachedThoughts = relayThoughts.get(sourceMessageId);
-      if (cachedThoughts && cachedThoughts.size) {
-        message.thoughts = Array.from(cachedThoughts.values());
-      }
-    }
-    if (messageId && seenMessageIds?.has(messageId)) return;
-    if (isCurrentConversation) {
-      appendMessage(message, autoScroll, messageId || null, false, sourceMessageId || null);
-      scheduleContextUsageRefresh(conversationId, 120);
-    }
-    if (sourceMessageId) relayActivities.delete(sourceMessageId);
-    if (sourceMessageId) relayThoughts.delete(sourceMessageId);
-    if (sourceMessageId) clearRelayStreamStateForMessage(sourceMessageId);
-    refreshSessionWorkerStatus().catch(() => {});
-  });
-  socket.on('relay_question', ({ question }) => upsertRelayQuestion(question));
-  socket.on('relay_question_updated', ({ question }) => upsertRelayQuestion(question));
-  socket.on('relay_question_changed', () => {
-    loadRelayQuestions(currentConvId);
-  });
-  socket.on('relay_board', ({ board }) => upsertRelayBoard(board));
-  socket.on('relay_board_updated', ({ board }) => upsertRelayBoard(board));
-  socket.on('relay_board_changed', () => {
-    loadRelayBoards();
-  });
-  socket.on('relay_activity', ({ conversationId, messageId, text, subagentRunId }) => {
-    if (!messageId || !text) return;
-    const entry = {
-      text: String(text || '').trim(),
-      subagentRunId: subagentRunId ? String(subagentRunId).trim() : null,
-    };
-    if (!entry.text) return;
-    const items = relayActivities.get(messageId) || [];
-    const last = items[items.length - 1];
-    const lastText = typeof last === 'string' ? last : String(last?.text || '');
-    const lastSubagentRunId = typeof last === 'object' && last ? (last.subagentRunId || null) : null;
-    if (lastText !== entry.text || lastSubagentRunId !== entry.subagentRunId) {
-      relayActivities.set(messageId, items.concat(entry).slice(-24));
-    }
-    if (entry.subagentRunId) {
-      upsertSubagentRun({ subagentRunId: entry.subagentRunId, messageId, conversationId });
-      addSubagentActivity(entry.subagentRunId, entry.text);
-    }
-    if (conversationId === currentConvId) {
-      const autoScroll = isMessagesNearBottom();
-      appendThinkingActivity(entry.text, entry.subagentRunId, autoScroll);
-    }
-  });
-  socket.on('relay_stream', ({ conversationId, messageId, text, done, seq }) => {
-    if (!messageId) return;
-    if (conversationId !== currentConvId) return;
-    const autoScroll = isMessagesNearBottom();
-    applyRelayStreamEvent({
-      messageId,
-      text: String(text || ''),
-      done: !!done,
-      seq,
-      autoScroll,
-    });
-  });
-  socket.on('relay_thought', ({ conversationId, messageId, reasoningId, text, done, subagentRunId }) => {
-    if (!messageId) return;
-    const key = String(reasoningId || 'reasoning');
-    const thoughtMap = relayThoughts.get(messageId) || new Map();
-    thoughtMap.set(key, { reasoningId: key, text: String(text || ''), done: !!done, subagentRunId: subagentRunId || null });
-    relayThoughts.set(messageId, thoughtMap);
-    if (subagentRunId) {
-      upsertSubagentRun({ subagentRunId, messageId, conversationId });
-      addSubagentThought(subagentRunId, { reasoningId: key, text: String(text || ''), done: !!done });
-    }
-    if (conversationId === currentConvId) {
-      const autoScroll = isMessagesNearBottom();
-      appendThinkingThought(key, String(text || ''), !!done, subagentRunId, autoScroll);
-    }
-  });
-  socket.on('subagent_status', ({ conversationId, messageId, subagentRunId, parentSubagentId, displayName, status, timestamp }) => {
-    if (!messageId || !subagentRunId) return;
-    upsertSubagentRun({
-      subagentRunId,
-      messageId,
-      conversationId,
-      parentSubagentId,
-      displayName,
-      status,
-      timestamp,
-    });
-    clearSubagentCancelInFlight(subagentRunId);
-    if (conversationId === currentConvId) {
-      updateSubagentBubbleFromStatus(subagentRunId, status);
-    }
-  });
-  socket.on('conversation_compacted', async ({ sourceConversationId, targetConversationId }) => {
-    if (!sourceConversationId || !targetConversationId) return;
-    await refreshConversations();
-    if (currentConvId === sourceConversationId) {
-      await openConversation(targetConversationId);
-    } else {
-      updateCompactButton();
-    }
-  });
-  socket.on('conversation_title_updated', ({ conversationId, title, updatedAt }) => {
-    applyConversationTitleUpdate(conversationId, title, updatedAt);
-    syncChatTitleControls();
-  });
-  socket.on('conversation_preferences_updated', ({ conversationId, preferredRelayMode, preferredModelsByMode, senderClientId }) => {
-    if (senderClientId && senderClientId === CLIENT_ID) return;
-    const id = String(conversationId || '').trim();
-    if (!id || !conversations[id]) return;
-    conversations[id] = {
-      ...conversations[id],
-      preferredRelayMode: preferredRelayMode || conversations[id].preferredRelayMode || FALLBACK_MODE,
-      preferredModelsByMode: preferredModelsByMode || conversations[id].preferredModelsByMode || {},
-    };
-    if (String(currentConvId || '').trim() === id) {
-      applyConversationPreferencesForConversation(id, {
-        preferredRelayMode,
-        preferredModelsByMode,
-      });
-    }
-  });
-  socket.on('conversation_draft_updated', (payload = {}) => {
-    applyIncomingConversationDraftUpdate(payload || {});
-  });
-  socket.on('conversation_session_bound', async ({ conversationId, sdkSessionId, runtimeSessionId }) => {
-    const id = String(conversationId || '').trim();
-    if (!id) return;
-    if (conversations[id]) {
-      conversations[id] = {
-        ...conversations[id],
-        sdkSessionId: String(sdkSessionId || conversations[id].sdkSessionId || '').trim() || null,
-        runtimeSessionId: String(runtimeSessionId || conversations[id].runtimeSessionId || '').trim() || null,
-      };
-    }
-    await refreshConversations();
-    if (currentConvId === id) {
-      await openConversation(id);
-    }
-  });
-  socket.on('message_status', ({ messageId, conversationId, status }) => {
-    const normalizedStatus = String(status || '').trim().toLowerCase();
-    const clearsProcessingStatus = ['done', 'failed', 'dropped', 'pending', 'parked', 'cancelled'].includes(normalizedStatus);
-    applyConversationTurnStatus({ conversationId, messageId, status });
-    if (conversationId && conversations[conversationId]) {
-      const conversation = conversations[conversationId];
-      if (normalizedStatus === 'processing') {
-        conversation.localTurnStatus = 'processing';
-        conversation.localTurnStatusUpdatedAt = Date.now();
-        conversation.localTurnMessageId = String(messageId || '').trim() || null;
-      } else if (clearsProcessingStatus) {
-        const trackedMessageId = String(conversation.localTurnMessageId || '').trim();
-        const incomingMessageId = String(messageId || '').trim();
-        if (!trackedMessageId || !incomingMessageId || trackedMessageId === incomingMessageId) {
-          delete conversation.localTurnStatus;
-          delete conversation.localTurnStatusUpdatedAt;
-          delete conversation.localTurnMessageId;
-        }
-      }
-    }
-    if (conversationId === currentConvId && normalizedStatus === 'processing') {
-      const autoScroll = isMessagesNearBottom();
-      showThinking(messageId || null, autoScroll);
-      renderThinkingActivities();
-      if (messageId) removeUserBubbleCancelButton(messageId);
-    }
-    if (clearsProcessingStatus) {
-      clearPendingUserMessage(messageId);
-      if (messageId) clearRelayStreamStateForMessage(messageId);
-      if (messageId) clearBubbleCancelState(messageId);
-      if (messageId) removeUserBubbleCancelButton(messageId);
-    }
-    if (conversationId === currentConvId && clearsProcessingStatus) {
-      removeThinking();
-      void refreshCurrentView().catch(() => {});
-      scheduleContextUsageRefresh(conversationId, 220);
-      refreshSessionWorkerStatus().catch(() => {});
-    }
-    renderConvList();
-  });
-  socket.on('conversation_deleted', ({ conversationId }) => {
-    delete conversations[conversationId];
-    for (const [id, question] of relayQuestions.entries()) {
-      if (question?.conversationId === conversationId) relayQuestions.delete(id);
-    }
-    for (const [id, board] of relayBoards.entries()) {
-      if (board?.conversationId === conversationId) relayBoards.delete(id);
-    }
-    for (const id of relayQuestionDrafts.keys()) {
-      const q = relayQuestionDrafts.get(id);
-      if (!q || q.conversationId === conversationId) relayQuestionDrafts.delete(id);
-    }
-    updatePendingQuestionBanner();
-    renderRelayBoards();
-    renderConvList();
-    if (currentConvId === conversationId) {
-      setCurrentConv(null);
-      renderMessages([]);
-      document.getElementById('chat-title').textContent = 'Select or start a conversation';
-      syncChatTitleControls();
-      updateSessionPill(null, null);
-      updateCompactButton();
-      scheduleContextUsageRefresh(null);
-    } else {
-      updateCompactButton();
-    }
-  });
-}
+initCwdPicker({
+  applyConversationWorkspaceRootUpdate,
+  refreshSessionWorkerStatus,
+});
 
-const THEME_STORAGE_KEY = 'copilot_theme';
-
-function normalizePwaAppName(rawValue, { allowEmpty = true } = {}) {
-  const normalized = String(rawValue || '').replace(/\s+/g, ' ').trim();
-  if (!normalized) {
-    return allowEmpty
-      ? { value: '', error: null }
-      : { value: '', error: 'App name cannot be empty.' };
-  }
-  if (normalized.length > PWA_APP_NAME_MAX_LENGTH) {
-    return { value: '', error: `App name must be ${PWA_APP_NAME_MAX_LENGTH} characters or fewer.` };
-  }
-  return { value: normalized, error: null };
-}
-
-function derivePwaShortName(name) {
-  const text = String(name || '').trim();
-  if (!text) return 'Copilot';
-  const firstWord = text.split(/\s+/)[0] || text;
-  if (firstWord.length <= 12) return firstWord;
-  return text.slice(0, 12).trim() || 'Copilot';
-}
-
-function resolveManifestUrlValue(rawValue, baseHref) {
-  const value = String(rawValue || '').trim();
-  if (!value || value.startsWith('data:') || value.startsWith('blob:')) return value;
-  try {
-    return new URL(value, baseHref).href;
-  } catch {
-    return value;
-  }
-}
-
-function normalizeManifestForBlob(manifest, defaultHref) {
-  const baseHref = new URL(String(defaultHref || '').trim(), window.location.href).href;
-  const next = { ...(manifest || {}) };
-  next.id = resolveManifestUrlValue(next.id, baseHref);
-  next.start_url = resolveManifestUrlValue(next.start_url, baseHref);
-  next.scope = resolveManifestUrlValue(next.scope, baseHref);
-  if (Array.isArray(next.icons)) {
-    next.icons = next.icons.map((icon) => {
-      if (!icon || typeof icon !== 'object') return icon;
-      const source = resolveManifestUrlValue(icon.src, baseHref);
-      return { ...icon, src: source };
-    });
-  }
-  return next;
-}
-
-function readStoredPwaAppName() {
-  const { value } = normalizePwaAppName(localStorage.getItem(PWA_APP_NAME_STORAGE_KEY), { allowEmpty: true });
-  return value;
-}
-
-function syncPwaAppNameInput() {
-  const input = document.getElementById('pwa-app-name-input');
-  if (!input) return;
-  input.value = readStoredPwaAppName();
-}
-
-async function loadManifestTemplate(defaultHref) {
-  if (manifestTemplateCache) return { ...manifestTemplateCache };
-  const fallback = {
-    name: PWA_APP_NAME_DEFAULT,
-    short_name: derivePwaShortName(PWA_APP_NAME_DEFAULT),
-    description: 'Installable Copilot Remote web app with standalone launcher support.',
-    id: './__copilot_remote_pwa__',
-    start_url: './',
-    scope: './',
-    display_override: ['standalone'],
-    display: 'standalone',
-    background_color: '#161b22',
-    theme_color: '#161b22',
-    icons: [
-      { src: 'app-icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any' },
-      { src: 'app-icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
-      { src: 'app-icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
-    ],
-  };
-  try {
-    const response = await fetch(defaultHref, { cache: 'no-store' });
-    const manifest = response.ok ? await response.json() : null;
-    if (manifest && typeof manifest === 'object' && !Array.isArray(manifest)) {
-      manifestTemplateCache = manifest;
-      return { ...manifestTemplateCache };
-    }
-  } catch (error) {
-    console.warn('Failed to load manifest template; using fallback.', error);
-  }
-  manifestTemplateCache = fallback;
-  return { ...manifestTemplateCache };
-}
-
-async function applyPwaManifestFromSettings() {
-  const manifestLink = document.querySelector('link[rel="manifest"]');
-  if (!manifestLink) return;
-
-  const defaultHref = String(manifestLink.dataset.defaultHref || manifestLink.getAttribute('href') || '').trim();
-  if (!defaultHref) return;
-  if (!manifestLink.dataset.defaultHref) manifestLink.dataset.defaultHref = defaultHref;
-
-  const customName = readStoredPwaAppName();
-  if (!customName) {
-    if (customManifestUrl) {
-      URL.revokeObjectURL(customManifestUrl);
-      customManifestUrl = null;
-    }
-    manifestLink.setAttribute('href', defaultHref);
-    return;
-  }
-
-  const baseManifest = await loadManifestTemplate(defaultHref);
-  const nextManifest = {
-    ...baseManifest,
-    name: customName,
-    short_name: derivePwaShortName(customName),
-  };
-  const normalizedManifest = normalizeManifestForBlob(nextManifest, defaultHref);
-  const manifestBlob = new Blob([JSON.stringify(normalizedManifest, null, 2)], { type: 'application/manifest+json' });
-  const objectUrl = URL.createObjectURL(manifestBlob);
-  if (customManifestUrl) URL.revokeObjectURL(customManifestUrl);
-  customManifestUrl = objectUrl;
-  manifestLink.setAttribute('href', objectUrl);
-}
-
-function updatePwaAppName(rawValue) {
-  const normalized = normalizePwaAppName(rawValue, { allowEmpty: true });
-  if (normalized.error) {
-    alert(normalized.error);
-    syncPwaAppNameInput();
-    return;
-  }
-  if (normalized.value) {
-    localStorage.setItem(PWA_APP_NAME_STORAGE_KEY, normalized.value);
-  } else {
-    localStorage.removeItem(PWA_APP_NAME_STORAGE_KEY);
-  }
-  applyPwaManifestFromSettings()
-    .then(() => {
-      syncPwaAppNameInput();
-      showTransientRelayNotice(normalized.value
-        ? `Install app name updated to "${normalized.value}".`
-        : 'Install app name reset to default.');
-    })
-    .catch((error) => {
-      alert(error?.message || 'Failed to apply install app name');
-      syncPwaAppNameInput();
-    });
-}
-
-function initTheme() {
-  const saved = localStorage.getItem(THEME_STORAGE_KEY);
-  if (saved === 'light') {
-    document.documentElement.setAttribute('data-theme', 'light');
-  } else {
-    document.documentElement.removeAttribute('data-theme');
-  }
-}
-
-function clampFontScale(value) {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) return FONT_SCALE_DEFAULT;
-  return Math.min(FONT_SCALE_MAX, Math.max(FONT_SCALE_MIN, numeric));
-}
-
-function readStoredFontScale() {
-  return clampFontScale(localStorage.getItem(FONT_SCALE_STORAGE_KEY));
-}
-
-function normalizeFontScaleSelectValue(raw = '') {
-  const text = String(raw || '').trim();
-  if (!text) return null;
-  const numeric = Number(text);
-  if (!Number.isFinite(numeric)) return null;
-  if (numeric > 3) return clampFontScale(numeric / 100);
-  return clampFontScale(numeric);
-}
-
-function getMessageViewportAnchor() {
-  const container = document.getElementById('messages');
-  if (!container) return null;
-  const containerRect = container.getBoundingClientRect();
-  const messages = Array.from(container.querySelectorAll('.msg[data-message-id]'));
-  for (const message of messages) {
-    const rect = message.getBoundingClientRect();
-    if (rect.bottom <= containerRect.top || rect.top >= containerRect.bottom) continue;
-    const messageId = String(message.dataset.messageId || '').trim();
-    if (!messageId) continue;
-    return {
-      messageId,
-      offsetTop: rect.top - containerRect.top,
-    };
-  }
-  return null;
-}
-
-function restoreMessageViewportAnchor(anchor) {
-  if (!anchor?.messageId) return;
-  const container = document.getElementById('messages');
-  if (!container) return;
-  const messageId = String(anchor.messageId || '').trim();
-  if (!messageId) return;
-  const message = Array.from(container.querySelectorAll('.msg[data-message-id]'))
-    .find((node) => String(node?.dataset?.messageId || '').trim() === messageId);
-  if (!message) return;
-  const containerRect = container.getBoundingClientRect();
-  const rect = message.getBoundingClientRect();
-  const delta = rect.top - containerRect.top - Number(anchor.offsetTop || 0);
-  if (Math.abs(delta) > 0.5) {
-    container.scrollTop += delta;
-  }
-}
-
-function syncFontScaleSelect() {
-  const select = document.getElementById('font-scale-select');
-  if (!select) return;
-  const currentPercent = Math.round(clampFontScale(fontScaleValue) * 100);
-  const candidate = String(currentPercent);
-  if (Array.from(select.options).some((option) => option.value === candidate)) {
-    select.value = candidate;
-    return;
-  }
-  const dynamicValue = String(currentPercent);
-  const dynamicLabel = `${currentPercent}%`;
-  let dynamicOption = select.querySelector('option[data-dynamic-font-scale="1"]');
-  if (!dynamicOption) {
-    dynamicOption = document.createElement('option');
-    dynamicOption.setAttribute('data-dynamic-font-scale', '1');
-    select.appendChild(dynamicOption);
-  }
-  dynamicOption.value = dynamicValue;
-  dynamicOption.textContent = dynamicLabel;
-  select.value = dynamicValue;
-}
-
-function setFontScale(nextScale, { persist = true, preserveMessageAnchor = true } = {}) {
-  const normalized = clampFontScale(nextScale);
-  if (Math.abs(normalized - fontScaleValue) <= 0.0001) {
-    if (persist) localStorage.setItem(FONT_SCALE_STORAGE_KEY, String(normalized));
-    syncFontScaleSelect();
-    return normalized;
-  }
-  const anchor = preserveMessageAnchor ? getMessageViewportAnchor() : null;
-  fontScaleValue = normalized;
-  document.documentElement.style.setProperty('--font-scale', normalized.toFixed(4));
-  document.documentElement.style.setProperty('--font-scale-percent', `${Math.round(normalized * 100)}%`);
-  if (persist) localStorage.setItem(FONT_SCALE_STORAGE_KEY, String(normalized));
-  syncFontScaleSelect();
-  if (anchor) {
-    requestAnimationFrame(() => {
-      restoreMessageViewportAnchor(anchor);
-    });
-  }
-  return normalized;
-}
-
-function showFontScaleIndicator(scaleValue) {
-  const indicator = document.getElementById('font-scale-indicator');
-  if (!indicator) return;
-  const normalized = clampFontScale(scaleValue);
-  indicator.textContent = `${Math.round(normalized * 100)}%`;
-  indicator.hidden = false;
-  indicator.classList.add('visible');
-  if (fontScaleIndicatorTimer) clearTimeout(fontScaleIndicatorTimer);
-  fontScaleIndicatorTimer = setTimeout(() => {
-    indicator.classList.remove('visible');
-    window.setTimeout(() => {
-      if (!indicator.classList.contains('visible')) indicator.hidden = true;
-    }, 180);
-    fontScaleIndicatorTimer = null;
-  }, FONT_SCALE_PILL_VISIBLE_MS);
-}
-
-function isImageZoomGestureTarget(target) {
-  if (!(target instanceof Element)) return false;
-  return !!target.closest('#file-preview-body.image-zoom-mode');
-}
-
-function pinchDistance(touchA, touchB) {
-  return Math.hypot(touchA.clientX - touchB.clientX, touchA.clientY - touchB.clientY);
-}
-
-function normalizeWheelDeltaPixels(event) {
-  const deltaY = Number(event?.deltaY);
-  if (!Number.isFinite(deltaY) || deltaY === 0) return 0;
-  const deltaMode = Number(event?.deltaMode || 0);
-  if (deltaMode === 1) return deltaY * 16; // lines -> approx pixels
-  if (deltaMode === 2) return deltaY * (window.innerHeight || 800); // pages -> pixels
-  return deltaY; // already pixels
-}
-
-function onGlobalFontScaleWheel(event) {
-  if (!(event.ctrlKey || event.metaKey)) return;
-  if (isImageZoomGestureTarget(event.target)) return;
-  event.preventDefault();
-  const deltaPixels = normalizeWheelDeltaPixels(event);
-  if (!Number.isFinite(deltaPixels) || deltaPixels === 0) return;
-  const direction = deltaPixels < 0 ? 1 : -1;
-  // Slow wheel gestures move by 1%, while faster spins accelerate.
-  const magnitude = Math.min(
-    FONT_SCALE_WHEEL_STEP_MAX,
-    Math.max(FONT_SCALE_WHEEL_STEP_MIN, Math.abs(deltaPixels) / 10_000),
-  );
-  const nextScale = setFontScale(fontScaleValue + (direction * magnitude), { persist: true, preserveMessageAnchor: true });
-  showFontScaleIndicator(nextScale);
-}
-
-function onGlobalFontScaleTouchStart(event) {
-  if (event.touches.length !== 2) return;
-  if (isImageZoomGestureTarget(event.target)) {
-    fontScalePinchState.active = false;
-    return;
-  }
-  const t0 = event.touches[0];
-  const t1 = event.touches[1];
-  fontScalePinchState = {
-    active: true,
-    startDistance: pinchDistance(t0, t1),
-    startScale: fontScaleValue,
-  };
-  event.preventDefault();
-}
-
-function onGlobalFontScaleTouchMove(event) {
-  if (!fontScalePinchState.active) return;
-  if (event.touches.length !== 2) {
-    fontScalePinchState.active = false;
-    return;
-  }
-  if (isImageZoomGestureTarget(event.target)) {
-    fontScalePinchState.active = false;
-    return;
-  }
-  event.preventDefault();
-  const t0 = event.touches[0];
-  const t1 = event.touches[1];
-  const distance = pinchDistance(t0, t1);
-  if (!fontScalePinchState.startDistance || !Number.isFinite(distance) || distance <= 0) return;
-  const ratio = distance / fontScalePinchState.startDistance;
-  const nextScale = fontScalePinchState.startScale * ratio;
-  const appliedScale = setFontScale(nextScale, { persist: true, preserveMessageAnchor: true });
-  showFontScaleIndicator(appliedScale);
-}
-
-function onGlobalFontScaleTouchEnd(event) {
-  if (event.touches.length < 2) {
-    fontScalePinchState.active = false;
-  }
-}
-
-function populateFontScaleSelect() {
-  const select = document.getElementById('font-scale-select');
-  if (!select || select.dataset.populated === '1') return;
-  select.dataset.populated = '1';
-  for (let value = 50; value <= 150; value += 10) {
-    const option = document.createElement('option');
-    option.value = String(value);
-    option.textContent = `${value}%`;
-    select.appendChild(option);
-  }
-}
-
-function initFontScaling() {
-  populateFontScaleSelect();
-  const inlineScale = Number(document.documentElement.style.getPropertyValue('--font-scale'));
-  const initialScale = Number.isFinite(inlineScale) ? clampFontScale(inlineScale) : readStoredFontScale();
-  setFontScale(initialScale, { persist: false, preserveMessageAnchor: false });
-  if (!window.__fontScaleGestureHandlersBound) {
-    window.__fontScaleGestureHandlersBound = true;
-    window.addEventListener('wheel', onGlobalFontScaleWheel, { passive: false, capture: true });
-    window.addEventListener('touchstart', onGlobalFontScaleTouchStart, { passive: false, capture: true });
-    window.addEventListener('touchmove', onGlobalFontScaleTouchMove, { passive: false, capture: true });
-    window.addEventListener('touchend', onGlobalFontScaleTouchEnd, { passive: true, capture: true });
-    window.addEventListener('touchcancel', onGlobalFontScaleTouchEnd, { passive: true, capture: true });
-  }
-}
-
-function updateFontScaleFromSelect(rawValue) {
-  const next = normalizeFontScaleSelectValue(rawValue);
-  if (next == null) {
-    syncFontScaleSelect();
-    return;
-  }
-  setFontScale(next, { persist: true, preserveMessageAnchor: true });
-}
-
-function updateTheme(theme) {
-  if (theme === 'light') {
-    document.documentElement.setAttribute('data-theme', 'light');
-    localStorage.setItem(THEME_STORAGE_KEY, 'light');
-  } else {
-    document.documentElement.removeAttribute('data-theme');
-    localStorage.setItem(THEME_STORAGE_KEY, 'dark');
-  }
-}
-
-function updateShowSuspendHostSetting(next) {
-  setShowSuspendHostSetting(next, { persist: true });
-  syncSuspendHostVisibility();
-}
-
-function openSettingsModal() {
-  closeChatActionsMenu();
-  const modal = document.getElementById('settings-modal');
-  const themeSelect = document.getElementById('theme-select');
-  if (themeSelect) {
-    themeSelect.value = localStorage.getItem(THEME_STORAGE_KEY) === 'light' ? 'light' : 'dark';
-  }
-  syncSuspendHostVisibility();
-  syncFontScaleSelect();
-  syncPwaAppNameInput();
-  syncDefaultSessionWorkspaceRootInput();
-  modal?.classList.add('visible');
-  modal?.setAttribute('aria-hidden', 'false');
-}
-
-function closeSettingsModal() {
-  const modal = document.getElementById('settings-modal');
-  modal?.classList.remove('visible');
-  modal?.setAttribute('aria-hidden', 'true');
-}
-
-window.updateTheme = updateTheme;
-window.updateFontScaleFromSelect = updateFontScaleFromSelect;
-window.updatePwaAppName = updatePwaAppName;
-window.updateDefaultSessionWorkspaceRootSetting = updateDefaultSessionWorkspaceRootSetting;
-window.updateShowSuspendHostSetting = updateShowSuspendHostSetting;
-window.openSettingsModal = openSettingsModal;
-window.closeSettingsModal = closeSettingsModal;
+initActionConfirmations({
+  lockChatActionsMenuShield,
+  closeChatActionsMenu,
+  syncQueueStatusMenuEntry,
+  refreshSessionWorkerStatus,
+  exposeOnWindow: false,
+});
 
 function showAuthGate() {
   document.getElementById('auth-gate').style.display = 'flex';
@@ -3196,13 +1569,6 @@ async function doAuth() {
   }
 }
 
-function registerPwaShell() {
-  if (!('serviceWorker' in navigator)) return;
-  const scopeBase = BASE;
-  const scopeRoot = `${scopeBase}/`;
-  const pwaVersion = String(window.__COPILOT_PWA_VERSION || '0').trim() || '0';
-  return navigator.serviceWorker.register(`${scopeBase}/sw.js?v=${encodeURIComponent(pwaVersion)}`, { scope: scopeRoot, updateViaCache: 'none' }).catch(() => {});
-}
 
 async function bootstrap() {
   if (ensureTrailingSlashPath()) return;
@@ -3227,6 +1593,13 @@ async function bootstrap() {
   showAuthGate();
 }
 
+window.updateTheme = updateTheme;
+window.updateFontScaleFromSelect = updateFontScaleFromSelect;
+window.updatePwaAppName = updatePwaAppName;
+window.updateDefaultSessionWorkspaceRootSetting = updateDefaultSessionWorkspaceRootSetting;
+window.updateShowSuspendHostSetting = updateShowSuspendHostSetting;
+window.openSettingsModal = openSettingsModal;
+window.closeSettingsModal = closeSettingsModal;
 window.doAuth = doAuth;
 window.initApp = initApp;
 window.connectSocket = connectSocket;

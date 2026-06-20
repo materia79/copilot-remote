@@ -1,0 +1,395 @@
+import {
+  BASE,
+  TOKEN,
+  CLIENT_ID,
+  currentConvId,
+  conversations,
+  seenMessageIds,
+  pendingUserMessageIds,
+  relayActivities,
+  relayThoughts,
+  relayQuestions,
+  relayBoards,
+  relayQuestionDrafts,
+  repoBrowserState,
+  setRelayOnline,
+  setCliOnline,
+  setCurrentConv,
+  updateWorkspaceRootHints,
+  updateCompactButton,
+  updateSessionPill,
+  clearPendingUserMessage,
+  hasPendingUserMessageDuplicate,
+  isMessagesNearBottom,
+  upsertSubagentRun,
+  addSubagentActivity,
+  addSubagentThought,
+  clearSubagentCancelInFlight,
+} from './store.js';
+import { scheduleContextUsageRefresh } from './api-client.js';
+import { renderConvList, refreshConversations, openConversation } from './journal-view.js';
+import {
+  upsertRelayQuestion,
+  loadRelayQuestions,
+  updatePendingQuestionBanner,
+} from './ask-user-view.js';
+import { upsertRelayBoard, loadRelayBoards, renderRelayBoards } from './relay-board-view.js';
+import {
+  showThinking,
+  removeThinking,
+  renderThinkingActivities,
+  appendThinkingActivity,
+  appendThinkingThought,
+  applyRelayStreamEvent,
+  clearRelayStreamStateForMessage,
+  applyConversationTurnStatus,
+  renderMessages,
+  appendMessage,
+  applyIncomingConversationDraftUpdate,
+  getRenderedConversationMessageFingerprints,
+  clearBubbleCancelState,
+  removeUserBubbleCancelButton,
+  updateSubagentBubbleFromStatus,
+} from './conversation-view.js';
+import { loadRepoBrowserTree } from './attachments-view.js';
+import { clearMessageSearchRuntimeState } from './message-search-view.js';
+import { stripRelayPromptContext } from './relay-prompt-sanitizer.mjs';
+import { isLikelyLiveDuplicateMessage } from './live-message-dedupe.mjs';
+
+const FALLBACK_MODE = 'agent';
+
+/** @type {import('socket.io-client').Socket | null} */
+let socket = null;
+
+/** @type {SocketHandlerDeps | null} */
+let deps = null;
+
+/**
+ * @typedef {Object} SocketHandlerDeps
+ * @property {() => (void | Promise<void>)} refreshCurrentView
+ * @property {() => (void | Promise<void>)} refreshSessionWorkerStatus
+ * @property {(force?: boolean) => (void | Promise<void>)} refreshModelCatalog
+ * @property {(payload?: object) => void} updateModelCatalogState
+ * @property {(payload?: object) => void} applyConversationWorkspaceRootUpdate
+ * @property {(conversationId: string, title: string, updatedAt?: string | number | null) => void} applyConversationTitleUpdate
+ * @property {() => void} syncChatTitleControls
+ * @property {(conversationId: string, payload?: object) => void} applyConversationPreferencesForConversation
+ */
+
+/**
+ * Register bootstrap-local callbacks required by socket event handlers.
+ * @param {SocketHandlerDeps} nextDeps
+ */
+export function initSocketHandlers(nextDeps) {
+  deps = nextDeps;
+}
+
+export function getSocket() {
+  return socket;
+}
+
+function requireDeps() {
+  if (!deps) {
+    throw new Error('socket-handlers: call initSocketHandlers() before connectSocket()');
+  }
+  return deps;
+}
+
+export async function connectSocket(overrideDeps) {
+  if (overrideDeps) {
+    deps = overrideDeps;
+  }
+  const {
+    refreshCurrentView,
+    refreshSessionWorkerStatus,
+    refreshModelCatalog,
+    updateModelCatalogState,
+    applyConversationWorkspaceRootUpdate,
+    applyConversationTitleUpdate,
+    syncChatTitleControls,
+    applyConversationPreferencesForConversation,
+  } = requireDeps();
+
+  socket = io({ path: `${BASE}/socket.io/`, auth: TOKEN ? { token: TOKEN, clientId: CLIENT_ID } : { clientId: CLIENT_ID } });
+
+  socket.on('connect', () => {
+    console.log('Socket connected');
+    clearMessageSearchRuntimeState();
+    setRelayOnline(true);
+    setCliOnline(true);
+    renderConvList();
+    refreshCurrentView().catch(() => {});
+    refreshSessionWorkerStatus().catch(() => {});
+    refreshModelCatalog().catch(() => {});
+  });
+  socket.on('connect_error', (e) => {
+    setRelayOnline(false);
+    console.error('Socket error:', e.message);
+  });
+  socket.on('disconnect', () => {
+    setRelayOnline(false);
+  });
+  socket.on('cli_status', ({ online }) => {
+    setCliOnline(online);
+    renderConvList();
+    if (online) refreshCurrentView().catch(() => {});
+    refreshSessionWorkerStatus().catch(() => {});
+    if (online) refreshModelCatalog().catch(() => {});
+  });
+  socket.on('models_updated', (payload) => {
+    updateModelCatalogState(payload || {});
+  });
+  socket.on('workspace_root_changed', (payload) => {
+    updateWorkspaceRootHints(payload || {});
+    if (repoBrowserState.activeRoot !== 'workspace') return;
+    repoBrowserState.currentPath = '';
+    if (repoBrowserState.open) {
+      void loadRepoBrowserTree();
+    }
+  });
+  socket.on('conversation_workspace_root_updated', (payload) => {
+    updateWorkspaceRootHints(payload || {});
+    applyConversationWorkspaceRootUpdate(payload || {});
+  });
+  socket.on('user_message', ({ conversationId, messageId, senderClientId, message }) => {
+    const normalizedMessage = {
+      ...(message && typeof message === 'object' ? message : {}),
+      text: stripRelayPromptContext(message?.text, message?.mode),
+    };
+    if (senderClientId && senderClientId === CLIENT_ID) {
+      pendingUserMessageIds.delete(messageId);
+      return;
+    }
+    if (messageId && (pendingUserMessageIds.has(messageId) || seenMessageIds?.has(messageId))) {
+      pendingUserMessageIds.delete(messageId);
+      return;
+    }
+    if (conversationId === currentConvId) {
+      const renderedMessages = getRenderedConversationMessageFingerprints(24);
+      const hasPendingTextMatch = hasPendingUserMessageDuplicate(conversationId, normalizedMessage.text);
+      if (isLikelyLiveDuplicateMessage({
+        incomingMessageId: messageId,
+        incomingMessage: normalizedMessage,
+        existingMessages: renderedMessages,
+        hasPendingTextMatch,
+      })) {
+        return;
+      }
+      appendMessage(normalizedMessage, true, messageId);
+    }
+  });
+  socket.on('assistant_message', ({ conversationId, message, messageId, sourceMessageId }) => {
+    const isCurrentConversation = conversationId === currentConvId;
+    const autoScroll = isCurrentConversation ? isMessagesNearBottom() : false;
+    removeThinking();
+    if ((!message?.activities || !message.activities.length) && sourceMessageId) {
+      const cached = relayActivities.get(sourceMessageId) || [];
+      if (cached.length) message.activities = cached.slice(0, 48);
+    }
+    if ((!message?.thoughts || !message.thoughts.length) && sourceMessageId) {
+      const cachedThoughts = relayThoughts.get(sourceMessageId);
+      if (cachedThoughts && cachedThoughts.size) {
+        message.thoughts = Array.from(cachedThoughts.values());
+      }
+    }
+    if (messageId && seenMessageIds?.has(messageId)) return;
+    if (isCurrentConversation) {
+      appendMessage(message, autoScroll, messageId || null, false, sourceMessageId || null);
+      scheduleContextUsageRefresh(conversationId, 120);
+    }
+    if (sourceMessageId) relayActivities.delete(sourceMessageId);
+    if (sourceMessageId) relayThoughts.delete(sourceMessageId);
+    if (sourceMessageId) clearRelayStreamStateForMessage(sourceMessageId);
+    refreshSessionWorkerStatus().catch(() => {});
+  });
+  socket.on('relay_question', ({ question }) => upsertRelayQuestion(question));
+  socket.on('relay_question_updated', ({ question }) => upsertRelayQuestion(question));
+  socket.on('relay_question_changed', () => {
+    loadRelayQuestions(currentConvId);
+  });
+  socket.on('relay_board', ({ board }) => upsertRelayBoard(board));
+  socket.on('relay_board_updated', ({ board }) => upsertRelayBoard(board));
+  socket.on('relay_board_changed', () => {
+    loadRelayBoards();
+  });
+  socket.on('relay_activity', ({ conversationId, messageId, text, subagentRunId }) => {
+    if (!messageId || !text) return;
+    const entry = {
+      text: String(text || '').trim(),
+      subagentRunId: subagentRunId ? String(subagentRunId).trim() : null,
+    };
+    if (!entry.text) return;
+    const items = relayActivities.get(messageId) || [];
+    const last = items[items.length - 1];
+    const lastText = typeof last === 'string' ? last : String(last?.text || '');
+    const lastSubagentRunId = typeof last === 'object' && last ? (last.subagentRunId || null) : null;
+    if (lastText !== entry.text || lastSubagentRunId !== entry.subagentRunId) {
+      relayActivities.set(messageId, items.concat(entry).slice(-24));
+    }
+    if (entry.subagentRunId) {
+      upsertSubagentRun({ subagentRunId: entry.subagentRunId, messageId, conversationId });
+      addSubagentActivity(entry.subagentRunId, entry.text);
+    }
+    if (conversationId === currentConvId) {
+      const autoScroll = isMessagesNearBottom();
+      appendThinkingActivity(entry.text, entry.subagentRunId, autoScroll);
+    }
+  });
+  socket.on('relay_stream', ({ conversationId, messageId, text, done, seq }) => {
+    if (!messageId) return;
+    if (conversationId !== currentConvId) return;
+    const autoScroll = isMessagesNearBottom();
+    applyRelayStreamEvent({
+      messageId,
+      text: String(text || ''),
+      done: !!done,
+      seq,
+      autoScroll,
+    });
+  });
+  socket.on('relay_thought', ({ conversationId, messageId, reasoningId, text, done, subagentRunId }) => {
+    if (!messageId) return;
+    const key = String(reasoningId || 'reasoning');
+    const thoughtMap = relayThoughts.get(messageId) || new Map();
+    thoughtMap.set(key, { reasoningId: key, text: String(text || ''), done: !!done, subagentRunId: subagentRunId || null });
+    relayThoughts.set(messageId, thoughtMap);
+    if (subagentRunId) {
+      upsertSubagentRun({ subagentRunId, messageId, conversationId });
+      addSubagentThought(subagentRunId, { reasoningId: key, text: String(text || ''), done: !!done });
+    }
+    if (conversationId === currentConvId) {
+      const autoScroll = isMessagesNearBottom();
+      appendThinkingThought(key, String(text || ''), !!done, subagentRunId, autoScroll);
+    }
+  });
+  socket.on('subagent_status', ({ conversationId, messageId, subagentRunId, parentSubagentId, displayName, status, timestamp }) => {
+    if (!messageId || !subagentRunId) return;
+    upsertSubagentRun({
+      subagentRunId,
+      messageId,
+      conversationId,
+      parentSubagentId,
+      displayName,
+      status,
+      timestamp,
+    });
+    clearSubagentCancelInFlight(subagentRunId);
+    if (conversationId === currentConvId) {
+      updateSubagentBubbleFromStatus(subagentRunId, status);
+    }
+  });
+  socket.on('conversation_compacted', async ({ sourceConversationId, targetConversationId }) => {
+    if (!sourceConversationId || !targetConversationId) return;
+    await refreshConversations();
+    if (currentConvId === sourceConversationId) {
+      await openConversation(targetConversationId);
+    } else {
+      updateCompactButton();
+    }
+  });
+  socket.on('conversation_title_updated', ({ conversationId, title, updatedAt }) => {
+    applyConversationTitleUpdate(conversationId, title, updatedAt);
+    syncChatTitleControls();
+  });
+  socket.on('conversation_preferences_updated', ({ conversationId, preferredRelayMode, preferredModelsByMode, senderClientId }) => {
+    if (senderClientId && senderClientId === CLIENT_ID) return;
+    const id = String(conversationId || '').trim();
+    if (!id || !conversations[id]) return;
+    conversations[id] = {
+      ...conversations[id],
+      preferredRelayMode: preferredRelayMode || conversations[id].preferredRelayMode || FALLBACK_MODE,
+      preferredModelsByMode: preferredModelsByMode || conversations[id].preferredModelsByMode || {},
+    };
+    if (String(currentConvId || '').trim() === id) {
+      applyConversationPreferencesForConversation(id, {
+        preferredRelayMode,
+        preferredModelsByMode,
+      });
+    }
+  });
+  socket.on('conversation_draft_updated', (payload = {}) => {
+    applyIncomingConversationDraftUpdate(payload || {});
+  });
+  socket.on('conversation_session_bound', async ({ conversationId, sdkSessionId, runtimeSessionId }) => {
+    const id = String(conversationId || '').trim();
+    if (!id) return;
+    if (conversations[id]) {
+      conversations[id] = {
+        ...conversations[id],
+        sdkSessionId: String(sdkSessionId || conversations[id].sdkSessionId || '').trim() || null,
+        runtimeSessionId: String(runtimeSessionId || conversations[id].runtimeSessionId || '').trim() || null,
+      };
+    }
+    await refreshConversations();
+    if (currentConvId === id) {
+      await openConversation(id);
+    }
+  });
+  socket.on('message_status', ({ messageId, conversationId, status }) => {
+    const normalizedStatus = String(status || '').trim().toLowerCase();
+    const clearsProcessingStatus = ['done', 'failed', 'dropped', 'pending', 'parked', 'cancelled'].includes(normalizedStatus);
+    applyConversationTurnStatus({ conversationId, messageId, status });
+    if (conversationId && conversations[conversationId]) {
+      const conversation = conversations[conversationId];
+      if (normalizedStatus === 'processing') {
+        conversation.localTurnStatus = 'processing';
+        conversation.localTurnStatusUpdatedAt = Date.now();
+        conversation.localTurnMessageId = String(messageId || '').trim() || null;
+      } else if (clearsProcessingStatus) {
+        const trackedMessageId = String(conversation.localTurnMessageId || '').trim();
+        const incomingMessageId = String(messageId || '').trim();
+        if (!trackedMessageId || !incomingMessageId || trackedMessageId === incomingMessageId) {
+          delete conversation.localTurnStatus;
+          delete conversation.localTurnStatusUpdatedAt;
+          delete conversation.localTurnMessageId;
+        }
+      }
+    }
+    if (conversationId === currentConvId && normalizedStatus === 'processing') {
+      const autoScroll = isMessagesNearBottom();
+      showThinking(messageId || null, autoScroll);
+      renderThinkingActivities();
+      if (messageId) removeUserBubbleCancelButton(messageId);
+    }
+    if (clearsProcessingStatus) {
+      clearPendingUserMessage(messageId);
+      if (messageId) clearRelayStreamStateForMessage(messageId);
+      if (messageId) clearBubbleCancelState(messageId);
+      if (messageId) removeUserBubbleCancelButton(messageId);
+    }
+    if (conversationId === currentConvId && clearsProcessingStatus) {
+      removeThinking();
+      void refreshCurrentView().catch(() => {});
+      scheduleContextUsageRefresh(conversationId, 220);
+      refreshSessionWorkerStatus().catch(() => {});
+    }
+    renderConvList();
+  });
+  socket.on('conversation_deleted', ({ conversationId }) => {
+    delete conversations[conversationId];
+    for (const [id, question] of relayQuestions.entries()) {
+      if (question?.conversationId === conversationId) relayQuestions.delete(id);
+    }
+    for (const [id, board] of relayBoards.entries()) {
+      if (board?.conversationId === conversationId) relayBoards.delete(id);
+    }
+    for (const id of relayQuestionDrafts.keys()) {
+      const q = relayQuestionDrafts.get(id);
+      if (!q || q.conversationId === conversationId) relayQuestionDrafts.delete(id);
+    }
+    updatePendingQuestionBanner();
+    renderRelayBoards();
+    renderConvList();
+    if (currentConvId === conversationId) {
+      setCurrentConv(null);
+      renderMessages([]);
+      document.getElementById('chat-title').textContent = 'Select or start a conversation';
+      syncChatTitleControls();
+      updateSessionPill(null, null);
+      updateCompactButton();
+      scheduleContextUsageRefresh(null);
+    } else {
+      updateCompactButton();
+    }
+  });
+}
