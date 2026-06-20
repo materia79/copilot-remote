@@ -1,6 +1,10 @@
 const SW_URL = new URL(self.location.href);
 const SW_VERSION = String(SW_URL.searchParams.get('v') || '').trim() || '0';
 const CACHE_NAME = `copilot-remote-shell-v${SW_VERSION}`;
+const REGISTRATION_SCOPE_PATH = (() => {
+  const path = new URL(self.registration.scope).pathname || '/';
+  return path.endsWith('/') ? path : `${path}/`;
+})();
 const STATIC_ASSETS = [
   './',
   'index.html',
@@ -20,7 +24,9 @@ function isApiRequest(url) {
 }
 
 function isPwaMetadataRequest(url) {
-  return /\/(?:manifest\.webmanifest|app-icon(?:-\d+)?\.png|app-icon\.svg|favicon\.ico)$/.test(url.pathname);
+  if (!url.pathname.startsWith(REGISTRATION_SCOPE_PATH)) return false;
+  const relativePath = url.pathname.slice(REGISTRATION_SCOPE_PATH.length);
+  return /^(?:manifest\.webmanifest|app-icon(?:-\d+)?\.png|app-icon\.svg|favicon\.ico)$/.test(relativePath);
 }
 
 async function cacheShell() {

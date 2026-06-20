@@ -2,7 +2,7 @@
   "name": "Copilot Remote",
   "short_name": "Copilot",
   "description": "Installable Copilot Remote web app with standalone launcher support.",
-  "id": "./",
+  "id": "./__copilot_remote_pwa__",
   "start_url": "./",
   "scope": "./",
   "display_override": ["standalone"],

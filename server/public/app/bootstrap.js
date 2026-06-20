@@ -2423,7 +2423,7 @@ async function loadManifestTemplate(defaultHref) {
     name: PWA_APP_NAME_DEFAULT,
     short_name: derivePwaShortName(PWA_APP_NAME_DEFAULT),
     description: 'Installable Copilot Remote web app with standalone launcher support.',
-    id: './',
+    id: './__copilot_remote_pwa__',
     start_url: './',
     scope: './',
     display_override: ['standalone'],

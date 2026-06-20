@@ -191,7 +191,7 @@ You can also hide the **💤 Suspend host** action from **⚙️ Settings** with
 **Show Suspend host action** checkbox. This only controls UI visibility; it does not
 change host suspend implementation behavior.
 
-If you host the relay behind a subpath, set `remotePath` in `server/config.json` to that public path prefix and open the URL with a trailing slash so the PWA scope matches correctly for install prompts.
+If you host the relay behind a subpath, set `remotePath` in `server/config.json` to that public path prefix and open the URL with a trailing slash so the PWA scope matches correctly for install prompts. The relay serves a path-relative manifest identity (`id`, `start_url`, `scope`) so each install stays bound to its own URL subtree and avoids cross-app collisions on shared origins.
 
 ## Model Selection
 
@@ -603,6 +603,9 @@ call `/api/usage` directly.
   "processingTimeoutMs": 600000,
   "conversationSessionMode": "isolated",
   "contextIndicatorMode": "default",
+  "sdkVersion": "1.0.63",
+  "sdkPath": "/absolute/path/to/copilot-sdk/index.js",
+  "cliPath": "/absolute/path/to/app.js",
   "sshTunnel": {
     "mode": "disabled",
     "required": false,
@@ -626,6 +629,9 @@ call `/api/usage` directly.
 | `processingTimeoutMs` | `600000` | Max response wait time (ms) |
 | `conversationSessionMode` | `isolated` | SDK session strategy (`isolated` or `shared`) |
 | `contextIndicatorMode` | `default` | Input context indicator style (`default` shimmer line or `bar` fill indicator) |
+| `sdkVersion` | *(latest detected)* | Optional semver pin (for example `1.0.63`) used by relay SDK auto-detection |
+| `sdkPath` | *(auto-detected)* | Optional absolute override for Copilot SDK entry path (`.../copilot-sdk/index.js`) |
+| `cliPath` | *(auto-detected)* | Optional absolute override for Copilot CLI app path (`.../app.js`) |
 | `restartGracefulTimeoutMs` | `8000` | Graceful shutdown wait before force fallback |
 | `restartShutdownTimeoutMs` | `45000` | Drain timeout while waiting for active queue jobs |
 | `restartSpawnTimeoutMs` | `18000` | Max wait for resume process to leave online state |
@@ -643,6 +649,19 @@ call `/api/usage` directly.
 | `sshTunnel.identityFile` | *(optional)* | SSH private key path (`~` expanded); uses ssh-agent if omitted |
 | `sshTunnel.autoReclaimPort` | `true` | When remote bind fails, run a remote reclaim step before retrying |
 | `sshTunnel.remoteCleanupCommand` | *(optional)* | Override reclaim command (`ssh user@host <command>`) for custom VPS cleanup |
+
+### SDK auto-detection behavior
+
+- Relay first honors explicit `sdkPath` + `cliPath` from `config.json` when both are set.
+- Otherwise it auto-detects the highest available semver under platform-specific install roots:
+  - **Windows:** `%LOCALAPPDATA%\copilot\pkg`
+  - **Linux:** `$XDG_CACHE_HOME/copilot/pkg` (default `~/.cache/copilot/pkg`), then `$XDG_DATA_HOME/copilot/pkg` (default `~/.local/share/copilot/pkg`)
+  - **macOS:** `~/Library/Application Support/copilot/pkg`
+- Within each root it checks platform subdirs (`<platform>-<arch>`, then `universal`) and picks the highest version containing both:
+  - `copilot-sdk/index.js`
+  - `app.js`
+- Optional environment override: set `COPILOT_PKG_DIR` to force a specific pkg base directory.
+- Optional config pin: set `sdkVersion` to require an exact version during auto-detection.
 
 ## SSH Reverse Tunnel
 

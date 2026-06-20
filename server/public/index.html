@@ -2422,6 +2422,82 @@
     }
   }
 
+  @media (max-width: 680px) and (orientation: portrait) {
+    .input-row {
+      flex-wrap: wrap;
+      align-items: stretch;
+      gap: 8px;
+    }
+    #msg-input {
+      order: 6;
+      flex: 1 1 100%;
+      width: 100%;
+    }
+    #mode-select {
+      order: 1;
+      flex: 0 0 calc(100% - 96px);
+      width: calc(100% - 96px);
+      min-width: 0;
+    }
+    #repo-browser-input-btn {
+      order: 2;
+      flex: 0 0 40px;
+    }
+    #attach-btn {
+      order: 3;
+      flex: 0 0 40px;
+    }
+    #model-select {
+      order: 4;
+      flex: 1 1 0;
+      width: auto;
+      min-width: 0;
+    }
+    #send-btn {
+      order: 5;
+      margin-left: auto;
+      flex: 0 0 auto;
+    }
+  }
+
+  @media (max-width: 680px) and (orientation: landscape) {
+    .input-row {
+      flex-wrap: wrap;
+      align-items: stretch;
+      gap: 8px;
+    }
+    #mode-select {
+      order: 1;
+      flex: 0 0 104px;
+      width: 104px;
+      min-width: 0;
+    }
+    #repo-browser-input-btn {
+      order: 2;
+      flex: 0 0 40px;
+    }
+    #attach-btn {
+      order: 3;
+      flex: 0 0 40px;
+    }
+    #model-select {
+      order: 4;
+      flex: 1 1 0;
+      width: auto;
+      min-width: 0;
+    }
+    #send-btn {
+      order: 5;
+      margin-left: auto;
+      flex: 0 0 auto;
+    }
+    #msg-input {
+      order: 6;
+      flex: 1 1 100%;
+      width: 100%;
+    }
+  }
+
   ::-webkit-scrollbar { width: 6px; }
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }

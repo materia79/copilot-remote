@@ -55,6 +55,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const INDEX_HTML_PATH = path.join(PUBLIC_DIR, 'index.html');
+const PWA_MANIFEST_PATH = path.join(PUBLIC_DIR, 'manifest.webmanifest');
+const PWA_SW_PATH = path.join(PUBLIC_DIR, 'sw.js');
 const SOCKET_IO_CLIENT_JS_PATH = path.join(__dirname, '..', 'node_modules', 'socket.io', 'client-dist', 'socket.io.js');
 const APP_CONFIG_PLACEHOLDER = /window\.__COPILOT_APP_CONFIG = \{ basePath: '[^']*' \};/;
 const PWA_VERSION_PLACEHOLDER = /const __PWA_VERSION = '[^']*';/;
@@ -3735,6 +3737,39 @@ function renderIndexHtmlWithPwaVersion() {
     .replace(PWA_VERSION_PLACEHOLDER, `const __PWA_VERSION = '${version}';`);
 }
 
+function loadPwaManifestTemplate() {
+  const fallback = {
+    name: 'Copilot Remote',
+    short_name: 'Copilot',
+    description: 'Installable Copilot Remote web app with standalone launcher support.',
+    display_override: ['standalone'],
+    display: 'standalone',
+    background_color: '#161b22',
+    theme_color: '#161b22',
+    icons: [
+      { src: 'app-icon.svg?v=25', sizes: 'any', type: 'image/svg+xml', purpose: 'any' },
+      { src: 'app-icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
+      { src: 'app-icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+    ],
+  };
+  try {
+    const raw = fs.readFileSync(PWA_MANIFEST_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+  } catch {}
+  return fallback;
+}
+
+function buildScopedPwaManifest() {
+  const manifest = loadPwaManifestTemplate();
+  return {
+    ...manifest,
+    id: './__copilot_remote_pwa__',
+    start_url: './',
+    scope: './',
+  };
+}
+
 const sessionDiscoveryService = createSessionDiscoveryService({
   fs,
   path,
@@ -3891,6 +3926,21 @@ app.use((req, _res, next) => {
 app.get('/socket.io/socket.io.js', (req, res, next) => {
   res.setHeader('Cache-Control', 'no-store');
   res.sendFile(SOCKET_IO_CLIENT_JS_PATH, (error) => {
+    if (error) next(error);
+  });
+});
+app.get('/manifest.webmanifest', (req, res, next) => {
+  try {
+    const manifest = buildScopedPwaManifest();
+    res.setHeader('Cache-Control', 'no-store');
+    res.type('application/manifest+json').send(JSON.stringify(manifest, null, 2));
+  } catch (error) {
+    next(error);
+  }
+});
+app.get('/sw.js', (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.sendFile(PWA_SW_PATH, (error) => {
     if (error) next(error);
   });
 });
