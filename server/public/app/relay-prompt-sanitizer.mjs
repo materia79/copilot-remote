@@ -91,8 +91,17 @@ function buildPromptPrefixPatterns(mode) {
   });
 }
 
+function stripAttachmentPromptArtifacts(text) {
+  return String(text || '')
+    .replace(/\[Attached file references\][\s\S]*?\[\/Attached file references\]/gi, ' ')
+    .replace(/\[Attached image(?:s)?\s*:[\s\S]*?\]/gi, ' ')
+    .replace(/\[Attached file\s*:[\s\S]*?\]/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 export function stripRelayPromptContext(text, relayMode = '') {
-  const value = String(text || '').trim();
+  const value = stripAttachmentPromptArtifacts(text);
   if (!value) return '';
   const patterns = buildPromptPrefixPatterns(relayMode);
   for (const pattern of patterns) {

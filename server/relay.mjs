@@ -242,17 +242,12 @@ function redactAttachmentPathsFromPrompt(text) {
 
 function buildPrompt(msg) {
   const text = String(msg?.text || '').trim();
+  const attachmentPromptContext = String(msg?.attachmentPromptContext || '').trim();
   const attachments = Array.isArray(msg?.attachments) ? msg.attachments : [];
   if (!attachments.length) return text;
-
-  const attachmentNote = attachments
-    .map((att) => att?.name ? `${att.name} (${att.type || 'image'})` : (att?.type || 'image'))
-    .join(', ');
-  const attachmentBlock = `\n\n[Attached image${attachments.length === 1 ? '' : 's'}: ${attachmentNote}]`;
-  const systemReminderBlock = buildAttachmentSystemReminder(attachments);
-  return text
-    ? `${text}${attachmentBlock}${systemReminderBlock ? `\n\n${systemReminderBlock}` : ''}`
-    : `${attachmentBlock.trimStart()}${systemReminderBlock ? `\n\n${systemReminderBlock}` : ''}`;
+  const systemReminderBlock = attachmentPromptContext || buildAttachmentSystemReminder(attachments);
+  if (text && systemReminderBlock) return `${text}\n\n${systemReminderBlock}`;
+  return text || systemReminderBlock;
 }
 
 function extractBase64FromDataUrl(dataUrl) {

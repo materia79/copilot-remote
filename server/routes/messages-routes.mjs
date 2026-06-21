@@ -861,6 +861,7 @@ export function buildDequeuedRelayMessage({
 } = {}) {
   if (!msg) return null;
   const attachments = parseAttachments(msg.attachments).map(hydrateAttachment).filter(Boolean);
+  const attachmentPromptContext = buildAttachmentPromptContext(attachments);
   let runtimeSession = msg.runtime_session_id ? stmts.getRuntimeSessionById.get(msg.runtime_session_id) : null;
   if (!runtimeSession) {
     const now = new Date().toISOString();
@@ -884,6 +885,7 @@ export function buildDequeuedRelayMessage({
     relayMode: normalizeRelayMode(msg.relay_mode) || defaultRelayMode,
     text: msg.text,
     attachments,
+    attachmentPromptContext,
     conversationSessionMode: configuredConversationSessionMode,
     status: msg.status,
     timestamp: msg.timestamp,
@@ -892,6 +894,31 @@ export function buildDequeuedRelayMessage({
     ownerAssignedAt: msg.owner_assigned_at || null,
     ownerLeaseExpiresAt: msg.owner_lease_expires_at || null,
   };
+}
+
+function buildAttachmentPromptContext(attachments) {
+  if (!Array.isArray(attachments) || !attachments.length) return '';
+  const lines = [
+    '<system_reminder>',
+    'Attached files:',
+  ];
+  for (let index = 0; index < attachments.length; index++) {
+    const att = attachments[index];
+    if (!att || typeof att !== 'object') continue;
+    const name = String(att.name || '').trim() || `attachment-${index + 1}`;
+    const mime = String(att.type || '').trim() || 'application/octet-stream';
+    const pathValue = String(att.path || '').trim();
+    const reference = String(att.reference || '').trim();
+    const rawSize = Number(att.size);
+    const size = Number.isFinite(rawSize) && rawSize >= 0 ? Math.round(rawSize) : 0;
+    lines.push(`- File ${index + 1}: "${name}"`);
+    if (pathValue) lines.push(`  Path: ${pathValue}`);
+    if (reference) lines.push(`  Reference: @file:${pathValue || reference.replace(/^@+/, '')}`);
+    lines.push(`  MIME: ${mime}`);
+    lines.push(`  Size: ${size} bytes`);
+  }
+  lines.push('</system_reminder>');
+  return lines.join('\n');
 }
 
 function serveFileWithRangeSupport(req, res, filePath, meta, { safeName, cacheDelete = null } = {}) {
@@ -3578,6 +3605,13 @@ export function registerMessagesRoutes(app, deps) {
         defaultRelayMode: DEFAULT_RELAY_MODE,
         defaultModel: DEFAULT_MODEL,
       });
+      
+      if (out.attachments.length) {
+        const withPathCount = out.attachments.filter((att) => String(att?.path || '').trim()).length;
+        const names = out.attachments.map((att) => String(att?.name || '').trim() || 'attachment').slice(0, 3).join(', ');
+        console.log(`[${ts()}] ATTACH    ${out.id.slice(0,8)} files=${out.attachments.length} paths=${withPathCount} names=${JSON.stringify(names)}`);
+      }
+
       if (sessionWorkerRoutingEnabled && out.ownerSessionId) {
         const existingWorker = sessionWorkerRegistry?.getWorker?.(out.ownerSessionId) || null;
         sessionWorkerRegistry?.upsertWorker?.({

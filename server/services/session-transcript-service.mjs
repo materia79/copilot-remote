@@ -76,6 +76,9 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
     return value
       .replace(/<system_reminder>[\s\S]*?<\/system_reminder>/gi, ' ')
       .replace(/<current_datetime>[\s\S]*?<\/current_datetime>/gi, ' ')
+      .replace(/\[Attached file references\][\s\S]*?\[\/Attached file references\]/gi, ' ')
+      .replace(/\[Attached image(?:s)?\s*:[\s\S]*?\]/gi, ' ')
+      .replace(/\[Attached file\s*:[\s\S]*?\]/gi, ' ')
       .replace(/\s+/g, ' ')
       .trim();
   }
