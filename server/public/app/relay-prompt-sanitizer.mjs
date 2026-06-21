@@ -93,10 +93,9 @@ function buildPromptPrefixPatterns(mode) {
 
 function stripAttachmentPromptArtifacts(text) {
   return String(text || '')
-    .replace(/\[Attached file references\][\s\S]*?\[\/Attached file references\]/gi, ' ')
-    .replace(/\[Attached image(?:s)?\s*:[\s\S]*?\]/gi, ' ')
-    .replace(/\[Attached file\s*:[\s\S]*?\]/gi, ' ')
-    .replace(/\s+/g, ' ')
+    .replace(/\[Attached file references\][\s\S]*?\[\/Attached file references\]/gi, '')
+    .replace(/\[Attached image(?:s)?\s*:[\s\S]*?\]/gi, '')
+    .replace(/\[Attached file\s*:[\s\S]*?\]/gi, '')
     .trim();
 }
 

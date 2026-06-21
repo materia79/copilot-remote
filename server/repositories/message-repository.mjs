@@ -115,6 +115,32 @@ export function createMessageRepository(db) {
               NULLIF(c.sdk_session_id, '')
             ) = ?
         `),
+        listPendingWorkerOwnerSessionIds: db.prepare(`
+          SELECT COALESCE(
+            NULLIF(q.owner_sdk_session_id, ''),
+            NULLIF(rs.sdk_session_id, ''),
+            NULLIF(c.sdk_session_id, '')
+          ) AS sdk_session_id
+          FROM queue q
+          LEFT JOIN runtime_sessions rs
+            ON rs.id = q.runtime_session_id
+          LEFT JOIN conversations c
+            ON c.id = q.conversation_id
+          WHERE q.status = 'pending'
+            AND (q.next_attempt_at IS NULL OR q.next_attempt_at <= ?)
+            AND COALESCE(
+              NULLIF(q.owner_sdk_session_id, ''),
+              NULLIF(rs.sdk_session_id, ''),
+              NULLIF(c.sdk_session_id, '')
+            ) IS NOT NULL
+          GROUP BY COALESCE(
+            NULLIF(q.owner_sdk_session_id, ''),
+            NULLIF(rs.sdk_session_id, ''),
+            NULLIF(c.sdk_session_id, '')
+          )
+          ORDER BY MIN(q.timestamp) ASC
+          LIMIT ?
+        `),
         countStatus:    db.prepare(`SELECT status, COUNT(*) as cnt FROM queue WHERE status IN ('pending','processing','parked') GROUP BY status`),
         countRuntimeSessions: db.prepare(`SELECT COUNT(*) AS cnt FROM runtime_sessions WHERE status = 'active'`),
         setProcessing:  db.prepare(`UPDATE queue SET status = 'processing', processing_at = ? WHERE id = ?`),

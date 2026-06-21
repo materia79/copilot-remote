@@ -91,6 +91,8 @@ export function createSessionWorkerWebSocketService({
   authToken,
   queueCounts,
   touchCli = () => {},
+  noteWorkerHeartbeat = () => {},
+  onDeliverySendFailed = async () => {},
   requestWork = async () => null,
   pathPrefix = '',
   pollIntervalMs = 1000,
@@ -150,6 +152,19 @@ export function createSessionWorkerWebSocketService({
     }
   }
 
+  function noteHeartbeat(meta, reason = 'worker-message') {
+    if (!meta?.sessionId) return;
+    try {
+      noteWorkerHeartbeat(meta.sessionId, {
+        pid: meta.pid,
+        reason,
+        timestamp: nowIso(),
+      });
+    } catch {
+      // Heartbeat bookkeeping should not break socket delivery.
+    }
+  }
+
   async function maybeDeliverToSocket(socket, reason = 'ready') {
     const meta = clientState.get(socket);
     if (!meta || meta.delivering || !meta.ready) return false;
@@ -165,14 +180,33 @@ export function createSessionWorkerWebSocketService({
       touchCli();
       if (!pending || typeof pending !== 'object') return false;
       if (pending.message) {
-        meta.ready = false;
-        meta.lastDeliveredAt = nowIso();
-        return emitEvent(socket, {
+        const deliveredAt = nowIso();
+        const sent = emitEvent(socket, {
           type: 'queue.deliver',
           reason,
           pending,
-          timestamp: meta.lastDeliveredAt,
+          timestamp: deliveredAt,
         });
+        if (sent) {
+          meta.ready = false;
+          meta.lastDeliveredAt = deliveredAt;
+          meta.deliveryFailures = 0;
+          return true;
+        }
+        meta.deliveryFailures = Number(meta.deliveryFailures || 0) + 1;
+        meta.ready = true;
+        logWarn(`[worker-ws] delivery send failed for ${String(meta.sessionId || 'unknown').slice(0, 8)} reason=${reason}`);
+        await Promise.resolve(onDeliverySendFailed({
+          pending,
+          sessionId: meta.sessionId,
+          pid: meta.pid,
+          reason,
+          deliveryFailures: meta.deliveryFailures,
+        })).catch((error) => {
+          logWarn(`[worker-ws] delivery send failure recovery failed for ${String(meta.sessionId || 'unknown').slice(0, 8)}: ${error?.message || error}`);
+        });
+        try { socket.close(); } catch {}
+        return false;
       }
       if (pending.paused || pending.reason || pending.routing?.blockedReason) {
         emitEvent(socket, {
@@ -261,6 +295,7 @@ export function createSessionWorkerWebSocketService({
       delivering: false,
       connectedAt: nowIso(),
       lastDeliveredAt: null,
+      deliveryFailures: 0,
     });
     touchCli();
     emitEvent(ws, {
@@ -284,6 +319,9 @@ export function createSessionWorkerWebSocketService({
       if (payload.type === 'worker.hello') {
         meta.sessionId = normalizeText(payload.sessionId) || meta.sessionId;
         meta.pid = normalizePositiveInt(payload.pid) || meta.pid;
+        meta.ready = true;
+        meta.lastHelloAt = nowIso();
+        noteHeartbeat(meta, 'worker-hello');
         emitEvent(ws, {
           type: 'server.hello',
           reason: 'ack',
@@ -291,13 +329,29 @@ export function createSessionWorkerWebSocketService({
           sessionId: meta.sessionId,
           timestamp: nowIso(),
         });
+        void maybeDeliverToSocket(ws, 'worker-hello');
         return;
       }
       if (payload.type === 'worker.ready') {
         meta.sessionId = normalizeText(payload.sessionId) || meta.sessionId;
         meta.pid = normalizePositiveInt(payload.pid) || meta.pid;
         meta.ready = true;
+        meta.lastReadyAt = nowIso();
+        noteHeartbeat(meta, String(payload.reason || 'worker-ready'));
         void maybeDeliverToSocket(ws, String(payload.reason || 'worker-ready'));
+        return;
+      }
+      if (payload.type === 'worker.ping') {
+        meta.sessionId = normalizeText(payload.sessionId) || meta.sessionId;
+        meta.pid = normalizePositiveInt(payload.pid) || meta.pid;
+        meta.lastPingAt = nowIso();
+        noteHeartbeat(meta, String(payload.reason || 'worker-ping'));
+        emitEvent(ws, {
+          type: 'server.pong',
+          reason: String(payload.reason || 'worker-ping'),
+          sessionId: meta.sessionId,
+          timestamp: nowIso(),
+        });
       }
     });
     ws.on('close', () => {
@@ -356,12 +410,15 @@ export function createSessionWorkerWebSocketService({
 
   function status() {
     let readyCount = 0;
+    let deliveringCount = 0;
     for (const meta of clientState.values()) {
       if (meta?.ready) readyCount += 1;
+      if (meta?.delivering) deliveringCount += 1;
     }
     return {
       connectedCount: clients.size,
       readyCount,
+      deliveringCount,
       path: wsPath,
       acceptedPaths,
     };

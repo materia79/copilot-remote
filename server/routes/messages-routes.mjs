@@ -3094,9 +3094,7 @@ export function registerMessagesRoutes(app, deps) {
           retry: 0,
           pid: existingWorker?.pid || null,
         });
-        const activeOwnerSessionId = normalizeSessionWorkerId(relayBridgeOwnerService?.getOwner?.()?.sessionId);
-        const shouldPrimeWorker = ownerSessionId !== activeOwnerSessionId;
-        if (shouldPrimeWorker && typeof sessionWorkerSupervisor?.ensureWorker === 'function') {
+        if (typeof sessionWorkerSupervisor?.ensureWorker === 'function') {
           sessionWorkerSupervisor?.clearRestartSchedule?.(ownerSessionId, { resetKilledMarker: true });
           void sessionWorkerSupervisor.ensureWorker(ownerSessionId).then((result) => {
             if (!result?.ok) {
@@ -3873,8 +3871,16 @@ export function registerMessagesRoutes(app, deps) {
 
     const finalized = finalize();
     if (!finalized) {
-      console.log(`[${ts()}] RESPONSE  ${messageId?.slice(0,8)} ignored=not_pending_or_processing`);
-      return res.json({ ok: true, ignored: 'not_pending_or_processing' });
+      const currentRow = stmts.findQById?.get(messageId) || null;
+      const currentStatus = String(currentRow?.status || 'unknown');
+      console.log(`[${ts()}] RESPONSE  ${messageId?.slice(0,8)} ignored=not_pending_or_processing actual_status=${currentStatus}`);
+      // Ensure UI is updated even if the response was duplicate/late
+      if (currentStatus === 'done') {
+        io.emit('message_status', { messageId, conversationId: targetConversationId, status: 'done' });
+      } else if (currentStatus === 'failed') {
+        io.emit('message_status', { messageId, conversationId: targetConversationId, status: 'failed' });
+      }
+      return res.json({ ok: true, ignored: 'not_pending_or_processing', actualStatus: currentStatus });
     }
     const queuedAtMs = Date.parse(String(q?.timestamp || '').trim());
     const processingAtMs = Date.parse(String(q?.processing_at || '').trim());

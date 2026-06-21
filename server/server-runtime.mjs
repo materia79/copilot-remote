@@ -321,6 +321,7 @@ const runtimeTimers = {
   ownerWatchdog: null,
   staleRecovery: null,
   questionExpiry: null,
+  pendingWorkerPrime: null,
   shutdownDrain: null,
 };
 
@@ -2009,7 +2010,7 @@ async function spawnSessionWorkerCli(targetSessionId) {
   const resolvedWorkspaceRoot = resolveLaunchWorkspaceRootForSession(normalizedTargetSessionId);
   const launched = await launchSessionCli({
     targetSessionId: normalizedTargetSessionId,
-    processCwd: resolvedWorkspaceRoot,
+    processCwd: REPO_ROOT,
     workspaceRoot: resolvedWorkspaceRoot,
     env: sessionWorkerLaunchEnv,
     platform: process.platform,
@@ -4109,17 +4110,79 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
     restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
   };
 }
+
+async function recoverUndeliveredSessionWorkerMessage({ pending = null, sessionId = null, reason = 'ws-send-failed' } = {}) {
+  const messageId = String(pending?.message?.id || pending?.messageId || '').trim();
+  const requesterSessionId = String(sessionId || pending?.message?.ownerSessionId || '').trim();
+  if (!messageId) return false;
+  const row = stmts.findQById.get(messageId);
+  if (!row || String(row.status || '').trim().toLowerCase() !== 'processing') return false;
+
+  const retryCount = Number(row.retry_count || 0) + 1;
+  const nextAttemptAt = addMsIso(Math.min(5_000, computeRetryDelayMs(retryCount)));
+  const result = db.prepare(`
+    UPDATE queue
+    SET status = 'pending',
+        processing_at = NULL,
+        retry_count = ?,
+        next_attempt_at = ?,
+        owner_lease_expires_at = NULL
+    WHERE id = ?
+      AND status = 'processing'
+  `).run(retryCount, nextAttemptAt, messageId);
+  if (result.changes <= 0) return false;
+
+  if (requesterSessionId) {
+    sessionWorkerSupervisor?.markIdle?.(requesterSessionId, Number(queueCounts?.().pendingCount || 0));
+  }
+  console.warn(`${runtimeLogPrefix()}WS REQUEUE ${messageId.slice(0, 8)} session=${requesterSessionId ? requesterSessionId.slice(0, 8) : 'unknown'} retry=${retryCount} reason=${String(reason || 'ws-send-failed')}`);
+  io.emit('message_status', { messageId, conversationId: row.conversation_id, status: 'pending' });
+  io.emit('queue_updated', { recovered: 1, reason: 'worker-ws-send-failed' });
+  sessionWorkerWebSocketService?.emitQueueChanged?.('worker-ws-send-failed');
+  return true;
+}
+
 const sessionWorkerWebSocketService = createSessionWorkerWebSocketService({
   WebSocketServerImpl: WebSocketServer,
   httpServer,
   authToken: config.authToken,
   queueCounts,
   touchCli,
+  noteWorkerHeartbeat: (sessionId) => {
+    sessionWorkerSupervisor?.noteSessionHeartbeat?.(sessionId);
+  },
+  onDeliverySendFailed: recoverUndeliveredSessionWorkerMessage,
   requestWork: requestSessionWorkerSocketDelivery,
   pathPrefix: remotePath,
   pollIntervalMs: 500,
   logger: console,
 });
+
+async function primePendingSessionWorkers(reason = 'pending-worker-prime') {
+  if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED !== true) return 0;
+  if (runtimeShutdownStarted) return 0;
+  if (typeof sessionWorkerSupervisor?.ensureWorker !== 'function') return 0;
+  if (typeof stmts.listPendingWorkerOwnerSessionIds?.all !== 'function') return 0;
+
+  const now = new Date().toISOString();
+  const rows = stmts.listPendingWorkerOwnerSessionIds.all(now, 25);
+  let requested = 0;
+  for (const row of rows) {
+    const sdkSessionId = String(row?.sdk_session_id || '').trim();
+    if (!sdkSessionId) continue;
+    if (sessionWorkerSupervisor?.isKillBlocked?.(sdkSessionId) === true) continue;
+    requested += 1;
+    try {
+      const result = await sessionWorkerSupervisor.ensureWorker(sdkSessionId);
+      if (!result?.ok) {
+        console.warn(`${runtimeLogPrefix()}WORKER PRIME blocked session=${sdkSessionId.slice(0, 8)} reason=${String(result?.error || reason || 'pending-worker-prime')}`);
+      }
+    } catch (error) {
+      console.warn(`${runtimeLogPrefix()}WORKER PRIME failed session=${sdkSessionId.slice(0, 8)} reason=${String(reason || 'pending-worker-prime')} err=${error?.message || error}`);
+    }
+  }
+  return requested;
+}
 
 app.use(express.json({ limit: '20mb' }));
 app.use((req, _res, next) => {
@@ -4577,6 +4640,11 @@ function touchCli() {
   }
 }
 sessionWorkerWebSocketService.start();
+void primePendingSessionWorkers('startup');
+runtimeTimers.pendingWorkerPrime = setInterval(() => {
+  void primePendingSessionWorkers('maintenance');
+}, 5_000);
+if (typeof runtimeTimers.pendingWorkerPrime.unref === 'function') runtimeTimers.pendingWorkerPrime.unref();
 
 // POST /api/heartbeat — CLI sends a ping every poll interval
 
@@ -4678,6 +4746,7 @@ function clearRuntimeTimers() {
   runtimeTimers.ownerWatchdog = null;
   runtimeTimers.staleRecovery = null;
   runtimeTimers.questionExpiry = null;
+  runtimeTimers.pendingWorkerPrime = null;
   runtimeTimers.shutdownDrain = null;
 }
 

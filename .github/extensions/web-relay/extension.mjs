@@ -559,7 +559,10 @@ async function startPolling() {
       getPendingAskUserRequest: () => getScopedPendingAskUserRequest(),
       setPendingAskUserRequest: (value) => { setScopedPendingAskUserRequest(value); },
       clearRelayScopeState: () => { clearScopedRelayState(); },
-      shouldFetchPending: () => !(workerWebSocketLink?.status?.().connected),
+      // Worker-routed turns are delivered over the session-worker WebSocket.
+      // Keep this loop for heartbeat/maintenance only; do not dequeue via HTTP
+      // when the worker socket is disconnected or stale.
+      shouldFetchPending: () => false,
       syncActiveSession,
       ensureSessionForConversation,
       extractQuestionPrompt,
@@ -582,9 +585,6 @@ function startWorkerWebSocketLink() {
     getSessionId: () => session?.sessionId || null,
     onDeliver: async (pending, reason = "ws-deliver") => {
       await pollingLoopController?.handlePendingPayload?.(pending, reason);
-    },
-    pollNow: async () => {
-      await pollingLoopController?.kick?.();
     },
   });
   workerWebSocketLink.start();
@@ -894,7 +894,7 @@ session = await joinSessionWithRetry({
             : "🔐 Token source: server/config.json",
           { ephemeral: true }
         );
-        await session.log("🌐 Web relay loaded — worker websocket enabled with fallback polling every 10 s", { ephemeral: true });
+        await session.log("🌐 Web relay loaded — worker websocket delivery enabled with heartbeat maintenance", { ephemeral: true });
       } catch (e) { dbg("session.log error:", e.message); }
     },
     onPreToolUse: async (request) => {

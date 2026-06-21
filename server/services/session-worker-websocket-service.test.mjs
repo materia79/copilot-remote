@@ -174,3 +174,127 @@ test('worker websocket service uses session identity from ready payload', async 
   assert.equal(socket.sent.some((payload) => payload.includes('"type":"queue.deliver"')), true);
   service.stop();
 });
+
+test('worker websocket service treats hello as readiness for delivery', async () => {
+  const httpServer = new EventEmitter();
+  let requestSessionId = null;
+  let requestPid = null;
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    queueCounts: () => ({ pendingCount: 1, processingCount: 0, parkedCount: 0 }),
+    requestWork: async ({ sessionId, pid }) => {
+      requestSessionId = sessionId;
+      requestPid = pid;
+      return {
+        message: {
+          id: 'm-hello',
+          conversationId: 'c-hello',
+          ownerSessionId: sessionId,
+        },
+      };
+    },
+  });
+
+  service.start();
+  httpServer.emit('upgrade',
+    { url: '/api/session-worker/ws?token=secret-token', headers: { host: 'localhost:3333' } },
+    {},
+    Buffer.alloc(0),
+  );
+
+  const socket = lastWss?.sockets?.[0] || null;
+  assert.ok(socket);
+  socket.emit('message', JSON.stringify({ type: 'worker.hello', sessionId: 'sdk-hello', pid: 456 }));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(requestSessionId, 'sdk-hello');
+  assert.equal(requestPid, 456);
+  assert.equal(socket.sent.some((payload) => payload.includes('"type":"queue.deliver"')), true);
+  service.stop();
+});
+
+test('worker websocket service records websocket heartbeat pings', async () => {
+  const httpServer = new EventEmitter();
+  const heartbeats = [];
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    queueCounts: () => ({ pendingCount: 0, processingCount: 0, parkedCount: 0 }),
+    noteWorkerHeartbeat: (sessionId, details) => {
+      heartbeats.push({ sessionId, details });
+    },
+  });
+
+  service.start();
+  httpServer.emit('upgrade',
+    { url: '/api/session-worker/ws?token=secret-token', headers: { host: 'localhost:3333' } },
+    {},
+    Buffer.alloc(0),
+  );
+
+  const socket = lastWss?.sockets?.[0] || null;
+  assert.ok(socket);
+  socket.emit('message', JSON.stringify({ type: 'worker.ping', sessionId: 'sdk-ping', pid: 789, reason: 'readiness-refresh' }));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(heartbeats.length, 1);
+  assert.equal(heartbeats[0].sessionId, 'sdk-ping');
+  assert.equal(heartbeats[0].details.pid, 789);
+  assert.equal(socket.sent.some((payload) => payload.includes('"type":"server.pong"')), true);
+  service.stop();
+});
+
+test('worker websocket service preserves readiness and closes on delivery send failure', async () => {
+  const httpServer = new EventEmitter();
+  let requestCalls = 0;
+  const sendFailures = [];
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    queueCounts: () => ({ pendingCount: 1, processingCount: 0, parkedCount: 0 }),
+    requestWork: async ({ sessionId }) => {
+      requestCalls += 1;
+      return {
+        message: {
+          id: `m-fail-${requestCalls}`,
+          conversationId: 'c-fail',
+          ownerSessionId: sessionId,
+        },
+      };
+    },
+    onDeliverySendFailed: async (details) => {
+      sendFailures.push(details);
+    },
+    logger: { warn: () => {}, debug: () => {} },
+  });
+
+  service.start();
+  httpServer.emit('upgrade',
+    { url: '/api/session-worker/ws?token=secret-token&sessionId=sdk-fail', headers: { host: 'localhost:3333' } },
+    {},
+    Buffer.alloc(0),
+  );
+
+  const socket = lastWss?.sockets?.[0] || null;
+  assert.ok(socket);
+  const originalSend = socket.send.bind(socket);
+  socket.send = (payload) => {
+    if (String(payload).includes('"type":"queue.deliver"')) {
+      throw new Error('simulated send failure');
+    }
+    return originalSend(payload);
+  };
+  socket.emit('message', JSON.stringify({ type: 'worker.ready', reason: 'send-failure-test' }));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(requestCalls, 1);
+  assert.equal(sendFailures.length, 1);
+  assert.equal(sendFailures[0].pending.message.id, 'm-fail-1');
+  assert.equal(sendFailures[0].sessionId, 'sdk-fail');
+  assert.equal(socket.closeCalls, 1);
+  service.stop();
+});

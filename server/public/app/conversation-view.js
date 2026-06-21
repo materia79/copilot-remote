@@ -737,7 +737,7 @@ export function showThinking(messageId = null, autoScroll = true) {
       <div id="thinking-text" class="thinking-text"></div>
       <div class="dots"><span></span><span></span><span></span></div>
       <div id="thinking-activity" class="thinking-activity"></div>
-      <div id="subagent-bubbles-root" class="subagent-bubbles-container"></div>
+      <div class="subagent-bubbles-container" data-subagent-bubbles-root="1"></div>
     </div>
     <div class="msg-label">Copilot</div>`;
   const target = nextMessageId ? el.querySelector(`[data-message-id="${nextMessageId}"]`) : null;
@@ -936,7 +936,7 @@ function getSubagentParentId(subagentRunId) {
 
 function findSubagentBubbleContainer(parentSubagentId) {
   if (!parentSubagentId) {
-    return document.getElementById('subagent-bubbles-root');
+    return document.querySelector('#thinking-indicator .subagent-bubbles-container[data-subagent-bubbles-root="1"]');
   }
   const parentBubble = document.querySelector(`.subagent-bubble[data-subagent-run-id="${CSS.escape(parentSubagentId)}"]`);
   if (!parentBubble) return null;

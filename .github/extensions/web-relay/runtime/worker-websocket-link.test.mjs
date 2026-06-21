@@ -47,6 +47,47 @@ class FakeWebSocket {
   }
 }
 
+class FakeWebSocketStaticConstants {
+  static instances = [];
+  static CONNECTING = 0;
+  static OPEN = 1;
+  static CLOSED = 3;
+
+  constructor(url) {
+    this.url = url;
+    this.readyState = this.constructor.CONNECTING;
+    this.listeners = new Map();
+    this.sent = [];
+    FakeWebSocketStaticConstants.instances.push(this);
+  }
+
+  addEventListener(type, listener) {
+    const list = this.listeners.get(type) || [];
+    list.push(listener);
+    this.listeners.set(type, list);
+  }
+
+  emit(type, payload = {}) {
+    for (const listener of this.listeners.get(type) || []) {
+      listener(payload);
+    }
+  }
+
+  open() {
+    this.readyState = this.constructor.OPEN;
+    this.emit("open");
+  }
+
+  close() {
+    this.readyState = this.constructor.CLOSED;
+    this.emit("close");
+  }
+
+  send(payload) {
+    this.sent.push(String(payload));
+  }
+}
+
 test("worker websocket link sends ready and processes delivered queue messages", async () => {
   FakeWebSocket.instances = [];
   const deliveries = [];
@@ -81,6 +122,80 @@ test("worker websocket link sends ready and processes delivered queue messages",
   assert.deepEqual(deliveries, [{ pending: { message: { id: "m1" } }, reason: "test" }]);
   assert.equal(socket.sent.length, 3);
   assert.match(socket.sent[2], /"type":"worker.ready"/);
+  link.stop();
+});
+
+test("worker websocket link handles queue changes with websocket readiness only", async () => {
+  FakeWebSocket.instances = [];
+  const link = createWorkerWebSocketLink({
+    serverUrl: "http://localhost:3333",
+    token: "tok",
+    getSessionReady: () => true,
+    getSessionId: () => "sdk-queue",
+    getPid: () => 1001,
+    WebSocketImpl: FakeWebSocket,
+    jitterMs: 0,
+  });
+
+  link.start();
+  const socket = FakeWebSocket.instances[0];
+  socket.open();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const before = socket.sent.length;
+  socket.receive({ type: "queue.changed", reason: "new-message", pendingCount: 1 });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(socket.sent.length, before + 1);
+  assert.match(socket.sent.at(-1), /"type":"worker.ready"/);
+  assert.match(socket.sent.at(-1), /"reason":"queue-changed"/);
+  assert.equal(link.status().lastQueueChangedAt > 0, true);
+  link.stop();
+});
+
+test("worker websocket link refreshes readiness and reconnects stale sockets", async () => {
+  FakeWebSocket.instances = [];
+  let nowMs = 1000;
+  const intervals = [];
+  const scheduledReconnects = [];
+  const link = createWorkerWebSocketLink({
+    serverUrl: "http://localhost:3333",
+    token: "tok",
+    getSessionReady: () => true,
+    getSessionId: () => "sdk-refresh",
+    getPid: () => 2002,
+    WebSocketImpl: FakeWebSocket,
+    readyRefreshMs: 1000,
+    staleConnectionMs: 5000,
+    jitterMs: 0,
+    now: () => nowMs,
+    setIntervalImpl: (fn, delay) => {
+      intervals.push({ fn, delay });
+      return { delay };
+    },
+    clearIntervalImpl: () => {},
+    setTimeoutImpl: (fn, delay) => {
+      scheduledReconnects.push({ fn, delay });
+      return { delay };
+    },
+    clearTimeoutImpl: () => {},
+  });
+
+  link.start();
+  const socket = FakeWebSocket.instances[0];
+  socket.open();
+  assert.equal(intervals[0]?.delay, 1000);
+
+  nowMs = 2000;
+  intervals[0].fn();
+  assert.match(socket.sent.at(-3), /"type":"worker.ping"/);
+  assert.match(socket.sent.at(-2), /"type":"worker.hello"/);
+  assert.match(socket.sent.at(-1), /"type":"worker.ready"/);
+
+  nowMs = 8001;
+  intervals[0].fn();
+  assert.equal(socket.readyState, socket.CLOSED);
+  assert.equal(scheduledReconnects[0]?.delay, 1000);
   link.stop();
 });
 
@@ -143,5 +258,29 @@ test("worker websocket link reconnect backoff caps at 8 seconds", () => {
   const eighth = FakeWebSocket.instances[7];
   eighth.close();
   assert.equal(scheduled[0]?.delay, 8_000);
+  link.stop();
+});
+
+test("worker websocket link supports websocket implementations with static state constants", async () => {
+  FakeWebSocketStaticConstants.instances = [];
+  const link = createWorkerWebSocketLink({
+    serverUrl: "http://localhost:3333",
+    token: "tok",
+    getSessionReady: () => true,
+    getSessionId: () => "sdk-static",
+    getPid: () => 4242,
+    WebSocketImpl: FakeWebSocketStaticConstants,
+    jitterMs: 0,
+  });
+
+  link.start();
+  assert.equal(FakeWebSocketStaticConstants.instances.length, 1);
+  const socket = FakeWebSocketStaticConstants.instances[0];
+  socket.open();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(socket.sent.length, 2);
+  assert.match(socket.sent[0], /"type":"worker.hello"/);
+  assert.match(socket.sent[1], /"type":"worker.ready"/);
   link.stop();
 });

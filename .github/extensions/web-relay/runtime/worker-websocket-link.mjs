@@ -10,6 +10,19 @@ function normalizePositiveInt(value) {
   return intValue > 0 ? intValue : null;
 }
 
+function resolveSocketStateValue(socket, stateName, fallback) {
+  const candidates = [
+    socket?.[stateName],
+    socket?.constructor?.[stateName],
+    globalThis?.WebSocket?.[stateName],
+  ];
+  for (const value of candidates) {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) return numeric;
+  }
+  return fallback;
+}
+
 function toWebSocketUrl(serverUrl, token, getSessionId, getPid) {
   const source = new URL(String(serverUrl || "http://localhost:3333"));
   source.protocol = source.protocol === "https:" ? "wss:" : "ws:";
@@ -28,42 +41,48 @@ export function createWorkerWebSocketLink({
   token,
   dbg = () => {},
   onDeliver = async () => {},
-  pollNow = async () => {},
   getSessionReady = () => false,
   getSessionId = () => null,
   getPid = () => null,
   minBackoffMs = 1000,
   maxBackoffMs = 8_000,
   jitterMs = 250,
+  readyRefreshMs = 10_000,
+  staleConnectionMs = 30_000,
   WebSocketImpl = globalThis.WebSocket,
   setTimeoutImpl = setTimeout,
   clearTimeoutImpl = clearTimeout,
+  setIntervalImpl = setInterval,
+  clearIntervalImpl = clearInterval,
+  now = () => Date.now(),
 } = {}) {
   let ws = null;
   let stopped = false;
   let reconnectTimer = null;
+  let readyRefreshTimer = null;
   let reconnectAttempt = 0;
   let reconnectDelayMs = 0;
-  let pollInFlight = null;
   let deliveryInFlight = null;
+  let lastOpenAt = null;
+  let lastMessageAt = null;
+  let lastHelloSentAt = null;
+  let lastReadySentAt = null;
+  let lastPingSentAt = null;
+  let lastPongAt = null;
+  let lastQueueChangedAt = null;
+  let lastDeliveryAt = null;
 
-  async function triggerPoll(reason = "ws-event") {
-    if (!getSessionReady()) return false;
-    if (pollInFlight) return pollInFlight;
-    pollInFlight = Promise.resolve()
-      .then(() => pollNow(reason))
-      .catch((error) => {
-        dbg("worker ws trigger poll failed", reason, error?.message || String(error));
-        return false;
-      })
-      .finally(() => {
-        pollInFlight = null;
-      });
-    return pollInFlight;
+  function getNowMs() {
+    const value = Number(now());
+    return Number.isFinite(value) ? value : Date.now();
+  }
+
+  function isSocketOpen() {
+    return !!ws && ws.readyState === resolveSocketStateValue(ws, "OPEN", 1);
   }
 
   function send(payload) {
-    if (!ws || ws.readyState !== ws.OPEN) return false;
+    if (!isSocketOpen()) return false;
     try {
       ws.send(JSON.stringify(payload));
       return true;
@@ -72,14 +91,40 @@ export function createWorkerWebSocketLink({
     }
   }
 
-  async function notifyReady(reason = "worker-ready") {
+  function notifyHello(reason = "worker-hello") {
     if (!getSessionReady()) return false;
-    return send({
+    const sent = send({
+      type: "worker.hello",
+      reason,
+      sessionId: normalizeText(getSessionId()),
+      pid: normalizePositiveInt(getPid()),
+    });
+    if (sent) lastHelloSentAt = getNowMs();
+    return sent;
+  }
+
+  async function notifyReady(reason = "worker-ready") {
+    if (!getSessionReady() || deliveryInFlight) return false;
+    const sent = send({
       type: "worker.ready",
       reason,
       sessionId: normalizeText(getSessionId()),
       pid: normalizePositiveInt(getPid()),
     });
+    if (sent) lastReadySentAt = getNowMs();
+    return sent;
+  }
+
+  function notifyPing(reason = "readiness-refresh") {
+    if (!getSessionReady()) return false;
+    const sent = send({
+      type: "worker.ping",
+      reason,
+      sessionId: normalizeText(getSessionId()),
+      pid: normalizePositiveInt(getPid()),
+    });
+    if (sent) lastPingSentAt = getNowMs();
+    return sent;
   }
 
   async function deliverPending(pending, reason = "queue-deliver") {
@@ -92,6 +137,7 @@ export function createWorkerWebSocketLink({
         return false;
       })
       .finally(() => {
+        lastDeliveryAt = getNowMs();
         deliveryInFlight = null;
       });
     return deliveryInFlight;
@@ -101,6 +147,42 @@ export function createWorkerWebSocketLink({
     if (!reconnectTimer) return;
     clearTimeoutImpl(reconnectTimer);
     reconnectTimer = null;
+  }
+
+  function clearReadyRefreshTimer() {
+    if (!readyRefreshTimer) return;
+    clearIntervalImpl(readyRefreshTimer);
+    readyRefreshTimer = null;
+  }
+
+  function closeStaleSocket(reason) {
+    if (!isSocketOpen()) return false;
+    dbg("worker ws stale connection closing", reason);
+    try { ws?.close?.(); } catch {}
+    return true;
+  }
+
+  function refreshReadiness(reason = "readiness-refresh") {
+    if (stopped || !getSessionReady() || !isSocketOpen()) return false;
+    const nowMs = getNowMs();
+    const staleMs = Math.max(0, Number(staleConnectionMs) || 0);
+    if (staleMs > 0 && lastMessageAt && (nowMs - lastMessageAt) > staleMs) {
+      return closeStaleSocket(`no-server-message:${reason}`);
+    }
+    notifyPing(reason);
+    if (deliveryInFlight) return true;
+    notifyHello(reason);
+    void notifyReady(reason);
+    return true;
+  }
+
+  function startReadyRefreshTimer() {
+    clearReadyRefreshTimer();
+    const intervalMs = Math.max(1000, Number(readyRefreshMs) || 10_000);
+    readyRefreshTimer = setIntervalImpl(() => {
+      refreshReadiness("readiness-refresh");
+    }, intervalMs);
+    if (typeof readyRefreshTimer?.unref === "function") readyRefreshTimer.unref();
   }
 
   function scheduleReconnect() {
@@ -119,7 +201,11 @@ export function createWorkerWebSocketLink({
 
   function connect() {
     if (stopped) return;
-    if (ws && (ws.readyState === ws.OPEN || ws.readyState === ws.CONNECTING)) return;
+    if (ws) {
+      const openState = resolveSocketStateValue(ws, "OPEN", 1);
+      const connectingState = resolveSocketStateValue(ws, "CONNECTING", 0);
+      if (ws.readyState === openState || ws.readyState === connectingState) return;
+    }
     if (typeof WebSocketImpl !== "function") {
       dbg("worker ws unavailable: global WebSocket is missing");
       return;
@@ -127,17 +213,18 @@ export function createWorkerWebSocketLink({
     const url = toWebSocketUrl(serverUrl, token, getSessionId, getPid);
     ws = new WebSocketImpl(url);
     ws.addEventListener("open", () => {
+      const openedAt = getNowMs();
       reconnectAttempt = 0;
       reconnectDelayMs = 0;
+      lastOpenAt = openedAt;
+      lastMessageAt = openedAt;
       dbg("worker ws connected");
-      send({
-        type: "worker.hello",
-        sessionId: normalizeText(getSessionId()),
-        pid: normalizePositiveInt(getPid()),
-      });
+      notifyHello("ws-open");
       void notifyReady("ws-open");
+      startReadyRefreshTimer();
     });
     ws.addEventListener("message", (event) => {
+      lastMessageAt = getNowMs();
       let payload = null;
       try {
         payload = JSON.parse(String(event?.data || ""));
@@ -149,13 +236,22 @@ export function createWorkerWebSocketLink({
           .finally(() => notifyReady("delivery-complete"));
         return;
       }
+      if (payload?.type === "server.hello") {
+        void notifyReady(String(payload.reason || "server-hello"));
+        return;
+      }
+      if (payload?.type === "server.pong") {
+        lastPongAt = getNowMs();
+        return;
+      }
       if (payload?.type === "server.draining") {
         dbg("worker ws draining", payload.reason || "relay-shutdown");
         try { ws?.close?.(); } catch {}
         return;
       }
       if (payload?.type === "queue.changed") {
-        void triggerPoll("ws-queue-changed");
+        lastQueueChangedAt = getNowMs();
+        void notifyReady("queue-changed");
         return;
       }
       if (payload?.type === "queue.blocked") {
@@ -163,6 +259,7 @@ export function createWorkerWebSocketLink({
       }
     });
     ws.addEventListener("close", () => {
+      clearReadyRefreshTimer();
       if (stopped) return;
       dbg("worker ws disconnected");
       scheduleReconnect();
@@ -181,6 +278,7 @@ export function createWorkerWebSocketLink({
   function stop() {
     stopped = true;
     clearReconnectTimer();
+    clearReadyRefreshTimer();
     if (ws) {
       try { ws.close(); } catch {}
       ws = null;
@@ -194,6 +292,14 @@ export function createWorkerWebSocketLink({
       delivering: !!deliveryInFlight,
       reconnectAttempt,
       reconnectDelayMs,
+      lastOpenAt,
+      lastMessageAt,
+      lastHelloSentAt,
+      lastReadySentAt,
+      lastPingSentAt,
+      lastPongAt,
+      lastQueueChangedAt,
+      lastDeliveryAt,
     };
   }
 

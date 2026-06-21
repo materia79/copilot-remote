@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import Database from 'better-sqlite3';
+import { createMessageRepository } from './message-repository.mjs';
 
 function createTestDb() {
   const db = new Database(':memory:');
@@ -15,7 +16,8 @@ function createTestDb() {
     CREATE TABLE runtime_sessions (
       id TEXT PRIMARY KEY,
       conversation_id TEXT,
-      sdk_session_id TEXT
+      sdk_session_id TEXT,
+      status TEXT
     );
 
     CREATE TABLE messages (
@@ -151,4 +153,48 @@ test('routed worker dequeue uses runtime session binding when queue owner is emp
 
   const wrongWorkerRow = findPendingForWorker.get(now, 'sdk-b', 'sdk-b');
   assert.equal(wrongWorkerRow, undefined);
+});
+
+test('repository lists due pending worker owners from queue and bindings', () => {
+  const db = createTestDb();
+  const repo = createMessageRepository(db);
+  const now = '2026-06-11T20:00:00.000Z';
+
+  db.prepare('INSERT INTO conversations (id, title, status, sdk_session_id) VALUES (?, ?, ?, ?)').run(
+    'conv-owned',
+    'Owned',
+    'active',
+    'conv-sdk',
+  );
+  db.prepare('INSERT INTO conversations (id, title, status, sdk_session_id) VALUES (?, ?, ?, ?)').run(
+    'conv-runtime',
+    'Runtime',
+    'active',
+    '',
+  );
+  db.prepare('INSERT INTO runtime_sessions (id, conversation_id, sdk_session_id) VALUES (?, ?, ?)').run(
+    'runtime-owned',
+    'conv-owned',
+    'runtime-sdk-ignored',
+  );
+  db.prepare('INSERT INTO runtime_sessions (id, conversation_id, sdk_session_id) VALUES (?, ?, ?)').run(
+    'runtime-bound',
+    'conv-runtime',
+    'runtime-sdk',
+  );
+
+  const insert = db.prepare(`
+    INSERT INTO queue (
+      id, conversation_id, runtime_session_id, is_new_conversation, model,
+      model_variant_id, reasoning_effort, relay_mode, text, attachments,
+      status, timestamp, retry_count, next_attempt_at, owner_sdk_session_id
+    ) VALUES (?, ?, ?, 0, ?, ?, NULL, ?, ?, NULL, ?, ?, 0, ?, ?)
+  `);
+  insert.run('message-owned', 'conv-owned', 'runtime-owned', 'gpt-5.4-mini', 'gpt-5.4-mini', 'agent', 'owned', 'pending', now, null, 'owner-sdk');
+  insert.run('message-runtime', 'conv-runtime', 'runtime-bound', 'gpt-5.4-mini', 'gpt-5.4-mini', 'agent', 'runtime', 'pending', '2026-06-11T20:00:01.000Z', null, '');
+  insert.run('message-later', 'conv-runtime', 'runtime-bound', 'gpt-5.4-mini', 'gpt-5.4-mini', 'agent', 'later', 'pending', now, '2026-06-11T21:00:00.000Z', 'later-sdk');
+  insert.run('message-processing', 'conv-runtime', 'runtime-bound', 'gpt-5.4-mini', 'gpt-5.4-mini', 'agent', 'processing', 'processing', now, null, 'processing-sdk');
+
+  const owners = repo.listPendingWorkerOwnerSessionIds.all(now, 10).map((row) => row.sdk_session_id);
+  assert.deepEqual(owners, ['owner-sdk', 'runtime-sdk']);
 });
