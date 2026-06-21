@@ -183,3 +183,42 @@ test('managed tunnel keeps Windows spawn behavior stable', () => {
   assert.equal(spawnCalls[0].command, 'ssh');
   assert.deepEqual(spawnCalls[0].options, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
 });
+
+test('remote reclaim uses single quoted sh -lc command', async () => {
+  const spawnCalls = [];
+  const children = [];
+  const manager = createSshTunnelManager({
+    tunnelConfig: {
+      mode: 'managed',
+      user: 'ubuntu',
+      host: 'relay.example.com',
+      remotePort: 4444,
+      autoReclaimPort: true,
+    },
+    spawnImpl(command, args, options) {
+      spawnCalls.push({ command, args, options });
+      const child = createFakeChild();
+      children.push(child);
+      return child;
+    },
+    logger: { log() {}, warn() {} },
+  });
+
+  manager.start();
+  assert.equal(spawnCalls.length, 1);
+  children[0].stderr.emit('data', Buffer.from('Error: remote port forwarding failed for listen port 4444'));
+  children[0].exitCode = 255;
+  children[0].emit('close', 255);
+  assert.equal(spawnCalls.length, 2);
+
+  const reclaimArgs = spawnCalls[1].args;
+  const remoteCommand = reclaimArgs[reclaimArgs.length - 1];
+  assert.equal(reclaimArgs[reclaimArgs.length - 2], 'ubuntu@relay.example.com');
+  assert.match(remoteCommand, /^sh -lc '/);
+  assert.match(remoteCommand, /lsof -tiTCP:4444/);
+  assert.ok(!reclaimArgs.includes('-lc'));
+
+  children[1].exitCode = 0;
+  children[1].emit('close', 0);
+  await Promise.resolve();
+});

@@ -123,6 +123,10 @@ function buildCleanupCommand(tunnelConfig) {
   ].join(' ');
 }
 
+function shellSingleQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
 export function createSshTunnelManager({
   tunnelConfig: rawTunnelConfig = {},
   localPort = 3333,
@@ -210,7 +214,8 @@ export function createSshTunnelManager({
       '-o', 'BatchMode=yes',
     ];
     if (tunnelConfig.identityFile) args.push('-i', tunnelConfig.identityFile);
-    args.push(`${tunnelConfig.user}@${tunnelConfig.host}`, 'sh', '-lc', buildCleanupCommand(tunnelConfig));
+    const remoteCleanupCommand = `sh -lc ${shellSingleQuote(buildCleanupCommand(tunnelConfig))}`;
+    args.push(`${tunnelConfig.user}@${tunnelConfig.host}`, remoteCleanupCommand);
 
     log(`Attempting remote reclaim for listen port ${tunnelConfig.remotePort}...`);
     try {
