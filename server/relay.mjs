@@ -203,6 +203,43 @@ function logTextBlock(title, text) {
   console.log(`[relay ${ts()}] ${'-'.repeat(60)}`);
 }
 
+function escapeXmlText(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function buildAttachmentSystemReminder(attachments) {
+  if (!Array.isArray(attachments) || !attachments.length) return '';
+  const lines = [
+    '<system_reminder>',
+    'Attached files:',
+  ];
+  for (let idx = 0; idx < attachments.length; idx++) {
+    const att = attachments[idx];
+    if (!att || typeof att !== 'object') continue;
+    const name = escapeXmlText(String(att.name || '').trim() || `attachment-${idx + 1}`);
+    const mime = escapeXmlText(String(att.type || '').trim() || 'application/octet-stream');
+    const rawSize = Number(att.size);
+    const size = Number.isFinite(rawSize) && rawSize >= 0 ? Math.round(rawSize) : 0;
+    const filePath = String(att.path || '').trim();
+
+    lines.push(`- File ${idx + 1}: "${name}"`);
+    if (filePath) lines.push(`  Path: ${escapeXmlText(filePath)}`);
+    lines.push(`  MIME: ${mime}`);
+    lines.push(`  Size: ${size} bytes`);
+  }
+  lines.push('</system_reminder>');
+  return lines.join('\n');
+}
+
+function redactAttachmentPathsFromPrompt(text) {
+  return String(text || '').replace(/^(\s*Path:\s*).+$/gim, '$1[REDACTED_PATH]');
+}
+
 function buildPrompt(msg) {
   const text = String(msg?.text || '').trim();
   const attachments = Array.isArray(msg?.attachments) ? msg.attachments : [];
@@ -212,7 +249,10 @@ function buildPrompt(msg) {
     .map((att) => att?.name ? `${att.name} (${att.type || 'image'})` : (att?.type || 'image'))
     .join(', ');
   const attachmentBlock = `\n\n[Attached image${attachments.length === 1 ? '' : 's'}: ${attachmentNote}]`;
-  return text ? `${text}${attachmentBlock}` : attachmentBlock.trimStart();
+  const systemReminderBlock = buildAttachmentSystemReminder(attachments);
+  return text
+    ? `${text}${attachmentBlock}${systemReminderBlock ? `\n\n${systemReminderBlock}` : ''}`
+    : `${attachmentBlock.trimStart()}${systemReminderBlock ? `\n\n${systemReminderBlock}` : ''}`;
 }
 
 function extractBase64FromDataUrl(dataUrl) {
@@ -850,14 +890,15 @@ async function processNext(approveAll) {
   const started = Date.now();
   const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
   const sdkAttachments = buildSdkAttachments(msg);
+  const prompt = buildPrompt(msg);
+  const promptForLog = redactAttachmentPathsFromPrompt(prompt);
   log(`Processing msg ${msg.id.slice(0, 8)} conv=${msg.conversationId.slice(0, 8)} rs=${String(msg.runtimeSessionId || 'none').slice(0, 8)} model=${msg.model || 'default'}${msg.reasoningEffort ? ` effort=${msg.reasoningEffort}` : ''} len=${(msg.text || '').length}${attachments.length ? ` attachments=${attachments.length}` : ''}`);
-  logTextBlock(`PROMPT ${msg.id.slice(0, 8)}`, msg.text);
+  logTextBlock(`PROMPT ${msg.id.slice(0, 8)}`, promptForLog);
 
   try {
     const session = await getOrCreateSession(msg.runtimeSessionId, msg.conversationId, msg.model, approveAll);
     await publishModelSnapshot(session, 'process-message');
 
-    const prompt = buildPrompt(msg);
     activeUserInputHandler = (request) => relayUserInputQuestion(msg, request);
     let response;
     try {
