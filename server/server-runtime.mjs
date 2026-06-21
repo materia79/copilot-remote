@@ -2010,8 +2010,7 @@ async function spawnSessionWorkerCli(targetSessionId) {
   const resolvedWorkspaceRoot = resolveLaunchWorkspaceRootForSession(normalizedTargetSessionId);
   const launched = await launchSessionCli({
     targetSessionId: normalizedTargetSessionId,
-    processCwd: REPO_ROOT,
-    workspaceRoot: resolvedWorkspaceRoot,
+    cwd: resolvedWorkspaceRoot,
     env: sessionWorkerLaunchEnv,
     platform: process.platform,
     spawnImpl: spawn,
