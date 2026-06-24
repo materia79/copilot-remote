@@ -1,3 +1,5 @@
+import { isValidModelId, normalizeModelIdCandidate } from "../../../../shared/model-id.mjs";
+
 export function createModelSwitchingService({
   api,
   dbg,
@@ -23,8 +25,12 @@ export function createModelSwitchingService({
 
   function normalizeModelId(modelInfo) {
     if (!modelInfo) return null;
-    if (typeof modelInfo === "string") return modelInfo;
-    return modelInfo.modelId || modelInfo.id || modelInfo.model || null;
+    if (typeof modelInfo === "string") {
+      const candidate = normalizeModelIdCandidate(modelInfo);
+      return isValidModelId(candidate) ? candidate : null;
+    }
+    const candidate = normalizeModelIdCandidate(modelInfo.modelId || modelInfo.id || modelInfo.model || null);
+    return isValidModelId(candidate) ? candidate : null;
   }
 
   function canonicalModelId(id) {
@@ -32,9 +38,11 @@ export function createModelSwitchingService({
   }
 
   function extractModelIds(value, out = []) {
+    const CONTAINER_KEYS = ["data", "models", "list", "available", "items", "entries", "result", "response"];
     if (!value) return out;
     if (typeof value === "string") {
-      out.push(value);
+      const candidate = normalizeModelIdCandidate(value);
+      if (isValidModelId(candidate)) out.push(candidate);
       return out;
     }
     if (Array.isArray(value)) {
@@ -42,10 +50,16 @@ export function createModelSwitchingService({
       return out;
     }
     if (typeof value === "object") {
-      for (const key of ["modelId", "id", "model", "name"]) {
-        if (typeof value[key] === "string") out.push(value[key]);
+      for (const key of ["modelId", "id", "model"]) {
+        const candidate = normalizeModelIdCandidate(value[key]);
+        if (isValidModelId(candidate)) out.push(candidate);
       }
-      for (const item of Object.values(value)) extractModelIds(item, out);
+      for (const key of CONTAINER_KEYS) {
+        const next = value[key];
+        if (next !== undefined && next !== null) {
+          extractModelIds(next, out);
+        }
+      }
     }
     return out;
   }

@@ -531,22 +531,47 @@ function refreshModelCatalog(force = false) {
 }
 
 function applyModelVariantCatalogState(payload) {
-  const variants = Array.isArray(payload?.variants)
+  const rawVariants = Array.isArray(payload?.variants)
     ? payload.variants.map((entry) => ({
       variantId: String(entry?.variantId || '').trim(),
       baseModelId: String(entry?.baseModelId || '').trim(),
       provider: String(entry?.provider || 'other').trim().toLowerCase() || 'other',
       label: String(entry?.label || '').trim(),
+      releaseStatus: String(entry?.releaseStatus || '').trim().toLowerCase() || null,
       reasoningEffort: String(entry?.reasoningEffort || '').trim().toLowerCase() || null,
       enabled: !!entry?.enabled,
       sortOrder: Number.isFinite(Number(entry?.sortOrder)) ? Math.max(0, Math.trunc(Number(entry.sortOrder))) : 0,
     })).filter((entry) => entry.variantId && entry.baseModelId)
     : [];
-  const enabledVariantIds = new Set(
-    Array.isArray(payload?.enabledVariantIds)
-      ? payload.enabledVariantIds.map((value) => String(value || '').trim()).filter(Boolean)
-      : variants.filter((entry) => entry.enabled).map((entry) => entry.variantId),
-  );
+  const canonicalizeId = (value) => String(value || '').trim().toLowerCase();
+  const dedupedVariantsMap = new Map();
+  for (const entry of rawVariants) {
+    const dedupeKey = canonicalizeId(entry.variantId);
+    const existing = dedupedVariantsMap.get(dedupeKey);
+    if (!existing) {
+      dedupedVariantsMap.set(dedupeKey, {
+        ...entry,
+        variantId: dedupeKey,
+        baseModelId: canonicalizeId(entry.baseModelId),
+      });
+      continue;
+    }
+    dedupedVariantsMap.set(dedupeKey, {
+      ...existing,
+      enabled: existing.enabled || entry.enabled,
+      releaseStatus: (existing.releaseStatus === null || entry.releaseStatus === null)
+        ? null
+        : (existing.releaseStatus || entry.releaseStatus),
+      sortOrder: Math.min(existing.sortOrder, entry.sortOrder),
+      label: existing.label || entry.label,
+      provider: existing.provider || entry.provider,
+    });
+  }
+  const variants = Array.from(dedupedVariantsMap.values());
+  const requestedEnabledVariantIds = Array.isArray(payload?.enabledVariantIds)
+    ? payload.enabledVariantIds.map((value) => canonicalizeId(value)).filter(Boolean)
+    : variants.filter((entry) => entry.enabled).map((entry) => entry.variantId);
+  const enabledVariantIds = new Set(requestedEnabledVariantIds.filter((value) => dedupedVariantsMap.has(value)));
   modelVariantCatalogState = {
     variants,
     enabledVariantIds: Array.from(enabledVariantIds),
@@ -567,7 +592,25 @@ function renderModelVariantCatalogBody() {
     if (!grouped.has(providerKey)) grouped.set(providerKey, []);
     grouped.get(providerKey).push(entry);
   }
+  const selected = new Set(modelVariantCatalogState.enabledVariantIds);
+  const selectedOrder = new Map(
+    modelVariantCatalogState.enabledVariantIds.map((variantId, index) => [variantId, index]),
+  );
+  const providerSortMeta = (providerKey) => {
+    const rows = grouped.get(providerKey) || [];
+    const selectedPositions = rows
+      .filter((row) => selected.has(row.variantId))
+      .map((row) => selectedOrder.get(row.variantId))
+      .filter((value) => Number.isFinite(value));
+    const hasSelected = selectedPositions.length > 0;
+    const firstSelectedPos = hasSelected ? Math.min(...selectedPositions) : Number.POSITIVE_INFINITY;
+    return { hasSelected, firstSelectedPos };
+  };
   const providerOrder = Array.from(grouped.keys()).sort((a, b) => {
+    const aMeta = providerSortMeta(a);
+    const bMeta = providerSortMeta(b);
+    if (aMeta.hasSelected !== bMeta.hasSelected) return aMeta.hasSelected ? -1 : 1;
+    if (aMeta.firstSelectedPos !== bMeta.firstSelectedPos) return aMeta.firstSelectedPos - bMeta.firstSelectedPos;
     const aLabel = PROVIDER_LABELS[a] || a;
     const bLabel = PROVIDER_LABELS[b] || b;
     return aLabel.localeCompare(bLabel);
@@ -575,7 +618,6 @@ function renderModelVariantCatalogBody() {
   const refreshedLabel = modelVariantCatalogState.refreshedAt
     ? new Date(modelVariantCatalogState.refreshedAt).toLocaleString()
     : 'Never';
-  const selected = new Set(modelVariantCatalogState.enabledVariantIds);
   const warnings = [
     modelVariantCatalogState.warning ? `⚠️ ${escHtml(modelVariantCatalogState.warning)}` : '',
     modelVariantCatalogState.error ? `⚠️ ${escHtml(modelVariantCatalogState.error)}` : '',
@@ -583,16 +625,35 @@ function renderModelVariantCatalogBody() {
   const groupsHtml = providerOrder.map((providerKey) => {
     const providerLabel = PROVIDER_LABELS[providerKey] || providerKey;
     const rows = grouped.get(providerKey) || [];
-    rows.sort((a, b) => (a.sortOrder - b.sortOrder) || a.variantId.localeCompare(b.variantId));
+    rows.sort((a, b) => {
+      const aSelected = selected.has(a.variantId);
+      const bSelected = selected.has(b.variantId);
+      if (aSelected !== bSelected) return aSelected ? -1 : 1;
+
+      const aSelectedPos = selectedOrder.has(a.variantId)
+        ? selectedOrder.get(a.variantId)
+        : Number.POSITIVE_INFINITY;
+      const bSelectedPos = selectedOrder.has(b.variantId)
+        ? selectedOrder.get(b.variantId)
+        : Number.POSITIVE_INFINITY;
+      if (aSelectedPos !== bSelectedPos) return aSelectedPos - bSelectedPos;
+
+      if (a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
+      return a.variantId.localeCompare(b.variantId);
+    });
     const rowsHtml = rows.map((row) => {
       const checked = selected.has(row.variantId);
       const label = row.label || humanizeModelLabel(row.baseModelId) || row.baseModelId;
       const effortChip = row.reasoningEffort ? ` <span style="font-size:0.72rem;color:var(--muted)">(${escHtml(row.reasoningEffort)})</span>` : '';
+      const unavailable = row.releaseStatus === 'unavailable';
+      const statusChip = unavailable
+        ? ' <span style="font-size:0.72rem;color:var(--warn,#f7c873)">unavailable (kept)</span>'
+        : '';
       return `
         <label style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px dashed var(--border);font-size:0.84rem">
           <input class="model-variant-checkbox" type="checkbox" data-variant-id="${escHtml(row.variantId)}" ${checked ? 'checked' : ''}>
           <span style="display:flex;flex-direction:column;gap:2px">
-            <span>${escHtml(label)}${effortChip}</span>
+            <span>${escHtml(label)}${effortChip}${statusChip}</span>
             <code style="font-size:0.72rem;color:var(--muted)">${escHtml(row.variantId)}</code>
           </span>
         </label>
@@ -610,12 +671,11 @@ function renderModelVariantCatalogBody() {
       <div style="font-size:0.8rem;color:var(--muted)">
         Saved globally for this relay. Refreshed: <strong>${escHtml(refreshedLabel)}</strong>
       </div>
+      <div style="font-size:0.78rem;color:var(--muted)">
+        Variants marked unavailable are preserved from earlier selections so updates do not reset your models.
+      </div>
       ${warnings.map((line) => `<div style="font-size:0.78rem;color:var(--warn,#f7c873)">${line}</div>`).join('')}
       <div style="display:grid;gap:10px">${groupsHtml || '<div style="color:var(--muted)">No models discovered yet. Click Refresh.</div>'}</div>
-      <div class="summary-modal-actions">
-        <button class="summary-btn" type="button" onclick="saveSelectedModelsFromModal()">💾 Save enabled models</button>
-        <button class="summary-close" type="button" onclick="closeSummaryModal()">Cancel</button>
-      </div>
     </div>
   `;
   renderSummaryModalContent({
@@ -631,6 +691,17 @@ function renderModelVariantCatalogBody() {
     },
     kind: 'select-models',
   });
+  const headerActions = document.querySelector('#summary-modal .summary-header-actions');
+  const refreshBtn = document.getElementById('summary-modal-refresh');
+  if (headerActions && refreshBtn && !document.getElementById('summary-modal-save-models')) {
+    const saveBtn = document.createElement('button');
+    saveBtn.id = 'summary-modal-save-models';
+    saveBtn.className = 'summary-btn';
+    saveBtn.type = 'button';
+    saveBtn.textContent = '💾 Save enabled models';
+    saveBtn.onclick = () => saveSelectedModelsFromModal();
+    headerActions.insertBefore(saveBtn, refreshBtn);
+  }
 }
 
 async function openSelectModelsModal() {

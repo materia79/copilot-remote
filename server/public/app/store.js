@@ -1074,6 +1074,8 @@ export function renderSummaryModalContent({ title, subtitle = '', bodyHtml = '',
   const titleEl = document.getElementById('summary-modal-title');
   const subtitleEl = document.getElementById('summary-modal-subtitle');
   const bodyEl = document.getElementById('summary-modal-body');
+  const staleModelSaveBtn = document.getElementById('summary-modal-save-models');
+  if (staleModelSaveBtn) staleModelSaveBtn.remove();
   if (titleEl) titleEl.textContent = String(title || 'Details').trim() || 'Details';
   if (subtitleEl) subtitleEl.textContent = String(subtitle || '').trim();
   if (bodyEl) bodyEl.innerHTML = bodyHtml || '';

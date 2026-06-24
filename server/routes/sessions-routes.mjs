@@ -37,6 +37,35 @@ export function resolveBootstrapModelSelection({
   return String(modelState?.currentModel || modelState?.defaultModel || defaultModel).trim() || defaultModel;
 }
 
+export function buildModelVariantCatalogPayload({
+  rows = [],
+  modelState = {},
+  reasoningEfforts = [],
+} = {}) {
+  const safeRows = Array.isArray(rows) ? rows : [];
+  const enabledVariantIds = safeRows
+    .filter((row) => !!row?.enabled)
+    .map((row) => row.variantId);
+  return {
+    variants: safeRows.map((row) => ({
+      variantId: row.variantId,
+      baseModelId: row.baseModelId,
+      provider: row.provider,
+      label: row.label,
+      releaseStatus: row.releaseStatus || null,
+      reasoningEffort: row.reasoningEffort || null,
+      enabled: !!row.enabled,
+      sortOrder: row.sortOrder,
+    })),
+    enabledVariantIds,
+    source: modelState?.source || null,
+    refreshedAt: modelState?.refreshedAt || null,
+    warning: modelState?.warning || null,
+    error: modelState?.error || null,
+    reasoningEfforts: Array.isArray(reasoningEfforts) ? reasoningEfforts : [],
+  };
+}
+
 export function parseDefaultSessionWorkspaceRootUpdateRequest(body = {}) {
   const payload = body && typeof body === 'object' ? body : {};
   const hasBodyValue = (
@@ -2897,35 +2926,19 @@ export function registerSessionsRoutes(app, deps) {
     });
   });
 
-  function buildModelVariantCatalogPayload() {
+  function buildModelVariantCatalogPayloadForRoute() {
     const rows = typeof listModelVariantRows === 'function' ? listModelVariantRows() : [];
     const modelState = getModelCatalogState();
-    const enabledVariantIds = rows
-      .filter((row) => !!row.enabled)
-      .map((row) => row.variantId);
-    return {
-      variants: rows.map((row) => ({
-        variantId: row.variantId,
-        baseModelId: row.baseModelId,
-        provider: row.provider,
-        label: row.label,
-        releaseStatus: row.releaseStatus || null,
-        reasoningEffort: row.reasoningEffort || null,
-        enabled: !!row.enabled,
-        sortOrder: row.sortOrder,
-      })),
-      enabledVariantIds,
-      source: modelState.source,
-      refreshedAt: modelState.refreshedAt,
-      warning: modelState.warning,
-      error: modelState.error,
-      reasoningEfforts: Array.isArray(SUPPORTED_REASONING_EFFORTS) ? SUPPORTED_REASONING_EFFORTS : [],
-    };
+    return buildModelVariantCatalogPayload({
+      rows,
+      modelState,
+      reasoningEfforts: SUPPORTED_REASONING_EFFORTS,
+    });
   }
 
   app.get('/api/model-variants', auth, (req, res) => {
     ensureSessionId(req, res);
-    res.json(buildModelVariantCatalogPayload());
+    res.json(buildModelVariantCatalogPayloadForRoute());
   });
 
   app.post('/api/model-variants/refresh', auth, async (req, res) => {
@@ -2938,7 +2951,7 @@ export function registerSessionsRoutes(app, deps) {
       io.emit('models_updated', getModelCatalogState());
       return res.json({
         ok: true,
-        ...buildModelVariantCatalogPayload(),
+        ...buildModelVariantCatalogPayloadForRoute(),
       });
     } catch (error) {
       return res.status(500).json({
@@ -2960,7 +2973,7 @@ export function registerSessionsRoutes(app, deps) {
     io.emit('models_updated', getModelCatalogState());
     return res.json({
       ok: true,
-      ...buildModelVariantCatalogPayload(),
+      ...buildModelVariantCatalogPayloadForRoute(),
     });
   });
 

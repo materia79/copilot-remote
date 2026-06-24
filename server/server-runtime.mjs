@@ -55,6 +55,8 @@ import { FEATURES, normalizeFeatureFlags } from './features.mjs';
 import { RELAY_RESTART_EXIT_CODE } from './relay-exit-codes.mjs';
 import { DEFAULT_QUESTION_TIMEOUT_MS } from '../shared/question-timeout.mjs';
 import { normalizeRelayThoughtList } from './public/app/relay-thoughts.mjs';
+import { filterValidModelIds, isValidModelId, canonicalizeModelId } from '../shared/model-id.mjs';
+import { selectModelIdsForVariantRefresh } from '../shared/model-refresh.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
@@ -757,6 +759,10 @@ function uniqueStringList(values) {
   return out;
 }
 
+function validatedModelIdList(values) {
+  return filterValidModelIds(uniqueStringList(values));
+}
+
 function curatedModelList() {
   return uniqueStringList(CURATED_MODEL_IDS);
 }
@@ -871,18 +877,23 @@ function parseModelVariantId(variantId = '', {
 }
 
 function normalizeModelVariantRow(row = {}) {
-  const baseModelId = String(row?.base_model_id || row?.baseModelId || '').trim();
+  const rawBaseModelId = String(row?.base_model_id || row?.baseModelId || '').trim();
+  const baseModelId = canonicalizeModelId(rawBaseModelId) || rawBaseModelId;
   const reasoningEffort = normalizeReasoningEffort(row?.reasoning_effort ?? row?.reasoningEffort);
-  const variantId = String(row?.variant_id || row?.variantId || buildModelVariantId(baseModelId, reasoningEffort)).trim();
+  const rawVariantId = String(row?.variant_id || row?.variantId || buildModelVariantId(baseModelId, reasoningEffort)).trim();
+  const parsed = parseModelVariantId(rawVariantId, { knownBaseModels: baseModelId ? [baseModelId] : [] });
+  const normalizedBaseModelId = canonicalizeModelId(parsed?.baseModelId || baseModelId) || baseModelId;
+  const normalizedReasoningEffort = normalizeReasoningEffort(parsed?.reasoningEffort || reasoningEffort);
+  const variantId = buildModelVariantId(normalizedBaseModelId, normalizedReasoningEffort);
   const provider = String(row?.provider || row?.providerId || modelProviderForId(baseModelId)).trim() || 'other';
-  const label = String(row?.label || row?.displayName || modelDisplayLabel(baseModelId)).trim() || baseModelId;
+  const label = String(row?.label || row?.displayName || modelDisplayLabel(normalizedBaseModelId)).trim() || normalizedBaseModelId;
   const enabledValue = Number(row?.enabled);
   const enabled = Number.isFinite(enabledValue) ? enabledValue === 1 : !!row?.enabled;
   return {
     variantId,
-    baseModelId,
+    baseModelId: normalizedBaseModelId,
     provider,
-    reasoningEffort,
+    reasoningEffort: normalizedReasoningEffort,
     label,
     releaseStatus: String(row?.release_status || row?.releaseStatus || '').trim() || null,
     enabled,
@@ -946,10 +957,12 @@ function getModelCatalogState() {
 }
 
 function updateModelCatalog(snapshot = {}) {
-  const incomingModels = uniqueStringList(Array.isArray(snapshot.models) ? snapshot.models : []);
-  const incomingCurrent = String(snapshot.currentModel || '').trim();
-  const incomingDefault = String(snapshot.defaultModel || '').trim();
-  const merged = uniqueStringList([
+  const incomingModels = validatedModelIdList(Array.isArray(snapshot.models) ? snapshot.models : []);
+  const incomingCurrentRaw = String(snapshot.currentModel || '').trim();
+  const incomingDefaultRaw = String(snapshot.defaultModel || '').trim();
+  const incomingCurrent = isValidModelId(incomingCurrentRaw) ? incomingCurrentRaw : '';
+  const incomingDefault = isValidModelId(incomingDefaultRaw) ? incomingDefaultRaw : '';
+  const merged = validatedModelIdList([
     ...curatedModelList(),
     ...incomingModels,
     incomingCurrent,
@@ -1116,6 +1129,7 @@ function upsertModelVariantCatalogEntries(entries = [], {
     listModelVariantRows().map((row) => [row.variantId, row.enabled ? 1 : 0]),
   );
   const incomingIds = new Set(normalizedEntries.map((entry) => entry.variantId));
+  const incomingBaseIds = new Set(normalizedEntries.map((entry) => entry.baseModelId));
   const nowIso = new Date().toISOString();
   const tx = db.transaction(() => {
     for (const entry of normalizedEntries) {
@@ -1134,9 +1148,26 @@ function upsertModelVariantCatalogEntries(entries = [], {
         nowIso,
       );
     }
-    for (const existingId of existingEnabled.keys()) {
-      if (incomingIds.has(existingId)) continue;
-      modelSelectorSql.deleteVariant.run(existingId);
+    for (const row of listModelVariantRows()) {
+      if (incomingIds.has(row.variantId)) continue;
+      const shouldMarkUnavailable = row.enabled || incomingBaseIds.has(row.baseModelId);
+      if (shouldMarkUnavailable) {
+        modelSelectorSql.upsertVariant.run(
+          row.variantId,
+          row.baseModelId,
+          row.provider || modelProviderForId(row.baseModelId),
+          row.label || modelDisplayLabel(row.baseModelId),
+          'unavailable',
+          row.reasoningEffort || null,
+          row.enabled ? 1 : 0,
+          row.sortOrder,
+          nowIso,
+        );
+        continue;
+      }
+      // Variants that are both disabled and fully absent from the incoming base set
+      // are no longer relevant; prune them so they do not linger as selectable.
+      modelSelectorSql.deleteVariant.run(row.variantId);
     }
     modelSelectorSql.upsertSelectorState.run(
       String(source || 'manual-refresh').trim() || 'manual-refresh',
@@ -1180,10 +1211,10 @@ function parseModelsFromHelpConfigOutput(text) {
   while ((match = regex.exec(section))) {
     const candidate = String(match[1] || '').trim();
     if (!candidate || candidate === 'auto') continue;
-    if (!/^[a-z0-9][a-z0-9.-]*[a-z0-9]$/i.test(candidate)) continue;
+    if (!isValidModelId(candidate)) continue;
     models.push(candidate);
   }
-  return uniqueStringList(models);
+  return validatedModelIdList(models);
 }
 
 function parseReasoningEffortsFromHelpOutput(text) {
@@ -1229,12 +1260,33 @@ function runCopilotCliCommand(args = [], timeoutMs = 30_000) {
 }
 
 async function refreshModelVariantCatalogFromCli() {
-  const [configHelpText, genericHelpText] = await Promise.all([
-    runCopilotCliCommand(['help', 'config']),
-    runCopilotCliCommand(['help']),
-  ]);
-  const modelIds = parseModelsFromHelpConfigOutput(configHelpText);
-  const reasoningEfforts = parseReasoningEffortsFromHelpOutput(genericHelpText);
+  let source = 'rpc-snapshot';
+  let modelIds = [];
+  let reasoningEfforts = SUPPORTED_REASONING_EFFORTS.slice();
+  const refreshSelectionFromSnapshot = selectModelIdsForVariantRefresh({
+    snapshotModels: Array.isArray(modelCatalog.models) ? modelCatalog.models : [],
+    currentModel: modelCatalog.currentModel,
+    defaultModel: modelCatalog.defaultModel,
+    helpModelIds: [],
+  });
+  source = refreshSelectionFromSnapshot.source;
+  modelIds = refreshSelectionFromSnapshot.modelIds;
+  if (!modelIds.length) {
+    const [configHelpText, genericHelpText] = await Promise.all([
+      runCopilotCliCommand(['help', 'config']),
+      runCopilotCliCommand(['help']),
+    ]);
+    const helpModelIds = parseModelsFromHelpConfigOutput(configHelpText);
+    const refreshSelectionFromHelp = selectModelIdsForVariantRefresh({
+      snapshotModels: [],
+      currentModel: '',
+      defaultModel: '',
+      helpModelIds,
+    });
+    source = refreshSelectionFromHelp.source;
+    modelIds = refreshSelectionFromHelp.modelIds;
+    reasoningEfforts = parseReasoningEffortsFromHelpOutput(genericHelpText);
+  }
   const entries = [];
   let sortOrder = 0;
   for (const modelId of modelIds) {
@@ -1265,10 +1317,10 @@ async function refreshModelVariantCatalogFromCli() {
     });
   }
   if (!entries.length) {
-    throw new Error('No models found in copilot help output');
+    throw new Error('No models found in snapshot/help model output');
   }
   return upsertModelVariantCatalogEntries(entries, {
-    source: 'copilot-help-manual-refresh',
+    source,
     error: null,
     preserveEnabled: true,
   });
@@ -1917,6 +1969,63 @@ modelSelectorSql = {
 
 {
   const existingCount = Number(db.prepare(`SELECT COUNT(*) AS cnt FROM model_variants`).get()?.cnt || 0);
+  const normalizeLegacyVariantIdsTx = db.transaction(() => {
+    const rows = modelSelectorSql.listVariants.all();
+    const canonicalRows = new Map();
+    for (const rawRow of rows) {
+      const row = normalizeModelVariantRow(rawRow);
+      const canonicalBaseModelId = canonicalizeModelId(row.baseModelId);
+      if (!canonicalBaseModelId) continue;
+      const canonicalVariantId = buildModelVariantId(canonicalBaseModelId, row.reasoningEffort);
+      const existing = canonicalRows.get(canonicalVariantId);
+      if (!existing) {
+        canonicalRows.set(canonicalVariantId, {
+          variantId: canonicalVariantId,
+          baseModelId: canonicalBaseModelId,
+          provider: row.provider || modelProviderForId(canonicalBaseModelId),
+          label: row.label || modelDisplayLabel(canonicalBaseModelId),
+          releaseStatus: row.releaseStatus || null,
+          reasoningEffort: row.reasoningEffort || null,
+          enabled: row.enabled ? 1 : 0,
+          sortOrder: row.sortOrder,
+          updatedAt: row.updatedAt,
+        });
+        continue;
+      }
+      existing.enabled = existing.enabled || (row.enabled ? 1 : 0) ? 1 : 0;
+      if (existing.releaseStatus !== null && row.releaseStatus === null) {
+        existing.releaseStatus = null;
+      }
+      existing.sortOrder = Math.min(existing.sortOrder, row.sortOrder);
+      if (!existing.label && row.label) existing.label = row.label;
+    }
+
+    const nowIso = new Date().toISOString();
+    for (const entry of canonicalRows.values()) {
+      modelSelectorSql.upsertVariant.run(
+        entry.variantId,
+        entry.baseModelId,
+        entry.provider || modelProviderForId(entry.baseModelId),
+        entry.label || modelDisplayLabel(entry.baseModelId),
+        entry.releaseStatus || null,
+        entry.reasoningEffort || null,
+        entry.enabled ? 1 : 0,
+        entry.sortOrder,
+        nowIso,
+      );
+    }
+    for (const rawRow of rows) {
+      const rawVariantId = String(rawRow?.variant_id || '').trim();
+      const rawBaseModelId = String(rawRow?.base_model_id || '').trim();
+      const canonicalBaseModelId = canonicalizeModelId(rawBaseModelId);
+      if (!canonicalBaseModelId) continue;
+      const canonicalReasoningEffort = normalizeReasoningEffort(rawRow?.reasoning_effort);
+      const canonicalVariantId = buildModelVariantId(canonicalBaseModelId, canonicalReasoningEffort);
+      if (rawVariantId !== canonicalVariantId) {
+        modelSelectorSql.deleteVariant.run(rawVariantId);
+      }
+    }
+  });
   if (existingCount === 0) {
     const nowIso = new Date().toISOString();
     const seedEntries = buildModelVariantEntries(curatedModelList(), { defaultEnabled: true });
@@ -1941,6 +2050,7 @@ modelSelectorSql = {
     const nowIso = new Date().toISOString();
     modelSelectorSql.upsertSelectorState.run('legacy', nowIso, null, nowIso);
   }
+  normalizeLegacyVariantIdsTx();
 }
 
 const deleteArchiveService = createDeleteArchiveService(db, null);
