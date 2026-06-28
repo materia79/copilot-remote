@@ -222,6 +222,11 @@ Mode is stored with each queued message so the relay can change behavior per tur
 Clarification prompts from the CLI are forwarded back into the browser as question
 cards with a reply box.
 
+`plan` mode behavior:
+- Draft a concise implementation plan only (no implementation output).
+- Read-only inspection is allowed when it materially improves plan quality (for example `glob`, `rg`, `view`).
+- Do not edit repository files or run mutating commands unless implementation is explicitly requested.
+
 ## Conversation titles
 
 The active conversation header includes a `✍️` button for renaming the conversation inline.

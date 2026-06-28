@@ -24,7 +24,8 @@ function buildModeInstructionText(mode) {
   if (mode === "plan") {
     return [
       "Draft a concise plan only.",
-      "Do not edit files or run tools unless the user explicitly asks for implementation.",
+      "Use read-only inspection tools (glob, rg, view) only when they materially improve plan quality; otherwise draft from provided context.",
+      "Do not edit repository files or run mutating commands unless the user explicitly asks for implementation.",
       "If clarification is required, pause and ask through the web relay.",
       "These instructions remain in effect until relay mode changes.",
     ].join(" ");
