@@ -2718,6 +2718,7 @@ export function registerSessionsRoutes(app, deps) {
         valid: runtimeState.tunnelState?.valid ?? true,
       },
       workerWebSocket: runtimeState.workerWebSocketStatus || null,
+      tmuxInspector: runtimeState.tmuxInspectorStatus || null,
       activeBridgeOwner: runtimeState.activeBridgeOwner || null,
       restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
       relayShutdown: runtimeState.relayShutdown || null,

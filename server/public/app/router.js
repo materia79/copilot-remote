@@ -232,12 +232,24 @@ export function sanitizePreviewHtml(html) {
 }
 
 export function renderMarkdownPreview(source, allowEmbeddedHtml) {
+  const sourceText = String(source ?? '');
+  const fallbackEscaped = `<p>${escHtml(sourceText).replace(/\n/g, '<br>')}</p>`;
   if (allowEmbeddedHtml) {
-    return sanitizePreviewHtml(marked.parse(String(source || '')));
+    const parsed = marked.parse(sourceText);
+    if (typeof parsed !== 'string') return fallbackEscaped;
+    return sanitizePreviewHtml(parsed);
   }
   const renderer = new marked.Renderer();
-  renderer.html = (html) => escHtml(html);
-  return sanitizePreviewHtml(marked.parse(String(source || ''), { renderer }));
+  renderer.html = (htmlToken) => {
+    if (typeof htmlToken === 'string') return escHtml(htmlToken);
+    if (htmlToken && typeof htmlToken === 'object') {
+      return escHtml(htmlToken.raw ?? htmlToken.text ?? '');
+    }
+    return '';
+  };
+  const parsed = marked.parse(sourceText, { renderer });
+  if (typeof parsed !== 'string') return fallbackEscaped;
+  return sanitizePreviewHtml(parsed);
 }
 
 export function eventTargetElement(event) {

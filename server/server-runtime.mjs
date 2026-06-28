@@ -46,6 +46,9 @@ import { createSessionWorkerProcessInspector } from './services/session-worker-p
 import { launchSessionCli } from './services/session-worker-launch-service.mjs';
 import { createSshTunnelManager } from './services/ssh-tunnel-manager-service.mjs';
 import { createSessionWorkerWebSocketService } from './services/session-worker-websocket-service.mjs';
+import { createTmuxInspectorAccessPolicy } from './services/tmux-inspector-access-policy.mjs';
+import { createTmuxInspectorStreamService } from './services/tmux-inspector-stream-service.mjs';
+import { createTmuxInspectorSocketService } from './services/tmux-inspector-socket-service.mjs';
 import {
   resolveDefaultSessionWorkspaceRootState as resolveDefaultSessionWorkspaceRootStateFromService,
   resolveLaunchWorkspaceRootPath,
@@ -4266,6 +4269,21 @@ const sessionWorkerWebSocketService = createSessionWorkerWebSocketService({
   pollIntervalMs: 500,
   logger: console,
 });
+const tmuxInspectorAccessPolicy = createTmuxInspectorAccessPolicy({
+  sessionWorkerRegistry,
+  sessionWorkerSupervisor,
+});
+const tmuxInspectorStreamService = createTmuxInspectorStreamService({
+  platform: process.platform,
+  pollIntervalMs: 250,
+  historyLines: 400,
+  isSessionAllowed: (sdkSessionId) => tmuxInspectorAccessPolicy.evaluateSession(sdkSessionId),
+});
+const tmuxInspectorSocketService = createTmuxInspectorSocketService({
+  streamService: tmuxInspectorStreamService,
+  accessPolicy: tmuxInspectorAccessPolicy,
+  logger: console,
+});
 
 async function primePendingSessionWorkers(reason = 'pending-worker-prime') {
   if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED !== true) return 0;
@@ -4345,6 +4363,7 @@ const runtimeState = {
   get relayShutdown() { return getRelayShutdownState(); },
   get activeBridgeOwner() { return relayBridgeOwnerService.getOwner(); },
   get workerWebSocketStatus() { return sessionWorkerWebSocketService.status(); },
+  get tmuxInspectorStatus() { return tmuxInspectorSocketService.status(); },
   get featureFlags() { return featureFlags; },
   get sessionWorkerSupervisor() { return sessionWorkerSupervisor; },
 };
@@ -4831,6 +4850,7 @@ io.on('connection', (socket) => {
   socket.data.sessionId = socket.handshake.auth?.clientId || socket.handshake.query?.clientId || cookies[SESSION_COOKIE] || null;
   // Send current CLI status immediately on connect
   socket.emit('cli_status', { online: cliOnline });
+  tmuxInspectorSocketService.registerSocket(socket);
 });
 
 // ─── SSH Reverse Tunnel ────────────────────────────────────────────────────────
@@ -4872,6 +4892,7 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
   console.log(`${runtimeLogPrefix()}Runtime shutdown started (${reason}, exitCode=${runtimeShutdownExitCode})`);
   clearRuntimeTimers();
   sessionWorkerWebSocketService.stop();
+  tmuxInspectorSocketService.stop();
   stopWorkspaceFileWatcher();
   sshTunnelManager.stop();
   try { relaySingletonGuard.release(); } catch (error) {

@@ -35,6 +35,9 @@
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/powershell.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.5.0/css/xterm.min.css">
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.5.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.10.0/lib/xterm-addon-fit.min.js"></script>
 <script>
   if (window.hljs && typeof window.hljs.registerAliases === 'function') {
     window.hljs.registerAliases(['pwsh', 'ps1'], { languageName: 'powershell' });
@@ -1441,7 +1444,7 @@
     margin-top: 10px;
   }
 
-  #settings-modal, #summary-modal {
+  #settings-modal, #summary-modal, #tmux-inspector-modal {
     position: fixed;
     inset: 0;
     z-index: 12050;
@@ -1451,7 +1454,76 @@
     background: rgba(0, 0, 0, 0.68);
     padding: 18px;
   }
-  #settings-modal.visible, #summary-modal.visible { display: flex; }
+  #settings-modal.visible, #summary-modal.visible, #tmux-inspector-modal.visible { display: flex; }
+  .tmux-inspector-dialog {
+    width: min(1120px, 100%);
+    height: min(80vh, 760px);
+    display: grid;
+    grid-template-rows: auto auto 1fr;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+  }
+  .tmux-inspector-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg3);
+  }
+  .tmux-inspector-title {
+    font-size: var(--fs-core-composer);
+    font-weight: 600;
+  }
+  .tmux-inspector-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--muted);
+    font-size: var(--fs-meta-sm);
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  #tmux-inspector-status[data-state="error"] {
+    color: var(--danger);
+  }
+  #tmux-inspector-close {
+    width: 34px;
+    height: 34px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg2);
+    color: var(--text);
+    cursor: pointer;
+    font-size: 1.15rem;
+    line-height: 1;
+  }
+  #tmux-inspector-close:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  #tmux-inspector-term {
+    width: 100%;
+    height: 100%;
+    min-height: 280px;
+    background: #0b0f14;
+    overflow: hidden;
+  }
+  .tmux-inspector-plain-output {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    padding: 12px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: #dbe6f4;
+    background: #0b0f14;
+    font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  }
   .summary-modal-actions {
     display: flex;
     gap: 10px;
@@ -2533,7 +2605,7 @@
       justify-content: flex-start;
     }
 
-    #settings-modal, #summary-modal {
+    #settings-modal, #summary-modal, #tmux-inspector-modal {
       padding: 8px;
       align-items: stretch;
       justify-content: center;
@@ -2551,6 +2623,11 @@
     }
     .summary-modal-actions > * {
       flex: 1 1 calc(50% - 5px);
+    }
+    .tmux-inspector-dialog {
+      width: 100%;
+      height: calc(var(--app-height) - 16px);
+      border-radius: 10px;
     }
   }
 
@@ -2690,6 +2767,7 @@
             <button id="chat-menu-usage" class="chat-actions-menu-item" type="button" role="menuitem">📊 Check Usage</button>
             <button id="chat-menu-compact" class="chat-actions-menu-item" type="button" role="menuitem">🗜️ Compact</button>
             <button id="chat-menu-refresh-history" class="chat-actions-menu-item" type="button" role="menuitem">🔄️ Refresh history</button>
+            <button id="chat-menu-inspect-tmux" class="chat-actions-menu-item" type="button" role="menuitem">🖥️ Inspect tmux console</button>
             <button id="chat-menu-select-models" class="chat-actions-menu-item" type="button" role="menuitem">🤗 Select Models</button>
             <button id="chat-menu-change-cwd" class="chat-actions-menu-item" type="button" role="menuitem">🗂️ Change CWD</button>
             <button id="chat-menu-settings" class="chat-actions-menu-item" type="button" role="menuitem">⚙️ Settings</button>
@@ -2845,6 +2923,22 @@
       </div>
     </div>
     <div id="summary-modal-body" class="summary-body"></div>
+  </div>
+</div>
+
+<div id="tmux-inspector-modal" aria-hidden="true">
+  <div class="tmux-inspector-dialog" role="dialog" aria-modal="true" aria-labelledby="tmux-inspector-title">
+    <div class="tmux-inspector-header">
+      <div id="tmux-inspector-title" class="tmux-inspector-title">tmux Console Inspector (read-only)</div>
+      <button id="tmux-inspector-close" type="button" aria-label="Close tmux inspector">×</button>
+    </div>
+    <div class="tmux-inspector-meta">
+      <span>Session:</span>
+      <strong id="tmux-inspector-session"></strong>
+      <span>•</span>
+      <span id="tmux-inspector-status"></span>
+    </div>
+    <div id="tmux-inspector-term" aria-label="tmux console stream"></div>
   </div>
 </div>
 

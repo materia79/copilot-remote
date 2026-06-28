@@ -27,6 +27,10 @@ for debugging without changing the Windows launch path. Worker processes now lau
 relay repository root so the project-local `web-relay` extension is always discoverable; the
 session's actual target workspace is still passed via `COPILOT_WORKSPACE_ROOT` / `INIT_CWD`.
 
+The web client now includes a read-only **Inspect tmux console** action in the conversation
+three-dot menu. It streams only from active relay session workers and only while the viewer
+is actively watching that session.
+
 > **Single-owner rule:** Use either extension-managed relay transport **or** standalone `relay.mjs`, never both at the same time.
 > Agent/runtime restart policy is defined in `.github/copilot-instructions.md`.
 

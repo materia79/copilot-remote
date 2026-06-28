@@ -122,6 +122,7 @@ import {
   bindTapAction,
   bindMenuAction,
 } from './cwd-picker.js';
+import { initTmuxInspectorView, closeTmuxInspectorView } from './tmux-inspector-view.js';
 import {
   initTheme,
   updateTheme,
@@ -1441,6 +1442,11 @@ initActionConfirmations({
   refreshSessionWorkerStatus,
   exposeOnWindow: false,
 });
+initTmuxInspectorView({
+  bindMenuAction,
+  lockChatActionsMenuShield,
+  closeChatActionsMenu,
+});
 
 function showAuthGate() {
   document.getElementById('auth-gate').style.display = 'flex';
@@ -1457,6 +1463,7 @@ async function initApp() {
   setupViewportTracking();
   window.addEventListener('pagehide', () => {
     void flushConversationDraft(currentConvId);
+    closeTmuxInspectorView();
   });
   document.getElementById('auth-gate').style.display = 'none';
   document.getElementById('app').classList.add('visible');
