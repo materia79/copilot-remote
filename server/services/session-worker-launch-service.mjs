@@ -23,6 +23,25 @@ function isPidAlive(pidValue) {
   }
 }
 
+function normalizeText(value) {
+  const text = String(value || '').trim();
+  return text || null;
+}
+
+function buildPosixWorkerLaunchCommand(targetSessionId, env = {}) {
+  const cliExecutable = normalizeText(env?.COPILOT_WEB_RELAY_CLI_EXECUTABLE)
+    || normalizeText(env?.COPILOT_CLI_EXECUTABLE)
+    || normalizeText(env?.COPILOT_CLI_PATH)
+    || 'copilot';
+  const extensionBootstrapPath = normalizeText(env?.COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH)
+    || normalizeText(env?.COPILOT_EXTENSION_BOOTSTRAP_PATH);
+  const extensionPath = normalizeText(env?.EXTENSION_PATH);
+  if (extensionBootstrapPath && extensionPath) {
+    return `${shellQuote(cliExecutable)} ${shellQuote(extensionBootstrapPath)} --allow-all --session-id ${shellQuote(targetSessionId)}`;
+  }
+  return `gh copilot -- --allow-all --session-id ${shellQuote(targetSessionId)}`;
+}
+
 export function normalizeTmuxSessionName(targetSessionId) {
   const text = String(targetSessionId || '').trim();
   if (!text) throw new Error('missing-target-session-id');
@@ -89,6 +108,10 @@ export function getTmuxPanePid(sessionName, {
 }
 
 export function buildTmuxWorkerShellCommand(targetSessionId, env = {}) {
+  const launchEnv = {
+    ...env,
+    SESSION_ID: String(targetSessionId || '').trim() || String(env?.SESSION_ID || '').trim(),
+  };
   const exports = [];
   for (const key of [
     'GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS',
@@ -97,10 +120,15 @@ export function buildTmuxWorkerShellCommand(targetSessionId, env = {}) {
     'COPILOT_WEB_RELAY_CONFIG',
     'COPILOT_WEB_RELAY_TOOLS',
     'COPILOT_WEB_RELAY_LOG_DIR',
+    'COPILOT_WEB_RELAY_CLI_EXECUTABLE',
+    'COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH',
+    'COPILOT_SDK_PATH',
+    'EXTENSION_PATH',
+    'SESSION_ID',
     'COPILOT_WORKSPACE_ROOT',
     'INIT_CWD',
   ]) {
-    const value = String(env?.[key] || '').trim();
+    const value = String(launchEnv?.[key] || '').trim();
     if (!value) continue;
     exports.push(`${key}=${shellQuote(value)}`);
   }
@@ -108,7 +136,8 @@ export function buildTmuxWorkerShellCommand(targetSessionId, env = {}) {
   // Use script to create a pseudo-TTY without GH_FORCE_TTY so the CLI routes
   // ask_user requests through the SDK's onUserInputRequest handler instead of
   // drawing terminal prompts.
-  return `${prefix}exec script -q -c ${shellQuote(`gh copilot -- --allow-all --session-id ${shellQuote(targetSessionId)}`)} /dev/null`;
+  const workerCommand = buildPosixWorkerLaunchCommand(targetSessionId, env);
+  return `${prefix}exec script -q -c ${shellQuote(workerCommand)} /dev/null`;
 }
 
 function sleep(ms) {
@@ -167,6 +196,10 @@ export async function launchSessionCli({
     workspaceRoot: launchWorkspaceRoot,
     env,
   });
+  const launchSessionEnv = {
+    ...launchEnv,
+    SESSION_ID: target,
+  };
 
   if (isTmuxAvailable({ platform, execFileSyncImpl })) {
     const sessionName = normalizeTmuxSessionName(target);
@@ -189,9 +222,9 @@ export async function launchSessionCli({
       launchProcessCwd,
       'sh',
       '-lc',
-      buildTmuxWorkerShellCommand(target, launchEnv),
+      buildTmuxWorkerShellCommand(target, launchSessionEnv),
     ], {
-      env: launchEnv,
+      env: launchSessionEnv,
       stdio: ['ignore', 'ignore', 'ignore'],
     });
     const attempts = Math.max(1, Number(tmuxPollAttempts) || 1);
@@ -221,9 +254,17 @@ export async function launchSessionCli({
     throw new Error('worker-spawn-unhealthy:tmux-pane-missing');
   }
 
+  const posixBootstrapPath = normalizeText(launchSessionEnv.COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH)
+    || normalizeText(launchSessionEnv.COPILOT_EXTENSION_BOOTSTRAP_PATH);
+  const posixExtensionPath = normalizeText(launchSessionEnv.EXTENSION_PATH);
+  const posixCliExecutable = normalizeText(launchSessionEnv.COPILOT_WEB_RELAY_CLI_EXECUTABLE)
+    || normalizeText(launchSessionEnv.COPILOT_CLI_EXECUTABLE)
+    || normalizeText(launchSessionEnv.COPILOT_CLI_PATH)
+    || 'copilot';
+  const useBootstrapLaunch = Boolean(posixBootstrapPath && posixExtensionPath);
   const spawnCommand = platform === 'win32'
-    ? (launchEnv.ComSpec || process.env.ComSpec || 'cmd.exe')
-    : 'gh';
+    ? (launchSessionEnv.ComSpec || process.env.ComSpec || 'cmd.exe')
+    : (useBootstrapLaunch ? posixCliExecutable : 'gh');
   const spawnArgs = platform === 'win32'
     ? [
       '/d',
@@ -238,10 +279,12 @@ export async function launchSessionCli({
       '--session-id',
       target,
     ]
-    : ['copilot', '--', '--allow-all', '--session-id', target];
+    : (useBootstrapLaunch
+      ? [posixBootstrapPath, '--allow-all', '--session-id', target]
+      : ['copilot', '--', '--allow-all', '--session-id', target]);
   const child = spawnImpl(spawnCommand, spawnArgs, {
     cwd: launchProcessCwd,
-    env: launchEnv,
+    env: launchSessionEnv,
     detached: true,
     stdio: 'ignore',
     windowsHide: platform !== 'win32',

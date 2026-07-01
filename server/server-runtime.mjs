@@ -2082,6 +2082,30 @@ const sessionWorkerProcessInspector = createSessionWorkerProcessInspector({
   execFileSyncImpl: execFileSync,
 });
 function buildSessionWorkerLaunchEnv() {
+  const normalizePathValue = (value) => {
+    const text = String(value || '').trim();
+    return text || null;
+  };
+  const resolveBootstrapPath = () => {
+    const explicit = normalizePathValue(process.env.COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH)
+      || normalizePathValue(process.env.COPILOT_EXTENSION_BOOTSTRAP_PATH);
+    if (explicit && fs.existsSync(explicit)) return explicit;
+
+    const distDir = normalizePathValue(process.env.COPILOT_CLI_DIST_DIR);
+    if (distDir) {
+      const candidate = path.join(distDir, 'preloads', 'extension_bootstrap.mjs');
+      if (fs.existsSync(candidate)) return candidate;
+    }
+
+    const configuredSdkPath = normalizePathValue(config.sdkPath);
+    if (configuredSdkPath) {
+      const versionDir = path.resolve(path.dirname(configuredSdkPath), '..');
+      const candidate = path.join(versionDir, 'preloads', 'extension_bootstrap.mjs');
+      if (fs.existsSync(candidate)) return candidate;
+    }
+    return null;
+  };
+
   const next = { ...process.env };
   if (!String(next.GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS || '').trim()) {
     next.GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS = 'true';
@@ -2100,6 +2124,14 @@ function buildSessionWorkerLaunchEnv() {
   }
   if (!String(next.COPILOT_WEB_RELAY_LOG_DIR || '').trim()) {
     next.COPILOT_WEB_RELAY_LOG_DIR = path.join(__dirname, 'logs');
+  }
+  const cliExecutable = normalizePathValue(config.cliPath);
+  if (cliExecutable && !String(next.COPILOT_WEB_RELAY_CLI_EXECUTABLE || '').trim()) {
+    next.COPILOT_WEB_RELAY_CLI_EXECUTABLE = cliExecutable;
+  }
+  const bootstrapPath = resolveBootstrapPath();
+  if (bootstrapPath && !String(next.COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH || '').trim()) {
+    next.COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH = bootstrapPath;
   }
   return next;
 }
