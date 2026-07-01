@@ -2141,16 +2141,18 @@ const relayCliLauncherService = createRelayCliLauncherService({
   env: sessionWorkerLaunchEnv,
   log: (message) => console.log(`${runtimeLogPrefix()}${message}`),
 });
-async function spawnSessionWorkerCli(targetSessionId) {
+async function spawnSessionWorkerCli(targetSessionId, { allowProcessReuse = true } = {}) {
   const normalizedTargetSessionId = String(targetSessionId || '').trim();
   if (!normalizedTargetSessionId) {
     throw new Error('missing-target-session-id');
   }
-  const liveWorker = sessionWorkerProcessInspector.findProcessForSession(normalizedTargetSessionId);
-  if (liveWorker?.processId) {
-    const workerId = `worker-${normalizedTargetSessionId.slice(0, 8)}`;
-    console.log(`${runtimeLogPrefix()}worker launcher: reused ${workerId} session=${normalizedTargetSessionId.slice(0, 8)} pid=${liveWorker.processId}`);
-    return { workerId, pid: liveWorker.processId };
+  if (allowProcessReuse) {
+    const liveWorker = sessionWorkerProcessInspector.findProcessForSession(normalizedTargetSessionId);
+    if (liveWorker?.processId) {
+      const workerId = `worker-${normalizedTargetSessionId.slice(0, 8)}`;
+      console.log(`${runtimeLogPrefix()}worker launcher: reused ${workerId} session=${normalizedTargetSessionId.slice(0, 8)} pid=${liveWorker.processId}`);
+      return { workerId, pid: liveWorker.processId };
+    }
   }
   const resolvedWorkspaceRoot = resolveLaunchWorkspaceRootForSession(normalizedTargetSessionId);
   const launched = await launchSessionCli({
@@ -2161,6 +2163,7 @@ async function spawnSessionWorkerCli(targetSessionId) {
     spawnImpl: spawn,
     execFileSyncImpl: execFileSync,
     processInspector: sessionWorkerProcessInspector,
+    allowProcessReuse,
   });
   const workerPid = Number.isInteger(Number(launched?.pid)) ? Number(launched.pid) : null;
   const workerId = `worker-${normalizedTargetSessionId.slice(0, 8)}`;
@@ -2171,7 +2174,7 @@ async function spawnSessionWorkerCli(targetSessionId) {
 }
 const sessionWorkerSupervisor = createSessionWorkerSupervisor({
   registry: sessionWorkerRegistry,
-  spawnWorker: async (sdkSessionId) => spawnSessionWorkerCli(sdkSessionId),
+  spawnWorker: async (sdkSessionId, options = {}) => spawnSessionWorkerCli(sdkSessionId, options),
   diagnosticPlanReference: () => path.join(currentWorkspaceRootPath(), '.cursor', 'plans', 'worker-startup-monitoring-plan.md'),
   log: (message) => console.warn(`${runtimeLogPrefix()}${message}`),
 });

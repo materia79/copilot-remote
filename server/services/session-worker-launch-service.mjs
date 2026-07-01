@@ -172,21 +172,24 @@ export async function launchSessionCli({
   tmuxPollDelayMs = 200,
   detachedPollAttempts = 10,
   detachedPollDelayMs = 200,
+  allowProcessReuse = true,
 } = {}) {
   const target = String(targetSessionId || '').trim();
   if (!target) throw new Error('missing-target-session-id');
 
-  const liveProcess = typeof processInspector?.findProcessForSession === 'function'
-    ? processInspector.findProcessForSession(target)
-    : null;
-  const liveProcessPid = parsePositiveInt(liveProcess?.processId);
-  if (liveProcessPid && isPidAlive(liveProcessPid)) {
-    return {
-      pid: liveProcessPid,
-      reused: true,
-      launchMode: platform === 'win32' ? 'detached' : 'existing',
-      tmuxSessionName: null,
-    };
+  if (allowProcessReuse) {
+    const liveProcess = typeof processInspector?.findProcessForSession === 'function'
+      ? processInspector.findProcessForSession(target)
+      : null;
+    const liveProcessPid = parsePositiveInt(liveProcess?.processId);
+    if (liveProcessPid && isPidAlive(liveProcessPid)) {
+      return {
+        pid: liveProcessPid,
+        reused: true,
+        launchMode: platform === 'win32' ? 'detached' : 'existing',
+        tmuxSessionName: null,
+      };
+    }
   }
 
   const launchWorkspaceRoot = String(workspaceRoot || cwd || process.cwd());
@@ -203,14 +206,16 @@ export async function launchSessionCli({
 
   if (isTmuxAvailable({ platform, execFileSyncImpl })) {
     const sessionName = normalizeTmuxSessionName(target);
-    const existingPanePid = getTmuxPanePid(sessionName, { execFileSyncImpl });
-    if (existingPanePid && isPidAlive(existingPanePid)) {
-      return {
-        pid: existingPanePid,
-        reused: true,
-        launchMode: 'tmux',
-        tmuxSessionName: sessionName,
-      };
+    if (allowProcessReuse) {
+      const existingPanePid = getTmuxPanePid(sessionName, { execFileSyncImpl });
+      if (existingPanePid && isPidAlive(existingPanePid)) {
+        return {
+          pid: existingPanePid,
+          reused: true,
+          launchMode: 'tmux',
+          tmuxSessionName: sessionName,
+        };
+      }
     }
     killTmuxSession(sessionName, { execFileSyncImpl });
     execFileSyncImpl('tmux', [

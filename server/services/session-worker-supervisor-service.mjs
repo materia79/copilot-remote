@@ -574,7 +574,9 @@ export function createSessionWorkerSupervisor({
           if (!isStartActive() || isKillBlocked(sessionId)) {
             return buildStartBlockedResult();
           }
-          const spawned = await spawnWorker(sessionId);
+          const spawned = await spawnWorker(sessionId, {
+            allowProcessReuse: !blockedByStartupFailure,
+          });
           if (!isStartActive() || isKillBlocked(sessionId)) {
             return buildStartBlockedResult();
           }

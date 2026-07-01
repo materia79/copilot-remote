@@ -480,6 +480,37 @@ test('launchSessionCli reuses a live existing process before launching', async (
   assert.equal(launched.launchMode, 'existing');
 });
 
+test('launchSessionCli bypasses process reuse when disabled', async () => {
+  const spawnCalls = [];
+  const launched = await launchSessionCli({
+    targetSessionId: 'abc-123',
+    cwd: '/repo',
+    platform: 'linux',
+    allowProcessReuse: false,
+    processInspector: {
+      findProcessForSession() {
+        return { processId: process.pid, commandLine: 'gh copilot -- --session-id abc-123' };
+      },
+    },
+    execFileSyncImpl(command) {
+      if (command === 'tmux') throw new Error('missing tmux');
+      throw new Error(`unexpected command: ${command}`);
+    },
+    spawnImpl(command, args, options) {
+      spawnCalls.push({ command, args, options });
+      return {
+        pid: 4243,
+        unref() {},
+      };
+    },
+  });
+
+  assert.equal(launched.reused, false);
+  assert.equal(launched.launchMode, 'detached');
+  assert.equal(launched.pid, 4243);
+  assert.equal(spawnCalls[0]?.command, 'gh');
+});
+
 test('launchSessionCli ignores a dead discovered pid and continues to launch', async () => {
   const spawnCalls = [];
   const launched = await launchSessionCli({

@@ -54,12 +54,14 @@ test('supervisor does not reuse worker after startup heartbeat timeout', async (
   const registry = createSessionWorkerRegistry();
   let nowMs = 10_000;
   let spawnCount = 0;
+  const spawnOptions = [];
   const supervisor = createSessionWorkerSupervisor({
     registry,
     now: () => nowMs,
     heartbeatTimeoutMs: 1_000,
-    spawnWorker: async () => {
+    spawnWorker: async (_sessionId, options = {}) => {
       spawnCount += 1;
+      spawnOptions.push(options);
       return { workerId: `worker-timeout-${spawnCount}`, pid: null };
     },
   });
@@ -77,6 +79,8 @@ test('supervisor does not reuse worker after startup heartbeat timeout', async (
   assert.equal(second.ok, true);
   assert.equal(second.reused, false);
   assert.equal(spawnCount, 2);
+  assert.equal(spawnOptions[0]?.allowProcessReuse, true);
+  assert.equal(spawnOptions[1]?.allowProcessReuse, false);
 });
 
 test('markKilled blocks ensureWorker within grace period', async () => {
