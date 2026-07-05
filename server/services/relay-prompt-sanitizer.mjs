@@ -117,6 +117,8 @@ function buildPromptPrefixPatterns(mode) {
 
 function stripAttachmentPromptArtifacts(text) {
   return String(text || '')
+    .replace(/<current_datetime>[\s\S]*?<\/current_datetime>/gi, '')
+    .replace(/<system_reminder>[\s\S]*?<\/system_reminder>/gi, '')
     .replace(/\[Attached file references\][\s\S]*?\[\/Attached file references\]/gi, '')
     .replace(/\[Attached image(?:s)?\s*:[\s\S]*?\]/gi, '')
     .replace(/\[Attached file\s*:[\s\S]*?\]/gi, '')

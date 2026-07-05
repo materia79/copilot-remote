@@ -434,8 +434,15 @@ export function resolveConversationTitle({ title = '', titleSource = '', discove
   const storedTitle = String(title || '').trim();
   const source = String(titleSource || '').trim().toLowerCase();
   const discovered = String(discoveredTitle || '').trim();
-  if (source === 'manual') return storedTitle || discovered;
-  return discovered || storedTitle;
+  const normalizedDiscovered = discovered.toLowerCase();
+  const poisonedDiscoveredTitle = normalizedDiscovered.startsWith('[relay mode:')
+    || normalizedDiscovered.startsWith('implement relay tool guidance')
+    || normalizedDiscovered.includes('relay tool guidance')
+    || normalizedDiscovered.includes('for any user-facing question or clarification, use the ask_user tool')
+    || normalizedDiscovered.includes('these instructions remain in effect until relay mode changes');
+  const safeDiscovered = poisonedDiscoveredTitle ? '' : discovered;
+  if (source === 'manual') return storedTitle || safeDiscovered;
+  return safeDiscovered || storedTitle;
 }
 
 export function persistConversationTitle({
