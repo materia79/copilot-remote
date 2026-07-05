@@ -1241,6 +1241,17 @@ export function registerSessionsRoutes(app, deps) {
       AND sdk_session_id IS NOT NULL
       AND TRIM(sdk_session_id) <> ''
   `);
+  const getConversationUsageSnapshotAggregate = db.prepare(`
+    SELECT
+      COUNT(*) AS snapshot_count,
+      MAX(captured_at) AS captured_at,
+      SUM(CASE WHEN plan_delta_used IS NOT NULL AND plan_delta_used > 0 THEN plan_delta_used ELSE 0 END) AS plan_credits_used,
+      MAX(plan_entitlement) AS plan_entitlement,
+      SUM(CASE WHEN premium_delta_used IS NOT NULL AND premium_delta_used > 0 THEN premium_delta_used ELSE 0 END) AS premium_credits_used,
+      SUM(CASE WHEN premium_delta_used IS NOT NULL AND premium_delta_used > 0 THEN 1 ELSE 0 END) AS premium_request_count
+    FROM message_usage_snapshots
+    WHERE conversation_id = ?
+  `);
   const hardDeleteConversationRows = db.transaction((conversationId) => {
     if (typeof stmts.deleteConvQuestions?.run === 'function') {
       stmts.deleteConvQuestions.run(conversationId);
@@ -1405,20 +1416,61 @@ export function registerSessionsRoutes(app, deps) {
     return null;
   }
 
-  function resolveSessionUsageSummaryForSdkSession(sdkSessionId) {
+  function resolveSessionUsageSummaryForSdkSession({ sdkSessionId, conversationId } = {}) {
     const sid = String(sdkSessionId || '').trim();
-    if (!sid || typeof readSessionUsageSummary !== 'function') return null;
-    const summary = readSessionUsageSummary(sid);
-    if (!summary || typeof summary !== 'object') return null;
-    const aicUsed = Number(summary.aicUsed);
-    const totalPremiumRequests = Number(summary.totalPremiumRequests);
+    const convId = String(conversationId || '').trim();
+    const summary = (sid && typeof readSessionUsageSummary === 'function')
+      ? readSessionUsageSummary(sid)
+      : null;
+    if (summary && typeof summary === 'object') {
+      const aicUsed = Number(summary.aicUsed);
+      const totalPremiumRequests = Number(summary.totalPremiumRequests);
+      return {
+        shutdownAt: summary.shutdownAt || null,
+        aicUsed: Number.isFinite(aicUsed) ? aicUsed : null,
+        totalPremiumRequests: Number.isFinite(totalPremiumRequests) ? totalPremiumRequests : null,
+        totalNanoAiu: Number.isFinite(Number(summary.totalNanoAiu)) ? Number(summary.totalNanoAiu) : null,
+        totalApiDurationMs: Number.isFinite(Number(summary.totalApiDurationMs)) ? Number(summary.totalApiDurationMs) : null,
+        requestCount: Number.isFinite(Number(summary.requestCount)) ? Number(summary.requestCount) : null,
+        source: 'session-shutdown',
+        estimated: false,
+      };
+    }
+    if (!convId) return null;
+    const aggregate = getConversationUsageSnapshotAggregate.get(convId) || null;
+    const snapshotCount = Number(aggregate?.snapshot_count || 0);
+    if (!Number.isFinite(snapshotCount) || snapshotCount <= 0) return null;
+    const planCreditsUsed = Number(aggregate?.plan_credits_used);
+    const planEntitlement = Number(aggregate?.plan_entitlement);
+    const planMonthlyPercentUsed = Number.isFinite(planCreditsUsed) && Number.isFinite(planEntitlement) && planEntitlement > 0
+      ? Math.max(0, (planCreditsUsed / planEntitlement) * 100)
+      : null;
+    const premiumCreditsUsed = Number(aggregate?.premium_credits_used);
+    const premiumRequestCount = Number(aggregate?.premium_request_count);
+    const normalizedPlanCreditsUsed = Number.isFinite(planCreditsUsed) ? Math.max(0, planCreditsUsed) : null;
+    const normalizedPremiumCreditsUsed = Number.isFinite(premiumCreditsUsed) ? Math.max(0, premiumCreditsUsed) : null;
+    const estimatedAicUsed = (
+      normalizedPlanCreditsUsed != null && normalizedPlanCreditsUsed > 0
+        ? normalizedPlanCreditsUsed
+        : (normalizedPremiumCreditsUsed != null && normalizedPremiumCreditsUsed > 0
+          ? normalizedPremiumCreditsUsed
+          : null)
+    );
     return {
-      shutdownAt: summary.shutdownAt || null,
-      aicUsed: Number.isFinite(aicUsed) ? aicUsed : null,
-      totalPremiumRequests: Number.isFinite(totalPremiumRequests) ? totalPremiumRequests : null,
-      totalNanoAiu: Number.isFinite(Number(summary.totalNanoAiu)) ? Number(summary.totalNanoAiu) : null,
-      totalApiDurationMs: Number.isFinite(Number(summary.totalApiDurationMs)) ? Number(summary.totalApiDurationMs) : null,
-      requestCount: Number.isFinite(Number(summary.requestCount)) ? Number(summary.requestCount) : null,
+      shutdownAt: null,
+      aicUsed: estimatedAicUsed,
+      totalPremiumRequests: null,
+      totalNanoAiu: null,
+      totalApiDurationMs: null,
+      requestCount: null,
+      source: 'usage-snapshots',
+      estimated: true,
+      capturedAt: aggregate?.captured_at || null,
+      planCreditsUsed: normalizedPlanCreditsUsed,
+      planEntitlement: Number.isFinite(planEntitlement) ? planEntitlement : null,
+      planMonthlyPercentUsed,
+      premiumCreditsUsed: normalizedPremiumCreditsUsed,
+      premiumRequestEstimate: Number.isFinite(premiumRequestCount) ? Math.max(0, Math.trunc(premiumRequestCount)) : null,
     };
   }
 
@@ -2087,7 +2139,10 @@ export function registerSessionsRoutes(app, deps) {
     });
     const inFlight = inFlightStateForConversation(conversationId);
     const transcriptMessages = readSessionTranscriptMessages(sdkSessionId, { limit: Number.POSITIVE_INFINITY });
-    const sessionUsageSummary = resolveSessionUsageSummaryForSdkSession(sdkSessionId);
+    const sessionUsageSummary = resolveSessionUsageSummaryForSdkSession({
+      sdkSessionId,
+      conversationId,
+    });
     const sessionRoot = buildConversationSessionRootPayload({
       conversationId,
       sdkSessionId: conv.sdk_session_id || conversationId,
@@ -2212,7 +2267,9 @@ export function registerSessionsRoutes(app, deps) {
       const updatedAt = String(match?.updatedAt || '').trim() || new Date().toISOString();
       const discoveredTitle = String(match?.title || '').trim() || 'Session';
       const transcriptMessages = readSessionTranscriptMessages(requestedId, { limit: Number.POSITIVE_INFINITY });
-      const sessionUsageSummary = resolveSessionUsageSummaryForSdkSession(requestedId);
+      const sessionUsageSummary = resolveSessionUsageSummaryForSdkSession({
+        sdkSessionId: requestedId,
+      });
       const history = selectConversationHistoryPage(
         buildConversationMessages({
           dbMessages: [],
@@ -2297,7 +2354,10 @@ export function registerSessionsRoutes(app, deps) {
       sdkSessionId,
       { limit: Number.POSITIVE_INFINITY },
     );
-    const sessionUsageSummary = resolveSessionUsageSummaryForSdkSession(sdkSessionId);
+    const sessionUsageSummary = resolveSessionUsageSummaryForSdkSession({
+      sdkSessionId,
+      conversationId: resolvedConversationId,
+    });
     const sessionRoot = buildConversationSessionRootPayload({
       conversationId: resolvedConversationId,
       sdkSessionId: conv.sdk_session_id || resolvedConversationId,

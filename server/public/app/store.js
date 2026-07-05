@@ -577,10 +577,17 @@ export function updateSessionPill(conversation, runtimeSession) {
     || null;
   const aicUsed = Number(usageSummary?.aicUsed ?? usageSummary?.aic_used);
   const premiumRequests = Number(usageSummary?.totalPremiumRequests ?? usageSummary?.total_premium_requests);
+  const planCreditsUsed = Number(usageSummary?.planCreditsUsed ?? usageSummary?.plan_credits_used);
+  const planMonthlyPercentUsed = Number(usageSummary?.planMonthlyPercentUsed ?? usageSummary?.plan_monthly_percent_used);
   if (!usageLine) return;
   const parts = [];
   if (Number.isFinite(aicUsed) && aicUsed >= 0) {
     parts.push(`Session: ${aicUsed.toFixed(2)} AIC used`);
+  } else if (Number.isFinite(planCreditsUsed) && planCreditsUsed > 0) {
+    parts.push(`Session plan: ${planCreditsUsed.toFixed(3)} credits used`);
+  }
+  if (Number.isFinite(planMonthlyPercentUsed) && planMonthlyPercentUsed > 0) {
+    parts.push(`${planMonthlyPercentUsed.toFixed(3)}% monthly plan`);
   }
   if (Number.isFinite(premiumRequests) && premiumRequests >= 0) {
     parts.push(`${Math.trunc(premiumRequests)} premium request${Math.trunc(premiumRequests) === 1 ? '' : 's'}`);
