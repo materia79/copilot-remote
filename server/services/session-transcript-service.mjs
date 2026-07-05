@@ -237,6 +237,42 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
     return messages;
   }
 
+  function toFiniteNumber(value) {
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric : null;
+  }
+
+  function parseSessionUsageSummaryFromEvents(events = []) {
+    const sourceEvents = Array.isArray(events) ? events : [];
+    let latest = null;
+    for (const event of sourceEvents) {
+      if (String(event?.type || '').trim() !== 'session.shutdown') continue;
+      const data = event?.data && typeof event.data === 'object' ? event.data : null;
+      if (!data) continue;
+      latest = { event, data };
+    }
+    if (!latest) return null;
+    const shutdownAt = String(latest.event?.timestamp || '').trim() || null;
+    const totalNanoAiu = toFiniteNumber(latest.data?.totalNanoAiu);
+    const totalPremiumRequests = toFiniteNumber(latest.data?.totalPremiumRequests);
+    const totalApiDurationMs = toFiniteNumber(latest.data?.totalApiDurationMs);
+    const requestCount = toFiniteNumber(latest.data?.modelMetrics && typeof latest.data.modelMetrics === 'object'
+      ? Object.values(latest.data.modelMetrics).reduce((sum, metric) => {
+        const count = toFiniteNumber(metric?.requests?.count);
+        return sum + Number(count || 0);
+      }, 0)
+      : null);
+    const aicUsed = totalNanoAiu != null ? (totalNanoAiu / 1_000_000_000) : null;
+    return {
+      shutdownAt,
+      totalNanoAiu,
+      aicUsed,
+      totalPremiumRequests,
+      totalApiDurationMs,
+      requestCount,
+    };
+  }
+
   function readSessionTranscriptMessages(sessionId, options = {}) {
     const sid = String(sessionId || '').trim();
     if (!sid) return [];
@@ -278,19 +314,48 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
       events.push(event);
     }
     const messages = parseSessionEventsToMessages(events);
+    const usageSummary = parseSessionUsageSummaryFromEvents(events);
 
     cacheTranscript(sid, {
       mtimeMs,
       sizeBytes,
       cachedAt: Date.now(),
       messages,
+      usageSummary,
     });
     const windowed = sliceMessages(messages, options);
     return options.withMeta === true ? windowed : windowed.messages;
   }
 
+  function readSessionUsageSummary(sessionId) {
+    const sid = String(sessionId || '').trim();
+    if (!sid) return null;
+    const root = resolveSessionStateRoot();
+    const eventsPath = path.join(root, sid, 'events.jsonl');
+    if (!fs.existsSync(eventsPath)) return null;
+    let stat = null;
+    try {
+      stat = fs.statSync(eventsPath);
+    } catch {
+      return null;
+    }
+
+    const mtimeMs = Number(stat?.mtimeMs || 0);
+    const sizeBytes = Number(stat?.size || 0);
+    const cached = transcriptCache.get(sid);
+    if (cached && cached.mtimeMs === mtimeMs && cached.sizeBytes === sizeBytes) {
+      cached.cachedAt = Date.now();
+      return cached.usageSummary || null;
+    }
+
+    // Reuse transcript read path to refresh cache and extract summary.
+    void readSessionTranscriptMessages(sid, { limit: 1 });
+    return transcriptCache.get(sid)?.usageSummary || null;
+  }
+
   return {
     parseSessionEventsToMessages,
     readSessionTranscriptMessages,
+    readSessionUsageSummary,
   };
 }

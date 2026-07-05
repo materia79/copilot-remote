@@ -546,6 +546,7 @@ export function autoResize(el) {
 
 export function updateSessionPill(conversation, runtimeSession) {
   const title = document.getElementById('chat-title');
+  const usageLine = document.getElementById('chat-title-session-usage');
   const sdkSessionId = String(
     runtimeSession?.sdkSessionId
     || runtimeSession?.sdk_session_id
@@ -558,12 +559,39 @@ export function updateSessionPill(conversation, runtimeSession) {
       delete title.dataset.copilotSessionId;
       title.title = '';
     }
+    if (usageLine) {
+      usageLine.textContent = '';
+      usageLine.hidden = true;
+    }
     return;
   }
   if (title) {
     title.dataset.copilotSessionId = sdkSessionId;
     title.title = `Copilot session ${sdkSessionId} (click to copy)`;
   }
+
+  const usageSummary = runtimeSession?.sessionUsageSummary
+    || runtimeSession?.session_usage_summary
+    || conversation?.sessionUsageSummary
+    || conversation?.session_usage_summary
+    || null;
+  const aicUsed = Number(usageSummary?.aicUsed ?? usageSummary?.aic_used);
+  const premiumRequests = Number(usageSummary?.totalPremiumRequests ?? usageSummary?.total_premium_requests);
+  if (!usageLine) return;
+  const parts = [];
+  if (Number.isFinite(aicUsed) && aicUsed >= 0) {
+    parts.push(`Session: ${aicUsed.toFixed(2)} AIC used`);
+  }
+  if (Number.isFinite(premiumRequests) && premiumRequests >= 0) {
+    parts.push(`${Math.trunc(premiumRequests)} premium request${Math.trunc(premiumRequests) === 1 ? '' : 's'}`);
+  }
+  if (!parts.length) {
+    usageLine.textContent = '';
+    usageLine.hidden = true;
+    return;
+  }
+  usageLine.textContent = parts.join(' · ');
+  usageLine.hidden = false;
 }
 
 export function updateCompactButton() {

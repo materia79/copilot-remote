@@ -7,10 +7,21 @@ export function deriveComposerControlState({
   cancelRequested = false,
   hasDraft = false,
   sendInFlight = false,
+  modelMetadataBlocked = false,
 } = {}) {
   const active = !!hasActiveTurn;
   const stopping = !!cancelRequested;
   const draft = !!hasDraft;
+  const metadataBlocked = !!modelMetadataBlocked;
+
+  if (metadataBlocked && !active) {
+    return {
+      action: 'send',
+      label: 'Send',
+      title: 'Refresh model metadata to send',
+      disabled: true,
+    };
+  }
 
   if (sendInFlight) {
     if (active && draft) {

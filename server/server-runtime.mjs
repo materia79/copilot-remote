@@ -102,6 +102,7 @@ const DEFAULT_MODEL = 'gpt-5.4-mini';
 const MODEL_CATALOG_STALE_MS = 2 * 60 * 1000;
 const SUPPORTED_RELAY_MODES = ['plan', 'ask', 'agent', 'autopilot'];
 const DEFAULT_RELAY_MODE = 'agent';
+const AUTO_MODEL_SENTINEL = 'auto';
 const SUPPORTED_CONVERSATION_SESSION_MODES = ['isolated', 'shared'];
 const DEFAULT_CONVERSATION_SESSION_MODE = 'isolated';
 const MAX_UPLOAD_ATTACHMENTS = 6;
@@ -945,17 +946,106 @@ function buildModelVariantEntries(baseModels = [], {
   return entries;
 }
 
+function isModelCatalogRefreshedAtStale(refreshedAt) {
+  if (!refreshedAt) return true;
+  const parsed = Date.parse(refreshedAt);
+  if (!Number.isFinite(parsed)) return true;
+  return (Date.now() - parsed) > MODEL_CATALOG_STALE_MS;
+}
+
+function hasValidReasoningByModel(reasoningByModel = {}) {
+  if (!reasoningByModel || typeof reasoningByModel !== 'object') return false;
+  const modelIds = Object.keys(reasoningByModel).filter((modelId) => modelId !== AUTO_MODEL_SENTINEL);
+  if (!modelIds.length) return false;
+  return modelIds.every((modelId) => {
+    const efforts = reasoningByModel[modelId];
+    return Array.isArray(efforts) && efforts.length > 0;
+  });
+}
+
 function getModelCatalogState() {
   const selectorState = getModelVariantSelectorState();
+  const enabledRows = listEnabledModelVariantRows();
+  const modelRows = enabledRows.length ? enabledRows : listModelVariantRows().filter((row) => row.enabled);
+  const allRows = listModelVariantRows();
+  const reasoningByModel = {};
+  const models = [];
+  const seenModels = new Set();
+  for (const row of modelRows) {
+    const baseModelId = String(row?.baseModelId || '').trim();
+    if (!baseModelId) continue;
+    if (!seenModels.has(baseModelId)) {
+      seenModels.add(baseModelId);
+      models.push(baseModelId);
+    }
+    const effort = normalizeReasoningEffort(row?.reasoningEffort || 'none') || 'none';
+    const current = reasoningByModel[baseModelId] || [];
+    if (!current.includes(effort)) current.push(effort);
+    reasoningByModel[baseModelId] = current;
+  }
+  const knownModelIds = new Set(Object.keys(reasoningByModel));
+  for (const row of allRows) {
+    const baseModelId = String(row?.baseModelId || '').trim();
+    if (!baseModelId) continue;
+    knownModelIds.add(baseModelId);
+    const effort = normalizeReasoningEffort(row?.reasoningEffort || 'none') || 'none';
+    const current = reasoningByModel[baseModelId] || [];
+    if (!current.includes(effort)) current.push(effort);
+    reasoningByModel[baseModelId] = current;
+  }
+  for (const modelId of knownModelIds) {
+    const efforts = uniqueStringList(
+      (reasoningByModel[modelId] || [])
+        .map((value) => normalizeReasoningEffort(value))
+        .filter(Boolean),
+    );
+    reasoningByModel[modelId] = efforts;
+  }
+  const autoEfforts = uniqueStringList(
+    Object.entries(reasoningByModel)
+      .filter(([modelId]) => modelId !== AUTO_MODEL_SENTINEL)
+      .flatMap(([, list]) => Array.isArray(list) ? list : [])
+      .map((value) => normalizeReasoningEffort(value))
+      .filter(Boolean),
+  );
+  if (autoEfforts.length) {
+    reasoningByModel[AUTO_MODEL_SENTINEL] = autoEfforts;
+  } else {
+    delete reasoningByModel[AUTO_MODEL_SENTINEL];
+  }
+  const catalogModels = [AUTO_MODEL_SENTINEL, ...models.filter((value) => value.toLowerCase() !== AUTO_MODEL_SENTINEL)];
+  const currentResolved = parseModelVariantSelection(selectorState.currentModel);
+  const defaultResolved = parseModelVariantSelection(selectorState.defaultModel);
+  const currentModel = String(currentResolved?.baseModelId || selectorState.currentModel || '').trim() || catalogModels[0] || DEFAULT_MODEL;
+  const defaultModel = String(defaultResolved?.baseModelId || selectorState.defaultModel || '').trim() || currentModel || catalogModels[0] || DEFAULT_MODEL;
+  const reasoningMetadataValid = hasValidReasoningByModel(reasoningByModel);
+  const catalogRefreshedAtStale = isModelCatalogRefreshedAtStale(selectorState.refreshedAt);
+  const metadataError = !reasoningMetadataValid || !!selectorState.error || modelRows.length === 0;
+  const stale = metadataError;
+  const metadataValid = !metadataError;
+  const ageWarning = catalogRefreshedAtStale
+    ? 'Model catalog may be out of date. Refresh models if selections look wrong.'
+    : null;
+  const warning = [selectorState.warning, ageWarning].filter(Boolean).join(' ').trim() || null;
+  const reasoningEfforts = uniqueStringList(
+    Object.values(reasoningByModel)
+      .flatMap((list) => Array.isArray(list) ? list : [])
+      .map((value) => normalizeReasoningEffort(value))
+      .filter(Boolean),
+  );
   return {
-    models: selectorState.models,
-    currentModel: selectorState.currentModel,
-    defaultModel: selectorState.defaultModel,
+    models: catalogModels,
+    currentModel,
+    defaultModel,
     source: selectorState.source,
     refreshedAt: selectorState.refreshedAt,
-    stale: false,
-    warning: selectorState.warning,
+    stale,
+    metadataValid,
+    reasoningMetadataValid,
+    warning,
     error: selectorState.error,
+    reasoningByModel,
+    reasoningEfforts,
   };
 }
 
@@ -1002,56 +1092,90 @@ function updateModelCatalog(snapshot = {}) {
   return getModelCatalogState();
 }
 
+function getSupportedReasoningEffortsForModel(model = '') {
+  const modelId = String(model || '').trim().toLowerCase();
+  if (!modelId || modelId === AUTO_MODEL_SENTINEL) return [];
+  const state = getModelCatalogState();
+  return Array.isArray(state.reasoningByModel?.[modelId])
+    ? state.reasoningByModel[modelId].map((value) => normalizeReasoningEffort(value)).filter(Boolean)
+    : [];
+}
+
+function resolveRequestedReasoningEffort(model, requestedReasoningEffort = '') {
+  const modelId = String(model || '').trim().toLowerCase();
+  if (modelId === AUTO_MODEL_SENTINEL) {
+    return { ok: true, effort: null, supported: getSupportedReasoningEffortsForModel(AUTO_MODEL_SENTINEL) };
+  }
+  const supported = getSupportedReasoningEffortsForModel(modelId);
+  const requested = normalizeReasoningEffort(requestedReasoningEffort);
+  if (!supported.length) {
+    return { ok: false, error: 'Reasoning metadata unavailable for model', supported };
+  }
+  if (!requested) {
+    return { ok: false, error: 'Reasoning effort is required', supported };
+  }
+  if (!supported.includes(requested)) {
+    return { ok: false, error: 'Unsupported reasoning effort', supported };
+  }
+  return { ok: true, effort: requested, supported };
+}
+
 function resolveRequestedModel(model) {
   const requested = String(model || '').trim();
   const state = getModelCatalogState();
-  const fallbackVariant = state.currentModel || state.defaultModel || buildModelVariantId(DEFAULT_MODEL, isReasoningVariantEligibleModel(DEFAULT_MODEL) ? 'none' : null);
-  const fallbackResolution = parseModelVariantSelection(fallbackVariant);
-  const fallbackModel = fallbackResolution?.baseModelId || DEFAULT_MODEL;
+  const availableModels = Array.isArray(state.models) ? state.models : [];
+  const fallbackModel = String(state.currentModel || state.defaultModel || DEFAULT_MODEL).trim() || DEFAULT_MODEL;
+  const fallbackVariant = fallbackModel.toLowerCase() === AUTO_MODEL_SENTINEL
+    ? AUTO_MODEL_SENTINEL
+    : fallbackModel;
+
   if (!requested) {
     return {
       ok: true,
       model: fallbackModel,
-      modelVariantId: fallbackResolution?.variantId || fallbackVariant,
-      reasoningEffort: fallbackResolution?.reasoningEffort || null,
+      modelVariantId: fallbackVariant,
+      reasoningEffort: null,
       warning: null,
     };
   }
-  const resolved = parseModelVariantSelection(requested);
-  if (!resolved) {
-    return { ok: false, error: 'Unsupported model variant', available: state.models };
-  }
-  let resolvedVariantId = resolved.variantId;
-  let resolvedBaseModelId = resolved.baseModelId;
-  let resolvedReasoningEffort = resolved.reasoningEffort;
-  if (!state.models.includes(resolvedVariantId)) {
-    const sameBase = state.models.filter((entry) => {
-      const parsed = parseModelVariantSelection(entry);
-      return parsed && parsed.baseModelId === resolvedBaseModelId;
-    });
-    if (sameBase.length) {
-      const noneVariant = sameBase.find((entry) => /-none$/i.test(entry)) || sameBase[0];
-      const parsedNone = parseModelVariantSelection(noneVariant);
-      if (parsedNone) {
-        resolvedVariantId = parsedNone.variantId;
-        resolvedBaseModelId = parsedNone.baseModelId;
-        resolvedReasoningEffort = parsedNone.reasoningEffort;
-      }
-    }
-  }
-  if (state.models.includes(resolvedVariantId)) {
+
+  if (requested.toLowerCase() === AUTO_MODEL_SENTINEL) {
     return {
       ok: true,
-      model: resolvedBaseModelId,
-      modelVariantId: resolvedVariantId,
-      reasoningEffort: resolvedReasoningEffort,
+      model: AUTO_MODEL_SENTINEL,
+      modelVariantId: AUTO_MODEL_SENTINEL,
+      reasoningEffort: null,
       warning: null,
     };
   }
+
+  const requestedModel = requested.toLowerCase();
+  if (availableModels.includes(requestedModel)) {
+    return {
+      ok: true,
+      model: requestedModel,
+      modelVariantId: requestedModel,
+      reasoningEffort: null,
+      warning: null,
+    };
+  }
+
+  const parsedVariant = parseModelVariantSelection(requested);
+  if (!parsedVariant) {
+    return { ok: false, error: 'Unsupported model', available: availableModels };
+  }
+  if (!availableModels.includes(parsedVariant.baseModelId)) {
+    return { ok: false, error: 'Unsupported model', available: availableModels };
+  }
+  const parsedEffort = normalizeReasoningEffort(parsedVariant.reasoningEffort || '');
   return {
-    ok: false,
-    error: 'Unsupported model',
-    available: state.models,
+    ok: true,
+    model: parsedVariant.baseModelId,
+    modelVariantId: parsedEffort
+      ? buildModelVariantId(parsedVariant.baseModelId, parsedEffort)
+      : parsedVariant.variantId,
+    reasoningEffort: parsedEffort || null,
+    warning: null,
   };
 }
 
@@ -1382,6 +1506,9 @@ db.exec(`
     model           TEXT,
     mode            TEXT,
     attachments     TEXT,
+    model_requested TEXT,
+    model_actual    TEXT,
+    model_origin    TEXT,
     timestamp       TEXT NOT NULL,
     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
   );
@@ -1417,6 +1544,32 @@ db.exec(`
   );
 
   CREATE INDEX IF NOT EXISTS idx_queue_status ON queue(status, timestamp);
+
+  CREATE TABLE IF NOT EXISTS message_usage_snapshots (
+    response_message_id TEXT PRIMARY KEY,
+    queue_message_id TEXT,
+    conversation_id TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'live',
+    stale INTEGER NOT NULL DEFAULT 0,
+    premium_remaining REAL,
+    premium_entitlement REAL,
+    premium_used_percent REAL,
+    premium_delta_used REAL,
+    chat_remaining REAL,
+    chat_entitlement REAL,
+    chat_used_percent REAL,
+    chat_delta_used REAL,
+    plan_remaining REAL,
+    plan_entitlement REAL,
+    plan_used_percent REAL,
+    plan_delta_used REAL,
+    captured_at TEXT NOT NULL,
+    FOREIGN KEY (response_message_id) REFERENCES messages(id) ON DELETE CASCADE,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_message_usage_conv_time ON message_usage_snapshots(conversation_id, captured_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_message_usage_queue_id ON message_usage_snapshots(queue_message_id);
 
   CREATE TABLE IF NOT EXISTS runtime_sessions (
     id              TEXT PRIMARY KEY,
@@ -1714,6 +1867,15 @@ if (!messageColumns.includes('attachments')) {
 }
 if (!messageColumns.includes('mode')) {
   db.exec(`ALTER TABLE messages ADD COLUMN mode TEXT`);
+}
+if (!messageColumns.includes('model_requested')) {
+  db.exec(`ALTER TABLE messages ADD COLUMN model_requested TEXT`);
+}
+if (!messageColumns.includes('model_actual')) {
+  db.exec(`ALTER TABLE messages ADD COLUMN model_actual TEXT`);
+}
+if (!messageColumns.includes('model_origin')) {
+  db.exec(`ALTER TABLE messages ADD COLUMN model_origin TEXT`);
 }
 
 const queueColumns = db.prepare(`PRAGMA table_info(queue)`).all().map((c) => c.name);
@@ -3970,6 +4132,7 @@ function fetchUsageSummary(cb) {
         const snap = data?.quota_snapshots || {};
         const premium = snap.premium_interactions || {};
         const chat = snap.chat || {};
+        const planSnapshot = snap.plan || data?.plan || data?.copilot_plan_quota || {};
         cb(null, {
           plan: data?.copilot_plan,
           resetDate: data?.quota_reset_date,
@@ -3977,12 +4140,19 @@ function fetchUsageSummary(cb) {
             unlimited: chat.unlimited ?? true,
             remaining: chat.remaining ?? null,
             entitlement: chat.entitlement ?? null,
+            percentRemaining: chat.percent_remaining ?? null,
           },
           premiumInteractions: {
             unlimited: premium.unlimited ?? false,
             remaining: Math.round(premium.quota_remaining ?? premium.remaining ?? 0),
             entitlement: premium.entitlement ?? 1500,
             percentRemaining: premium.percent_remaining ?? null,
+          },
+          planQuota: {
+            unlimited: planSnapshot.unlimited ?? false,
+            remaining: planSnapshot.quota_remaining ?? planSnapshot.remaining ?? null,
+            entitlement: planSnapshot.entitlement ?? null,
+            percentRemaining: planSnapshot.percent_remaining ?? null,
           },
         });
       })
@@ -4120,6 +4290,7 @@ const sessionTranscriptService = createSessionTranscriptService({
 });
 const readSessionTranscriptMessages = sessionTranscriptService.readSessionTranscriptMessages;
 const parseSessionEventsToMessages = sessionTranscriptService.parseSessionEventsToMessages;
+const readSessionUsageSummary = sessionTranscriptService.readSessionUsageSummary;
 const contextSnapshotService = createContextSnapshotService({
   fs,
   path,
@@ -4480,6 +4651,7 @@ const sharedRouteDeps = {
   addMsIso,
   computeRetryDelayMs,
   resolveRequestedModel,
+  resolveRequestedReasoningEffort,
   normalizeRelayMode,
   DEFAULT_RELAY_MODE,
   DEFAULT_MODEL,
@@ -4509,6 +4681,7 @@ const sharedRouteDeps = {
   discoverSessionStateConversations,
   readSessionTranscriptMessages,
   parseSessionEventsToMessages,
+  readSessionUsageSummary,
   collectOrphanedUploadsFromConversation,
   deleteOrphanedUploads,
   fs,

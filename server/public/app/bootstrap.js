@@ -44,6 +44,7 @@ import {
   saveConversationScrollTop,
   getSessionWorkerState,
   resolveConversationUiState,
+  summaryModalState,
 } from './store.js';
 import {
   verifyExistingSession,
@@ -146,9 +147,13 @@ import {
 } from './action-confirmations.js';
 
 const MODEL_STORAGE_KEY = 'copilot_selected_model';
+const REASONING_STORAGE_KEY = 'copilot_selected_reasoning_effort';
 const MODE_STORAGE_KEY = 'copilot_selected_mode';
 const MODELS_BY_MODE_STORAGE_KEY = 'copilot_selected_models_by_mode';
+const REASONING_BY_MODE_STORAGE_KEY = 'copilot_selected_reasoning_by_mode';
+const AUTO_MODEL_OPTION = 'auto';
 const FALLBACK_MODEL = 'gpt-5.4-mini';
+const FALLBACK_REASONING_EFFORT = 'none';
 const FALLBACK_MODE = 'agent';
 const PROVIDER_LABELS = {
   openai: 'OpenAI',
@@ -170,13 +175,22 @@ let modelCatalogState = {
   models: [FALLBACK_MODEL],
   currentModel: FALLBACK_MODEL,
   defaultModel: FALLBACK_MODEL,
-  stale: false,
+  reasoningByModel: {},
+  reasoningEfforts: [],
+  stale: true,
+  metadataValid: false,
+  reasoningMetadataValid: false,
   warning: null,
+  error: null,
   refreshedAt: null,
 };
+let lastHealthyModelCatalogState = null;
+let modelMetadataBlocked = true;
+let modelMetadataRetryInFlight = false;
 let modelVariantCatalogState = {
   variants: [],
   enabledVariantIds: [],
+  reasoningByModel: {},
   source: null,
   refreshedAt: null,
   warning: null,
@@ -184,6 +198,7 @@ let modelVariantCatalogState = {
   reasoningEfforts: [],
 };
 let activeConversationPreferredModelsByMode = {};
+let activeConversationPreferredReasoningByMode = {};
 let suppressConversationPreferenceSync = false;
 let conversationPreferenceWriteVersion = 0;
 let pullRefreshState = {
@@ -302,10 +317,132 @@ function humanizeModelLabel(modelId = '') {
 }
 
 function modelOptionLabel(modelVariantId = '') {
+  if (String(modelVariantId || '').trim().toLowerCase() === AUTO_MODEL_OPTION) return 'Auto';
   const { baseModelId, reasoningEffort } = splitVariantId(modelVariantId);
   if (!baseModelId) return modelVariantId;
   const baseLabel = humanizeModelLabel(baseModelId);
   return reasoningEffort ? `${baseLabel} (${reasoningEffort})` : baseLabel;
+}
+
+function normalizeReasoningEffortList(efforts = []) {
+  const values = Array.isArray(efforts)
+    ? efforts.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean)
+    : [];
+  return Array.from(new Set(values));
+}
+
+function isModelMetadataHealthy(payload = modelCatalogState) {
+  if (!payload || typeof payload !== 'object') return false;
+  if (payload.metadataValid === false) return false;
+  if (payload.stale) return false;
+  const reasoningByModel = payload.reasoningByModel && typeof payload.reasoningByModel === 'object'
+    ? payload.reasoningByModel
+    : {};
+  const modelIds = Object.keys(reasoningByModel).filter((modelId) => modelId !== AUTO_MODEL_OPTION);
+  if (!modelIds.length) return false;
+  return modelIds.every((modelId) => {
+    const efforts = reasoningByModel[modelId];
+    return Array.isArray(efforts) && efforts.length > 0;
+  });
+}
+
+function syncModelMetadataBlocker(message = '') {
+  const blocker = document.getElementById('model-metadata-blocker');
+  const text = document.getElementById('model-metadata-blocker-text');
+  const retryBtn = document.getElementById('model-metadata-retry-btn');
+  const blocked = modelMetadataBlocked || !isModelMetadataHealthy();
+  if (text) {
+    text.textContent = String(message || '').trim()
+      || 'Model metadata is unavailable. Refresh to choose a model and reasoning effort.';
+  }
+  if (retryBtn) retryBtn.disabled = modelMetadataRetryInFlight;
+  blocker?.classList.toggle('visible', blocked);
+  const modelSelect = document.getElementById('model-select');
+  const reasoningSelect = document.getElementById('reasoning-effort-select');
+  if (modelSelect) {
+    modelSelect.disabled = blocked;
+    modelSelect.title = blocked ? 'Model metadata unavailable' : 'Model';
+  }
+  if (reasoningSelect) {
+    reasoningSelect.disabled = blocked;
+    reasoningSelect.title = blocked ? 'Reasoning metadata unavailable' : 'Reasoning effort';
+  }
+  window.syncComposerControlState?.();
+}
+
+function applyModelMetadataHardFail(message = '') {
+  modelMetadataBlocked = true;
+  syncModelMetadataBlocker(message);
+  setModelBanner(`⚠️ ${String(message || 'Model metadata is unavailable.').trim()}`);
+}
+
+function clearModelMetadataHardFail() {
+  modelMetadataBlocked = false;
+  syncModelMetadataBlocker('');
+  if (!modelCatalogState.warning && !modelCatalogState.stale) {
+    setModelBanner('');
+  }
+}
+
+function readStoredReasoningByMode() {
+  const raw = String(localStorage.getItem(REASONING_BY_MODE_STORAGE_KEY) || '').trim();
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const out = {};
+    for (const [mode, effort] of Object.entries(parsed)) {
+      const modeKey = String(mode || '').trim();
+      const effortValue = String(effort || '').trim().toLowerCase();
+      if (!modeKey || !effortValue) continue;
+      out[modeKey] = effortValue;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function reasoningOptionsForModel(modelId = '') {
+  if (!isModelMetadataHealthy()) return [];
+  const key = String(modelId || '').trim().toLowerCase();
+  return normalizeReasoningEffortList(modelCatalogState.reasoningByModel?.[key] || []);
+}
+
+function selectedReasoningEffortValue() {
+  const select = document.getElementById('reasoning-effort-select');
+  const value = String(select?.value || '').trim().toLowerCase();
+  if (value) return value;
+  return FALLBACK_REASONING_EFFORT;
+}
+
+function updateReasoningSelectorForModel(modelId, preferredEffort = '') {
+  const select = document.getElementById('reasoning-effort-select');
+  if (!select) return;
+  const options = reasoningOptionsForModel(modelId);
+  const selectedBefore = String(select.value || '').trim().toLowerCase();
+  select.innerHTML = '';
+  if (!options.length) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = 'Unavailable';
+    select.appendChild(opt);
+    select.value = '';
+    return;
+  }
+  for (const effort of options) {
+    const opt = document.createElement('option');
+    opt.value = effort;
+    opt.textContent = effort;
+    select.appendChild(opt);
+  }
+  const preferred = String(preferredEffort || '').trim().toLowerCase();
+  const resolved = [preferred, selectedBefore, localStorage.getItem(REASONING_STORAGE_KEY)]
+    .map((value) => String(value || '').trim().toLowerCase())
+    .find((value) => value && options.includes(value))
+    || options[0];
+  select.value = resolved;
+  localStorage.setItem(REASONING_STORAGE_KEY, resolved);
 }
 
 function updateModelCatalogState(payload) {
@@ -317,16 +454,55 @@ function updateModelCatalogState(payload) {
   const currentModel = String(payload?.currentModel || models[0] || '').trim();
   const defaultModel = String(payload?.defaultModel || models[0] || '').trim();
   const nextModels = Array.from(new Set(models.filter(Boolean)));
+  if (!nextModels.includes(AUTO_MODEL_OPTION)) nextModels.unshift(AUTO_MODEL_OPTION);
   if (!nextModels.length) nextModels.push(FALLBACK_MODEL);
 
-  modelCatalogState = {
+  const nextState = {
     models: nextModels,
     currentModel: currentModel || nextModels[0] || FALLBACK_MODEL,
     defaultModel: defaultModel || nextModels[0] || FALLBACK_MODEL,
+    reasoningByModel: payload?.reasoningByModel && typeof payload.reasoningByModel === 'object'
+      ? Object.fromEntries(Object.entries(payload.reasoningByModel).map(([modelId, efforts]) => [
+        String(modelId || '').trim().toLowerCase(),
+        normalizeReasoningEffortList(efforts),
+      ]))
+      : {},
+    reasoningEfforts: normalizeReasoningEffortList(payload?.reasoningEfforts || []),
     stale: !!payload?.stale,
+    metadataValid: payload?.metadataValid === true,
+    reasoningMetadataValid: payload?.reasoningMetadataValid === true,
     warning: payload?.warning ? String(payload.warning) : null,
+    error: payload?.error ? String(payload.error) : null,
     refreshedAt: payload?.refreshedAt || null,
   };
+
+  const nextHealthy = isModelMetadataHealthy(nextState);
+  const currentlyHealthy = isModelMetadataHealthy(modelCatalogState);
+  if (!nextHealthy && !currentlyHealthy && isModelMetadataHealthy(lastHealthyModelCatalogState)) {
+    modelCatalogState = { ...lastHealthyModelCatalogState };
+    clearModelMetadataHardFail();
+    setModelBanner('⚠️ Model metadata refresh failed; restored last known good catalog.');
+    syncModelMetadataBlocker();
+    return;
+  }
+  if (!nextHealthy && currentlyHealthy) {
+    setModelBanner('⚠️ Model metadata refresh failed; keeping last known good catalog.');
+    syncModelMetadataBlocker();
+    return;
+  }
+
+  modelCatalogState = nextState;
+
+  if (!nextHealthy) {
+    applyModelMetadataHardFail(
+      modelCatalogState.error
+        ? `Model metadata error: ${modelCatalogState.error}`
+        : (modelCatalogState.warning || 'Model metadata is stale or incomplete.'),
+    );
+  } else {
+    lastHealthyModelCatalogState = modelCatalogState;
+    clearModelMetadataHardFail();
+  }
 
   const selectedBefore = select.value;
   const selectedMode = String(document.getElementById('mode-select')?.value || '').trim();
@@ -343,6 +519,8 @@ function updateModelCatalogState(payload) {
     .find((value) => value && nextModels.includes(value)) || nextModels[0];
   select.value = preferred;
   localStorage.setItem(MODEL_STORAGE_KEY, preferred);
+  const preferredReasoningForMode = String(activeConversationPreferredReasoningByMode?.[selectedMode] || '').trim().toLowerCase();
+  updateReasoningSelectorForModel(preferred, preferredReasoningForMode);
   if (selectedMode) {
     activeConversationPreferredModelsByMode = withUpdatedModelPreference({
       preferredModelsByMode: activeConversationPreferredModelsByMode,
@@ -351,15 +529,21 @@ function updateModelCatalogState(payload) {
       supportedModes: Array.from(document.getElementById('mode-select')?.options || []).map((option) => option.value),
     });
     localStorage.setItem(MODELS_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredModelsByMode));
+    activeConversationPreferredReasoningByMode = {
+      ...activeConversationPreferredReasoningByMode,
+      [selectedMode]: selectedReasoningEffortValue(),
+    };
+    localStorage.setItem(REASONING_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredReasoningByMode));
   }
 
-  if (modelCatalogState.warning) {
+  if (modelCatalogState.warning && isModelMetadataHealthy(modelCatalogState)) {
     setModelBanner(`⚠️ ${modelCatalogState.warning}`);
-  } else if (modelCatalogState.stale) {
+  } else if (modelCatalogState.stale && isModelMetadataHealthy(modelCatalogState)) {
     setModelBanner('⚠️ Model list is cached from CLI; selection may be stale.');
-  } else {
+  } else if (isModelMetadataHealthy(modelCatalogState)) {
     setModelBanner('');
   }
+  syncModelMetadataBlocker();
 }
 
 function selectedModelValue() {
@@ -397,6 +581,7 @@ async function persistCurrentConversationPreferences() {
   if (!modeSelect || !modelSelect) return;
   const mode = String(modeSelect.value || '').trim() || FALLBACK_MODE;
   const model = String(modelSelect.value || '').trim();
+  const reasoningEffort = selectedReasoningEffortValue();
   const supportedModes = modeOptions();
   activeConversationPreferredModelsByMode = withUpdatedModelPreference({
     preferredModelsByMode: activeConversationPreferredModelsByMode,
@@ -407,6 +592,12 @@ async function persistCurrentConversationPreferences() {
   localStorage.setItem(MODELS_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredModelsByMode));
   localStorage.setItem(MODE_STORAGE_KEY, mode);
   if (model) localStorage.setItem(MODEL_STORAGE_KEY, model);
+  if (reasoningEffort) localStorage.setItem(REASONING_STORAGE_KEY, reasoningEffort);
+  activeConversationPreferredReasoningByMode = {
+    ...activeConversationPreferredReasoningByMode,
+    [mode]: reasoningEffort || FALLBACK_REASONING_EFFORT,
+  };
+  localStorage.setItem(REASONING_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredReasoningByMode));
 
   const writeVersion = ++conversationPreferenceWriteVersion;
   const response = await updateConversationPreferences(convId, {
@@ -447,13 +638,20 @@ function applyConversationPreferences({
   suppressConversationPreferenceSync = true;
   modeSelect.value = selection.mode;
   if (selection.model) modelSelect.value = selection.model;
+  const modeReasoning = String(activeConversationPreferredReasoningByMode?.[selection.mode] || '').trim().toLowerCase();
+  updateReasoningSelectorForModel(selection.model || modelSelect.value, modeReasoning);
   suppressConversationPreferenceSync = false;
 
   activeConversationPreferredModelsByMode = {
     ...readStoredModelsByMode(),
     ...selection.preferredModelsByMode,
   };
+  activeConversationPreferredReasoningByMode = {
+    ...readStoredReasoningByMode(),
+    ...activeConversationPreferredReasoningByMode,
+  };
   localStorage.setItem(MODELS_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredModelsByMode));
+  localStorage.setItem(REASONING_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredReasoningByMode));
   localStorage.setItem(MODE_STORAGE_KEY, selection.mode);
   if (selection.model) localStorage.setItem(MODEL_STORAGE_KEY, selection.model);
 }
@@ -488,9 +686,27 @@ function initModelSelector() {
         model: select.value,
         supportedModes: modeOptions(),
       });
+      const preferredReasoning = String(activeConversationPreferredReasoningByMode?.[mode] || '').trim().toLowerCase();
+      updateReasoningSelectorForModel(select.value, preferredReasoning);
       void persistCurrentConversationPreferences().catch(() => {});
     });
   }
+}
+
+function initReasoningSelector() {
+  const select = document.getElementById('reasoning-effort-select');
+  if (!select || select.dataset.bound === '1') return;
+  select.dataset.bound = '1';
+  select.addEventListener('change', () => {
+    if (suppressConversationPreferenceSync) return;
+    const mode = String(document.getElementById('mode-select')?.value || '').trim() || FALLBACK_MODE;
+    activeConversationPreferredReasoningByMode = {
+      ...activeConversationPreferredReasoningByMode,
+      [mode]: selectedReasoningEffortValue(),
+    };
+    localStorage.setItem(REASONING_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredReasoningByMode));
+    void persistCurrentConversationPreferences().catch(() => {});
+  });
 }
 
 function initModeSelector() {
@@ -516,6 +732,8 @@ function initModeSelector() {
         modelSelect.value = modeModel;
         suppressConversationPreferenceSync = false;
       }
+      const modeReasoning = String(activeConversationPreferredReasoningByMode?.[mode] || '').trim().toLowerCase();
+      updateReasoningSelectorForModel(modelSelect.value, modeReasoning);
     }
     void persistCurrentConversationPreferences().catch(() => {});
   });
@@ -524,11 +742,39 @@ function initModeSelector() {
 function refreshModelCatalog(force = false) {
   return loadModelCatalog().then((r) => {
     if (!r) {
-      if (force) setModelBanner('⚠️ Could not refresh live model list; using current selection.');
-      return;
+      if (isModelMetadataHealthy(modelCatalogState) || isModelMetadataHealthy(lastHealthyModelCatalogState)) {
+        setModelBanner('⚠️ Could not refresh model metadata; using last known good catalog.');
+        syncModelMetadataBlocker();
+        return null;
+      }
+      applyModelMetadataHardFail(force
+        ? 'Could not refresh live model metadata.'
+        : 'Could not load model metadata.');
+      return null;
     }
     updateModelCatalogState(r);
+    return r;
   });
+}
+
+async function retryModelMetadataRefresh() {
+  if (modelMetadataRetryInFlight) return;
+  modelMetadataRetryInFlight = true;
+  syncModelMetadataBlocker('Refreshing model metadata…');
+  try {
+    const refreshed = await refreshModelVariantCatalog();
+    if (!refreshed) throw new Error('Model variant refresh failed');
+    await refreshModelCatalog(true);
+    if (!isModelMetadataHealthy()) {
+      throw new Error('Model metadata is still unavailable after refresh');
+    }
+    showTransientRelayNotice('Model metadata refreshed.');
+  } catch (error) {
+    applyModelMetadataHardFail(error?.message || 'Model metadata refresh failed.');
+  } finally {
+    modelMetadataRetryInFlight = false;
+    syncModelMetadataBlocker();
+  }
 }
 
 function applyModelVariantCatalogState(payload) {
@@ -576,6 +822,12 @@ function applyModelVariantCatalogState(payload) {
   modelVariantCatalogState = {
     variants,
     enabledVariantIds: Array.from(enabledVariantIds),
+    reasoningByModel: payload?.reasoningByModel && typeof payload.reasoningByModel === 'object'
+      ? Object.fromEntries(Object.entries(payload.reasoningByModel).map(([modelId, efforts]) => [
+        String(modelId || '').trim().toLowerCase(),
+        normalizeReasoningEffortList(efforts),
+      ]))
+      : {},
     source: String(payload?.source || '').trim() || null,
     refreshedAt: payload?.refreshedAt || null,
     warning: payload?.warning ? String(payload.warning) : null,
@@ -584,6 +836,52 @@ function applyModelVariantCatalogState(payload) {
       ? payload.reasoningEfforts.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean)
       : [],
   };
+}
+
+function buildReasoningEffortsByBaseModel(variants = [], reasoningByModel = {}) {
+  const map = new Map();
+  for (const entry of variants) {
+    const baseModelId = String(entry.baseModelId || '').trim().toLowerCase();
+    if (!baseModelId) continue;
+    if (!map.has(baseModelId)) {
+      map.set(baseModelId, {
+        label: entry.label,
+        efforts: new Set(),
+      });
+    }
+    const effort = String(entry.reasoningEffort || '').trim().toLowerCase();
+    if (effort) map.get(baseModelId).efforts.add(effort);
+  }
+  for (const [baseModelId, efforts] of Object.entries(reasoningByModel || {})) {
+    const key = String(baseModelId || '').trim().toLowerCase();
+    if (!key) continue;
+    if (!map.has(key)) {
+      map.set(key, { label: humanizeModelLabel(key), efforts: new Set() });
+    }
+    for (const effort of Array.isArray(efforts) ? efforts : []) {
+      const normalized = String(effort || '').trim().toLowerCase();
+      if (normalized) map.get(key).efforts.add(normalized);
+    }
+  }
+  return map;
+}
+
+function renderReasoningEffortChipRow(efforts = []) {
+  const list = Array.from(efforts).sort();
+  if (!list.length) {
+    return '<span class="model-reasoning-chip model-reasoning-chip-muted">standard</span>';
+  }
+  return list.map((effort) => `<span class="model-reasoning-chip">${escHtml(effort)}</span>`).join('');
+}
+
+async function reconcileOpenModelVariantModal() {
+  const modal = document.getElementById('summary-modal');
+  if (!modal?.classList.contains('visible')) return;
+  if (summaryModalState.kind !== 'select-models') return;
+  const payload = await loadModelVariantCatalog();
+  if (!payload) return;
+  applyModelVariantCatalogState(payload);
+  renderModelVariantCatalogBody();
 }
 
 function renderModelVariantCatalogBody() {
@@ -623,6 +921,10 @@ function renderModelVariantCatalogBody() {
     modelVariantCatalogState.warning ? `⚠️ ${escHtml(modelVariantCatalogState.warning)}` : '',
     modelVariantCatalogState.error ? `⚠️ ${escHtml(modelVariantCatalogState.error)}` : '',
   ].filter(Boolean);
+  const reasoningByBaseModel = buildReasoningEffortsByBaseModel(
+    modelVariantCatalogState.variants,
+    modelVariantCatalogState.reasoningByModel,
+  );
   const groupsHtml = providerOrder.map((providerKey) => {
     const providerLabel = PROVIDER_LABELS[providerKey] || providerKey;
     const rows = grouped.get(providerKey) || [];
@@ -642,28 +944,51 @@ function renderModelVariantCatalogBody() {
       if (a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
       return a.variantId.localeCompare(b.variantId);
     });
-    const rowsHtml = rows.map((row) => {
-      const checked = selected.has(row.variantId);
-      const label = row.label || humanizeModelLabel(row.baseModelId) || row.baseModelId;
-      const effortChip = row.reasoningEffort ? ` <span style="font-size:0.72rem;color:var(--muted)">(${escHtml(row.reasoningEffort)})</span>` : '';
-      const unavailable = row.releaseStatus === 'unavailable';
-      const statusChip = unavailable
-        ? ' <span style="font-size:0.72rem;color:var(--warn,#f7c873)">unavailable (kept)</span>'
-        : '';
+    const byBaseModel = new Map();
+    for (const row of rows) {
+      const baseModelId = String(row.baseModelId || '').trim().toLowerCase();
+      if (!byBaseModel.has(baseModelId)) byBaseModel.set(baseModelId, []);
+      byBaseModel.get(baseModelId).push(row);
+    }
+    const baseModelBlocks = Array.from(byBaseModel.entries()).map(([baseModelId, variantRows]) => {
+      const meta = reasoningByBaseModel.get(baseModelId) || { label: humanizeModelLabel(baseModelId), efforts: new Set() };
+      const label = meta.label || humanizeModelLabel(baseModelId) || baseModelId;
+      const variantRowsHtml = variantRows.map((row) => {
+        const checked = selected.has(row.variantId);
+        const effortChip = row.reasoningEffort
+          ? ` <span class="model-reasoning-chip">${escHtml(row.reasoningEffort)}</span>`
+          : '';
+        const unavailable = row.releaseStatus === 'unavailable';
+        const statusChip = unavailable
+          ? ' <span class="model-reasoning-chip model-reasoning-chip-warn">unavailable</span>'
+          : '';
+        return `
+          <label class="model-variant-row">
+            <input class="model-variant-checkbox" type="checkbox" data-variant-id="${escHtml(row.variantId)}" ${checked ? 'checked' : ''}>
+            <span class="model-variant-row-copy">
+              <span class="model-variant-row-title">${escHtml(row.variantId)}${effortChip}${statusChip}</span>
+            </span>
+          </label>
+        `;
+      }).join('');
       return `
-        <label style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px dashed var(--border);font-size:0.84rem">
-          <input class="model-variant-checkbox" type="checkbox" data-variant-id="${escHtml(row.variantId)}" ${checked ? 'checked' : ''}>
-          <span style="display:flex;flex-direction:column;gap:2px">
-            <span>${escHtml(label)}${effortChip}${statusChip}</span>
-            <code style="font-size:0.72rem;color:var(--muted)">${escHtml(row.variantId)}</code>
-          </span>
-        </label>
+        <div class="model-base-group">
+          <div class="model-base-header">
+            <div class="model-base-title">${escHtml(label)}</div>
+            <div class="model-base-reasoning">
+              <span class="model-base-reasoning-label">Reasoning</span>
+              ${renderReasoningEffortChipRow(meta.efforts)}
+            </div>
+            <code class="model-base-id">${escHtml(baseModelId)}</code>
+          </div>
+          <div class="model-variant-list">${variantRowsHtml}</div>
+        </div>
       `;
     }).join('');
     return `
-      <section style="border:1px solid var(--border);border-radius:10px;padding:10px 12px;background:var(--bg3);display:flex;flex-direction:column;gap:6px">
-        <div style="font-weight:600">${escHtml(providerLabel)}</div>
-        ${rowsHtml || '<div style="color:var(--muted);font-size:0.82rem">No models</div>'}
+      <section class="model-provider-group">
+        <div class="model-provider-title">${escHtml(providerLabel)}</div>
+        ${baseModelBlocks || '<div class="model-provider-empty">No models</div>'}
       </section>
     `;
   }).join('');
@@ -674,6 +999,9 @@ function renderModelVariantCatalogBody() {
       </div>
       <div style="font-size:0.78rem;color:var(--muted)">
         Variants marked unavailable are preserved from earlier selections so updates do not reset your models.
+      </div>
+      <div style="font-size:0.78rem;color:var(--muted)">
+        Each model shows all supported reasoning efforts above its selectable variants.
       </div>
       ${warnings.map((line) => `<div style="font-size:0.78rem;color:var(--warn,#f7c873)">${line}</div>`).join('')}
       <div style="display:grid;gap:10px">${groupsHtml || '<div style="color:var(--muted)">No models discovered yet. Click Refresh.</div>'}</div>
@@ -901,6 +1229,11 @@ function startRelayBoardPolling() {
 }
 
 async function refreshSessionWorkerStatus() {
+  const currentId = String(currentConvId || '').trim();
+  const currentConversation = currentId ? conversations[currentId] : null;
+  const currentSdkSessionId = String(currentConversation?.sdkSessionId || currentConversation?.sdk_session_id || '').trim();
+  const previousWorkerState = currentSdkSessionId ? getSessionWorkerState(currentSdkSessionId) : null;
+  const previousWorkerStatus = String(previousWorkerState?.status || '').trim().toLowerCase();
   const status = await refreshWorkspaceRootHints();
   if (!status) return;
   setConversationDraftPersistenceEnabled(status?.features?.CONVERSATION_DRAFT_PERSISTENCE_ENABLED === true);
@@ -909,6 +1242,18 @@ async function refreshSessionWorkerStatus() {
     renderConvList();
   }
   updateCliStatus();
+  const nextWorkerState = currentSdkSessionId ? getSessionWorkerState(currentSdkSessionId) : null;
+  const transitionedToOffline = (
+    ['starting', 'ready', 'processing'].includes(previousWorkerStatus)
+    && !nextWorkerState
+  );
+  const hasSessionUsageSummary = !!(
+    currentConversation?.sessionUsageSummary
+    || currentConversation?.session_usage_summary
+  );
+  if (transitionedToOffline && currentId && !hasSessionUsageSummary) {
+    refreshCurrentView().catch(() => {});
+  }
 }
 
 function startSessionWorkerStatusPolling() {
@@ -1424,6 +1769,7 @@ initSocketHandlers({
   refreshSessionWorkerStatus,
   refreshModelCatalog,
   updateModelCatalogState,
+  reconcileOpenModelVariantModal,
   applyConversationWorkspaceRootUpdate,
   applyConversationTitleUpdate,
   syncChatTitleControls,
@@ -1460,6 +1806,7 @@ async function initApp() {
   syncPwaVersionMenuEntry();
   syncQueueStatusMenuEntry();
   syncSuspendHostVisibility();
+  activeConversationPreferredReasoningByMode = readStoredReasoningByMode();
   setupViewportTracking();
   window.addEventListener('pagehide', () => {
     void flushConversationDraft(currentConvId);
@@ -1608,6 +1955,15 @@ async function initApp() {
   }
   initModeSelector();
   initModelSelector();
+  initReasoningSelector();
+  const modelMetadataRetryBtn = document.getElementById('model-metadata-retry-btn');
+  if (modelMetadataRetryBtn && modelMetadataRetryBtn.dataset.bound !== '1') {
+    modelMetadataRetryBtn.dataset.bound = '1';
+    modelMetadataRetryBtn.addEventListener('click', () => {
+      void retryModelMetadataRefresh();
+    });
+  }
+  syncModelMetadataBlocker();
   const status = await refreshWorkspaceRootHints();
   syncQueueStatusMenuEntry(status);
   setSessionWorkerStatesFromStatusPayload(status?.sessionWorker || null);
@@ -1698,8 +2054,11 @@ window.refreshRepoBrowser = refreshRepoBrowser;
 window.initModeSelector = initModeSelector;
 window.initModelSelector = initModelSelector;
 window.refreshModelCatalog = refreshModelCatalog;
+window.retryModelMetadataRefresh = retryModelMetadataRefresh;
+window.isModelMetadataBlocked = () => modelMetadataBlocked || !isModelMetadataHealthy();
 window.saveSelectedModelsFromModal = saveSelectedModelsFromModal;
 window.selectedModelValue = selectedModelValue;
+window.selectedReasoningEffortValue = selectedReasoningEffortValue;
 window.getPreferredModelSelection = () => selectedModelValue();
 window.applyConversationPreferences = applyConversationPreferencesForConversation;
 window.applyModelCatalogState = updateModelCatalogState;

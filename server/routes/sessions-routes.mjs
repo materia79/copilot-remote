@@ -9,6 +9,9 @@ import { createSdkSessionSyncService } from '../services/sdk-session-sync-servic
 import { createSessionHistoryRefreshService } from '../services/session-history-refresh-service.mjs';
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 import { persistConversationPreferences } from '../services/conversation-preferences-service.mjs';
+import { mapUsageSnapshotRow } from '../services/usage-snapshot-helpers.mjs';
+
+export { mapUsageSnapshotRow };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SESSION_WORKER_STATUS_QUEUE_STATES = Object.freeze(['pending', 'processing', 'parked']);
@@ -37,6 +40,20 @@ export function resolveBootstrapModelSelection({
   return String(modelState?.currentModel || modelState?.defaultModel || defaultModel).trim() || defaultModel;
 }
 
+export function buildReasoningByModelFromVariantRows(rows = []) {
+  const map = {};
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const baseModelId = String(row?.baseModelId || '').trim().toLowerCase();
+    if (!baseModelId) continue;
+    const effort = String(row?.reasoningEffort || '').trim().toLowerCase();
+    if (!effort) continue;
+    const current = map[baseModelId] || [];
+    if (!current.includes(effort)) current.push(effort);
+    map[baseModelId] = current;
+  }
+  return map;
+}
+
 export function buildModelVariantCatalogPayload({
   rows = [],
   modelState = {},
@@ -46,6 +63,9 @@ export function buildModelVariantCatalogPayload({
   const enabledVariantIds = safeRows
     .filter((row) => !!row?.enabled)
     .map((row) => row.variantId);
+  const reasoningByModel = modelState?.reasoningByModel && typeof modelState.reasoningByModel === 'object'
+    ? modelState.reasoningByModel
+    : buildReasoningByModelFromVariantRows(safeRows);
   return {
     variants: safeRows.map((row) => ({
       variantId: row.variantId,
@@ -58,6 +78,7 @@ export function buildModelVariantCatalogPayload({
       sortOrder: row.sortOrder,
     })),
     enabledVariantIds,
+    reasoningByModel,
     source: modelState?.source || null,
     refreshedAt: modelState?.refreshedAt || null,
     warning: modelState?.warning || null,
@@ -962,6 +983,7 @@ export function buildConversationMessages({
   relayThoughtsByMessageId = new Map(),
   responseMessageToSourceId = new Map(),
   queueRows = [],
+  usageByResponseMessageId = new Map(),
 } = {}) {
   const queueRowsById = new Map(
     (Array.isArray(queueRows) ? queueRows : [])
@@ -982,7 +1004,11 @@ export function buildConversationMessages({
           role: message?.role,
           text: stripRelayPromptContext(message?.text, message?.mode),
           model: message?.model || undefined,
+          modelOrigin: message?.model_origin
+            || message?.modelOrigin
+            || ((String(queueRow?.model || '').trim().toLowerCase() === 'auto') ? 'auto' : undefined),
           reasoningEffort: queueRow?.reasoning_effort || undefined,
+          usage: message?.role === 'assistant' ? (usageByResponseMessageId.get(id) || undefined) : undefined,
           attachments: message?.attachments || [],
           mode: message?.mode || undefined,
           timestamp: message?.timestamp,
@@ -1008,7 +1034,11 @@ export function buildConversationMessages({
         : (id ? (relayThoughtsByMessageId.get(id) || []) : []),
       text: stripRelayPromptContext(message?.text, message?.mode),
       sourceMessageId,
+      modelOrigin: message?.modelOrigin
+        || message?.model_origin
+        || ((String(queueRow?.model || '').trim().toLowerCase() === 'auto') ? 'auto' : undefined),
       reasoningEffort: message?.reasoningEffort || queueRow?.reasoning_effort || undefined,
+      usage: message?.role === 'assistant' ? (usageByResponseMessageId.get(id) || message?.usage || undefined) : message?.usage,
     };
   });
 
@@ -1170,6 +1200,7 @@ export function registerSessionsRoutes(app, deps) {
     fetchUsageSummary,
     discoverSessionStateConversations,
     readSessionTranscriptMessages,
+    readSessionUsageSummary,
     parseSessionEventsToMessages,
     ensureRuntimeSessionBinding,
     bootstrapRuntimeSessionBindings,
@@ -1360,6 +1391,35 @@ export function registerSessionsRoutes(app, deps) {
       finalized.push(conversationId);
     }
     return finalized;
+  }
+
+  function resolveConversationByIdOrSdkSessionId(requestedId) {
+    const lookupId = String(requestedId || '').trim();
+    if (!lookupId) return null;
+    const byConversationId = stmts.getConv.get(lookupId);
+    if (byConversationId) return byConversationId;
+    if (typeof stmts.getConvBySdkSessionId?.get === 'function') {
+      const bySdkSessionId = stmts.getConvBySdkSessionId.get(lookupId);
+      if (bySdkSessionId) return bySdkSessionId;
+    }
+    return null;
+  }
+
+  function resolveSessionUsageSummaryForSdkSession(sdkSessionId) {
+    const sid = String(sdkSessionId || '').trim();
+    if (!sid || typeof readSessionUsageSummary !== 'function') return null;
+    const summary = readSessionUsageSummary(sid);
+    if (!summary || typeof summary !== 'object') return null;
+    const aicUsed = Number(summary.aicUsed);
+    const totalPremiumRequests = Number(summary.totalPremiumRequests);
+    return {
+      shutdownAt: summary.shutdownAt || null,
+      aicUsed: Number.isFinite(aicUsed) ? aicUsed : null,
+      totalPremiumRequests: Number.isFinite(totalPremiumRequests) ? totalPremiumRequests : null,
+      totalNanoAiu: Number.isFinite(Number(summary.totalNanoAiu)) ? Number(summary.totalNanoAiu) : null,
+      totalApiDurationMs: Number.isFinite(Number(summary.totalApiDurationMs)) ? Number(summary.totalApiDurationMs) : null,
+      requestCount: Number.isFinite(Number(summary.requestCount)) ? Number(summary.requestCount) : null,
+    };
   }
 
   // GET /api/conversations — list all conversations
@@ -1958,7 +2018,10 @@ export function registerSessionsRoutes(app, deps) {
       return res.status(404).json({ error: 'Conversation not found' });
     }
 
-    const ensured = sessionHistoryRefreshService.ensureConversationForRefresh(requestedId);
+    const existingConversation = resolveConversationByIdOrSdkSessionId(requestedId);
+    const ensured = existingConversation
+      ? { ok: true, created: false, conversation: existingConversation }
+      : sessionHistoryRefreshService.ensureConversationForRefresh(requestedId);
     if (!ensured?.ok) {
       return res.status(Number(ensured?.statusCode || 404)).json({ error: ensured?.error || 'Conversation not found' });
     }
@@ -2023,7 +2086,8 @@ export function registerSessionsRoutes(app, deps) {
       defaultRelayMode: DEFAULT_RELAY_MODE,
     });
     const inFlight = inFlightStateForConversation(conversationId);
-    const transcriptMessages = readSessionTranscriptMessages(String(conv.sdk_session_id || conversationId || '').trim(), { limit: Number.POSITIVE_INFINITY });
+    const transcriptMessages = readSessionTranscriptMessages(sdkSessionId, { limit: Number.POSITIVE_INFINITY });
+    const sessionUsageSummary = resolveSessionUsageSummaryForSdkSession(sdkSessionId);
     const sessionRoot = buildConversationSessionRootPayload({
       conversationId,
       sdkSessionId: conv.sdk_session_id || conversationId,
@@ -2039,7 +2103,7 @@ export function registerSessionsRoutes(app, deps) {
       : null;
     const dbMessages = stmts.getMessages.all(conversationId);
     const queueRows = db.prepare(`
-      SELECT id, response_message_id, text, timestamp, retry_count, reasoning_effort
+      SELECT id, response_message_id, text, timestamp, retry_count, reasoning_effort, model
       FROM queue
       WHERE conversation_id = ?
     `).all(conversationId);
@@ -2058,6 +2122,11 @@ export function registerSessionsRoutes(app, deps) {
         .filter((m) => m.role === 'assistant')
         .map((m) => [m.id, relayThoughtsForResponse ? relayThoughtsForResponse(m.id) : []]),
     );
+    const usageByResponseMessageId = new Map(
+      (stmts.listMessageUsageSnapshotsByConversation?.all(conversationId) || [])
+        .map((row) => [String(row?.response_message_id || '').trim(), mapUsageSnapshotRow(row)])
+        .filter(([messageId, usage]) => !!messageId && !!usage),
+    );
     let messages = buildConversationMessages({
       dbMessages: dbMessages.map((message) => ({
         ...message,
@@ -2068,6 +2137,7 @@ export function registerSessionsRoutes(app, deps) {
       relayThoughtsByMessageId,
       responseMessageToSourceId,
       queueRows,
+      usageByResponseMessageId,
     });
     messages = messages.map((message) => {
       if (message.role !== 'assistant') return message;
@@ -2108,6 +2178,7 @@ export function registerSessionsRoutes(app, deps) {
       } : null,
       createdAt: conv.created_at,
       updatedAt: conv.updated_at,
+      sessionUsageSummary,
       inFlight,
       preferredRelayMode: preferences.preferredRelayMode,
       preferredModelsByMode: preferences.preferredModelsByMode,
@@ -2132,7 +2203,7 @@ export function registerSessionsRoutes(app, deps) {
     if (stmts.getDeletedSdkSession.get(requestedId)) {
       return res.status(404).json({ error: 'Conversation not found' });
     }
-    const conv = stmts.getConv.get(requestedId);
+    const conv = resolveConversationByIdOrSdkSessionId(requestedId);
     if (!conv) {
       const discovered = discoverSessionStateConversations(400);
       const match = discovered.find((item) => String(item?.sdkSessionId || '').trim() === requestedId) || null;
@@ -2141,6 +2212,7 @@ export function registerSessionsRoutes(app, deps) {
       const updatedAt = String(match?.updatedAt || '').trim() || new Date().toISOString();
       const discoveredTitle = String(match?.title || '').trim() || 'Session';
       const transcriptMessages = readSessionTranscriptMessages(requestedId, { limit: Number.POSITIVE_INFINITY });
+      const sessionUsageSummary = resolveSessionUsageSummaryForSdkSession(requestedId);
       const history = selectConversationHistoryPage(
         buildConversationMessages({
           dbMessages: [],
@@ -2187,6 +2259,7 @@ export function registerSessionsRoutes(app, deps) {
         } : null,
         createdAt: updatedAt,
         updatedAt,
+        sessionUsageSummary,
         inFlight: null,
         preferredRelayMode: normalizeRelayModePreference(null, {
           supportedRelayModes: SUPPORTED_RELAY_MODES,
@@ -2200,7 +2273,8 @@ export function registerSessionsRoutes(app, deps) {
         pageInfo: history.pageInfo,
       });
     }
-    const runtimeSession = stmts.getRuntimeSessionByConversation.get(req.params.id) || null;
+    const resolvedConversationId = String(conv.id || '').trim() || requestedId;
+    const runtimeSession = stmts.getRuntimeSessionByConversation.get(resolvedConversationId) || null;
     const discoveredSessionState = (() => {
       const sdkSessionId = String(conv.sdk_session_id || '').trim();
       if (!sdkSessionId) return null;
@@ -2217,27 +2291,32 @@ export function registerSessionsRoutes(app, deps) {
       supportedRelayModes: SUPPORTED_RELAY_MODES,
       defaultRelayMode: DEFAULT_RELAY_MODE,
     });
-    const inFlight = inFlightStateForConversation(req.params.id);
-    const transcriptMessages = readSessionTranscriptMessages(String(conv.sdk_session_id || req.params.id || '').trim(), { limit: Number.POSITIVE_INFINITY });
+    const inFlight = inFlightStateForConversation(resolvedConversationId);
+    const sdkSessionId = String(conv.sdk_session_id || resolvedConversationId || '').trim();
+    const transcriptMessages = readSessionTranscriptMessages(
+      sdkSessionId,
+      { limit: Number.POSITIVE_INFINITY },
+    );
+    const sessionUsageSummary = resolveSessionUsageSummaryForSdkSession(sdkSessionId);
     const sessionRoot = buildConversationSessionRootPayload({
-      conversationId: req.params.id,
-      sdkSessionId: conv.sdk_session_id || req.params.id,
+      conversationId: resolvedConversationId,
+      sdkSessionId: conv.sdk_session_id || resolvedConversationId,
       title: resolvedTitle,
       resolveSessionStateRoot,
     });
     const workspaceState = typeof resolveConversationWorkspaceState === 'function'
       ? resolveConversationWorkspaceState({
-        conversationId: req.params.id,
-        sdkSessionId: conv.sdk_session_id || req.params.id,
+        conversationId: resolvedConversationId,
+        sdkSessionId: conv.sdk_session_id || resolvedConversationId,
         discoveredWorkspaceRootPath: discoveredSessionState?.workspaceRootPath || '',
       })
       : null;
-    const dbMessages = stmts.getMessages.all(req.params.id);
+    const dbMessages = stmts.getMessages.all(resolvedConversationId);
     const queueRows = db.prepare(`
-      SELECT id, response_message_id, text, timestamp, retry_count, reasoning_effort
+      SELECT id, response_message_id, text, timestamp, retry_count, reasoning_effort, model
       FROM queue
       WHERE conversation_id = ?
-    `).all(req.params.id);
+    `).all(resolvedConversationId);
     const responseMessageToSourceId = new Map(
       queueRows
         .map((row) => [String(row?.response_message_id || '').trim(), String(row?.id || '').trim()])
@@ -2253,6 +2332,11 @@ export function registerSessionsRoutes(app, deps) {
         .filter((m) => m.role === 'assistant')
         .map((m) => [m.id, relayThoughtsForResponse ? relayThoughtsForResponse(m.id) : []]),
     );
+    const usageByResponseMessageId = new Map(
+      (stmts.listMessageUsageSnapshotsByConversation?.all(conv.id) || [])
+        .map((row) => [String(row?.response_message_id || '').trim(), mapUsageSnapshotRow(row)])
+        .filter(([messageId, usage]) => !!messageId && !!usage),
+    );
     let messages = buildConversationMessages({
       dbMessages: dbMessages.map((message) => ({
         ...message,
@@ -2263,6 +2347,7 @@ export function registerSessionsRoutes(app, deps) {
       relayThoughtsByMessageId,
       responseMessageToSourceId,
       queueRows,
+      usageByResponseMessageId,
     });
     messages = messages.map((message) => {
       if (message.role !== 'assistant') return message;
@@ -2303,6 +2388,7 @@ export function registerSessionsRoutes(app, deps) {
       } : null,
       createdAt: conv.created_at,
       updatedAt: conv.updated_at,
+      sessionUsageSummary,
       inFlight,
       preferredRelayMode: preferences.preferredRelayMode,
       preferredModelsByMode: preferences.preferredModelsByMode,
@@ -2933,7 +3019,7 @@ export function registerSessionsRoutes(app, deps) {
     return buildModelVariantCatalogPayload({
       rows,
       modelState,
-      reasoningEfforts: SUPPORTED_REASONING_EFFORTS,
+      reasoningEfforts: modelState.reasoningEfforts || [],
     });
   }
 
@@ -2985,10 +3071,15 @@ export function registerSessionsRoutes(app, deps) {
       models: modelState.models,
       currentModel: modelState.currentModel,
       defaultModel: modelState.defaultModel,
+      reasoningByModel: modelState.reasoningByModel || {},
+      reasoningEfforts: modelState.reasoningEfforts || [],
       stale: modelState.stale,
+      metadataValid: modelState.metadataValid === true,
+      reasoningMetadataValid: modelState.reasoningMetadataValid === true,
       refreshedAt: modelState.refreshedAt,
       source: modelState.source,
       warning: modelState.warning,
+      error: modelState.error,
     });
   });
 
@@ -3001,22 +3092,10 @@ export function registerSessionsRoutes(app, deps) {
       source: source || 'relay-extension',
       error,
     });
-    io.emit('models_updated', {
-      models: nextState.models,
-      currentModel: nextState.currentModel,
-      defaultModel: nextState.defaultModel,
-      stale: nextState.stale,
-      refreshedAt: nextState.refreshedAt,
-      warning: nextState.warning,
-    });
+    io.emit('models_updated', getModelCatalogState());
     res.json({
       ok: true,
-      models: nextState.models,
-      currentModel: nextState.currentModel,
-      defaultModel: nextState.defaultModel,
-      stale: nextState.stale,
-      refreshedAt: nextState.refreshedAt,
-      warning: nextState.warning,
+      ...getModelCatalogState(),
     });
   });
 

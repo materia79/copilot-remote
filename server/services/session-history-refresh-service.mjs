@@ -86,6 +86,9 @@ export function createSessionHistoryRefreshService({
         String(message?.mode || '').trim() || null,
         null,
         timestamp,
+        null,
+        role === 'assistant' ? (String(message?.model || '').trim() || null) : null,
+        null,
       );
       if (role !== 'assistant') continue;
       const activities = ensureArray(message?.activities)

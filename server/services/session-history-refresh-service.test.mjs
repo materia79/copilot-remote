@@ -22,6 +22,9 @@ function makeDb() {
       model TEXT,
       mode TEXT,
       attachments TEXT,
+      model_requested TEXT,
+      model_actual TEXT,
+      model_origin TEXT,
       timestamp TEXT NOT NULL
     );
     CREATE TABLE queue (
@@ -95,8 +98,8 @@ function makeStmts(db) {
       WHERE id = ? AND (sdk_session_id IS NULL OR sdk_session_id = '')
     `),
     insertMsg: db.prepare(`
-      INSERT INTO messages (id, conversation_id, role, text, model, mode, attachments, timestamp)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO messages (id, conversation_id, role, text, model, mode, attachments, timestamp, model_requested, model_actual, model_origin)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `),
     insertActivity: db.prepare(`
       INSERT INTO relay_activity (queue_message_id, response_message_id, conversation_id, relay_mode, text, created_at, subagent_run_id)

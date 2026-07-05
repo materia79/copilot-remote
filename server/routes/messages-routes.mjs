@@ -12,6 +12,12 @@ import {
   persistConversationModeModelPreference as persistConversationModeModelPreferenceTx,
 } from '../services/conversation-preferences-service.mjs';
 import { killTmuxSession } from '../services/session-worker-launch-service.mjs';
+import {
+  fetchUsageSummaryPromise,
+  staleUsageSnapshotFromRow,
+  usageSnapshotFromRow,
+  usageSnapshotFromSummary,
+} from '../services/usage-snapshot-helpers.mjs';
 
 export const SESSION_WORKER_OWNER_LEASE_MS = 120_000;
 export const SESSION_WORKER_TRANSIENT_DEQUEUE_RETRIES = 2;
@@ -27,6 +33,18 @@ const STRANDED_SESSION_HEARTBEAT_FRESH_MS = 15_000;
 // onUserInputRequest (multi-step ask_user). Without this, the transcript is used prematurely and
 // the queue row is marked done while additional questions are still pending.
 const RELAY_QUESTION_FINALIZATION_HOLD_MS = 5_000;
+const AUTO_MODEL_SENTINEL = 'auto';
+const USAGE_FETCH_RETRY_DELAY_MS = 250;
+
+function deriveModelOrigin(model) {
+  const requested = String(model || '').trim().toLowerCase();
+  if (!requested) return null;
+  return requested === AUTO_MODEL_SENTINEL ? 'auto' : 'manual';
+}
+
+function isAutoModel(model) {
+  return String(model || '').trim().toLowerCase() === AUTO_MODEL_SENTINEL;
+}
 
 function normalizeSessionWorkerId(value) {
   const text = String(value || '').trim();
@@ -1035,6 +1053,7 @@ export function registerMessagesRoutes(app, deps) {
     addMsIso,
     computeRetryDelayMs,
     resolveRequestedModel,
+    resolveRequestedReasoningEffort = () => ({ ok: false, error: 'Reasoning metadata unavailable', supported: [] }),
     normalizeRelayMode,
     DEFAULT_RELAY_MODE,
     DEFAULT_MODEL,
@@ -1056,6 +1075,7 @@ export function registerMessagesRoutes(app, deps) {
     sessionWorkerRegistry,
     sessionWorkerSupervisor,
     sessionWorkerProcessInspector,
+    fetchUsageSummary = null,
     opaqueResponseRecoveryWaitMs = OPAQUE_RESPONSE_RECOVERY_WAIT_MS,
     opaqueResponseRecoveryPollMs = OPAQUE_RESPONSE_RECOVERY_POLL_MS,
     relayQuestionFinalizationHoldMs = RELAY_QUESTION_FINALIZATION_HOLD_MS,
@@ -1243,6 +1263,12 @@ export function registerMessagesRoutes(app, deps) {
   }) {
     const now = new Date().toISOString();
     const responseId = uuidv4();
+    const requestedModel = String(queueRow?.model || '').trim() || null;
+    const modelOrigin = deriveModelOrigin(requestedModel);
+    const resolvedModel = String(model || '').trim()
+      || (modelOrigin === 'auto' ? 'unknown' : requestedModel)
+      || null;
+    const modelActual = String(model || '').trim() || null;
     const tx = db.transaction(() => {
       const result = stmts.setFailed.run(JSON.stringify(failureRecord), messageId);
       if (result.changes === 0) return false;
@@ -1252,10 +1278,13 @@ export function registerMessagesRoutes(app, deps) {
         conversationId,
         'assistant',
         responseText,
-        model || null,
+        resolvedModel,
         relayMode,
         null,
         now,
+        requestedModel,
+        modelActual,
+        modelOrigin,
       );
       stmts.linkActivityToResponse?.run(responseId, messageId);
       stmts.linkStreamEventsToResponse?.run(responseId, messageId);
@@ -1272,7 +1301,8 @@ export function registerMessagesRoutes(app, deps) {
       message: {
         role: 'assistant',
         text: responseText,
-        model: model || null,
+        model: resolvedModel,
+        modelOrigin: modelOrigin || undefined,
         reasoningEffort: String(queueRow?.reasoning_effort || '').trim() || null,
         mode: relayMode,
         timestamp: now,
@@ -1583,7 +1613,20 @@ export function registerMessagesRoutes(app, deps) {
     const now = new Date().toISOString();
     const messageId = uuidv4();
     const tx = db.transaction(() => {
-      stmts.insertMsg.run(messageId, conversationId, 'assistant', text, model || null, relayMode || null, null, now);
+      const normalizedModel = String(model || '').trim() || null;
+      stmts.insertMsg.run(
+        messageId,
+        conversationId,
+        'assistant',
+        text,
+        normalizedModel,
+        relayMode || null,
+        null,
+        now,
+        null,
+        normalizedModel,
+        deriveModelOrigin(normalizedModel),
+      );
       stmts.updateConvTime.run(now, conversationId);
     });
     tx();
@@ -1591,7 +1634,14 @@ export function registerMessagesRoutes(app, deps) {
       conversationId,
       sourceMessageId: null,
       messageId,
-      message: { role: 'assistant', text, model: model || null, mode: relayMode || null, timestamp: now },
+      message: {
+        role: 'assistant',
+        text,
+        model: String(model || '').trim() || null,
+        modelOrigin: deriveModelOrigin(model) || undefined,
+        mode: relayMode || null,
+        timestamp: now,
+      },
     });
     return messageId;
   }
@@ -2881,7 +2931,18 @@ export function registerMessagesRoutes(app, deps) {
 
   // POST /api/message — browser sends a message
   app.post('/api/message', auth, (req, res) => {
-    const { messageId: clientMessageId, clientId, conversationId, text, newConversation, model, relayMode, mode, attachments: rawAttachments } = req.body;
+    const {
+      messageId: clientMessageId,
+      clientId,
+      conversationId,
+      text,
+      newConversation,
+      model,
+      reasoningEffort,
+      relayMode,
+      mode,
+      attachments: rawAttachments,
+    } = req.body;
     const sessionId = clientId || ensureSessionId(req, res);
     const requesterIdentity = readBridgeIdentity(req);
     const requesterSessionId = normalizeSessionWorkerId(requesterIdentity?.sessionId);
@@ -2916,7 +2977,29 @@ export function registerMessagesRoutes(app, deps) {
     if (!modelResolution.ok) return res.status(400).json({ error: modelResolution.error, supportedModels: modelResolution.available || [] });
     const requestedModel = String(modelResolution.model || '').trim();
     const requestedModelVariantId = String(modelResolution.modelVariantId || model || requestedModel).trim();
-    const requestedReasoningEffort = String(modelResolution.reasoningEffort || '').trim() || null;
+    const explicitReasoningEffort = String(reasoningEffort || '').trim();
+    let reasoningResolution = resolveRequestedReasoningEffort(
+      requestedModel,
+      explicitReasoningEffort || modelResolution.reasoningEffort || null,
+    );
+    if (!reasoningResolution?.ok && !explicitReasoningEffort) {
+      const supportedEfforts = Array.isArray(reasoningResolution?.supported)
+        ? reasoningResolution.supported.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean)
+        : [];
+      const fallbackReasoningEffort = supportedEfforts.includes('none')
+        ? 'none'
+        : (supportedEfforts[0] || null);
+      if (fallbackReasoningEffort) {
+        reasoningResolution = resolveRequestedReasoningEffort(requestedModel, fallbackReasoningEffort);
+      }
+    }
+    if (!reasoningResolution?.ok) {
+      return res.status(400).json({
+        error: reasoningResolution?.error || 'Unsupported reasoning effort',
+        supportedReasoningEfforts: Array.isArray(reasoningResolution?.supported) ? reasoningResolution.supported : [],
+      });
+    }
+    const requestedReasoningEffort = reasoningResolution.effort || null;
     if (!requestedRelayMode) return res.status(400).json({ error: 'Unsupported relay mode' });
     const shouldCreateConversation = !!newConversation || !conversationId;
     const conversationWorkspaceState = (!shouldCreateConversation && typeof resolveConversationWorkspaceState === 'function')
@@ -3028,7 +3111,20 @@ export function registerMessagesRoutes(app, deps) {
         ].join('\n')
       : trimmedText;
 
-    stmts.insertMsg.run(msgId, convId, 'user', trimmedText, requestedModelVariantId, requestedRelayMode, attachments.length ? JSON.stringify(attachments) : null, now);
+    const requestedModelOrigin = deriveModelOrigin(requestedModelVariantId || requestedModel);
+    stmts.insertMsg.run(
+      msgId,
+      convId,
+      'user',
+      trimmedText,
+      requestedModelVariantId,
+      requestedRelayMode,
+      attachments.length ? JSON.stringify(attachments) : null,
+      now,
+      requestedModelVariantId || null,
+      null,
+      requestedModelOrigin,
+    );
     linkUploadReferences(convId, msgId, attachments);
     stmts.updateConvTime.run(now, convId);
     if (conversationDraftPersistenceEnabled) {
@@ -3136,7 +3232,20 @@ export function registerMessagesRoutes(app, deps) {
 
     emitToClientsExceptSessionId(
       'user_message',
-      { conversationId: convId, messageId: msgId, senderClientId: sessionId, message: { role: 'user', text: trimmedText, model: requestedModelVariantId, mode: requestedRelayMode, timestamp: now, attachments } },
+      {
+        conversationId: convId,
+        messageId: msgId,
+        senderClientId: sessionId,
+        message: {
+          role: 'user',
+          text: trimmedText,
+          model: requestedModelVariantId,
+          modelOrigin: requestedModelOrigin || undefined,
+          mode: requestedRelayMode,
+          timestamp: now,
+          attachments,
+        },
+      },
       sessionId,
     );
     io.emit('message_status', { messageId: msgId, conversationId: convId, status: 'pending' });
@@ -3855,12 +3964,30 @@ export function registerMessagesRoutes(app, deps) {
     if (!resolvedText) return res.status(400).json({ error: 'Empty response' });
 
     const responseId = uuidv4();
+    const requestedModel = String(q?.model || '').trim() || null;
+    const modelOrigin = deriveModelOrigin(requestedModel);
+    const explicitModel = String(model || '').trim() || null;
+    const resolvedAssistantModel = explicitModel
+      || (modelOrigin === 'auto' ? 'unknown' : requestedModel)
+      || null;
     const now = new Date().toISOString();
     const finalize = db.transaction(() => {
       const result = stmts.setDone.run(resolvedText, messageId);
       if (result.changes === 0) return false;
       stmts.setQueueResponseMessageId?.run(responseId, messageId);
-      stmts.insertMsg.run(responseId, targetConversationId, 'assistant', resolvedText, model || null, relayMode, null, now);
+      stmts.insertMsg.run(
+        responseId,
+        targetConversationId,
+        'assistant',
+        resolvedText,
+        resolvedAssistantModel,
+        relayMode,
+        null,
+        now,
+        requestedModel,
+        explicitModel,
+        modelOrigin,
+      );
       stmts.linkActivityToResponse.run(responseId, messageId);
       stmts.linkStreamEventsToResponse?.run(responseId, messageId);
       stmts.linkThoughtsToResponse?.run(responseId, messageId);
@@ -3938,6 +4065,53 @@ export function registerMessagesRoutes(app, deps) {
         });
       }
     }
+    let usageSnapshot = null;
+    if (typeof fetchUsageSummary === 'function' && stmts.upsertMessageUsageSnapshot) {
+      const previousUsageRow = stmts.getLatestMessageUsageSnapshotByConversation?.get(targetConversationId) || null;
+      const previousUsageSnapshot = usageSnapshotFromRow(previousUsageRow);
+      try {
+        const summary = await fetchUsageSummaryPromise(fetchUsageSummary);
+        usageSnapshot = usageSnapshotFromSummary(summary, previousUsageSnapshot, {
+          source: 'live',
+          stale: false,
+          capturedAt: now,
+        });
+      } catch (firstError) {
+        try {
+          await delay(USAGE_FETCH_RETRY_DELAY_MS);
+          const summary = await fetchUsageSummaryPromise(fetchUsageSummary);
+          usageSnapshot = usageSnapshotFromSummary(summary, previousUsageSnapshot, {
+            source: 'live-retry',
+            stale: false,
+            capturedAt: now,
+          });
+        } catch (retryError) {
+          usageSnapshot = staleUsageSnapshotFromRow(previousUsageRow, { capturedAt: now });
+        }
+      }
+      if (usageSnapshot) {
+        stmts.upsertMessageUsageSnapshot.run(
+          responseId,
+          messageId,
+          targetConversationId,
+          usageSnapshot.source,
+          usageSnapshot.stale ? 1 : 0,
+          usageSnapshot.premium.remaining,
+          usageSnapshot.premium.entitlement,
+          usageSnapshot.premium.usedPercent,
+          usageSnapshot.premium.deltaUsed,
+          usageSnapshot.chat.remaining,
+          usageSnapshot.chat.entitlement,
+          usageSnapshot.chat.usedPercent,
+          usageSnapshot.chat.deltaUsed,
+          usageSnapshot.plan.remaining,
+          usageSnapshot.plan.entitlement,
+          usageSnapshot.plan.usedPercent,
+          usageSnapshot.plan.deltaUsed,
+          usageSnapshot.capturedAt,
+        );
+      }
+    }
     const activities = relayActivityForResponse(responseId);
     const thoughts = relayThoughtsForResponse ? relayThoughtsForResponse(responseId) : [];
 
@@ -3950,9 +4124,11 @@ export function registerMessagesRoutes(app, deps) {
       message: {
         role: 'assistant',
         text: resolvedText,
-        model: model || null,
+        model: resolvedAssistantModel,
+        modelOrigin: modelOrigin || undefined,
         reasoningEffort: String(q?.reasoning_effort || '').trim() || null,
         mode: relayMode,
+        usage: usageSnapshot,
         timestamp: now,
         activities,
         thoughts,

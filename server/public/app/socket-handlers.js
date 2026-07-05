@@ -71,6 +71,7 @@ let deps = null;
  * @property {() => (void | Promise<void>)} refreshSessionWorkerStatus
  * @property {(force?: boolean) => (void | Promise<void>)} refreshModelCatalog
  * @property {(payload?: object) => void} updateModelCatalogState
+ * @property {() => (void | Promise<void>)} reconcileOpenModelVariantModal
  * @property {(payload?: object) => void} applyConversationWorkspaceRootUpdate
  * @property {(conversationId: string, title: string, updatedAt?: string | number | null) => void} applyConversationTitleUpdate
  * @property {() => void} syncChatTitleControls
@@ -105,6 +106,7 @@ export async function connectSocket(overrideDeps) {
     refreshSessionWorkerStatus,
     refreshModelCatalog,
     updateModelCatalogState,
+    reconcileOpenModelVariantModal = async () => {},
     applyConversationWorkspaceRootUpdate,
     applyConversationTitleUpdate,
     syncChatTitleControls,
@@ -139,6 +141,7 @@ export async function connectSocket(overrideDeps) {
   });
   socket.on('models_updated', (payload) => {
     updateModelCatalogState(payload || {});
+    void reconcileOpenModelVariantModal();
   });
   socket.on('workspace_root_changed', (payload) => {
     updateWorkspaceRootHints(payload || {});

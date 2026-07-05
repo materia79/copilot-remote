@@ -234,6 +234,7 @@ function syncSendButtonState() {
       attachmentCount: selectedAttachments.length,
     }),
     sendInFlight,
+    modelMetadataBlocked: window.isModelMetadataBlocked?.() === true,
   });
   btn.disabled = state.disabled;
   btn.dataset.action = state.action;
@@ -572,12 +573,35 @@ function createMessageNode(msg, msgId = null, force = false) {
   const { baseModelId, reasoningEffort } = splitVariantId(msg.model);
   const explicitReasoningEffort = String(msg?.reasoningEffort || '').trim().toLowerCase() || null;
   const resolvedReasoningEffort = explicitReasoningEffort || reasoningEffort;
+  const modelOrigin = String(msg?.modelOrigin || '').trim().toLowerCase();
   const modelTag = (msg.role === 'assistant' && baseModelId)
     ? ` <span class="msg-model">${escHtml(baseModelId)}</span>` : '';
   const reasoningTag = (msg.role === 'assistant' && resolvedReasoningEffort && resolvedReasoningEffort !== 'none')
     ? ` <span class="msg-reasoning">${escHtml(resolvedReasoningEffort)}</span>` : '';
   const modeTag = msg.mode
     ? ` <span class="msg-mode">${escHtml(msg.mode)}</span>` : '';
+  const autoTag = (msg.role === 'assistant' && modelOrigin === 'auto')
+    ? ' <span class="msg-auto">auto</span>' : '';
+  const usage = (msg.role === 'assistant' && msg?.usage && typeof msg.usage === 'object') ? msg.usage : null;
+  const deltaCredits = Number(usage?.premium?.deltaCredits ?? usage?.premium?.deltaUsed);
+  const deltaMonthlyPercent = Number(usage?.plan?.deltaMonthlyPercent);
+  const monthlyPercentRemaining = Number(usage?.plan?.percentRemaining);
+  const usageTurnParts = [];
+  if (Number.isFinite(deltaCredits) && deltaCredits > 0) {
+    usageTurnParts.push(`+${escHtml(String(deltaCredits))}`);
+  }
+  if (Number.isFinite(deltaMonthlyPercent) && deltaMonthlyPercent > 0) {
+    usageTurnParts.push(`${escHtml(deltaMonthlyPercent.toFixed(3))}%`);
+  }
+  const usageTurnTag = usageTurnParts.length
+    ? ` <span class="msg-usage">${usageTurnParts.join(' (')}${usageTurnParts.length > 1 ? ')' : ''}</span>`
+    : '';
+  const usageRemainingTag = Number.isFinite(monthlyPercentRemaining) && monthlyPercentRemaining > 0
+    ? ` <span class="msg-usage">month ${escHtml(monthlyPercentRemaining.toFixed(1))}% left</span>`
+    : '';
+  const usageStaleTag = usage?.stale
+    ? ' <span class="msg-usage msg-usage-stale">stale</span>'
+    : '';
   const content = msg.role === 'assistant'
     ? marked.parse(msg.text || '')
     : renderMarkdownPreview(msg.text || '', false);
@@ -600,7 +624,7 @@ function createMessageNode(msg, msgId = null, force = false) {
 
   div.innerHTML = `
     <div class="${bubbleClass}">${content}${attachmentHtml}${thoughtsHtml}${activityHtml}${userBubbleActionsHtml}</div>
-    <div class="msg-label">${label}${modelTag}${reasoningTag}${modeTag} · ${fmtDate(msg.timestamp)}</div>`;
+    <div class="msg-label">${label}${modelTag}${reasoningTag}${modeTag}${autoTag}${usageTurnTag}${usageRemainingTag}${usageStaleTag} · ${fmtDate(msg.timestamp)}</div>`;
 
   const bubble = div.querySelector('.msg-bubble');
   rewriteLocalAssetUrlsInNode(bubble, { preferDrive: msg.role === 'assistant' });
@@ -1740,6 +1764,10 @@ export async function sendMessage() {
   if (!(await validateSelectedConversationBeforeSend())) {
     return;
   }
+  if (window.isModelMetadataBlocked?.()) {
+    showTransientRelayNotice('Model metadata is unavailable. Refresh models to continue.');
+    return;
+  }
   const targetConversationId = String(currentConvId || '').trim() || null;
   if (hasPendingUserMessageDuplicate(targetConversationId, text)) {
     showTransientRelayNotice('That message is already pending.');
@@ -1758,6 +1786,11 @@ export async function sendMessage() {
     const isNew = !targetConversationId;
     const msgTimestamp = new Date().toISOString();
     const selectedModel = document.getElementById('model-select').value || '';
+    const selectedReasoningEffort = String(document.getElementById('reasoning-effort-select')?.value || '').trim().toLowerCase();
+    if (!selectedReasoningEffort) {
+      showTransientRelayNotice('Select a reasoning effort after refreshing model metadata.');
+      return;
+    }
     const selectedMode = document.getElementById('mode-select').value || 'agent';
     const titleSeed = text || (attachments[0]?.name || 'Attachment');
     clientMessageId = generateId();
@@ -1774,6 +1807,7 @@ export async function sendMessage() {
       clientId: CLIENT_ID,
       text,
       model: selectedModel,
+      reasoningEffort: selectedReasoningEffort,
       relayMode: selectedMode,
       conversationId: targetConversationId || undefined,
       newConversation: isNew || undefined,

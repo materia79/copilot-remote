@@ -412,6 +412,16 @@
     text-overflow: ellipsis;
   }
   #chat-title-cwd[hidden] { display: none; }
+  #chat-title-session-usage {
+    display: block;
+    margin-top: 2px;
+    font-size: var(--fs-meta-xs);
+    color: var(--muted);
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  #chat-title-session-usage[hidden] { display: none; }
   #chat-title[data-copilot-session-id] { cursor: copy; }
   #chat-title[data-copilot-session-id]:hover {
     text-decoration: underline;
@@ -1182,6 +1192,37 @@
     text-align: center;
   }
   #model-banner.visible { display: block; }
+  #model-metadata-blocker {
+    display: none;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    background: rgba(210, 153, 34, 0.15);
+    border: 1px solid var(--warn);
+    color: var(--warn);
+    border-radius: 8px;
+    padding: 8px 10px;
+    margin-bottom: 10px;
+    font-size: var(--fs-meta-sm);
+    text-align: center;
+  }
+  #model-metadata-blocker.visible { display: flex; }
+  #model-metadata-retry-btn {
+    border: 1px solid var(--warn);
+    background: transparent;
+    color: var(--warn);
+    border-radius: 999px;
+    padding: 4px 12px;
+    font-size: var(--fs-meta-sm);
+    cursor: pointer;
+  }
+  #model-metadata-retry-btn:hover { background: rgba(210, 153, 34, 0.2); }
+  #model-select:disabled,
+  #reasoning-effort-select:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
 
   .input-row { display: flex; gap: 10px; align-items: flex-end; }
   #repo-browser-desktop-btn,
@@ -1246,12 +1287,14 @@
     border: none; border-radius: 12px; cursor: pointer; font-weight: 700; font-size: var(--fs-core-composer);
     flex-shrink: 0; height: 46px;
   }
-  #model-select {
+  #model-select,
+  #reasoning-effort-select {
     background: var(--bg3); border: 1px solid var(--border); color: var(--text);
     border-radius: 12px; height: 46px; padding: 0 12px; font-size: var(--fs-core-control);
     min-width: 140px; outline: none;
   }
-  #model-select:focus { border-color: var(--accent); }
+  #model-select:focus,
+  #reasoning-effort-select:focus { border-color: var(--accent); }
   #mode-select {
     background: var(--bg3); border: 1px solid var(--border); color: var(--text);
     border-radius: 12px; height: 46px; padding: 0 12px; font-size: var(--fs-core-control);
@@ -1575,6 +1618,108 @@
     align-items: center;
     gap: 8px;
     flex-shrink: 0;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+  .model-provider-group {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 12px;
+    background: var(--bg3);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .model-provider-title {
+    font-weight: 600;
+  }
+  .model-provider-empty {
+    color: var(--muted);
+    font-size: 0.82rem;
+  }
+  .model-base-group {
+    border: 1px dashed var(--border);
+    border-radius: 10px;
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    background: var(--bg2);
+  }
+  .model-base-header {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .model-base-title {
+    font-weight: 600;
+    font-size: 0.92rem;
+  }
+  .model-base-reasoning {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.78rem;
+  }
+  .model-base-reasoning-label {
+    color: var(--muted);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    font-size: 0.68rem;
+  }
+  .model-base-id {
+    font-size: 0.72rem;
+    color: var(--muted);
+  }
+  .model-reasoning-chip {
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 8px;
+    font-size: 0.72rem;
+    line-height: 1.3;
+    background: var(--bg3);
+  }
+  .model-reasoning-chip-muted {
+    color: var(--muted);
+  }
+  .model-reasoning-chip-warn {
+    border-color: var(--warn, #f7c873);
+    color: var(--warn, #f7c873);
+  }
+  .model-variant-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .model-variant-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 6px;
+    border-bottom: 1px dashed var(--border);
+    font-size: 0.84rem;
+    min-height: 44px;
+  }
+  .model-variant-row:last-child {
+    border-bottom: none;
+  }
+  .model-variant-checkbox {
+    width: 18px;
+    height: 18px;
+    flex-shrink: 0;
+  }
+  .model-variant-row-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+  .model-variant-row-title {
+    word-break: break-word;
   }
   .summary-btn,
   .summary-close {
@@ -2147,6 +2292,19 @@
     border: 1px solid var(--border); border-radius: 4px; padding: 0 5px;
     color: var(--success); margin-left: 4px; vertical-align: middle;
   }
+  .msg-auto {
+    display: inline-block; font-size: var(--fs-ui-chip); background: var(--bg3);
+    border: 1px solid var(--border); border-radius: 4px; padding: 0 5px;
+    color: var(--accent); margin-left: 4px; vertical-align: middle;
+  }
+  .msg-usage {
+    display: inline-block; font-size: var(--fs-ui-chip); background: var(--bg3);
+    border: 1px solid var(--border); border-radius: 4px; padding: 0 5px;
+    color: var(--text); margin-left: 4px; vertical-align: middle;
+  }
+  .msg-usage-stale {
+    color: var(--warn);
+  }
 
   .relay-question-card {
     background: rgba(88, 166, 255, 0.06);
@@ -2441,6 +2599,16 @@
       overflow: hidden;
       text-overflow: ellipsis;
     }
+    #chat-title-session-usage {
+      display: block;
+      margin-top: 1px;
+      font-size: clamp(0.62rem, 2vw, 0.7rem);
+      line-height: 1.2;
+      min-width: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
     #chat-header-actions {
       margin-left: auto;
     }
@@ -2548,7 +2716,8 @@
       order: -2;
       flex: 0 0 40px;
     }
-    #model-select {
+    #model-select,
+    #reasoning-effort-select {
       order: -1;
       flex: 1 1 calc(100% - 48px);
       width: calc(100% - 48px);
@@ -2624,6 +2793,26 @@
     .summary-modal-actions > * {
       flex: 1 1 calc(50% - 5px);
     }
+    .summary-header-actions {
+      width: 100%;
+      justify-content: stretch;
+    }
+    .summary-header-actions .summary-btn,
+    .summary-header-actions .summary-close {
+      flex: 1 1 calc(50% - 4px);
+      min-height: 40px;
+    }
+    .model-variant-row {
+      min-height: 48px;
+      padding: 10px 4px;
+    }
+    .model-variant-checkbox {
+      width: 22px;
+      height: 22px;
+    }
+    .model-base-group {
+      padding: 12px 10px;
+    }
     .tmux-inspector-dialog {
       width: 100%;
       height: calc(var(--app-height) - 16px);
@@ -2662,8 +2851,14 @@
       width: auto;
       min-width: 0;
     }
-    #send-btn {
+    #reasoning-effort-select {
       order: 5;
+      flex: 1 1 0;
+      width: auto;
+      min-width: 0;
+    }
+    #send-btn {
+      order: 6;
       margin-left: auto;
       flex: 0 0 auto;
     }
@@ -2695,8 +2890,14 @@
       width: auto;
       min-width: 0;
     }
-    #send-btn {
+    #reasoning-effort-select {
       order: 5;
+      flex: 1 1 0;
+      width: auto;
+      min-width: 0;
+    }
+    #send-btn {
+      order: 6;
       margin-left: auto;
       flex: 0 0 auto;
     }
@@ -2748,7 +2949,7 @@
     <div id="chat-header">
       <button id="sidebar-toggle" class="header-icon-btn" type="button" title="Toggle conversations sidebar" aria-label="Toggle conversations sidebar">☰</button>
       <div id="chat-title-wrap">
-        <span id="chat-title-slot"><span id="chat-title-primary"><span id="chat-title">Select or start a conversation</span></span><span id="chat-title-cwd" hidden></span></span>
+        <span id="chat-title-slot"><span id="chat-title-primary"><span id="chat-title">Select or start a conversation</span></span><span id="chat-title-cwd" hidden></span><span id="chat-title-session-usage" hidden></span></span>
         <form id="chat-title-editor" hidden>
           <input id="chat-title-input" type="text" maxlength="120" autocomplete="off" spellcheck="false">
           <button id="chat-title-save-btn" class="chat-title-action-btn" type="submit">Save</button>
@@ -2791,6 +2992,10 @@
     <div id="input-area">
       <div id="offline-banner">⚠️ CLI is offline — messages will queue until it reconnects</div>
       <div id="model-banner"></div>
+      <div id="model-metadata-blocker" aria-live="polite">
+        <span id="model-metadata-blocker-text">Model metadata is unavailable. Refresh to choose a model and reasoning effort.</span>
+        <button type="button" id="model-metadata-retry-btn">Refresh models</button>
+      </div>
       <div id="attachment-preview"></div>
       <div id="emoji-popup" aria-hidden="true"></div>
       <div class="input-row">
@@ -2808,6 +3013,9 @@
         </select>
         <select id="model-select" title="Model">
           <option value="">Loading models…</option>
+        </select>
+        <select id="reasoning-effort-select" title="Reasoning effort" disabled>
+          <option value="">Unavailable</option>
         </select>
         <button id="send-btn" onclick="sendMessage()">Send</button>
       </div>

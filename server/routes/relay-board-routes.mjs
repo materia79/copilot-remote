@@ -206,7 +206,19 @@ export function registerRelayBoardRoutes(app, deps) {
           ? String(modelResolution.reasoningEffort || '').trim() || null
           : null;
         queuedMessageId = uuidv4();
-        stmts.insertMsg.run(queuedMessageId, convId, 'user', followupPrompt, resolvedVariantModel, relayMode, null, now);
+        stmts.insertMsg.run(
+          queuedMessageId,
+          convId,
+          'user',
+          followupPrompt,
+          resolvedVariantModel,
+          relayMode,
+          null,
+          now,
+          resolvedVariantModel || null,
+          null,
+          String(resolvedVariantModel || '').trim().toLowerCase() === 'auto' ? 'auto' : 'manual',
+        );
         stmts.updateConvTime.run(now, convId);
         stmts.insertQ.run(
           queuedMessageId,
@@ -233,6 +245,7 @@ export function registerRelayBoardRoutes(app, deps) {
             role: 'user',
             text: followupPrompt,
             model: resolvedVariantModel,
+            modelOrigin: String(resolvedVariantModel || '').trim().toLowerCase() === 'auto' ? 'auto' : 'manual',
             mode: relayMode,
             attachments: [],
             timestamp: now,
