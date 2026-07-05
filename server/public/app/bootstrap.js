@@ -24,8 +24,6 @@ import {
   showTransientRelayNotice,
   applyContextUsageBar,
   scrollBottom,
-  setPullRefreshIndicator,
-  resetPullRefreshIndicator,
   setHistoryRefreshInFlight,
   isHistoryRefreshInFlight,
   setSummaryModalLoading,
@@ -201,12 +199,6 @@ let activeConversationPreferredModelsByMode = {};
 let activeConversationPreferredReasoningByMode = {};
 let suppressConversationPreferenceSync = false;
 let conversationPreferenceWriteVersion = 0;
-let pullRefreshState = {
-  active: false,
-  ready: false,
-  startY: 0,
-  refreshing: false,
-};
 let latestQueueStatus = {
   pendingCount: 0,
   processingCount: 0,
@@ -1291,16 +1283,6 @@ function setupViewportTracking() {
   }
 }
 
-function initPullToRefresh() {
-  const el = document.getElementById('messages');
-  if (!el || el.dataset.pullRefreshBound === '1') return;
-  el.dataset.pullRefreshBound = '1';
-  el.addEventListener('touchstart', onMessagesTouchStart, { passive: true });
-  el.addEventListener('touchmove', onMessagesTouchMove, { passive: false });
-  el.addEventListener('touchend', onMessagesTouchEnd, { passive: true });
-  el.addEventListener('touchcancel', onMessagesTouchEnd, { passive: true });
-}
-
 function initMessageScrollPersistence() {
   const el = document.getElementById('messages');
   if (!el || el.dataset.scrollPersistenceBound === '1') return;
@@ -1310,42 +1292,6 @@ function initMessageScrollPersistence() {
     if (!convId) return;
     saveConversationScrollTop(convId, el.scrollTop);
   }, { passive: true });
-}
-
-function onMessagesTouchStart(event) {
-  const el = event.currentTarget;
-  if (!el || el.scrollTop > 0 || pullRefreshState.refreshing) return;
-  const touch = event.touches?.[0];
-  if (!touch) return;
-
-  pullRefreshState = {
-    active: true,
-    ready: false,
-    startY: touch.clientY,
-    refreshing: pullRefreshState.refreshing,
-  };
-  setPullRefreshIndicator(0, 'Pull down to refresh');
-}
-
-function onMessagesTouchMove(event) {
-  if (!pullRefreshState.active) return;
-  const el = event.currentTarget;
-  if (!el || el.scrollTop > 0) {
-    resetPullRefreshIndicator();
-    return;
-  }
-  const touch = event.touches?.[0];
-  if (!touch) return;
-  const delta = touch.clientY - pullRefreshState.startY;
-  if (delta <= 0) {
-    resetPullRefreshIndicator();
-    return;
-  }
-  const distance = Math.min(delta, 120);
-  const ready = distance >= 72;
-  pullRefreshState.ready = ready;
-  setPullRefreshIndicator(distance, ready ? 'Release to refresh' : 'Pull down to refresh', ready);
-  if (delta > 6) event.preventDefault();
 }
 
 async function runConversationHistoryRefresh({ source = 'menu' } = {}) {
@@ -1397,28 +1343,6 @@ async function runConversationHistoryRefresh({ source = 'menu' } = {}) {
   } finally {
     setHistoryRefreshInFlight(false);
     syncRefreshHistoryMenuState();
-  }
-}
-
-async function onMessagesTouchEnd() {
-  if (!pullRefreshState.active) return;
-  const shouldRefresh = pullRefreshState.ready && !pullRefreshState.refreshing;
-  pullRefreshState.active = false;
-  pullRefreshState.ready = false;
-  if (!shouldRefresh) {
-    resetPullRefreshIndicator();
-    return;
-  }
-  pullRefreshState.refreshing = true;
-  setPullRefreshIndicator(72, 'Refreshing…', true);
-  try {
-    const refreshed = await runConversationHistoryRefresh({ source: 'pull' });
-    if (!refreshed) {
-      await refreshCurrentView();
-    }
-  } finally {
-    pullRefreshState.refreshing = false;
-    resetPullRefreshIndicator();
   }
 }
 
@@ -1970,7 +1894,6 @@ async function initApp() {
   await refreshModelCatalog(true);
   initFullscreenButton();
   initInstallButton();
-  initPullToRefresh();
   syncRefreshHistoryMenuState();
   initChatTitleCopy();
   initEmojiPicker();

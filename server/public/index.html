@@ -667,37 +667,6 @@
     touch-action: pan-y;
   }
 
-  #pull-refresh-indicator {
-    position: sticky;
-    top: 0;
-    z-index: 1;
-    display: flex;
-    justify-content: center;
-    pointer-events: none;
-    opacity: 0;
-    transform: translateY(-8px);
-    transition: opacity 0.15s ease, transform 0.15s ease;
-  }
-  #pull-refresh-indicator.visible {
-    opacity: 1;
-    transform: translateY(0);
-  }
-  #pull-refresh-indicator.ready {
-    color: var(--accent);
-  }
-  #pull-refresh-indicator span {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    margin: 0 auto 2px;
-    padding: 6px 12px;
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    background: var(--bg2);
-    color: var(--muted);
-    font-size: var(--fs-meta-sm);
-  }
-
   #font-scale-indicator {
     position: fixed;
     top: calc(var(--header-safe-top, 0px) + 10px);
@@ -2827,7 +2796,7 @@
       gap: 8px;
     }
     #msg-input {
-      order: 6;
+      order: 7;
       flex: 1 1 100%;
       width: 100%;
     }
@@ -2902,7 +2871,7 @@
       flex: 0 0 auto;
     }
     #msg-input {
-      order: 6;
+      order: 7;
       flex: 1 1 100%;
       width: 100%;
     }
@@ -2982,7 +2951,6 @@
       <button id="pending-question-banner" onclick="openPendingQuestionFromBanner()" title="Open pending question"></button>
     </div>
     <div id="messages">
-      <div id="pull-refresh-indicator" aria-hidden="true"><span>↻ Pull down to refresh</span></div>
       <div class="empty-state">
         <div class="icon">💬</div>
         <h3>No conversation selected</h3>

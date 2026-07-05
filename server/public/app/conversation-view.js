@@ -569,7 +569,7 @@ function createMessageNode(msg, msgId = null, force = false) {
   div.dataset.messageTimestamp = String(msg?.timestamp || '').trim();
   if (fingerprint.sourceMessageId) div.dataset.sourceMessageId = fingerprint.sourceMessageId;
 
-  const label = msg.role === 'user' ? 'You' : 'Copilot';
+  const label = msg.role === 'user' ? 'You' : '';
   const { baseModelId, reasoningEffort } = splitVariantId(msg.model);
   const explicitReasoningEffort = String(msg?.reasoningEffort || '').trim().toLowerCase() || null;
   const resolvedReasoningEffort = explicitReasoningEffort || reasoningEffort;
@@ -762,8 +762,7 @@ export function showThinking(messageId = null, autoScroll = true) {
       <div class="dots"><span></span><span></span><span></span></div>
       <div id="thinking-activity" class="thinking-activity"></div>
       <div class="subagent-bubbles-container" data-subagent-bubbles-root="1"></div>
-    </div>
-    <div class="msg-label">Copilot</div>`;
+    </div>`;
   const target = nextMessageId ? el.querySelector(`[data-message-id="${nextMessageId}"]`) : null;
   if (target && target.parentNode === el) {
     const next = target.nextSibling;
@@ -1612,8 +1611,7 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
       .filter(([id]) => !!id),
   );
   if (!ordered.length) {
-    el.innerHTML = `<div id="pull-refresh-indicator" aria-hidden="true"><span>↻ Pull down to refresh</span></div>
-      <div class="empty-state">
+    el.innerHTML = `<div class="empty-state">
       <div class="icon">${currentConvId ? '💬' : '🚀'}</div>
       <h3>${currentConvId ? 'No messages yet' : 'New Conversation'}</h3>
       <p>${currentConvId ? 'Start the conversation below' : 'Type your first message below'}</p>
@@ -1650,7 +1648,7 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
     || ordered[ordered.length - 1]?.timestamp
     || '',
   ).trim();
-  el.innerHTML = `<div id="pull-refresh-indicator" aria-hidden="true"><span>↻ Pull down to refresh</span></div>${hasMoreOlder ? buildHistoryLoadMoreMarkup(false) : ''}`;
+  el.innerHTML = hasMoreOlder ? buildHistoryLoadMoreMarkup(false) : '';
   setConversationHistoryState({
     conversationId,
     hasMoreOlder,

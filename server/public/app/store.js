@@ -103,12 +103,6 @@ export let contextIndicatorMode = 'bar';
 export let compactInFlight = false;
 export let deferredInstallPrompt = null;
 export let viewportBaseHeight = window.innerHeight || document.documentElement.clientHeight || 0;
-export let pullRefreshState = {
-  active: false,
-  ready: false,
-  startY: 0,
-  refreshing: false,
-};
 export let historyRefreshInFlight = false;
 const SIDEBAR_WIDTH_PERCENT_MIN = 10;
 const SIDEBAR_WIDTH_PERCENT_MAX = 50;
@@ -1058,25 +1052,6 @@ export function syncViewportMetrics() {
   const messagesWidth = messagesEl ? Math.max(0, messagesEl.clientWidth || 0) : layoutWidth;
   document.documentElement.style.setProperty('--messages-height', `${Math.max(0, Math.round(messagesHeight))}px`);
   document.documentElement.style.setProperty('--messages-width', `${Math.max(0, Math.round(messagesWidth))}px`);
-}
-
-export function setPullRefreshIndicator(distance, label, ready = false) {
-  const el = document.getElementById('pull-refresh-indicator');
-  if (!el) return;
-  const span = el.querySelector('span');
-  if (span) span.textContent = label;
-  el.classList.add('visible');
-  el.classList.toggle('ready', !!ready);
-  el.style.transform = `translateY(${Math.min(distance / 2, 28)}px)`;
-}
-
-export function resetPullRefreshIndicator() {
-  const el = document.getElementById('pull-refresh-indicator');
-  if (!el) return;
-  const span = el.querySelector('span');
-  if (span) span.textContent = 'Pull down to refresh';
-  el.classList.remove('visible', 'ready');
-  el.style.transform = '';
 }
 
 export let summaryModalState = {
