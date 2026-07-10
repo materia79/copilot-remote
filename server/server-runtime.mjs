@@ -328,6 +328,7 @@ const runtimeTimers = {
   staleRecovery: null,
   questionExpiry: null,
   pendingWorkerPrime: null,
+  sharedViewerPrune: null,
   shutdownDrain: null,
 };
 
@@ -371,6 +372,7 @@ function socketIoPath() {
 // Remote path prefix when served behind a reverse proxy subpath.
 // Trailing slashes are stripped. Empty string means root.
 const remotePath = normalizeRemotePath(config.remotePath);
+const COOKIE_PATH = remotePath || '/';
 
 let modelCatalog = {
   models: [DEFAULT_MODEL],
@@ -1821,6 +1823,18 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_upload_refs_conv ON upload_refs(conversation_id, file_sha256);
   CREATE INDEX IF NOT EXISTS idx_upload_refs_sha ON upload_refs(file_sha256);
+
+  CREATE TABLE IF NOT EXISTS conversation_shares (
+    token            TEXT PRIMARY KEY,
+    conversation_id  TEXT NOT NULL,
+    created_at       TEXT NOT NULL,
+    last_accessed_at TEXT,
+    revoked_at       TEXT,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_conversation_shares_conversation
+    ON conversation_shares(conversation_id, revoked_at, created_at DESC);
 `);
 
 db.exec(`
@@ -2917,6 +2931,7 @@ function parseCookies(header) {
     const idx = part.indexOf('=');
     if (idx < 0) continue;
     const key = part.slice(0, idx).trim();
+    if (!key || Object.prototype.hasOwnProperty.call(cookies, key)) continue;
     const value = part.slice(idx + 1).trim();
     cookies[key] = decodeURIComponent(value);
   }
@@ -2943,7 +2958,7 @@ function ensureSessionId(req, res) {
   if (!sessionId) {
     sessionId = uuidv4();
     if (res) {
-      appendSetCookie(res, `${SESSION_COOKIE}=${encodeURIComponent(sessionId)}; Path=/; SameSite=Lax`);
+      appendSetCookie(res, `${SESSION_COOKIE}=${encodeURIComponent(sessionId)}; Path=${COOKIE_PATH}; SameSite=Lax`);
     }
   }
   return sessionId;
@@ -4235,8 +4250,11 @@ function computePwaShellVersion() {
   return formatPwaVersionTimestamp(sourceMs);
 }
 
-function renderIndexHtmlWithPwaVersion() {
-  const appConfig = JSON.stringify({ basePath: remotePath });
+function renderIndexHtmlWithPwaVersion(appConfigOverrides = {}) {
+  const appConfig = JSON.stringify({
+    basePath: remotePath,
+    ...(appConfigOverrides && typeof appConfigOverrides === 'object' ? appConfigOverrides : {}),
+  });
   const version = computePwaShellVersion();
   const source = fs.readFileSync(INDEX_HTML_PATH, 'utf8');
   return source
@@ -4267,8 +4285,19 @@ function loadPwaManifestTemplate() {
   return fallback;
 }
 
-function buildScopedPwaManifest() {
+function buildScopedPwaManifest({ shared = false } = {}) {
   const manifest = loadPwaManifestTemplate();
+  if (shared) {
+    return {
+      ...manifest,
+      id: './__copilot_remote_shared__',
+      start_url: './',
+      scope: './',
+      display_override: ['browser'],
+      display: 'browser',
+      prefer_related_applications: false,
+    };
+  }
   return {
     ...manifest,
     id: './__copilot_remote_pwa__',
@@ -4308,6 +4337,162 @@ httpServer.prependListener('upgrade', (req, _socket, _head) => {
   rewriteSocketIoRequestPath(req, remotePath);
 });
 const io         = new Server(httpServer, { cors: { origin: '*' }, path: socketIoPath() });
+const SHARED_VIEWER_STALE_MS = 45_000;
+const SHARED_VIEWER_MAX_PER_CONVERSATION = Number.isFinite(Number(config.sharedPresenceMaxPerConversation))
+  ? Math.max(1, Math.trunc(Number(config.sharedPresenceMaxPerConversation)))
+  : 200;
+const SHARED_VIEWER_MAX_GLOBAL = Number.isFinite(Number(config.sharedPresenceMaxGlobal))
+  ? Math.max(SHARED_VIEWER_MAX_PER_CONVERSATION, Math.trunc(Number(config.sharedPresenceMaxGlobal)))
+  : 5_000;
+const sharedViewersByConversation = new Map();
+
+function sanitizeSharedViewerId(value) {
+  const id = String(value || '').trim().replace(/[^a-zA-Z0-9:_-]+/g, '');
+  if (!id) return '';
+  return id.slice(0, 128);
+}
+
+function getSharedWatcherCount(conversationId) {
+  const convId = String(conversationId || '').trim();
+  if (!convId) return 0;
+  const viewers = sharedViewersByConversation.get(convId);
+  return viewers instanceof Map ? viewers.size : 0;
+}
+
+function emitConversationWatcherCount(conversationId) {
+  const convId = String(conversationId || '').trim();
+  if (!convId) return 0;
+  const watcherCount = getSharedWatcherCount(convId);
+  io.emit('conversation_watchers', { conversationId: convId, watcherCount });
+  return watcherCount;
+}
+
+function pruneSharedViewersMap(viewers, now = Date.now()) {
+  if (!(viewers instanceof Map) || viewers.size === 0) return false;
+  let changed = false;
+  for (const [key, entry] of viewers.entries()) {
+    const lastSeenAt = Number(entry?.lastSeenAt || 0);
+    if (!Number.isFinite(lastSeenAt) || (now - lastSeenAt) > SHARED_VIEWER_STALE_MS) {
+      viewers.delete(key);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function evictOldestSharedViewerFromMap(viewers) {
+  if (!(viewers instanceof Map) || viewers.size === 0) return false;
+  let oldestKey = '';
+  let oldestSeenAt = Number.POSITIVE_INFINITY;
+  for (const [key, entry] of viewers.entries()) {
+    const seenAt = Number(entry?.lastSeenAt || 0);
+    const normalizedSeenAt = Number.isFinite(seenAt) ? seenAt : 0;
+    if (normalizedSeenAt < oldestSeenAt) {
+      oldestSeenAt = normalizedSeenAt;
+      oldestKey = key;
+    }
+  }
+  if (!oldestKey) return false;
+  viewers.delete(oldestKey);
+  return true;
+}
+
+function countSharedViewerEntries() {
+  let total = 0;
+  for (const viewers of sharedViewersByConversation.values()) {
+    if (viewers instanceof Map) total += viewers.size;
+  }
+  return total;
+}
+
+function evictOldestSharedViewerGlobally() {
+  let targetConversationId = '';
+  let targetKey = '';
+  let oldestSeenAt = Number.POSITIVE_INFINITY;
+  for (const [conversationId, viewers] of sharedViewersByConversation.entries()) {
+    if (!(viewers instanceof Map) || viewers.size === 0) continue;
+    for (const [key, entry] of viewers.entries()) {
+      const seenAt = Number(entry?.lastSeenAt || 0);
+      const normalizedSeenAt = Number.isFinite(seenAt) ? seenAt : 0;
+      if (normalizedSeenAt < oldestSeenAt) {
+        oldestSeenAt = normalizedSeenAt;
+        targetConversationId = String(conversationId || '').trim();
+        targetKey = key;
+      }
+    }
+  }
+  if (!targetConversationId || !targetKey) return '';
+  const viewers = sharedViewersByConversation.get(targetConversationId);
+  if (!(viewers instanceof Map)) return '';
+  viewers.delete(targetKey);
+  if (viewers.size <= 0) sharedViewersByConversation.delete(targetConversationId);
+  return targetConversationId;
+}
+
+function pruneSharedViewerPresence() {
+  const now = Date.now();
+  const changedConversations = [];
+  for (const [conversationId, viewers] of sharedViewersByConversation.entries()) {
+    if (!(viewers instanceof Map) || viewers.size === 0) {
+      sharedViewersByConversation.delete(conversationId);
+      continue;
+    }
+    const before = viewers.size;
+    pruneSharedViewersMap(viewers, now);
+    if (viewers.size === 0) {
+      sharedViewersByConversation.delete(conversationId);
+    }
+    if (before !== viewers.size) {
+      changedConversations.push(String(conversationId || '').trim());
+    }
+  }
+  for (const conversationId of changedConversations) {
+    emitConversationWatcherCount(conversationId);
+  }
+}
+
+function markSharedViewerPresence({ conversationId, token, viewerId } = {}) {
+  const convId = String(conversationId || '').trim();
+  const shareToken = String(token || '').trim();
+  const viewer = sanitizeSharedViewerId(viewerId);
+  if (!convId || !shareToken || !viewer) return { ok: false, watcherCount: 0 };
+  const key = `${shareToken}:${viewer}`;
+  let viewers = sharedViewersByConversation.get(convId);
+  if (!(viewers instanceof Map)) {
+    viewers = new Map();
+    sharedViewersByConversation.set(convId, viewers);
+  }
+  const now = Date.now();
+  pruneSharedViewersMap(viewers, now);
+  const isNewViewer = !viewers.has(key);
+  if (isNewViewer) {
+    while (viewers.size >= SHARED_VIEWER_MAX_PER_CONVERSATION) {
+      if (!evictOldestSharedViewerFromMap(viewers)) break;
+    }
+    if (viewers.size >= SHARED_VIEWER_MAX_PER_CONVERSATION) {
+      emitConversationWatcherCount(convId);
+      return { ok: false, watcherCount: viewers.size, capped: true };
+    }
+    while (countSharedViewerEntries() >= SHARED_VIEWER_MAX_GLOBAL) {
+      const evictedConversationId = evictOldestSharedViewerGlobally();
+      if (!evictedConversationId) break;
+      if (evictedConversationId !== convId) emitConversationWatcherCount(evictedConversationId);
+    }
+    if (countSharedViewerEntries() >= SHARED_VIEWER_MAX_GLOBAL) {
+      emitConversationWatcherCount(convId);
+      return { ok: false, watcherCount: viewers.size, capped: true };
+    }
+  }
+  const before = viewers.size;
+  viewers.set(key, { lastSeenAt: now });
+  const watcherCount = viewers.size;
+  if (before !== watcherCount) {
+    emitConversationWatcherCount(convId);
+  } else {
+    io.emit('conversation_watchers', { conversationId: convId, watcherCount });
+  }
+  return { ok: true, watcherCount, capped: false };
+}
 async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'worker-ready' } = {}) {
   const requesterSessionId = String(sessionId || '').trim();
   if (!requesterSessionId) return { message: null, reason: 'missing-session-id' };
@@ -4530,7 +4715,8 @@ app.get('/socket.io/socket.io.js', (req, res, next) => {
 });
 app.get('/manifest.webmanifest', (req, res, next) => {
   try {
-    const manifest = buildScopedPwaManifest();
+    const shared = String(req.query?.shared || '').trim() === '1';
+    const manifest = buildScopedPwaManifest({ shared });
     res.setHeader('Cache-Control', 'no-store');
     res.type('application/manifest+json').send(JSON.stringify(manifest, null, 2));
   } catch (error) {
@@ -4547,6 +4733,18 @@ app.get(['/', '/index.html'], (req, res, next) => {
   try {
     const html = renderIndexHtmlWithPwaVersion();
     res.setHeader('Cache-Control', 'no-store');
+    res.type('html').send(html);
+  } catch (error) {
+    next(error);
+  }
+});
+app.get(['/shared/:token', '/shared/:token/'], (req, res, next) => {
+  try {
+    const rawToken = String(req.params?.token || '').trim().toLowerCase();
+    const shareToken = /^[a-f0-9]{32,128}$/.test(rawToken) ? rawToken : '';
+    const html = renderIndexHtmlWithPwaVersion({ sharedToken: shareToken });
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
     res.type('html').send(html);
   } catch (error) {
     next(error);
@@ -4705,6 +4903,8 @@ const sharedRouteDeps = {
   relayRestartOrchestrator,
   resolveSessionStateRoot,
   requestRelayShutdown,
+  markSharedViewerPresence,
+  getSharedWatcherCount,
 };
 registerMessagesRoutes(app, sharedRouteDeps);
 registerSessionsRoutes(app, sharedRouteDeps);
@@ -4774,6 +4974,8 @@ function expirePendingQuestions() {
 }
 runtimeTimers.questionExpiry = setInterval(expirePendingQuestions, 10_000);
 expirePendingQuestions();
+runtimeTimers.sharedViewerPrune = setInterval(pruneSharedViewerPresence, 5_000);
+if (typeof runtimeTimers.sharedViewerPrune.unref === 'function') runtimeTimers.sharedViewerPrune.unref();
 const runtimeBindingsBootstrapped = bootstrapRuntimeSessionBindings();
 if (runtimeBindingsBootstrapped > 0) {
   console.log(`${runtimeLogPrefix()}Runtime sessions bootstrapped: ${runtimeBindingsBootstrapped}`);
@@ -4787,6 +4989,9 @@ function runtimeLogPrefix() {
 // ─── Auth Middleware ──────────────────────────────────────────────────────────
 function auth(req, res, next) {
   const cookies = parseCookies(req.headers.cookie);
+  const secureAttr = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase() === 'https'
+    ? '; Secure'
+    : '';
   const token =
     (req.headers['authorization'] || '').replace(/^Bearer\s+/i, '') ||
     req.query.token ||
@@ -4794,12 +4999,12 @@ function auth(req, res, next) {
     cookies[AUTH_COOKIE];
   if (token === config.authToken) {
     if (res && cookies[AUTH_COOKIE] !== config.authToken) {
-      const secureAttr = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase() === 'https'
-        ? '; Secure'
-        : '';
-      appendSetCookie(res, `${AUTH_COOKIE}=${encodeURIComponent(config.authToken)}; Path=/; Max-Age=2592000; SameSite=Lax; HttpOnly${secureAttr}`);
+      appendSetCookie(res, `${AUTH_COOKIE}=${encodeURIComponent(config.authToken)}; Path=${COOKIE_PATH}; Max-Age=2592000; SameSite=Lax; HttpOnly${secureAttr}`);
     }
     return next();
+  }
+  if (res && cookies[AUTH_COOKIE]) {
+    appendSetCookie(res, `${AUTH_COOKIE}=; Path=${COOKIE_PATH}; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax; HttpOnly${secureAttr}`);
   }
   res.status(401).json({ error: 'Unauthorized' });
 }
@@ -5050,7 +5255,7 @@ io.use((socket, next) => {
 
 io.engine.on('initial_headers', (headers, req) => {
   const sessionId = ensureSessionId(req);
-  headers['Set-Cookie'] = `${SESSION_COOKIE}=${encodeURIComponent(sessionId)}; Path=/; SameSite=Lax`;
+  headers['Set-Cookie'] = `${SESSION_COOKIE}=${encodeURIComponent(sessionId)}; Path=${COOKIE_PATH}; SameSite=Lax`;
 });
 
 io.on('connection', (socket) => {
@@ -5084,6 +5289,7 @@ function clearRuntimeTimers() {
   runtimeTimers.staleRecovery = null;
   runtimeTimers.questionExpiry = null;
   runtimeTimers.pendingWorkerPrime = null;
+  runtimeTimers.sharedViewerPrune = null;
   runtimeTimers.shutdownDrain = null;
 }
 

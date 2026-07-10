@@ -25,6 +25,7 @@ import {
   addSubagentActivity,
   addSubagentThought,
   clearSubagentCancelInFlight,
+  setConversationWatcherCount,
 } from './store.js';
 import { scheduleContextUsageRefresh } from './api-client.js';
 import { renderConvList, refreshConversations, openConversation } from './journal-view.js';
@@ -315,6 +316,10 @@ export async function connectSocket(overrideDeps) {
   });
   socket.on('conversation_draft_updated', (payload = {}) => {
     applyIncomingConversationDraftUpdate(payload || {});
+  });
+  socket.on('conversation_watchers', ({ conversationId, watcherCount }) => {
+    setConversationWatcherCount(conversationId, watcherCount);
+    deps?.syncChatTitleControls?.();
   });
   socket.on('conversation_session_bound', async ({ conversationId, sdkSessionId, runtimeSessionId }) => {
     const id = String(conversationId || '').trim();

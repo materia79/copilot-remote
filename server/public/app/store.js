@@ -5,17 +5,42 @@ function resolveAppBase() {
   if (configuredBase && configuredBase !== '/') {
     return configuredBase.startsWith('/') ? configuredBase.replace(/\/+$/, '') : `/${configuredBase.replace(/\/+$/, '')}`;
   }
-  return window.location.pathname.replace(/\/+$/, '');
+  const pathname = String(window.location.pathname || '/');
+  const sharedIndex = pathname.indexOf('/shared/');
+  if (sharedIndex >= 0) return pathname.slice(0, sharedIndex).replace(/\/+$/, '');
+  return pathname.replace(/\/+$/, '');
 }
 
 export const BASE = resolveAppBase();
+function extractSharedTokenFromPathname(pathname) {
+  const path = String(pathname || '/');
+  const match = path.match(/\/shared\/([^/?#]+)\/?$/i);
+  if (!match) return '';
+  return String(match[1] || '').trim().toLowerCase();
+}
+
+function resolveSharedConversationToken() {
+  const configured = String(window.__COPILOT_APP_CONFIG?.sharedToken || '').trim().toLowerCase();
+  if (configured) return configured;
+  return extractSharedTokenFromPathname(window.location.pathname);
+}
+export const SHARED_CONVERSATION_TOKEN = resolveSharedConversationToken();
+export const IS_SHARED_VIEW = !!SHARED_CONVERSATION_TOKEN;
 export let TOKEN = '';
 export let socket = null;
 export let currentConvId = null;
-export let CLIENT_ID = sessionStorage.getItem('copilot_client_id');
+let clientIdStorageValue = '';
+try {
+  clientIdStorageValue = sessionStorage.getItem('copilot_client_id') || '';
+} catch {
+  clientIdStorageValue = '';
+}
+export let CLIENT_ID = clientIdStorageValue;
 if (!CLIENT_ID) {
   CLIENT_ID = generateId();
-  sessionStorage.setItem('copilot_client_id', CLIENT_ID);
+  try {
+    sessionStorage.setItem('copilot_client_id', CLIENT_ID);
+  } catch {}
 }
 
 export const seenMessageIds = new Set();
@@ -53,6 +78,7 @@ export let relayQuestions = new Map();
 export let relayBoards = new Map();
 export let relayActivities = new Map();
 export let relayThoughts = new Map();
+export let conversationWatcherCounts = new Map();
 export let sessionWorkerStates = new Map();
 export let subagentRuns = new Map();
 export const subagentCancelInFlight = new Set();
@@ -128,6 +154,23 @@ export function setCurrentConv(id) {
   if (id) localStorage.setItem('copilot_last_conv', id);
   else localStorage.removeItem('copilot_last_conv');
   updateCompactButton();
+}
+
+export function setConversationWatcherCount(conversationId, count) {
+  const id = String(conversationId || '').trim();
+  if (!id) return;
+  const next = Number.isFinite(Number(count)) ? Math.max(0, Math.trunc(Number(count))) : 0;
+  if (next <= 0) {
+    conversationWatcherCounts.delete(id);
+    return;
+  }
+  conversationWatcherCounts.set(id, next);
+}
+
+export function getConversationWatcherCount(conversationId) {
+  const id = String(conversationId || '').trim();
+  if (!id) return 0;
+  return Number(conversationWatcherCounts.get(id) || 0);
 }
 
 function conversationScrollStorageKey(conversationId) {
@@ -498,7 +541,8 @@ function resolveMessagesNearBottomThreshold(el, thresholdPx = null) {
   }
   const viewportHeight = Number(el?.clientHeight || 0);
   if (!Number.isFinite(viewportHeight) || viewportHeight <= 0) return 0;
-  return Math.max(0, Math.floor(viewportHeight * 0.5));
+  const relativeThreshold = Math.floor(viewportHeight * 0.08);
+  return Math.min(48, Math.max(12, relativeThreshold));
 }
 
 export function isMessagesNearBottom(thresholdPx = null) {

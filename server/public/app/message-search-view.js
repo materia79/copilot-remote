@@ -1,4 +1,4 @@
-import { escHtml } from './store.js';
+import { escHtml, IS_SHARED_VIEW } from './store.js';
 import { searchMessages } from './api-client.js';
 
 const SEARCH_PAGE_SIZE = 40;
@@ -133,6 +133,7 @@ function scheduleSearchDebounced() {
 }
 
 function openMessageSearchModal() {
+  if (IS_SHARED_VIEW) return;
   const { modal, input, list } = getSearchElements();
   if (!modal || !input || !list) return;
   modal.classList.add('visible');

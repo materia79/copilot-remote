@@ -13,6 +13,23 @@ const SHOW_SUSPEND_HOST_STORAGE_KEY = 'copilot_show_suspend_host';
 
 let defaultSessionWorkspaceRootUpdateInFlight = false;
 
+function readLocalStorage(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeLocalStorage(key, value) {
+  try {
+    localStorage.setItem(key, value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function closeChatActionsMenu() {
   const menu = document.getElementById('chat-actions-menu');
   const trigger = document.getElementById('chat-actions-menu-btn');
@@ -34,14 +51,14 @@ export function syncDefaultSessionWorkspaceRootInput() {
 }
 
 function readShowSuspendHostSetting() {
-  const stored = String(localStorage.getItem(SHOW_SUSPEND_HOST_STORAGE_KEY) || '').trim().toLowerCase();
+  const stored = String(readLocalStorage(SHOW_SUSPEND_HOST_STORAGE_KEY) || '').trim().toLowerCase();
   if (!stored) return true;
   return stored !== '0' && stored !== 'false';
 }
 
 function setShowSuspendHostSetting(show, { persist = true } = {}) {
   const next = !!show;
-  if (persist) localStorage.setItem(SHOW_SUSPEND_HOST_STORAGE_KEY, next ? '1' : '0');
+  if (persist) writeLocalStorage(SHOW_SUSPEND_HOST_STORAGE_KEY, next ? '1' : '0');
   return next;
 }
 
@@ -65,7 +82,7 @@ export function syncSuspendHostVisibility() {
 }
 
 export function initTheme() {
-  const saved = localStorage.getItem(THEME_STORAGE_KEY);
+  const saved = readLocalStorage(THEME_STORAGE_KEY);
   if (saved === 'light') {
     document.documentElement.setAttribute('data-theme', 'light');
   } else {
@@ -76,10 +93,10 @@ export function initTheme() {
 export function updateTheme(theme) {
   if (theme === 'light') {
     document.documentElement.setAttribute('data-theme', 'light');
-    localStorage.setItem(THEME_STORAGE_KEY, 'light');
+    writeLocalStorage(THEME_STORAGE_KEY, 'light');
   } else {
     document.documentElement.removeAttribute('data-theme');
-    localStorage.setItem(THEME_STORAGE_KEY, 'dark');
+    writeLocalStorage(THEME_STORAGE_KEY, 'dark');
   }
 }
 
@@ -127,7 +144,7 @@ export function openSettingsModal() {
   const modal = document.getElementById('settings-modal');
   const themeSelect = document.getElementById('theme-select');
   if (themeSelect) {
-    themeSelect.value = localStorage.getItem(THEME_STORAGE_KEY) === 'light' ? 'light' : 'dark';
+    themeSelect.value = readLocalStorage(THEME_STORAGE_KEY) === 'light' ? 'light' : 'dark';
   }
   syncSuspendHostVisibility();
   syncFontScaleSelect();

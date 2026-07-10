@@ -14,14 +14,34 @@ let fontScalePinchState = {
   startScale: FONT_SCALE_DEFAULT,
 };
 
+function readLocalStorage(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeLocalStorage(key, value) {
+  try {
+    localStorage.setItem(key, value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function clampFontScale(value) {
-  const numeric = Number(value);
+  if (value == null) return FONT_SCALE_DEFAULT;
+  const text = typeof value === 'string' ? value.trim() : value;
+  if (text === '') return FONT_SCALE_DEFAULT;
+  const numeric = Number(text);
   if (!Number.isFinite(numeric)) return FONT_SCALE_DEFAULT;
   return Math.min(FONT_SCALE_MAX, Math.max(FONT_SCALE_MIN, numeric));
 }
 
 function readStoredFontScale() {
-  return clampFontScale(localStorage.getItem(FONT_SCALE_STORAGE_KEY));
+  return clampFontScale(readLocalStorage(FONT_SCALE_STORAGE_KEY));
 }
 
 function normalizeFontScaleSelectValue(raw = '') {
@@ -93,7 +113,7 @@ export function syncFontScaleSelect() {
 export function setFontScale(nextScale, { persist = true, preserveMessageAnchor = true } = {}) {
   const normalized = clampFontScale(nextScale);
   if (Math.abs(normalized - fontScaleValue) <= 0.0001) {
-    if (persist) localStorage.setItem(FONT_SCALE_STORAGE_KEY, String(normalized));
+    if (persist) writeLocalStorage(FONT_SCALE_STORAGE_KEY, String(normalized));
     syncFontScaleSelect();
     return normalized;
   }
@@ -101,7 +121,7 @@ export function setFontScale(nextScale, { persist = true, preserveMessageAnchor 
   fontScaleValue = normalized;
   document.documentElement.style.setProperty('--font-scale', normalized.toFixed(4));
   document.documentElement.style.setProperty('--font-scale-percent', `${Math.round(normalized * 100)}%`);
-  if (persist) localStorage.setItem(FONT_SCALE_STORAGE_KEY, String(normalized));
+  if (persist) writeLocalStorage(FONT_SCALE_STORAGE_KEY, String(normalized));
   syncFontScaleSelect();
   if (anchor) {
     requestAnimationFrame(() => {

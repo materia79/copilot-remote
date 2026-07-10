@@ -219,5 +219,41 @@ export function createSessionRepository(db) {
           FROM conversations
           WHERE status = 'deleted' AND sdk_session_id = ?
         `),
+        // public conversation shares
+        getConversationShareByConversationId: db.prepare(`
+          SELECT token, conversation_id, created_at, last_accessed_at, revoked_at
+          FROM conversation_shares
+          WHERE conversation_id = ?
+            AND (revoked_at IS NULL OR revoked_at = '')
+          ORDER BY created_at DESC
+          LIMIT 1
+        `),
+        getConversationShareByToken: db.prepare(`
+          SELECT token, conversation_id, created_at, last_accessed_at, revoked_at
+          FROM conversation_shares
+          WHERE token = ?
+          LIMIT 1
+        `),
+        insertConversationShare: db.prepare(`
+          INSERT INTO conversation_shares (
+            token,
+            conversation_id,
+            created_at,
+            last_accessed_at,
+            revoked_at
+          ) VALUES (?, ?, ?, ?, NULL)
+        `),
+        touchConversationShare: db.prepare(`
+          UPDATE conversation_shares
+          SET last_accessed_at = ?
+          WHERE token = ?
+            AND (revoked_at IS NULL OR revoked_at = '')
+        `),
+        revokeConversationShareByToken: db.prepare(`
+          UPDATE conversation_shares
+          SET revoked_at = ?
+          WHERE token = ?
+            AND (revoked_at IS NULL OR revoked_at = '')
+        `),
     };
 }

@@ -11,6 +11,7 @@ import { renderLinkedPlainText } from './router.js';
 import { schemaFieldsFromQuestion } from './question-schema-view.mjs';
 
 let relayQuestionRenderHash = '';
+const relayQuestionStructuredDrafts = new Map();
 
 export function upsertRelayQuestion(question) {
   if (!question || !question.id) return;
@@ -32,6 +33,12 @@ export async function loadRelayQuestions(conversationId) {
     const question = next.get(questionId);
     if (!question || question.status !== 'pending') {
       relayQuestionDrafts.delete(questionId);
+    }
+  }
+  for (const questionId of relayQuestionStructuredDrafts.keys()) {
+    const question = next.get(questionId);
+    if (!question || question.status !== 'pending') {
+      relayQuestionStructuredDrafts.delete(questionId);
     }
   }
   relayQuestions.clear();
@@ -139,6 +146,13 @@ export function renderRelayQuestions() {
   if (relayQuestionRenderHash === nextHash && existingCards.length === questions.length) return;
   relayQuestionRenderHash = nextHash;
 
+  for (const node of existingCards) {
+    const questionId = String(node?.dataset?.questionId || '').trim();
+    const question = relayQuestions.get(questionId);
+    const fields = schemaFieldsFromQuestion(question);
+    if (!questionId || !fields.length) continue;
+    relayQuestionStructuredDrafts.set(questionId, collectStructuredAnswer(question));
+  }
   existingCards.forEach((node) => node.remove());
   if (!questions.length) return;
 
@@ -209,14 +223,19 @@ function renderMultiFieldForm(question) {
   const fields = schemaFieldsFromQuestion(question);
   if (!fields.length) return '';
   const disabled = question.status !== 'pending';
+  const draft = relayQuestionStructuredDrafts.get(question.id);
   const submitted = question.structuredAnswer && typeof question.structuredAnswer === 'object'
     ? question.structuredAnswer
     : {};
+  const hasSubmitted = Object.keys(submitted).length > 0;
+  const sourceValues = hasSubmitted && question.status !== 'pending'
+    ? submitted
+    : (draft && typeof draft === 'object' ? draft : submitted);
 
   const fieldHtml = fields.map((field, index) => {
     const id = fieldDomId(question.id, index);
-    const current = Object.prototype.hasOwnProperty.call(submitted, field.name)
-      ? submitted[field.name]
+    const current = Object.prototype.hasOwnProperty.call(sourceValues, field.name)
+      ? sourceValues[field.name]
       : (field.hasDefault ? field.default : undefined);
     const requiredMark = field.required ? ' <span class="relay-field-required">*</span>' : '';
     const descHtml = field.description
@@ -352,6 +371,7 @@ export async function submitRelayStructuredAnswer(questionId) {
       return;
     }
     relayQuestionDrafts.delete(questionId);
+    relayQuestionStructuredDrafts.delete(questionId);
     if (r.question) relayQuestions.set(questionId, r.question);
     updatePendingQuestionBanner();
     window.renderConvList?.();
@@ -386,6 +406,7 @@ export async function submitRelayQuestionAnswer(questionId, presetAnswer = null)
       : await answerRelayQuestion(questionId, answer, sdkSessionId || null);
     if (!r?.question) throw new Error('Failed to submit relay question answer');
     relayQuestionDrafts.delete(questionId);
+    relayQuestionStructuredDrafts.delete(questionId);
     relayQuestions.set(questionId, r.question);
     updatePendingQuestionBanner();
     window.renderConvList?.();

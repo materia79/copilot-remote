@@ -24,6 +24,7 @@ import {
   showTransientRelayNotice,
   applyContextUsageBar,
   scrollBottom,
+  isMessagesNearBottom,
   setHistoryRefreshInFlight,
   isHistoryRefreshInFlight,
   setSummaryModalLoading,
@@ -43,6 +44,10 @@ import {
   getSessionWorkerState,
   resolveConversationUiState,
   summaryModalState,
+  IS_SHARED_VIEW,
+  SHARED_CONVERSATION_TOKEN,
+  getConversationWatcherCount,
+  generateId,
 } from './store.js';
 import {
   verifyExistingSession,
@@ -58,8 +63,11 @@ import {
   refreshConversationHistory,
   updateConversationTitle,
   updateConversationPreferences,
+  createConversationShareLink,
   updateDefaultSessionWorkspaceRoot,
   scheduleContextUsageRefresh,
+  loadSharedConversation,
+  reportSharedViewerPresence,
 } from './api-client.js';
 import { loadConversations, refreshConversations, openConversation, renderConvList, applyLoadedConversationState, initConversationListLazyLoading } from './journal-view.js';
 import { newConversation, deleteConv } from './journal-view.js';
@@ -166,6 +174,16 @@ const LOCAL_PROCESSING_STALE_MS = 5 * 60 * 1000;
 let relayQuestionPollTimer = null;
 let relayBoardPollTimer = null;
 let sessionWorkerStatusPollTimer = null;
+let sharedConversationPollTimer = null;
+let sharedPresencePollTimer = null;
+let sharedConversationPollInFlight = false;
+let sharedConversationRequestSeq = 0;
+let sharedConversationAppliedSeq = 0;
+let liveConversationPollTimer = null;
+let liveConversationPollInFlight = false;
+let sharedViewerIdFallback = '';
+let sharedConversationRenderKey = '';
+let sharedConversationLastError = '';
 let viewportBaseHeight = window.innerHeight || document.documentElement.clientHeight || 0;
 let chatTitleEditingConversationId = null;
 let relayQuestionRenderHash = '';
@@ -204,6 +222,20 @@ let latestQueueStatus = {
   processingCount: 0,
   parkedCount: 0,
 };
+const SHARED_VIEWER_ID_STORAGE_KEY = 'copilot_shared_viewer_id';
+
+function resolveSharedTokenFromLocation() {
+  const configured = String(window.__COPILOT_APP_CONFIG?.sharedToken || SHARED_CONVERSATION_TOKEN || '').trim().toLowerCase();
+  if (configured) return configured;
+  const pathToken = String(window.location.pathname || '').match(/\/shared\/([^/?#]+)\/?$/i);
+  if (!pathToken) return '';
+  return String(pathToken[1] || '').trim().toLowerCase();
+}
+
+function isSharedReaderMode() {
+  if (IS_SHARED_VIEW) return true;
+  return !!resolveSharedTokenFromLocation();
+}
 
 function getTokenFromUrl() {
   return new URLSearchParams(window.location.search).get('token');
@@ -217,6 +249,7 @@ function stripTokenFromUrl() {
 }
 
 function ensureTrailingSlashPath() {
+  if (isSharedReaderMode()) return false;
   const url = new URL(window.location.href);
   const path = url.pathname || '/';
   if (path === '/' || path.endsWith('/')) return false;
@@ -227,8 +260,273 @@ function ensureTrailingSlashPath() {
   return true;
 }
 
+function sharedViewerId() {
+  let viewerId = '';
+  try {
+    viewerId = String(sessionStorage.getItem(SHARED_VIEWER_ID_STORAGE_KEY) || '').trim();
+  } catch {
+    viewerId = sharedViewerIdFallback;
+  }
+  if (!viewerId) {
+    viewerId = generateId();
+    sharedViewerIdFallback = viewerId;
+    try {
+      sessionStorage.setItem(SHARED_VIEWER_ID_STORAGE_KEY, viewerId);
+    } catch {}
+  }
+  return viewerId;
+}
+
+function stopSharedModeTimers() {
+  if (sharedConversationPollTimer) {
+    clearInterval(sharedConversationPollTimer);
+    sharedConversationPollTimer = null;
+  }
+  if (sharedPresencePollTimer) {
+    clearInterval(sharedPresencePollTimer);
+    sharedPresencePollTimer = null;
+  }
+  if (liveConversationPollTimer) {
+    clearInterval(liveConversationPollTimer);
+    liveConversationPollTimer = null;
+  }
+  sharedConversationPollInFlight = false;
+  sharedConversationRequestSeq = 0;
+  sharedConversationAppliedSeq = 0;
+  liveConversationPollInFlight = false;
+}
+
+function syncThemeMenuLabel() {
+  const button = document.getElementById('chat-menu-shared-theme-toggle');
+  if (!button) return;
+  const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+  button.textContent = isLight ? '🌙 Night mode' : '☀️ Day mode';
+}
+
+function initThemeMenuToggle() {
+  const themeBtn = document.getElementById('chat-menu-shared-theme-toggle');
+  if (!themeBtn) return;
+  themeBtn.hidden = false;
+  syncThemeMenuLabel();
+  if (themeBtn.dataset.bound === '1') return;
+  themeBtn.dataset.bound = '1';
+  bindMenuAction(themeBtn, (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+    updateTheme(isLight ? 'dark' : 'light');
+    syncThemeMenuLabel();
+    closeChatActionsMenu();
+  });
+}
+
+function disableSharedControl(element, {
+  title = 'Shared conversation (read-only)',
+  hide = false,
+} = {}) {
+  if (!element) return;
+  element.disabled = true;
+  element.setAttribute('aria-disabled', 'true');
+  if (title) element.title = title;
+  if (hide) element.hidden = true;
+}
+
+function hideSharedMenuEntry(element) {
+  if (!element) return;
+  element.hidden = true;
+  element.setAttribute('aria-hidden', 'true');
+  if ('disabled' in element) element.disabled = true;
+  if ('tabIndex' in element) element.tabIndex = -1;
+}
+
+function applySharedReaderUi() {
+  document.body.classList.add('shared-reader-mode', 'sidebar-collapsed');
+  closeSidebar();
+  const sidebar = document.getElementById('sidebar');
+  const sidebarResizer = document.getElementById('sidebar-resizer');
+  const sidebarToggle = document.getElementById('sidebar-toggle');
+  const newConversationBtn = document.getElementById('new-conv-btn');
+  const searchBtn = document.getElementById('message-search-btn');
+  const contextBtn = document.getElementById('context-btn');
+  const fullscreenBtn = document.getElementById('fullscreen-btn');
+  const input = document.getElementById('msg-input');
+  const sendBtn = document.getElementById('send-btn');
+  const attachBtn = document.getElementById('attach-btn');
+  const emojiBtn = document.getElementById('emoji-btn');
+  const repoDesktopBtn = document.getElementById('repo-browser-desktop-btn');
+  const repoInputBtn = document.getElementById('repo-browser-input-btn');
+  const repoFabBtn = document.getElementById('repo-browser-fab');
+  const modelSelect = document.getElementById('model-select');
+  const effortSelect = document.getElementById('reasoning-effort-select');
+  const modeSelect = document.getElementById('mode-select');
+  const chatMenuBtn = document.getElementById('chat-actions-menu-btn');
+  const chatMenu = document.getElementById('chat-actions-menu');
+  const sharedThemeBtn = document.getElementById('chat-menu-shared-theme-toggle');
+  const installBtn = document.getElementById('install-btn');
+  const activeElement = document.activeElement;
+  if (chatMenu && activeElement instanceof Element && chatMenu.contains(activeElement)) {
+    activeElement.blur();
+  }
+  closeChatActionsMenu();
+  if (sidebar) sidebar.hidden = true;
+  if (sidebarResizer) sidebarResizer.hidden = true;
+  if (sidebarToggle) sidebarToggle.hidden = true;
+  if (newConversationBtn) newConversationBtn.hidden = true;
+  disableSharedControl(searchBtn);
+  disableSharedControl(contextBtn);
+  if (fullscreenBtn) fullscreenBtn.hidden = true;
+  if (input) {
+    input.readOnly = true;
+    input.disabled = true;
+    input.placeholder = 'Shared conversation (read-only)';
+  }
+  disableSharedControl(sendBtn);
+  disableSharedControl(attachBtn);
+  disableSharedControl(emojiBtn);
+  disableSharedControl(repoDesktopBtn, { hide: true });
+  disableSharedControl(repoInputBtn);
+  if (repoFabBtn) repoFabBtn.hidden = true;
+  disableSharedControl(installBtn, { hide: true, title: 'PWA install is unavailable for shared conversations' });
+  if (modelSelect) modelSelect.hidden = true;
+  if (effortSelect) effortSelect.hidden = true;
+  if (modeSelect) modeSelect.hidden = true;
+  if (chatMenu && sharedThemeBtn) {
+    for (const child of Array.from(chatMenu.children)) {
+      if (child !== sharedThemeBtn) hideSharedMenuEntry(child);
+    }
+    sharedThemeBtn.hidden = false;
+    sharedThemeBtn.removeAttribute('aria-hidden');
+    sharedThemeBtn.disabled = false;
+    sharedThemeBtn.tabIndex = 0;
+    syncThemeMenuLabel();
+  } else if (chatMenuBtn) {
+    chatMenuBtn.hidden = true;
+  }
+  if (chatMenuBtn && !sharedThemeBtn) chatMenuBtn.hidden = true;
+}
+
+function syncChatTitleWatcherIndicator() {
+  const indicator = document.getElementById('chat-title-watch-indicator');
+  if (!indicator) return;
+  if (isSharedReaderMode()) {
+    indicator.hidden = true;
+    return;
+  }
+  const convId = String(currentConvId || '').trim();
+  const watcherCount = convId ? getConversationWatcherCount(convId) : 0;
+  indicator.hidden = watcherCount <= 0;
+  indicator.title = watcherCount > 0 ? `${watcherCount} watcher${watcherCount === 1 ? '' : 's'} currently reading this conversation` : '';
+}
+
+function computeSharedConversationRenderKey(response = null) {
+  const messages = Array.isArray(response?.messages) ? response.messages : [];
+  const ids = messages.map((message) => `${String(message?.id || '').trim()}:${String(message?.timestamp || '').trim()}`).join('|');
+  const inFlight = response?.inFlight || null;
+  return [
+    String(response?.id || '').trim(),
+    String(response?.updatedAt || '').trim(),
+    messages.length,
+    ids,
+    String(inFlight?.messageId || '').trim(),
+    String(inFlight?.status || '').trim(),
+    String(inFlight?.lastStreamSeq || '').trim(),
+    inFlight?.streamDone ? '1' : '0',
+  ].join('::');
+}
+
+function resolveStableScrollTopForLiveRefresh(messagesEl, capturedScrollTop) {
+  const captured = Number(capturedScrollTop);
+  const current = Number(messagesEl?.scrollTop);
+  if (!Number.isFinite(current)) return Number.isFinite(captured) ? captured : 0;
+  if (!Number.isFinite(captured)) return current;
+  if (Math.abs(current - captured) > 2) return current;
+  return captured;
+}
+
+async function refreshSharedConversation() {
+  if (sharedConversationPollInFlight) return;
+  const sharedToken = resolveSharedTokenFromLocation();
+  if (!sharedToken) return;
+  sharedConversationPollInFlight = true;
+  const requestSeq = ++sharedConversationRequestSeq;
+  const messagesEl = document.getElementById('messages');
+  const preserveBottom = isMessagesNearBottom();
+  const savedScrollTop = messagesEl?.scrollTop || 0;
+  try {
+    const response = await loadSharedConversation(sharedToken, { limit: 120 });
+    if (requestSeq < sharedConversationAppliedSeq) return;
+    if (!response?.ok) {
+      const message = String(response?.error || 'Could not load shared conversation.').trim();
+      if (message && message !== sharedConversationLastError) {
+        setModelBanner(`⚠️ ${message}`);
+        sharedConversationLastError = message;
+      }
+      return;
+    }
+    if (sharedConversationLastError) {
+      sharedConversationLastError = '';
+      setModelBanner('');
+    }
+    const convId = String(response.id || '').trim();
+    if (!convId) return;
+    setCurrentConv(convId);
+    conversations[convId] = {
+      ...(conversations[convId] || {}),
+      id: convId,
+      title: String(response.title || 'Shared conversation').trim() || 'Shared conversation',
+      updatedAt: response.updatedAt || new Date().toISOString(),
+      messageCount: Array.isArray(response.messages) ? response.messages.length : 0,
+      sdkSessionId: null,
+      runtimeSessionId: null,
+    };
+    const titleEl = document.getElementById('chat-title');
+    if (titleEl) titleEl.textContent = conversations[convId].title;
+    const renderKey = computeSharedConversationRenderKey(response);
+    if (renderKey && renderKey === sharedConversationRenderKey) {
+      sharedConversationAppliedSeq = requestSeq;
+      return;
+    }
+    sharedConversationRenderKey = renderKey;
+    const stableSavedScrollTop = resolveStableScrollTopForLiveRefresh(messagesEl, savedScrollTop);
+    applyLoadedConversationState(convId, response, {
+      restoreScroll: !preserveBottom,
+      savedScrollTop: preserveBottom ? null : stableSavedScrollTop,
+    });
+    sharedConversationAppliedSeq = requestSeq;
+    syncViewportMetrics();
+  } finally {
+    sharedConversationPollInFlight = false;
+  }
+}
+
+async function pulseSharedViewerPresence() {
+  const sharedToken = resolveSharedTokenFromLocation();
+  if (!sharedToken) return;
+  await reportSharedViewerPresence(sharedToken, sharedViewerId()).catch(() => {});
+}
+
+async function initSharedConversationReader() {
+  applySharedReaderUi();
+  await refreshSharedConversation();
+  await pulseSharedViewerPresence();
+  stopSharedModeTimers();
+  sharedConversationPollTimer = setInterval(() => {
+    void refreshSharedConversation();
+  }, 900);
+  sharedPresencePollTimer = setInterval(() => {
+    void pulseSharedViewerPresence();
+  }, 12_000);
+}
+
 function showAuthError(msg) {
   document.getElementById('auth-error').textContent = msg;
+}
+
+function resolveAuthErrorMessage(result = null) {
+  if (result?.status === 401) return 'Invalid token';
+  if (result?.status === 403) return 'Access denied';
+  if (result?.status > 0) return `Authentication failed (${result.status})`;
+  return String(result?.error || 'Could not reach the relay').trim() || 'Could not reach the relay';
 }
 
 function syncPwaVersionMenuEntry() {
@@ -1255,6 +1553,43 @@ function startSessionWorkerStatusPolling() {
   }, 4000);
 }
 
+async function pollAuthenticatedCurrentConversationLive() {
+  if (liveConversationPollInFlight) return;
+  if (isSharedReaderMode()) return;
+  const currentId = String(currentConvId || '').trim();
+  if (!currentId) return;
+  const currentConversation = conversations[currentId] || null;
+  const isProcessing = String(currentConversation?.localTurnStatus || '').trim().toLowerCase() === 'processing'
+    || !!document.getElementById('thinking-indicator');
+  if (!isProcessing) return;
+
+  liveConversationPollInFlight = true;
+  try {
+    const messagesEl = document.getElementById('messages');
+    const preserveBottom = isMessagesNearBottom();
+    const savedScrollTop = messagesEl?.scrollTop || 0;
+    const savedLoadedCount = loadConversationLoadedMessageCount(currentId);
+    const requestLimit = Math.max(20, getConversationLoadedMessageCount() || 0, savedLoadedCount || 0);
+    const response = await loadConversation(currentId, { limit: requestLimit });
+    if (!response) return;
+    if (String(currentConvId || '').trim() !== currentId) return;
+    const stableSavedScrollTop = resolveStableScrollTopForLiveRefresh(messagesEl, savedScrollTop);
+    applyLoadedConversationState(currentId, response, {
+      restoreScroll: !preserveBottom,
+      savedScrollTop: preserveBottom ? null : stableSavedScrollTop,
+    });
+  } finally {
+    liveConversationPollInFlight = false;
+  }
+}
+
+function startLiveConversationPolling() {
+  if (liveConversationPollTimer || isSharedReaderMode()) return;
+  liveConversationPollTimer = setInterval(() => {
+    pollAuthenticatedCurrentConversationLive().catch(() => {});
+  }, 900);
+}
+
 function setupViewportTracking() {
   syncViewportMetrics();
   const update = () => syncViewportMetrics();
@@ -1464,6 +1799,7 @@ function toggleChatActionsMenu() {
   const trigger = document.getElementById('chat-actions-menu-btn');
   if (!menu || !trigger || trigger.hidden || trigger.disabled) return;
   syncRefreshHistoryMenuState();
+  syncThemeMenuLabel();
   const willOpen = !!menu.hidden;
   menu.hidden = !willOpen;
   trigger.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
@@ -1537,6 +1873,7 @@ function syncChatTitleControls() {
   const { title, editBtn, editor, input } = getChatTitleElements();
   const convId = String(currentConvId || '').trim();
   const killBtn = document.getElementById('chat-menu-kill-session');
+  const sharedMode = isSharedReaderMode();
   const conversation = convId ? (conversations[convId] || null) : null;
   const sdkSessionId = String(conversation?.sdkSessionId || '').trim();
   if (title) {
@@ -1565,8 +1902,8 @@ function syncChatTitleControls() {
     editBtn.disabled = !convId || editing;
   }
   if (killBtn) {
-    killBtn.disabled = !convId || !sdkSessionId;
-    killBtn.hidden = !convId;
+    killBtn.disabled = sharedMode || !convId || !sdkSessionId;
+    killBtn.hidden = sharedMode || !convId;
   }
   if (editor) {
     editor.hidden = !editing;
@@ -1581,6 +1918,7 @@ function syncChatTitleControls() {
     editor.hidden = true;
   }
   syncChatHeaderWorkspaceLabel();
+  syncChatTitleWatcherIndicator();
 }
 
 function openChatTitleEditor() {
@@ -1724,15 +2062,24 @@ function showAuthGate() {
 }
 
 async function initApp() {
+  const sharedMode = isSharedReaderMode();
+  const sharedThemeBtn = document.getElementById('chat-menu-shared-theme-toggle');
   initTheme();
+  initThemeMenuToggle();
+  if (sharedThemeBtn && sharedMode) sharedThemeBtn.hidden = false;
   initFontScaling();
-  clearLegacyKnownCwdHistoryStorage();
+  if (!sharedMode) {
+    clearLegacyKnownCwdHistoryStorage();
+  }
   syncPwaVersionMenuEntry();
   syncQueueStatusMenuEntry();
-  syncSuspendHostVisibility();
-  activeConversationPreferredReasoningByMode = readStoredReasoningByMode();
+  if (!sharedMode) {
+    syncSuspendHostVisibility();
+    activeConversationPreferredReasoningByMode = readStoredReasoningByMode();
+  }
   setupViewportTracking();
   window.addEventListener('pagehide', () => {
+    stopSharedModeTimers();
     void flushConversationDraft(currentConvId);
     closeTmuxInspectorView();
   });
@@ -1745,90 +2092,115 @@ async function initApp() {
     event.stopPropagation();
     toggleChatActionsMenu();
   });
-  const chatMenuEditBtn = document.getElementById('chat-menu-edit-title');
-  const chatMenuUsageBtn = document.getElementById('chat-menu-usage');
-  bindMenuAction(chatMenuUsageBtn, (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    lockChatActionsMenuShield(350);
-    closeChatActionsMenu();
-    showUsage().catch((error) => {
-      alert(error?.message || 'Failed to load usage');
+  if (!sharedMode) {
+    const chatMenuEditBtn = document.getElementById('chat-menu-edit-title');
+    const chatMenuUsageBtn = document.getElementById('chat-menu-usage');
+    bindMenuAction(chatMenuUsageBtn, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      showUsage().catch((error) => {
+        alert(error?.message || 'Failed to load usage');
+      });
     });
-  });
-  bindMenuAction(chatMenuEditBtn, (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    lockChatActionsMenuShield(350);
-    closeChatActionsMenu();
-    openChatTitleEditor();
-  });
-  const chatMenuCompactBtn = document.getElementById('chat-menu-compact');
-  bindMenuAction(chatMenuCompactBtn, (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    lockChatActionsMenuShield(350);
-    closeChatActionsMenu();
-    compactCurrentConversation().catch((error) => {
-      alert(error?.message || 'Failed to compact conversation');
+    bindMenuAction(chatMenuEditBtn, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      openChatTitleEditor();
     });
-  });
-  const chatMenuRefreshHistoryBtn = document.getElementById('chat-menu-refresh-history');
-  bindMenuAction(chatMenuRefreshHistoryBtn, (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    lockChatActionsMenuShield(350);
-    closeChatActionsMenu();
-    runConversationHistoryRefresh({ source: 'menu' }).catch(() => {});
-  });
-  const chatMenuSelectModelsBtn = document.getElementById('chat-menu-select-models');
-  bindMenuAction(chatMenuSelectModelsBtn, (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    lockChatActionsMenuShield(350);
-    closeChatActionsMenu();
-    openSelectModelsModal().catch((error) => {
-      alert(error?.message || 'Failed to open model selector');
+    const chatMenuCompactBtn = document.getElementById('chat-menu-compact');
+    bindMenuAction(chatMenuCompactBtn, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      compactCurrentConversation().catch((error) => {
+        alert(error?.message || 'Failed to compact conversation');
+      });
     });
-  });
-  const chatMenuChangeCwdBtn = document.getElementById('chat-menu-change-cwd');
-  bindMenuAction(chatMenuChangeCwdBtn, (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    lockChatActionsMenuShield(350);
-    closeChatActionsMenu();
-    openChangeCwdModal();
-  });
-  const chatMenuSettingsBtn = document.getElementById('chat-menu-settings');
-  bindMenuAction(chatMenuSettingsBtn, (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    lockChatActionsMenuShield(350);
-    closeChatActionsMenu();
-    openSettingsModal();
-  });
-  const chatMenuRestartRelayBtn = document.getElementById('chat-menu-restart-relay');
-  bindMenuAction(chatMenuRestartRelayBtn, (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    lockChatActionsMenuShield(350);
-    closeChatActionsMenu();
-    openRestartRelayConfirmation();
-  });
-  const chatMenuEmptyQueueBtn = document.getElementById('chat-menu-empty-queue');
-  bindMenuAction(chatMenuEmptyQueueBtn, (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    openEmptyQueueConfirmation();
-  });
-  const chatMenuKillBtn = document.getElementById('chat-menu-kill-session');
-  bindMenuAction(chatMenuKillBtn, (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    lockChatActionsMenuShield(350);
-    closeChatActionsMenu();
-    openKillSessionConfirmation();
-  });
+    const chatMenuShareConversationBtn = document.getElementById('chat-menu-share-conversation');
+    bindMenuAction(chatMenuShareConversationBtn, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      const convId = String(currentConvId || '').trim();
+      if (!convId) {
+        showTransientRelayNotice('Select a conversation first.');
+        return;
+      }
+      createConversationShareLink(convId).then(async (result) => {
+        const shareUrl = String(result?.shareUrl || '').trim();
+        if (!shareUrl) {
+          showTransientRelayNotice(result?.error || 'Could not create share link.');
+          return;
+        }
+        const copied = await copyTextToClipboard(shareUrl);
+        showTransientRelayNotice(copied ? 'Share link copied to clipboard.' : shareUrl);
+      }).catch((error) => {
+        showTransientRelayNotice(error?.message || 'Could not create share link.');
+      });
+    });
+    const chatMenuRefreshHistoryBtn = document.getElementById('chat-menu-refresh-history');
+    bindMenuAction(chatMenuRefreshHistoryBtn, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      runConversationHistoryRefresh({ source: 'menu' }).catch(() => {});
+    });
+    const chatMenuSelectModelsBtn = document.getElementById('chat-menu-select-models');
+    bindMenuAction(chatMenuSelectModelsBtn, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      openSelectModelsModal().catch((error) => {
+        alert(error?.message || 'Failed to open model selector');
+      });
+    });
+    const chatMenuChangeCwdBtn = document.getElementById('chat-menu-change-cwd');
+    bindMenuAction(chatMenuChangeCwdBtn, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      openChangeCwdModal();
+    });
+    const chatMenuSettingsBtn = document.getElementById('chat-menu-settings');
+    bindMenuAction(chatMenuSettingsBtn, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      openSettingsModal();
+    });
+    const chatMenuRestartRelayBtn = document.getElementById('chat-menu-restart-relay');
+    bindMenuAction(chatMenuRestartRelayBtn, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      openRestartRelayConfirmation();
+    });
+    const chatMenuEmptyQueueBtn = document.getElementById('chat-menu-empty-queue');
+    bindMenuAction(chatMenuEmptyQueueBtn, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      openEmptyQueueConfirmation();
+    });
+    const chatMenuKillBtn = document.getElementById('chat-menu-kill-session');
+    bindMenuAction(chatMenuKillBtn, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      openKillSessionConfirmation();
+    });
+  }
   const sidebarToggleBtn = document.getElementById('sidebar-toggle');
   bindTapAction(sidebarToggleBtn, (event) => {
     event.preventDefault();
@@ -1877,6 +2249,15 @@ async function initApp() {
       closeChatTitleEditor();
     });
   }
+  if (sharedMode) {
+    initFullscreenButton();
+    initConversationHistoryLazyLoading();
+    initBubbleActionHandlers();
+    initMessageScrollPersistence();
+    syncChatTitleControls();
+    await initSharedConversationReader();
+    return;
+  }
   initModeSelector();
   initModelSelector();
   initReasoningSelector();
@@ -1907,6 +2288,7 @@ async function initApp() {
   startRelayQuestionPolling();
   startRelayBoardPolling();
   startSessionWorkerStatusPolling();
+  startLiveConversationPolling();
   await loadConversations();
   await loadRelayQuestions(currentConvId);
   await loadRelayBoards();
@@ -1917,30 +2299,45 @@ async function initApp() {
 async function doAuth() {
   const val = document.getElementById('token-input').value.trim() || getTokenFromUrl();
   if (!val) return showAuthError('Please enter a token');
-  const ok = await verifyToken(val);
-  if (ok) {
+  const result = await verifyToken(val);
+  if (result?.ok) {
     setToken(val);
     initApp();
   } else {
-    showAuthError('Invalid token');
+    showAuthError(resolveAuthErrorMessage(result));
   }
 }
 
 
 async function bootstrap() {
   if (ensureTrailingSlashPath()) return;
-  await applyPwaManifestFromSettings();
-  registerPwaShell();
-  initInstallButton();
+  const sharedMode = isSharedReaderMode();
+  if (sharedMode && navigator.serviceWorker?.getRegistrations) {
+    navigator.serviceWorker.getRegistrations()
+      .then((registrations) => Promise.all(registrations.map((registration) => registration.unregister().catch(() => false))))
+      .catch(() => {});
+  }
+  if (!sharedMode) {
+    await applyPwaManifestFromSettings();
+  }
+  if (!sharedMode) {
+    registerPwaShell();
+    initInstallButton();
+  }
+  if (sharedMode) {
+    await initApp();
+    return;
+  }
   const urlToken = getTokenFromUrl();
   if (urlToken) stripTokenFromUrl();
-  if (await verifyExistingSession()) {
+  const existingSession = await verifyExistingSession();
+  if (existingSession?.ok) {
     await initApp();
     return;
   }
   if (urlToken) {
-    const ok = await verifyToken(urlToken);
-    if (ok) {
+    const tokenResult = await verifyToken(urlToken);
+    if (tokenResult?.ok) {
       setToken(urlToken);
       await initApp();
       return;

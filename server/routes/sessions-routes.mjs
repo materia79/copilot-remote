@@ -21,6 +21,22 @@ function normalizeWorkerStatusText(value, fallback = null) {
   return text || fallback;
 }
 
+export function normalizeShareToken(value) {
+  const token = String(value || '').trim().toLowerCase();
+  if (!/^[a-f0-9]{32,128}$/.test(token)) return '';
+  return token;
+}
+
+export function buildConversationShareToken() {
+  return `${randomUUID().replace(/-/g, '')}${randomUUID().replace(/-/g, '')}`;
+}
+
+export function normalizeSharedViewerId(value) {
+  const viewerId = String(value || '').trim().replace(/[^a-zA-Z0-9:_-]+/g, '');
+  if (!viewerId) return '';
+  return viewerId.slice(0, 128);
+}
+
 function toSafeNonNegativeInt(value, fallback = 0) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return fallback;
@@ -1225,6 +1241,10 @@ export function registerSessionsRoutes(app, deps) {
     sessionWorkerSupervisor,
     sessionWorkerRegistry,
     resolveSessionStateRoot,
+    markSharedViewerPresence,
+    getSharedWatcherCount,
+    isSha256,
+    uploadPathForSha,
   } = deps;
   const conversationDraftPersistenceEnabled = featureFlags?.CONVERSATION_DRAFT_PERSISTENCE_ENABLED === true;
   const sdkSessionSyncService = createSdkSessionSyncService(db);
@@ -1292,9 +1312,71 @@ export function registerSessionsRoutes(app, deps) {
     discoverSessionStateConversations,
     inFlightStateForConversation,
   });
+  const SHARED_PRESENCE_RATE_WINDOW_MS = 10_000;
+  const SHARED_PRESENCE_RATE_LIMIT = 24;
+  const SHARED_PRESENCE_RATE_BUCKET_TTL_MS = 60_000;
+  const SHARED_PRESENCE_RATE_MAX_BUCKETS = 4_096;
+  const sharedPresenceRateBuckets = new Map();
 
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function extractClientIp(req) {
+    const forwardedFor = String(req.headers?.['x-forwarded-for'] || '').split(',')[0].trim();
+    if (forwardedFor) return forwardedFor.slice(0, 128);
+    const realIp = String(req.headers?.['x-real-ip'] || '').trim();
+    if (realIp) return realIp.slice(0, 128);
+    const reqIp = String(req.ip || req.socket?.remoteAddress || '').trim();
+    return reqIp.slice(0, 128) || 'unknown';
+  }
+
+  function pruneSharedPresenceRateBuckets(nowMs = Date.now()) {
+    for (const [bucketKey, bucket] of sharedPresenceRateBuckets.entries()) {
+      const lastSeenAt = Number(bucket?.lastSeenAt || 0);
+      if (!Number.isFinite(lastSeenAt) || (nowMs - lastSeenAt) > SHARED_PRESENCE_RATE_BUCKET_TTL_MS) {
+        sharedPresenceRateBuckets.delete(bucketKey);
+      }
+    }
+    if (sharedPresenceRateBuckets.size <= SHARED_PRESENCE_RATE_MAX_BUCKETS) return;
+    const buckets = Array.from(sharedPresenceRateBuckets.entries());
+    buckets.sort((a, b) => Number(a[1]?.lastSeenAt || 0) - Number(b[1]?.lastSeenAt || 0));
+    const overflow = sharedPresenceRateBuckets.size - SHARED_PRESENCE_RATE_MAX_BUCKETS;
+    for (let index = 0; index < overflow; index += 1) {
+      const key = buckets[index]?.[0];
+      if (!key) continue;
+      sharedPresenceRateBuckets.delete(key);
+    }
+  }
+
+  function consumeSharedPresenceRateLimit(token, req, nowMs = Date.now()) {
+    const shareToken = String(token || '').trim();
+    if (!shareToken) return { ok: false, retryAfterSeconds: 1 };
+    const clientIp = extractClientIp(req);
+    const bucketKey = `${shareToken}:${clientIp}`;
+    const existing = sharedPresenceRateBuckets.get(bucketKey) || {
+      windowStartAt: nowMs,
+      count: 0,
+      lastSeenAt: nowMs,
+    };
+    if (!Number.isFinite(existing.windowStartAt) || (nowMs - existing.windowStartAt) >= SHARED_PRESENCE_RATE_WINDOW_MS) {
+      existing.windowStartAt = nowMs;
+      existing.count = 0;
+    }
+    existing.lastSeenAt = nowMs;
+    if (existing.count >= SHARED_PRESENCE_RATE_LIMIT) {
+      sharedPresenceRateBuckets.set(bucketKey, existing);
+      const retryAfterMs = Math.max(250, SHARED_PRESENCE_RATE_WINDOW_MS - (nowMs - existing.windowStartAt));
+      pruneSharedPresenceRateBuckets(nowMs);
+      return {
+        ok: false,
+        retryAfterSeconds: Math.max(1, Math.ceil(retryAfterMs / 1000)),
+      };
+    }
+    existing.count += 1;
+    sharedPresenceRateBuckets.set(bucketKey, existing);
+    pruneSharedPresenceRateBuckets(nowMs);
+    return { ok: true, retryAfterSeconds: 0 };
   }
 
   function readBridgeIdentity(req) {
@@ -1421,6 +1503,172 @@ export function registerSessionsRoutes(app, deps) {
       if (bySdkSessionId) return bySdkSessionId;
     }
     return null;
+  }
+
+  function buildShareUrl(req, token) {
+    const shareToken = String(token || '').trim();
+    if (!shareToken) return '';
+    const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+    const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
+    const protocol = forwardedProto || req.protocol || 'http';
+    const basePath = String(remotePath || '').trim().replace(/\/+$/, '');
+    const relative = `${basePath}/shared/${shareToken}`.replace(/\/{2,}/g, '/');
+    if (!host) return relative;
+    return `${protocol}://${host}${relative}`;
+  }
+
+  function buildSharedUploadContentUrl(token, sha256) {
+    const shareToken = normalizeShareToken(token);
+    const normalizedSha = String(sha256 || '').trim().toLowerCase();
+    if (!shareToken || !isSha256(normalizedSha)) return '';
+    return `${String(remotePath || '').replace(/\/+$/, '')}/api/shared/${shareToken}/upload/${normalizedSha}/content`.replace(/\/{2,}/g, '/');
+  }
+
+  function conversationReferencesUploadSha(conversationId, sha256) {
+    const convId = String(conversationId || '').trim();
+    const normalizedSha = String(sha256 || '').trim().toLowerCase();
+    if (!convId || !isSha256(normalizedSha)) return false;
+    const rows = stmts.getMessages.all(convId);
+    for (const row of rows) {
+      const attachments = parseAttachments(row?.attachments);
+      for (const attachment of attachments) {
+        if (String(attachment?.sha256 || '').trim().toLowerCase() === normalizedSha) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  function rewriteSharedAttachmentContentUrl(attachment, shareToken) {
+    if (!attachment || typeof attachment !== 'object') return attachment;
+    const normalizedSha = String(attachment.sha256 || '').trim().toLowerCase();
+    if (!isSha256(normalizedSha)) return attachment;
+    const contentUrl = buildSharedUploadContentUrl(shareToken, normalizedSha);
+    if (!contentUrl) return attachment;
+    return {
+      ...attachment,
+      contentUrl,
+    };
+  }
+
+  function buildConversationPayloadForShare({
+    conv,
+    shareToken = '',
+    limit = 120,
+    beforeMessageId = '',
+    beforeTimestamp = '',
+    afterMessageId = '',
+    afterTimestamp = '',
+    aroundMessageId = '',
+  } = {}) {
+    const resolvedConversationId = String(conv?.id || '').trim();
+    if (!resolvedConversationId) return null;
+    const discoveredSessionState = (() => {
+      const sdkSessionId = String(conv.sdk_session_id || '').trim();
+      if (!sdkSessionId) return null;
+      const discovered = discoverSessionStateConversations(400);
+      return discovered.find((item) => String(item?.sdkSessionId || '').trim() === sdkSessionId) || null;
+    })();
+    const discoveredTitle = String(discoveredSessionState?.title || '').trim() || null;
+    const resolvedTitle = resolveConversationTitle({
+      title: conv.title,
+      titleSource: conv.title_source,
+      discoveredTitle,
+    });
+    const inFlight = inFlightStateForConversation(resolvedConversationId);
+    const sdkSessionId = String(conv.sdk_session_id || resolvedConversationId || '').trim();
+    const transcriptMessages = readSessionTranscriptMessages(
+      sdkSessionId,
+      { limit: Number.POSITIVE_INFINITY },
+    );
+    const dbMessages = stmts.getMessages.all(resolvedConversationId);
+    const queueRows = db.prepare(`
+      SELECT id, response_message_id, text, timestamp, retry_count, reasoning_effort, model
+      FROM queue
+      WHERE conversation_id = ?
+    `).all(resolvedConversationId);
+    const responseMessageToSourceId = new Map(
+      queueRows
+        .map((row) => [String(row?.response_message_id || '').trim(), String(row?.id || '').trim()])
+        .filter(([responseMessageId, sourceMessageId]) => !!responseMessageId && !!sourceMessageId),
+    );
+    const relayActivitiesByMessageId = new Map(
+      dbMessages
+        .filter((m) => m.role === 'assistant')
+        .map((m) => [m.id, relayActivityForResponse(m.id)]),
+    );
+    const relayThoughtsByMessageId = new Map(
+      dbMessages
+        .filter((m) => m.role === 'assistant')
+        .map((m) => [m.id, relayThoughtsForResponse ? relayThoughtsForResponse(m.id) : []]),
+    );
+    const usageByResponseMessageId = new Map(
+      (stmts.listMessageUsageSnapshotsByConversation?.all(conv.id) || [])
+        .map((row) => [String(row?.response_message_id || '').trim(), mapUsageSnapshotRow(row)])
+        .filter(([messageId, usage]) => !!messageId && !!usage),
+    );
+    let messages = buildConversationMessages({
+      dbMessages: dbMessages.map((message) => ({
+        ...message,
+        attachments: parseAttachments(message.attachments)
+          .map(hydrateAttachment)
+          .filter(Boolean)
+          .map((attachment) => rewriteSharedAttachmentContentUrl(attachment, shareToken)),
+      })),
+      transcriptMessages,
+      relayActivitiesByMessageId,
+      relayThoughtsByMessageId,
+      responseMessageToSourceId,
+      queueRows,
+      usageByResponseMessageId,
+    });
+    messages = messages.map((message) => {
+      const sourceMessageId = responseMessageToSourceId.get(String(message.id || '').trim()) || message.sourceMessageId || undefined;
+      const nextMessage = sourceMessageId ? { ...message, sourceMessageId } : message;
+      const attachments = Array.isArray(nextMessage?.attachments)
+        ? nextMessage.attachments.map((attachment) => rewriteSharedAttachmentContentUrl(attachment, shareToken))
+        : nextMessage?.attachments;
+      return attachments === nextMessage?.attachments
+        ? nextMessage
+        : { ...nextMessage, attachments };
+    });
+    const history = selectConversationHistoryPage(messages, {
+      limit,
+      beforeMessageId,
+      beforeTimestamp,
+      afterMessageId,
+      afterTimestamp,
+      aroundMessageId,
+    });
+    return {
+      id: resolvedConversationId,
+      sdkSessionId: conv.sdk_session_id || null,
+      title: resolvedTitle,
+      archived: Number(conv.archived || 0) === 1,
+      compactedInto: conv.compacted_into || null,
+      compactedFrom: conv.compacted_from || null,
+      runtimeSession: null,
+      sessionRootPath: null,
+      sessionRootName: resolvedTitle || 'Session',
+      configuredWorkspaceRootPath: null,
+      configuredWorkspaceRootName: null,
+      runtimeWorkspaceRootPath: null,
+      runtimeWorkspaceRootName: null,
+      currentWorkspaceRootPath: null,
+      currentWorkspaceRootName: null,
+      createdAt: conv.created_at,
+      updatedAt: conv.updated_at,
+      sessionUsageSummary: null,
+      inFlight,
+      preferredRelayMode: DEFAULT_RELAY_MODE,
+      preferredModelsByMode: {},
+      draftText: '',
+      draftUpdatedAt: null,
+      draftUpdatedByClientId: null,
+      messages: history.messages,
+      pageInfo: history.pageInfo,
+    };
   }
 
   function resolveSessionUsageSummaryForSdkSession({ sdkSessionId, conversationId } = {}) {
@@ -2251,6 +2499,154 @@ export function registerSessionsRoutes(app, deps) {
       pageInfo: history.pageInfo,
       refreshed: true,
     });
+  });
+
+  app.post('/api/conversation/:id/share', auth, (req, res) => {
+    const conversationId = String(req.params.id || '').trim();
+    if (!conversationId) return res.status(400).json({ error: 'Missing conversation id' });
+    const conv = stmts.getConvAnyStatus.get(conversationId) || null;
+    if (!conv || String(conv.status || '').trim().toLowerCase() === 'deleted') {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+    let share = stmts.getConversationShareByConversationId?.get(conversationId) || null;
+    if (!share) {
+      const now = new Date().toISOString();
+      let attempts = 0;
+      while (!share && attempts < 6) {
+        const token = buildConversationShareToken();
+        try {
+          stmts.insertConversationShare.run(token, conversationId, now, now);
+          share = stmts.getConversationShareByToken.get(token) || null;
+        } catch (error) {
+          if (String(error?.code || '') !== 'SQLITE_CONSTRAINT_PRIMARYKEY') throw error;
+        }
+        attempts += 1;
+      }
+    }
+    if (!share?.token) return res.status(500).json({ error: 'Failed to create share token' });
+    const now = new Date().toISOString();
+    stmts.touchConversationShare?.run(now, share.token);
+    const token = String(share.token || '').trim();
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      ok: true,
+      conversationId,
+      token,
+      shareUrl: buildShareUrl(req, token),
+      path: `${String(remotePath || '').replace(/\/+$/, '')}/shared/${token}`.replace(/\/{2,}/g, '/'),
+    });
+  });
+
+  app.get('/api/shared/:token', (req, res) => {
+    const token = normalizeShareToken(req.params.token);
+    if (!token) return res.status(404).json({ error: 'Shared conversation not found' });
+    const share = stmts.getConversationShareByToken?.get(token) || null;
+    if (!share || String(share.revoked_at || '').trim()) {
+      return res.status(404).json({ error: 'Shared conversation not found' });
+    }
+    const convId = String(share.conversation_id || '').trim();
+    if (!convId) return res.status(404).json({ error: 'Shared conversation not found' });
+    const conv = stmts.getConvAnyStatus.get(convId) || null;
+    if (!conv || String(conv.status || '').trim().toLowerCase() === 'deleted') {
+      return res.status(404).json({ error: 'Shared conversation not found' });
+    }
+    const limit = normalizeConversationHistoryLimit(req.query.limit, 120);
+    const beforeMessageId = String(req.query.beforeMessageId || '').trim();
+    const beforeTimestamp = String(req.query.beforeTimestamp || '').trim();
+    const afterMessageId = String(req.query.afterMessageId || '').trim();
+    const afterTimestamp = String(req.query.afterTimestamp || '').trim();
+    const aroundMessageId = String(req.query.aroundMessageId || '').trim();
+    const payload = buildConversationPayloadForShare({
+      conv,
+      shareToken: token,
+      limit,
+      beforeMessageId,
+      beforeTimestamp,
+      afterMessageId,
+      afterTimestamp,
+      aroundMessageId,
+    });
+    if (!payload) return res.status(404).json({ error: 'Shared conversation not found' });
+    const now = new Date().toISOString();
+    stmts.touchConversationShare?.run(now, token);
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
+    res.json({
+      ...payload,
+      shared: {
+        token,
+        readOnly: true,
+        watcherCount: Number(getSharedWatcherCount?.(convId) || 0),
+      },
+    });
+  });
+
+  app.post('/api/shared/:token/presence', (req, res) => {
+    const token = normalizeShareToken(req.params.token);
+    if (!token) return res.status(404).json({ error: 'Shared conversation not found' });
+    const share = stmts.getConversationShareByToken?.get(token) || null;
+    if (!share || String(share.revoked_at || '').trim()) {
+      return res.status(404).json({ error: 'Shared conversation not found' });
+    }
+    const conversationId = String(share.conversation_id || '').trim();
+    if (!conversationId) return res.status(404).json({ error: 'Shared conversation not found' });
+    const rateLimit = consumeSharedPresenceRateLimit(token, req);
+    if (!rateLimit.ok) {
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
+      res.setHeader('Retry-After', String(rateLimit.retryAfterSeconds || 1));
+      return res.status(429).json({
+        error: 'Too many presence updates; retry shortly.',
+        retryAfterSeconds: Number(rateLimit.retryAfterSeconds || 1),
+      });
+    }
+    const viewerId = normalizeSharedViewerId(req.body?.viewerId || req.query?.viewerId);
+    if (!viewerId) return res.status(400).json({ error: 'Missing viewer id' });
+    const presence = typeof markSharedViewerPresence === 'function'
+      ? markSharedViewerPresence({ conversationId, token, viewerId })
+      : { ok: false, watcherCount: 0 };
+    const now = new Date().toISOString();
+    stmts.touchConversationShare?.run(now, token);
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
+    res.json({
+      ok: presence?.ok !== false,
+      conversationId,
+      watcherCount: Number(presence?.watcherCount || 0),
+      capped: presence?.capped === true,
+    });
+  });
+
+  app.get('/api/shared/:token/upload/:sha256/content', (req, res) => {
+    const token = normalizeShareToken(req.params.token);
+    const sha256 = String(req.params.sha256 || '').trim().toLowerCase();
+    if (!token || !isSha256(sha256)) {
+      return res.status(404).json({ error: 'Shared attachment not found' });
+    }
+    const share = stmts.getConversationShareByToken?.get(token) || null;
+    if (!share || String(share.revoked_at || '').trim()) {
+      return res.status(404).json({ error: 'Shared attachment not found' });
+    }
+    const conversationId = String(share.conversation_id || '').trim();
+    if (!conversationId || !conversationReferencesUploadSha(conversationId, sha256)) {
+      return res.status(404).json({ error: 'Shared attachment not found' });
+    }
+    const file = stmts.getUploadFile.get(sha256);
+    if (!file) return res.status(404).json({ error: 'Shared attachment not found' });
+    const filePath = uploadPathForSha(sha256);
+    if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Missing file on disk' });
+    res.setHeader('Content-Type', file.mime_type || 'application/octet-stream');
+    res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
+    res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
+    const stream = fs.createReadStream(filePath);
+    stream.on('error', () => {
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Failed to stream shared attachment' });
+        return;
+      }
+      res.destroy();
+    });
+    stream.pipe(res);
   });
 
   // GET /api/conversation/:id — get paginated conversation history

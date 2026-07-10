@@ -38,6 +38,7 @@ import {
   markSubagentCancelInFlight,
   clearSubagentCancelInFlight,
   isSubagentCancelInFlight,
+  IS_SHARED_VIEW,
 } from './store.js';
 import { sendMessage as sendMessageApi, cancelConversationTurn, cancelQueuedConversationTurn, cancelSubagentRun, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi, updateConversationDraft as updateConversationDraftApi } from './api-client.js';
 import { linkifyWorkspaceMentionsInNode, renderMarkdownPreview, rewriteLocalAssetUrlsInNode } from './router.js';
@@ -62,6 +63,7 @@ const relayStreamStateByMessageId = new Map();
 const completedMessageIds = new Set();
 const bubbleCancelInFlight = new Set();
 const SUBAGENT_TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'dropped', 'done']);
+let lastRenderedMessageSnapshotKey = '';
 let sendInFlight = false;
 const COMPOSER_DRAFT_DEBOUNCE_MS = 500;
 let conversationDraftPersistenceEnabled = false;
@@ -380,6 +382,11 @@ export function hydrateConversationDraft(conversationId, {
   if (String(currentConvId || '').trim() !== id) return;
   const input = document.getElementById('msg-input');
   if (!input) return;
+  const isFocused = document.activeElement === input;
+  if (isFocused && input.value !== normalizedDraftText) {
+    syncSendButtonState();
+    return;
+  }
   if (input.value !== normalizedDraftText) {
     input.value = normalizedDraftText;
     autoResize(input);
@@ -410,7 +417,7 @@ export function applyIncomingConversationDraftUpdate({
   const input = document.getElementById('msg-input');
   if (!input) return;
   const isFocused = document.activeElement === input;
-  if (isFocused && input.value && input.value !== incomingDraftText) return;
+  if (isFocused && input.value !== incomingDraftText) return;
   if (input.value !== incomingDraftText) {
     input.value = incomingDraftText;
     autoResize(input);
@@ -618,7 +625,7 @@ function createMessageNode(msg, msgId = null, force = false) {
 
   const isQueuedUserMessage = msg.role === 'user' && msgId && pendingUserMessageIds.has(msgId);
   const isCancelInFlight = isQueuedUserMessage && bubbleCancelInFlight.has(msgId);
-  const userBubbleActionsHtml = isQueuedUserMessage
+  const userBubbleActionsHtml = (!IS_SHARED_VIEW && isQueuedUserMessage)
     ? `<div class="msg-bubble-actions"><button type="button" class="bubble-action-btn${isCancelInFlight ? ' stopping' : ''}" data-action="cancel-queued" data-message-id="${escHtml(msgId)}"${isCancelInFlight ? ' disabled' : ''}>${isCancelInFlight ? 'Cancelling…' : 'Cancel'}</button></div>`
     : '';
 
@@ -679,34 +686,45 @@ function prependMessageNodes(msgs) {
 export function decorateActivityText(text) {
   const value = String(text || '').trim();
   if (!value) return '';
-  if (/^[\u{1F300}-\u{1FAFF}\u2600-\u27BF]/u.test(value)) return value;
-  if (value.startsWith('● ')) return `🔄 ${value.slice(2).trim()}`;
-  if (/^Model selected:/i.test(value)) return `🧠 ${value}`;
-  if (/^Search \((glob|grep)\)/i.test(value)) return `🔍 ${value}`;
-  if (/^Tool \(ask_user\)/i.test(value)) return `❓ ${value}`;
-  if (/^Tool \(view\)/i.test(value)) return `👀 ${value}`;
-  if (/^Tool \(apply_patch\)/i.test(value)) return `🪡 ${value}`;
-  if (/^Tool \(powershell\)/i.test(value)) return `🪓 ${value}`;
-  if (/^Tool \(edit\)/i.test(value)) return `📝 ${value}`;
-  if (/^Tool \(read_file\)/i.test(value)) return `📄 ${value}`;
-  if (/^Tool \((grep_search|file_search)\)/i.test(value)) return `🔎 ${value}`;
-  if (/^Tool \(semantic_search\)/i.test(value)) return `🧭 ${value}`;
-  if (/^Tool \(vscode_listCodeUsages\)/i.test(value)) return `🔗 ${value}`;
-  if (/^Tool \(vscode_renameSymbol\)/i.test(value)) return `✏️ ${value}`;
-  if (/^Tool \(list_dir\)/i.test(value)) return `📂 ${value}`;
-  if (/^Tool \(create_directory\)/i.test(value)) return `📁 ${value}`;
-  if (/^Tool \((delete|remove)\)/i.test(value)) return `🗑️ ${value}`;
-  if (/^Tool \(execution_subagent\)/i.test(value)) return `🚀 ${value}`;
-  if (/^Tool \(get_errors\)/i.test(value)) return `🚨 ${value}`;
-  if (/^Tool \(debug_[^)]+\)/i.test(value)) return `🐞 ${value}`;
-  if (/^Tool \(fetch_webpage\)/i.test(value)) return `🌐 ${value}`;
-  if (/^Tool \(github_[^)]+\)/i.test(value)) return `🐙 ${value}`;
-  if (/^Tool \(run_in_terminal\)/i.test(value)) return `🖥️ ${value}`;
-  if (/^Tool \((create_file|write)\)/i.test(value)) return `🆕 ${value}`;
-  if (/^Tool \((bash|shell|terminal)\)/i.test(value)) return `🔧 ${value}`;
-  if (/^Tool \((sql|sqlite)\)/i.test(value)) return `🗄️ ${value}`;
-  if (/^Tool \(/i.test(value)) return `🛠️ ${value}`;
-  return `ℹ️ ${value}`;
+  const maskSharedPathSegments = (input) => {
+    const source = String(input || '');
+    const tokenMasked = source.replace(/@(file|folder):([^\s`]+)/gi, (_m, kind, rawPath) => {
+      const normalized = String(rawPath || '').replace(/\\/g, '/').replace(/\/+$/, '');
+      const segments = normalized.split('/').filter(Boolean);
+      const basename = segments[segments.length - 1] || normalized;
+      return `@${String(kind || '').toLowerCase()}:${basename}`;
+    });
+    return tokenMasked.replace(/([A-Za-z]:)?(?:[\\/~.]?[\\/])(?:[^\\/\s]+[\\/])+([^\\/\s]+)/g, (_m, _prefix, basename) => basename);
+  };
+  const sharedSafeValue = IS_SHARED_VIEW ? maskSharedPathSegments(value) : value;
+  if (/^[\u{1F300}-\u{1FAFF}\u2600-\u27BF]/u.test(sharedSafeValue)) return sharedSafeValue;
+  if (sharedSafeValue.startsWith('● ')) return `🔄 ${sharedSafeValue.slice(2).trim()}`;
+  if (/^Model selected:/i.test(sharedSafeValue)) return `🧠 ${sharedSafeValue}`;
+  if (/^Search \((glob|grep)\)/i.test(sharedSafeValue)) return `🔍 ${sharedSafeValue}`;
+  if (/^Tool \(ask_user\)/i.test(sharedSafeValue)) return `❓ ${sharedSafeValue}`;
+  if (/^Tool \(view\)/i.test(sharedSafeValue)) return `👀 ${sharedSafeValue}`;
+  if (/^Tool \(apply_patch\)/i.test(sharedSafeValue)) return `🪡 ${sharedSafeValue}`;
+  if (/^Tool \(powershell\)/i.test(sharedSafeValue)) return `🪓 ${sharedSafeValue}`;
+  if (/^Tool \(edit\)/i.test(sharedSafeValue)) return `📝 ${sharedSafeValue}`;
+  if (/^Tool \(read_file\)/i.test(sharedSafeValue)) return `📄 ${sharedSafeValue}`;
+  if (/^Tool \((grep_search|file_search)\)/i.test(sharedSafeValue)) return `🔎 ${sharedSafeValue}`;
+  if (/^Tool \(semantic_search\)/i.test(sharedSafeValue)) return `🧭 ${sharedSafeValue}`;
+  if (/^Tool \(vscode_listCodeUsages\)/i.test(sharedSafeValue)) return `🔗 ${sharedSafeValue}`;
+  if (/^Tool \(vscode_renameSymbol\)/i.test(sharedSafeValue)) return `✏️ ${sharedSafeValue}`;
+  if (/^Tool \(list_dir\)/i.test(sharedSafeValue)) return `📂 ${sharedSafeValue}`;
+  if (/^Tool \(create_directory\)/i.test(sharedSafeValue)) return `📁 ${sharedSafeValue}`;
+  if (/^Tool \((delete|remove)\)/i.test(sharedSafeValue)) return `🗑️ ${sharedSafeValue}`;
+  if (/^Tool \(execution_subagent\)/i.test(sharedSafeValue)) return `🚀 ${sharedSafeValue}`;
+  if (/^Tool \(get_errors\)/i.test(sharedSafeValue)) return `🚨 ${sharedSafeValue}`;
+  if (/^Tool \(debug_[^)]+\)/i.test(sharedSafeValue)) return `🐞 ${sharedSafeValue}`;
+  if (/^Tool \(fetch_webpage\)/i.test(sharedSafeValue)) return `🌐 ${sharedSafeValue}`;
+  if (/^Tool \(github_[^)]+\)/i.test(sharedSafeValue)) return `🐙 ${sharedSafeValue}`;
+  if (/^Tool \(run_in_terminal\)/i.test(sharedSafeValue)) return `🖥️ ${sharedSafeValue}`;
+  if (/^Tool \((create_file|write)\)/i.test(sharedSafeValue)) return `🆕 ${sharedSafeValue}`;
+  if (/^Tool \((bash|shell|terminal)\)/i.test(sharedSafeValue)) return `🔧 ${sharedSafeValue}`;
+  if (/^Tool \((sql|sqlite)\)/i.test(sharedSafeValue)) return `🗄️ ${sharedSafeValue}`;
+  if (/^Tool \(/i.test(sharedSafeValue)) return `🛠️ ${sharedSafeValue}`;
+  return `ℹ️ ${sharedSafeValue}`;
 }
 
 export function renderThoughtsMarkup(thoughts) {
@@ -752,7 +770,7 @@ export function showThinking(messageId = null, autoScroll = true) {
   div.id = 'thinking-indicator';
   if (nextMessageId) div.dataset.messageId = nextMessageId;
   const isCancelInFlight = nextMessageId && bubbleCancelInFlight.has(nextMessageId);
-  const stopBtnHtml = nextMessageId
+  const stopBtnHtml = (!IS_SHARED_VIEW && nextMessageId)
     ? `<button type="button" class="bubble-action-btn${isCancelInFlight ? ' stopping' : ''}" data-action="stop-turn" data-message-id="${escHtml(nextMessageId)}"${isCancelInFlight ? ' disabled' : ''}>${isCancelInFlight ? 'Stopping…' : 'Stop'}</button>`
     : '';
   div.innerHTML = `
@@ -1076,6 +1094,11 @@ function updateSubagentStopButton(subagentRunId, isStopping = false, statusOverr
   if (!id) return;
   const btn = document.querySelector(`.subagent-stop-btn[data-action="stop-subagent"][data-subagent-run-id="${CSS.escape(id)}"]`);
   if (!btn) return;
+  if (IS_SHARED_VIEW) {
+    btn.hidden = true;
+    btn.disabled = true;
+    return;
+  }
   const status = normalizeSubagentBubbleStatus(statusOverride || getSubagentStatus(id));
   const terminal = isSubagentTerminalStatus(status);
   const stopping = !!isStopping;
@@ -1601,10 +1624,41 @@ export function getRenderedConversationMessageFingerprints(limit = 24) {
   }));
 }
 
+function buildMessageSnapshotKey(messages = [], meta = {}) {
+  const conversationId = String(meta.conversationId || currentConvId || '').trim();
+  const pageInfo = meta.pageInfo && typeof meta.pageInfo === 'object' ? meta.pageInfo : null;
+  const hasMoreOlder = typeof meta.hasMoreOlder === 'boolean'
+    ? meta.hasMoreOlder
+    : (typeof meta.hasMoreHistory === 'boolean' ? meta.hasMoreHistory : !!pageInfo?.hasMoreOlder || !!pageInfo?.hasMore);
+  const hasMoreNewer = typeof meta.hasMoreNewer === 'boolean'
+    ? meta.hasMoreNewer
+    : !!pageInfo?.hasMoreNewer;
+  return JSON.stringify({
+    conversationId,
+    hasMoreOlder: !!hasMoreOlder,
+    hasMoreNewer: !!hasMoreNewer,
+    messages: (Array.isArray(messages) ? messages : []).map((item) => ({
+      id: String(item?.id || '').trim(),
+      role: String(item?.role || '').trim(),
+      text: String(item?.text || ''),
+      timestamp: String(item?.timestamp || '').trim(),
+      model: String(item?.model || '').trim(),
+      mode: String(item?.mode || '').trim(),
+      attachments: Array.isArray(item?.attachments) ? item.attachments.length : 0,
+    })),
+  });
+}
+
 export function renderMessages(msgs, scroll = true, meta = {}) {
   const el = getMessagesElement();
-  if (!el) return;
+  if (!el) return false;
   const ordered = sortConversationMessages(msgs || []);
+  const snapshotKey = buildMessageSnapshotKey(ordered, meta);
+  if (snapshotKey && snapshotKey === lastRenderedMessageSnapshotKey) {
+    renderRelayQuestions();
+    renderRelayBoards();
+    return false;
+  }
   const messageById = new Map(
     ordered
       .map((item) => [String(item?.id || '').trim(), item])
@@ -1619,7 +1673,8 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
     resetConversationHistoryState();
     renderRelayQuestions();
     renderRelayBoards();
-    return;
+    lastRenderedMessageSnapshotKey = snapshotKey;
+    return true;
   }
   const conversationId = String(meta.conversationId || currentConvId || '').trim();
   const pageInfo = meta.pageInfo && typeof meta.pageInfo === 'object' ? meta.pageInfo : null;
@@ -1678,6 +1733,7 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
   for (const m of ordered) appendMessage(m, false, m.id || null, true, getMessageThreadAnchor(m, messageById), false);
   renderRelayQuestions();
   renderRelayBoards();
+  lastRenderedMessageSnapshotKey = snapshotKey;
   if (scroll) scrollBottom();
   requestAnimationFrame(() => {
     const box = getMessagesElement();
@@ -1686,6 +1742,7 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
     const forwardDistance = Math.max(0, box.scrollHeight - box.clientHeight - box.scrollTop);
     void conversationFutureLoader.handleBoundaryDistance(forwardDistance);
   });
+  return true;
 }
 
 export async function loadOlderConversationMessages() {

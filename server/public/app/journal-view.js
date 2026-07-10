@@ -18,6 +18,7 @@ import {
   loadConversationScrollTop,
   loadConversationLoadedMessageCount,
   saveConversationScrollTop,
+  IS_SHARED_VIEW,
 } from './store.js';
 import {
   loadConversations as loadConversationsApi,
@@ -296,7 +297,7 @@ export function applyLoadedConversationState(id, response, { restoreScroll = fal
   if (repoBrowserState.open && repoBrowserState.activeRoot === 'workspace') {
     void loadRepoBrowserTree();
   }
-  renderMessages(response.messages, !restoreScroll, response);
+  const didRenderMessages = renderMessages(response.messages, !restoreScroll, response);
   hydrateConversationDraft(id, {
     draftText: response.draftText,
     draftUpdatedAt: response.draftUpdatedAt,
@@ -305,7 +306,7 @@ export function applyLoadedConversationState(id, response, { restoreScroll = fal
   restoreInFlightThinking(response.inFlight || null);
   updateSessionPill(conversations[id], response.runtimeSession || null);
   window.syncChatTitleControls?.();
-  if (!restoreScroll) return;
+  if (!restoreScroll || !didRenderMessages) return;
   const el = document.getElementById('messages');
   if (!el) return;
   if (Number.isFinite(savedScrollTop)) {
@@ -402,6 +403,10 @@ export async function openConversation(id, options = {}) {
 }
 
 export async function newConversation() {
+  if (IS_SHARED_VIEW) {
+    showTransientRelayNotice('Shared conversations are read-only.');
+    return;
+  }
   if (newConversationInFlight) return;
   newConversationInFlight = true;
   try {

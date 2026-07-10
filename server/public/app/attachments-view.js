@@ -71,6 +71,16 @@ function setRepoBrowserState(next) {
 
 let repoBrowserReloadQueued = false;
 
+function resolveAttachmentContentUrl(rawValue) {
+  const value = String(rawValue || '').trim();
+  if (!value) return '';
+  if (/^(?:https?:|data:|blob:)/i.test(value)) return value;
+  const normalizedBase = String(BASE || '').trim().replace(/\/+$/, '');
+  if (normalizedBase && value.startsWith(`${normalizedBase}/`)) return value;
+  if (value.startsWith('/')) return `${BASE}${value}`;
+  return value;
+}
+
 function flushQueuedRepoBrowserReload() {
   if (!repoBrowserState.open) {
     repoBrowserReloadQueued = false;
@@ -89,7 +99,7 @@ export function renderAttachmentMarkup(attachments) {
       const rawUrl = att?.dataUrl
         ? att.dataUrl
         : att?.contentUrl
-          ? (att.contentUrl.startsWith('/') ? `${BASE}${att.contentUrl}` : att.contentUrl)
+          ? resolveAttachmentContentUrl(att.contentUrl)
           : '';
       const isImage = String(att?.type || '').startsWith('image/');
       const isVideo = isVideoMimeType(att?.type);
@@ -103,7 +113,7 @@ export function renderAttachmentMarkup(attachments) {
           <div class="msg-attachment msg-attachment-${isVideo ? 'video' : 'image'}">
             ${isVideo
               ? `<div class="msg-attachment-video-chip">🎞️</div>`
-              : `<img src="${escHtml(rawUrl)}" alt="${name}" loading="lazy" onclick="${openHandler}">`}
+              : `<img src="${escHtml(rawUrl)}" alt="${name}" loading="eager" decoding="async" onclick="${openHandler}">`}
             <div class="msg-attachment-meta"><a href="#" onclick="${openHandler};return false;">${name}</a> · ${type}${sizeText} · <a href="#" onclick="${openHandler};return false;">open</a></div>
           </div>`;
       }

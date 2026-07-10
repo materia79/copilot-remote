@@ -24,16 +24,27 @@ export async function apiFetch(url, opts = {}) {
 export async function verifyExistingSession() {
   try {
     const response = await fetch(`${BASE}/api/status`);
-    if (!response.ok) return false;
     const payload = await response.json().catch(() => null);
-    if (payload) updateWorkspaceRootHints(payload);
-    setContextIndicatorMode(payload?.contextIndicatorMode);
-    setCliOnline(!!payload?.cliOnline);
-    setActiveRuntimeSessionCount(payload?.activeRuntimeSessionCount);
-    if (payload?.platform) setServerPlatform(payload.platform);
-    return true;
-  } catch {
-    return false;
+    if (response.ok && payload) {
+      updateWorkspaceRootHints(payload);
+      setContextIndicatorMode(payload?.contextIndicatorMode);
+      setCliOnline(!!payload?.cliOnline);
+      setActiveRuntimeSessionCount(payload?.activeRuntimeSessionCount);
+      if (payload?.platform) setServerPlatform(payload.platform);
+    }
+    return {
+      ok: response.ok,
+      status: response.status,
+      payload,
+      error: response.ok ? null : (payload?.error || 'Unauthorized'),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      payload: null,
+      error: error?.message || 'Network error',
+    };
   }
 }
 
@@ -42,16 +53,27 @@ export async function verifyToken(token) {
     const response = await fetch(`${BASE}/api/status`, {
       headers: { Authorization: `Bearer ${token}` },
     });
-    if (!response.ok) return false;
     const payload = await response.json().catch(() => null);
-    if (payload) updateWorkspaceRootHints(payload);
-    setContextIndicatorMode(payload?.contextIndicatorMode);
-    setCliOnline(!!payload?.cliOnline);
-    setActiveRuntimeSessionCount(payload?.activeRuntimeSessionCount);
-    if (payload?.platform) setServerPlatform(payload.platform);
-    return true;
-  } catch {
-    return false;
+    if (response.ok && payload) {
+      updateWorkspaceRootHints(payload);
+      setContextIndicatorMode(payload?.contextIndicatorMode);
+      setCliOnline(!!payload?.cliOnline);
+      setActiveRuntimeSessionCount(payload?.activeRuntimeSessionCount);
+      if (payload?.platform) setServerPlatform(payload.platform);
+    }
+    return {
+      ok: response.ok,
+      status: response.status,
+      payload,
+      error: response.ok ? null : (payload?.error || 'Unauthorized'),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      payload: null,
+      error: error?.message || 'Network error',
+    };
   }
 }
 
@@ -226,6 +248,89 @@ export async function updateConversationPreferences(id, preferences = {}) {
     method: 'PATCH',
     body: JSON.stringify(preferences || {}),
   });
+}
+
+export async function createConversationShareLink(id) {
+  const convId = String(id || '').trim();
+  if (!convId) return null;
+  return apiFetch(`/api/conversation/${encodeURIComponent(convId)}/share`, {
+    method: 'POST',
+  });
+}
+
+export async function loadSharedConversation(shareToken, options = {}) {
+  const token = String(shareToken || '').trim().toLowerCase();
+  if (!token) return { ok: false, status: 400, error: 'Missing shared token' };
+  const params = new URLSearchParams();
+  const limit = Math.max(1, Math.trunc(Number(options.limit) || 0));
+  if (limit) params.set('limit', String(limit));
+  const beforeMessageId = String(options.beforeMessageId || options.before || '').trim();
+  if (beforeMessageId) params.set('beforeMessageId', beforeMessageId);
+  const beforeTimestamp = String(options.beforeTimestamp || '').trim();
+  if (beforeTimestamp) params.set('beforeTimestamp', beforeTimestamp);
+  const afterMessageId = String(options.afterMessageId || options.after || '').trim();
+  if (afterMessageId) params.set('afterMessageId', afterMessageId);
+  const afterTimestamp = String(options.afterTimestamp || '').trim();
+  if (afterTimestamp) params.set('afterTimestamp', afterTimestamp);
+  const aroundMessageId = String(options.aroundMessageId || '').trim();
+  if (aroundMessageId) params.set('aroundMessageId', aroundMessageId);
+  const query = params.toString();
+  try {
+    const response = await fetch(`${BASE}/api/shared/${encodeURIComponent(token)}${query ? `?${query}` : ''}`, {
+      headers: { 'Content-Type': 'application/json' },
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      return {
+        ok: false,
+        status: response.status,
+        error: payload?.error || `Shared conversation request failed (${response.status})`,
+      };
+    }
+    return {
+      ok: true,
+      status: response.status,
+      ...(payload && typeof payload === 'object' ? payload : {}),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      error: error?.message || 'Network error',
+    };
+  }
+}
+
+export async function reportSharedViewerPresence(shareToken, viewerId) {
+  const token = String(shareToken || '').trim().toLowerCase();
+  const viewer = String(viewerId || '').trim();
+  if (!token || !viewer) return { ok: false, status: 400, error: 'Missing shared presence payload' };
+  try {
+    const response = await fetch(`${BASE}/api/shared/${encodeURIComponent(token)}/presence`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ viewerId: viewer }),
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      return {
+        ok: false,
+        status: response.status,
+        error: payload?.error || `Shared presence request failed (${response.status})`,
+      };
+    }
+    return {
+      ok: true,
+      status: response.status,
+      ...(payload && typeof payload === 'object' ? payload : {}),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      error: error?.message || 'Network error',
+    };
+  }
 }
 
 export async function updateConversationDraft(id, draft = {}) {
