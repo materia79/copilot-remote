@@ -1844,6 +1844,12 @@ function canRefreshConversationHistory(conversationId) {
 function syncRefreshHistoryMenuState() {
   const button = document.getElementById('chat-menu-refresh-history');
   if (!button) return;
+  if (button.hidden || button.getAttribute('aria-hidden') === 'true') {
+    button.disabled = true;
+    button.tabIndex = -1;
+    button.setAttribute('aria-disabled', 'true');
+    return;
+  }
   if (isHistoryRefreshInFlight()) {
     button.disabled = true;
     button.title = 'Refreshing conversation history';
@@ -2112,15 +2118,17 @@ async function initApp() {
       openChatTitleEditor();
     });
     const chatMenuCompactBtn = document.getElementById('chat-menu-compact');
-    bindMenuAction(chatMenuCompactBtn, (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      lockChatActionsMenuShield(350);
-      closeChatActionsMenu();
-      compactCurrentConversation().catch((error) => {
-        alert(error?.message || 'Failed to compact conversation');
+    if (chatMenuCompactBtn && !chatMenuCompactBtn.hidden && !chatMenuCompactBtn.disabled) {
+      bindMenuAction(chatMenuCompactBtn, (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        lockChatActionsMenuShield(350);
+        closeChatActionsMenu();
+        compactCurrentConversation().catch((error) => {
+          alert(error?.message || 'Failed to compact conversation');
+        });
       });
-    });
+    }
     const chatMenuShareConversationBtn = document.getElementById('chat-menu-share-conversation');
     bindMenuAction(chatMenuShareConversationBtn, (event) => {
       event.preventDefault();
@@ -2145,13 +2153,15 @@ async function initApp() {
       });
     });
     const chatMenuRefreshHistoryBtn = document.getElementById('chat-menu-refresh-history');
-    bindMenuAction(chatMenuRefreshHistoryBtn, (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      lockChatActionsMenuShield(350);
-      closeChatActionsMenu();
-      runConversationHistoryRefresh({ source: 'menu' }).catch(() => {});
-    });
+    if (chatMenuRefreshHistoryBtn && !chatMenuRefreshHistoryBtn.hidden && !chatMenuRefreshHistoryBtn.disabled) {
+      bindMenuAction(chatMenuRefreshHistoryBtn, (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        lockChatActionsMenuShield(350);
+        closeChatActionsMenu();
+        runConversationHistoryRefresh({ source: 'menu' }).catch(() => {});
+      });
+    }
     const chatMenuSelectModelsBtn = document.getElementById('chat-menu-select-models');
     bindMenuAction(chatMenuSelectModelsBtn, (event) => {
       event.preventDefault();

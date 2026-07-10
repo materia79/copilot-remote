@@ -582,6 +582,10 @@
     touch-action: manipulation;
     -webkit-tap-highlight-color: transparent;
   }
+  .chat-actions-menu-item[hidden],
+  .chat-actions-menu-meta[hidden] {
+    display: none !important;
+  }
   .chat-actions-menu-item:hover {
     background: var(--bg3);
     border-color: var(--border);
@@ -2992,10 +2996,11 @@
             <div id="chat-menu-pwa-version" class="chat-actions-menu-meta chat-actions-menu-meta-stacked" aria-hidden="true"><span class="chat-actions-menu-meta-primary">PWA shell version</span><span class="chat-actions-menu-meta-secondary" id="chat-menu-pwa-version-value">v?</span></div>
             <div id="chat-menu-queue-status" class="chat-actions-menu-meta chat-actions-menu-meta-stacked" aria-hidden="true"><div class="chat-actions-menu-meta-top"><span class="chat-actions-menu-meta-primary">Queue</span><button id="chat-menu-empty-queue" class="chat-actions-menu-meta-label" type="button">🚮 Empty queue</button></div><span class="chat-actions-menu-meta-secondary" id="chat-menu-queue-status-value">pending=?, processing=?, parked=?</span></div>
             <button id="chat-menu-edit-title" class="chat-actions-menu-item" type="button" role="menuitem">✍️ Edit conversation title</button>
+            <button id="chat-menu-shared-theme-toggle" class="chat-actions-menu-item" type="button" role="menuitem" hidden>🌙/☀️ Day/Night mode</button>
             <button id="chat-menu-usage" class="chat-actions-menu-item" type="button" role="menuitem">📊 Check Usage</button>
-            <button id="chat-menu-compact" class="chat-actions-menu-item" type="button" role="menuitem">🗜️ Compact</button>
+            <button id="chat-menu-compact" class="chat-actions-menu-item" type="button" role="menuitem" hidden disabled aria-hidden="true" tabindex="-1" style="display:none">🗜️ Compact</button>
             <button id="chat-menu-share-conversation" class="chat-actions-menu-item" type="button" role="menuitem">➡️ Share conversation</button>
-            <button id="chat-menu-refresh-history" class="chat-actions-menu-item" type="button" role="menuitem">🔄️ Refresh history</button>
+            <button id="chat-menu-refresh-history" class="chat-actions-menu-item" type="button" role="menuitem" hidden disabled aria-hidden="true" tabindex="-1" style="display:none">🔄️ Refresh history</button>
             <button id="chat-menu-inspect-tmux" class="chat-actions-menu-item" type="button" role="menuitem">🖥️ Inspect tmux console</button>
             <button id="chat-menu-select-models" class="chat-actions-menu-item" type="button" role="menuitem">🤗 Select Models</button>
             <button id="chat-menu-change-cwd" class="chat-actions-menu-item" type="button" role="menuitem">🗂️ Change CWD</button>
@@ -3003,7 +3008,6 @@
             <button id="chat-menu-restart-relay" class="chat-actions-menu-item" type="button" role="menuitem">🌄 Restart web relay</button>
             <button id="chat-menu-suspend-host" class="chat-actions-menu-item" type="button" role="menuitem" onclick="openSuspendHostConfirmation()">💤 Suspend host</button>
             <button id="chat-menu-kill-session" class="chat-actions-menu-item" type="button" role="menuitem">☠️ Kill session</button>
-            <button id="chat-menu-shared-theme-toggle" class="chat-actions-menu-item" type="button" role="menuitem" hidden>🌙/☀️ Day/Night mode</button>
           </div>
         </div>
         <button id="fullscreen-btn" class="header-icon-btn" onclick="toggleFullscreen()" title="Toggle fullscreen" aria-label="Toggle fullscreen">⛶</button>

@@ -642,6 +642,12 @@ export function updateSessionPill(conversation, runtimeSession) {
 export function updateCompactButton() {
   const btn = document.getElementById('chat-menu-compact');
   if (!btn) return;
+  if (btn.hidden || btn.getAttribute('aria-hidden') === 'true') {
+    btn.disabled = true;
+    btn.tabIndex = -1;
+    btn.setAttribute('aria-disabled', 'true');
+    return;
+  }
   const conv = currentConvId ? conversations[currentConvId] : null;
   const canCompact = !!(currentConvId && conv && !conv.archived && !compactInFlight);
   btn.disabled = !canCompact;
@@ -1036,6 +1042,12 @@ export function setHistoryRefreshInFlight(value) {
   historyRefreshInFlight = !!value;
   const refreshBtn = document.getElementById('chat-menu-refresh-history');
   if (refreshBtn) {
+    if (refreshBtn.hidden || refreshBtn.getAttribute('aria-hidden') === 'true') {
+      refreshBtn.disabled = true;
+      refreshBtn.tabIndex = -1;
+      refreshBtn.setAttribute('aria-disabled', 'true');
+      return;
+    }
     refreshBtn.disabled = historyRefreshInFlight;
     refreshBtn.textContent = historyRefreshInFlight ? '🔄️ Refreshing…' : '🔄️ Refresh history';
   }
