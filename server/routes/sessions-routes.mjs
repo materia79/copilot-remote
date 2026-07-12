@@ -2586,17 +2586,10 @@ export function registerSessionsRoutes(app, deps) {
     const sharedAccess = statusEventService.recordSharedAccess({
       shareToken: token,
       viewerIp: extractClientIp(req),
-      conversationId: convId,
-      conversationTitle: conv.title,
-      sdkSessionId: conv.sdk_session_id,
     });
     if (sharedAccess.event) {
       const details = sharedAccess.event.details;
-      console.log(
-        `SHARED ACCESS viewerIp=${details.viewerIp} conversationId=${details.conversationId} `
-        + `sdkSessionId=${details.sdkSessionId || '-'} title=${JSON.stringify(details.conversationTitle)} `
-        + `tokenPrefix=${details.shareTokenPrefix}`,
-      );
+      console.log(`SHARED ACCESS shareId=${details.shareId}`);
       io.emit('shared_access', sharedAccess.event);
     }
     const now = new Date().toISOString();

@@ -268,48 +268,28 @@ function resolveAuthCookiePath() {
   return base || '/';
 }
 
-function syncClientAuthCookie(token) {
-  const value = String(token || '').trim();
+function clearLegacyClientAuthCookie() {
   const path = resolveAuthCookiePath();
-  if (!value) {
-    document.cookie = `${AUTH_COOKIE_NAME}=; Path=${path}; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax`;
-    return;
-  }
-  document.cookie = `${AUTH_COOKIE_NAME}=${encodeURIComponent(value)}; Path=${path}; Max-Age=2592000; SameSite=Lax`;
+  document.cookie = `${AUTH_COOKIE_NAME}=; Path=${path}; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax`;
 }
 
-function loadPersistedAuthToken() {
+function consumeLegacyPersistedAuthToken() {
   let sessionValue = '';
+  let localValue = '';
   try {
     sessionValue = String(sessionStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || '').trim();
+    sessionStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
   } catch {
     sessionValue = '';
   }
-  if (sessionValue) return sessionValue;
   try {
-    return String(localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || '').trim();
+    localValue = String(localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || '').trim();
+    localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
   } catch {
-    return '';
+    localValue = '';
   }
-}
-
-function persistAuthToken(token) {
-  const value = String(token || '').trim();
-  try {
-    if (!value) {
-      sessionStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
-    } else {
-      sessionStorage.setItem(AUTH_TOKEN_STORAGE_KEY, value);
-    }
-  } catch {}
-  try {
-    if (!value) {
-      localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
-    } else {
-      localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, value);
-    }
-  } catch {}
-  syncClientAuthCookie(value);
+  clearLegacyClientAuthCookie();
+  return sessionValue || localValue;
 }
 
 function stripTokenFromUrl() {
@@ -627,6 +607,7 @@ async function refreshSharedConversation() {
     applyLoadedConversationState(convId, response, {
       restoreScroll: !preserveBottom,
       savedScrollTop: preserveBottom ? null : stableSavedScrollTop,
+      followLiveUpdates: preserveBottom,
     });
     sharedConversationAppliedSeq = requestSeq;
     syncViewportMetrics();
@@ -1818,6 +1799,7 @@ async function pollAuthenticatedCurrentConversationLive() {
     applyLoadedConversationState(currentId, response, {
       restoreScroll: !preserveBottom,
       savedScrollTop: preserveBottom ? null : stableSavedScrollTop,
+      followLiveUpdates: preserveBottom,
     });
   } finally {
     liveConversationPollInFlight = false;
@@ -1953,6 +1935,7 @@ async function refreshCurrentView() {
     applyLoadedConversationState(currentId, r, {
       restoreScroll: !preserveBottom,
       savedScrollTop: preserveBottom ? null : stableSavedScrollTop,
+      followLiveUpdates: preserveBottom,
     });
   } else {
     setRepoBrowserSessionInfo('', '');
@@ -2559,15 +2542,15 @@ async function initApp() {
 }
 
 async function doAuth() {
-  const val = document.getElementById('token-input').value.trim() || getTokenFromUrl();
+  const tokenInput = document.getElementById('token-input');
+  const val = tokenInput.value.trim() || getTokenFromUrl();
   if (!val) return showAuthError('Please enter a token');
   const result = await verifyToken(val);
   if (result?.ok) {
-    setToken(val);
-    persistAuthToken(val);
+    setToken('');
+    tokenInput.value = '';
     await startAppWithErrorHandling();
   } else {
-    if (result?.status === 401) persistAuthToken('');
     showAuthError(resolveAuthErrorMessage(result));
   }
 }
@@ -2594,24 +2577,18 @@ async function bootstrap() {
   }
   const urlToken = getTokenFromUrl();
   if (urlToken) stripTokenFromUrl();
-  const persistedToken = loadPersistedAuthToken();
+  const persistedToken = consumeLegacyPersistedAuthToken();
   const bootstrapToken = String(urlToken || persistedToken || '').trim();
   const existingSession = await verifyExistingSession(bootstrapToken);
   if (existingSession?.ok) {
-    if (existingSession?.source === 'token' && bootstrapToken) {
-      setToken(bootstrapToken);
-      persistAuthToken(bootstrapToken);
-    } else {
-      setToken('');
-    }
+    setToken('');
     await startAppWithErrorHandling();
     return;
   }
   if (urlToken) {
     const tokenResult = await verifyToken(urlToken);
     if (tokenResult?.ok) {
-      setToken(urlToken);
-      persistAuthToken(urlToken);
+      setToken('');
       await startAppWithErrorHandling();
       return;
     }
@@ -2619,14 +2596,12 @@ async function bootstrap() {
   if (!urlToken && persistedToken) {
     const persistedResult = await verifyToken(persistedToken);
     if (persistedResult?.ok) {
-      setToken(persistedToken);
-      persistAuthToken(persistedToken);
+      setToken('');
       await startAppWithErrorHandling();
       return;
     }
   }
   if (existingSession?.status === 401 && persistedToken) {
-    persistAuthToken('');
     setToken('');
   }
   if (urlToken) document.getElementById('token-input').value = urlToken;

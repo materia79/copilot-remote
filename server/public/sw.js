@@ -29,6 +29,11 @@ function isPwaMetadataRequest(url) {
   return /^(?:manifest\.webmanifest|app-icon(?:-\d+)?\.png|app-icon\.svg|favicon\.ico)$/.test(relativePath);
 }
 
+function isApplicationModuleRequest(url) {
+  if (!url.pathname.startsWith(`${REGISTRATION_SCOPE_PATH}app/`)) return false;
+  return /\.(?:m?js)$/i.test(url.pathname);
+}
+
 async function cacheShell() {
   const cache = await caches.open(CACHE_NAME);
   const assets = STATIC_ASSETS.map((asset) => new URL(asset, self.registration.scope).href);
@@ -89,6 +94,11 @@ self.addEventListener('fetch', (event) => {
   }
 
   if (isPwaMetadataRequest(url)) {
+    event.respondWith(networkFirst(request, request.url));
+    return;
+  }
+
+  if (isApplicationModuleRequest(url)) {
     event.respondWith(networkFirst(request, request.url));
     return;
   }

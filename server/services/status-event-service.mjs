@@ -1,4 +1,4 @@
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 
 const DEFAULT_MAX_EVENTS = 1_000;
 const DEFAULT_SHARED_ACCESS_DEDUPE_TTL_MS = 60_000;
@@ -28,6 +28,10 @@ function formatStatusEventRow(row) {
     source: 'server',
     details,
   };
+}
+
+function shareIdentifier(token) {
+  return createHash('sha256').update(String(token || '')).digest('hex').slice(0, 12);
 }
 
 export function createStatusEventService(db, {
@@ -78,9 +82,6 @@ export function createStatusEventService(db, {
   function recordSharedAccess({
     shareToken,
     viewerIp,
-    conversationId,
-    conversationTitle,
-    sdkSessionId = null,
     timestamp = Date.now(),
   } = {}) {
     const now = normalizeTimestamp(timestamp);
@@ -100,11 +101,7 @@ export function createStatusEventService(db, {
       type: 'shared-access-opened',
       source: 'server',
       details: {
-        viewerIp: ip,
-        conversationId: String(conversationId || '').trim(),
-        conversationTitle: String(conversationTitle || '').trim(),
-        sdkSessionId: String(sdkSessionId || '').trim() || null,
-        shareTokenPrefix: token.slice(0, 12),
+        shareId: shareIdentifier(token),
       },
     };
     const persist = db.transaction(() => {

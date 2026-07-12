@@ -57,10 +57,7 @@ function formatStatusEvent(event) {
   if (type === 'client-error') return `Error: ${formatValue(details.message || details.error)}`;
   if (type === 'unhandled-rejection') return `Unhandled rejection: ${formatValue(details.reason)}`;
   if (type === 'shared-access-opened') {
-    const conversation = [details.conversationTitle, details.conversationId].filter(Boolean).join(' (');
-    const suffix = details.conversationTitle && details.conversationId ? ')' : '';
-    const session = details.sdkSessionId ? `; session ${details.sdkSessionId}` : '';
-    return `Shared conversation opened by ${details.viewerIp || 'unknown'}: ${conversation || 'unknown conversation'}${suffix}${session}`;
+    return `Shared conversation opened (${details.shareId || 'unknown share'})`;
   }
   return formatValue(details);
 }

@@ -10,7 +10,10 @@ test('index auth gate uses resilient connect handler', () => {
   assert.match(source, /window\.__copilotAuthConnect = async \(event\) => \{/);
   assert.match(source, /if \(typeof window\.doAuth === 'function'\) \{/);
   assert.match(source, /fetch\(`\$\{__APP_BASE\}\/api\/status`, \{/);
-  assert.match(source, /window\.location\.reload\(\);/);
+  assert.match(source, /await window\.__loadCopilotApp\(\{ recover: true \}\);/);
+  assert.doesNotMatch(source, /localStorage\.setItem\(__AUTH_TOKEN_STORAGE_KEY/);
+  assert.doesNotMatch(source, /document\.cookie = `\$\{__AUTH_COOKIE_NAME\}=\$\{encodeURIComponent\(token\)\}/);
+  assert.match(source, /document\.cookie = `copilot_auth=; Path=\$\{cookiePath\}; Max-Age=0;/);
   assert.match(source, /onclick="window\.__copilotAuthConnect\(event\)"/);
   assert.match(source, /onkeydown="if\(event\.key==='Enter'\)window\.__copilotAuthConnect\(event\)"/);
 });

@@ -32,9 +32,91 @@
     if (versionValueEntry) versionValueEntry.textContent = `v${__PWA_VERSION}`;
   });
   const __PWA_BUST = `v=${__PWA_VERSION}`;
-  const __AUTH_TOKEN_STORAGE_KEY = 'copilot_auth_token';
-  const __AUTH_COOKIE_NAME = 'copilot_auth';
-  const __AUTH_COOKIE_PATH = __APP_BASE || '/';
+  const __PWA_RECOVERY_KEY = `copilot_pwa_recovery_${__PWA_VERSION}`;
+  const __pwaControllerIsCurrent = () => {
+    const scriptUrl = String(navigator.serviceWorker?.controller?.scriptURL || '');
+    if (!scriptUrl) return false;
+    try {
+      return new URL(scriptUrl).searchParams.get('v') === __PWA_VERSION;
+    } catch {
+      return false;
+    }
+  };
+  const __clearPwaRecoveryMarker = () => {
+    try { sessionStorage.removeItem(__PWA_RECOVERY_KEY); } catch {}
+  };
+  const __recoverStalePwaShell = async (scopeRoot) => {
+    let recoveryAttempted = false;
+    try {
+      recoveryAttempted = sessionStorage.getItem(__PWA_RECOVERY_KEY) === '1';
+      if (!recoveryAttempted) sessionStorage.setItem(__PWA_RECOVERY_KEY, '1');
+    } catch {}
+    if (recoveryAttempted) {
+      throw new Error('The updated app shell could not activate. Clear site data and reload.');
+    }
+    const registrations = await navigator.serviceWorker.getRegistrations();
+    await Promise.all(registrations
+      .filter((registration) => new URL(registration.scope).pathname === scopeRoot)
+      .map((registration) => registration.unregister()));
+    window.location.reload();
+    await new Promise(() => {});
+  };
+  const __activateCurrentPwaShell = async () => {
+    if (!('serviceWorker' in navigator)) return;
+    if (__IS_SHARED_ROUTE && !navigator.serviceWorker.controller) return;
+    const scopeRoot = `${__APP_BASE || ''}/`;
+    if (__pwaControllerIsCurrent()) {
+      __clearPwaRecoveryMarker();
+      return;
+    }
+    const hadController = !!navigator.serviceWorker.controller;
+    try {
+      const registration = await navigator.serviceWorker.register(
+        `${__APP_BASE}/sw.js?${__PWA_BUST}`,
+        { scope: scopeRoot, updateViaCache: 'none' },
+      );
+      await registration.update();
+    } catch (error) {
+      if (!hadController) return;
+      await __recoverStalePwaShell(scopeRoot);
+      throw error;
+    }
+    if (__pwaControllerIsCurrent()) {
+      __clearPwaRecoveryMarker();
+      return;
+    }
+    await new Promise((resolve) => {
+      let pollTimer = 0;
+      let timeoutTimer = 0;
+      const finish = () => {
+        navigator.serviceWorker.removeEventListener('controllerchange', check);
+        clearInterval(pollTimer);
+        clearTimeout(timeoutTimer);
+        resolve();
+      };
+      const check = () => {
+        if (__pwaControllerIsCurrent()) finish();
+      };
+      navigator.serviceWorker.addEventListener('controllerchange', check);
+      pollTimer = setInterval(check, 50);
+      timeoutTimer = setTimeout(finish, 5000);
+    });
+    if (__pwaControllerIsCurrent()) {
+      __clearPwaRecoveryMarker();
+      return;
+    }
+    if (!hadController) return;
+    await __recoverStalePwaShell(scopeRoot);
+  };
+  const __clearLegacyClientAuthCookie = () => {
+    const cookiePath = __APP_BASE || '/';
+    document.cookie = `copilot_auth=; Path=${cookiePath}; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax`;
+  };
+  window.__loadCopilotApp = async ({ recover = false } = {}) => {
+    await __activateCurrentPwaShell();
+    const recoverySuffix = recover ? `&recover=${Date.now()}` : '';
+    return import(`${__APP_BASE}/app/bootstrap.js?${__PWA_BUST}${recoverySuffix}`);
+  };
   window.__copilotAuthConnect = async (event) => {
     event?.preventDefault?.();
     const input = document.getElementById('token-input');
@@ -52,15 +134,14 @@
     // Fallback for cases where the app module failed to initialize on mobile:
     // validate token directly so auth is still possible.
     try {
+      __clearLegacyClientAuthCookie();
       const response = await fetch(`${__APP_BASE}/api/status`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (response.ok) {
-        try { sessionStorage.setItem(__AUTH_TOKEN_STORAGE_KEY, token); } catch {}
-        try { localStorage.setItem(__AUTH_TOKEN_STORAGE_KEY, token); } catch {}
-        document.cookie = `${__AUTH_COOKIE_NAME}=${encodeURIComponent(token)}; Path=${__AUTH_COOKIE_PATH}; Max-Age=2592000; SameSite=Lax`;
+        if (input) input.value = '';
         try {
-          await import(`${__APP_BASE}/app/bootstrap.js?${__PWA_BUST}&recover=${Date.now()}`);
+          await window.__loadCopilotApp({ recover: true });
         } catch (error) {
           if (errorEl) errorEl.textContent = `Authenticated, but app failed to initialize: ${String(error?.message || error || 'unknown error')}`;
           return;
@@ -3361,7 +3442,10 @@
 </div>
 
 <script>
-  document.write(`<scr` + `ipt type="module" src="${__APP_BASE}/app/bootstrap.js?${__PWA_BUST}"></scr` + `ipt>`);
+  window.__loadCopilotApp().catch((error) => {
+    const errorEl = document.getElementById('auth-error');
+    if (errorEl) errorEl.textContent = `App failed to initialize: ${String(error?.message || error || 'unknown error')}`;
+  });
 </script>
 </body>
 </html>

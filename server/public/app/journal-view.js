@@ -258,7 +258,11 @@ export function renderConvList() {
   scheduleConversationListBoundaryCheck();
 }
 
-export function applyLoadedConversationState(id, response, { restoreScroll = false, savedScrollTop = null } = {}) {
+export function applyLoadedConversationState(id, response, {
+  restoreScroll = false,
+  savedScrollTop = null,
+  followLiveUpdates = !restoreScroll,
+} = {}) {
   if (!response) {
     setRepoBrowserSessionInfo('', '');
     restoreInFlightThinking(null);
@@ -304,7 +308,7 @@ export function applyLoadedConversationState(id, response, { restoreScroll = fal
     draftUpdatedAt: response.draftUpdatedAt,
     draftUpdatedByClientId: response.draftUpdatedByClientId,
   });
-  restoreInFlightThinking(response.inFlight || null);
+  restoreInFlightThinking(response.inFlight || null, followLiveUpdates);
   updateSessionPill(conversations[id], response.runtimeSession || null);
   window.syncChatTitleControls?.();
   if (!restoreScroll || !didRenderMessages) return;

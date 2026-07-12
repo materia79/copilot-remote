@@ -18,7 +18,7 @@ function createService(options = {}) {
   return { db, service: createStatusEventService(db, options) };
 }
 
-test('persists a full-IP shared-access event and replays it to later clients', () => {
+test('persists minimized shared-access telemetry and replays it to later clients', () => {
   const { db, service } = createService();
   const result = service.recordSharedAccess({
     shareToken: 'a'.repeat(64),
@@ -37,11 +37,7 @@ test('persists a full-IP shared-access event and replays it to later clients', (
     type: 'shared-access-opened',
     source: 'server',
     details: {
-      viewerIp: '203.0.113.24',
-      conversationId: 'conversation-1',
-      conversationTitle: 'Release notes',
-      sdkSessionId: 'sdk-1',
-      shareTokenPrefix: 'aaaaaaaaaaaa',
+      shareId: 'ffe054fe7ae0',
     },
   }]);
 });

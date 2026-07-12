@@ -886,7 +886,7 @@ export function renderThinkingActivities() {
   }
 }
 
-export function restoreInFlightThinking(inFlight) {
+export function restoreInFlightThinking(inFlight, autoScroll = true) {
   clearRelayStreamState();
   const messageId = String(inFlight?.messageId || '').trim();
   const status = String(inFlight?.status || '').trim().toLowerCase();
@@ -934,7 +934,7 @@ export function restoreInFlightThinking(inFlight) {
     });
   }
   thinkingText = '';
-  showThinking(messageId);
+  showThinking(messageId, autoScroll);
   renderThinkingActivities();
   renderThinkingThoughts();
   renderRestoredSubagentBubbles(messageId);
@@ -942,7 +942,7 @@ export function restoreInFlightThinking(inFlight) {
   if (streamState) {
     rememberRelayStreamState(messageId, streamState.seq, streamState.done || !!inFlight?.streamDone);
     if (!isOpaqueRelayText(streamState.text)) {
-      updateThinkingText(streamState.text, messageId, streamState.done || !!inFlight?.streamDone);
+      updateThinkingText(streamState.text, messageId, streamState.done || !!inFlight?.streamDone, autoScroll);
     }
     return;
   }
