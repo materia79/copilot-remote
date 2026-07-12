@@ -445,7 +445,7 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/response` | (CLI) Submit response for a message |
 | GET | `/api/restart-orchestrator` | Read relay restart orchestrator state |
 | POST | `/api/restart-orchestrator/request` | Queue a restart transaction for a target SDK session |
-| POST | `/api/activity` | (CLI) Push in-flight tool activity for current message |
+| POST | `/api/activity` | (CLI) Push in-flight tool activity for current message; web search/fetch entries may include bounded queries, URLs, and output previews, while `store_memory`/`vote_memory` entries include available memory metadata |
 | POST | `/api/stream` | (CLI) Push in-flight assistant text stream for current pending message |
 | POST | `/api/relay/pause` | Pause dequeueing and drop currently queued messages |
 | POST | `/api/relay/resume` | Resume dequeueing after pause |

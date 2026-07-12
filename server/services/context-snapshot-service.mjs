@@ -16,6 +16,9 @@ const MODEL_FALLBACK_LIMITS = Object.freeze({
   'claude-opus-4.6-fast': 200000,
   'claude-opus-4.5': 200000,
   // OpenAI GPT-5 series
+  'gpt-5.6-terra': 272000,
+  'gpt-5.6-luna': 272000,
+  'gpt-5.6-sol': 272000,
   'gpt-5.5': 256000,
   'gpt-5.4': 256000,
   'gpt-5.3-codex': 256000,
@@ -75,7 +78,7 @@ function findFirstNumericByKey(obj, candidateKeys) {
   return null;
 }
 
-function resolveContextLimitTokens(modelId, data, modelUsage) {
+function resolveContextLimitTokens(modelId, data, modelUsage, getModelContextLimitTokens = null) {
   const directCandidates = [
     getByPath(data, ['maxContextTokens']),
     getByPath(data, ['contextWindow']),
@@ -92,6 +95,10 @@ function resolveContextLimitTokens(modelId, data, modelUsage) {
     if (Number.isFinite(numeric) && numeric > 0) return Math.round(numeric);
   }
   const model = normalizeText(modelId).toLowerCase();
+  const catalogLimit = typeof getModelContextLimitTokens === 'function'
+    ? toNullableInt(getModelContextLimitTokens(model))
+    : null;
+  if (catalogLimit !== null && catalogLimit > 0) return catalogLimit;
   return MODEL_FALLBACK_LIMITS[model] || null;
 }
 
@@ -162,7 +169,7 @@ function hasSnapshotSignals(data) {
     || Number.isFinite(Number(modelUsage?.cacheWriteTokens));
 }
 
-function buildSnapshotFromEvent({ event, data, eventsPath, sessionId, pathModule }) {
+function buildSnapshotFromEvent({ event, data, eventsPath, sessionId, pathModule, getModelContextLimitTokens }) {
   const currentModel = resolveEventModelId(data);
   const copilotSessionId = extractSessionIdFromEventsPath(pathModule, eventsPath) || sessionId;
   const modelUsage = currentModel && data?.modelMetrics?.[currentModel]?.usage && typeof data.modelMetrics[currentModel].usage === 'object'
@@ -182,7 +189,7 @@ function buildSnapshotFromEvent({ event, data, eventsPath, sessionId, pathModule
     ?? ((promptTokens !== null || completionTokens !== null || reasoningTokens !== null)
       ? (Number(promptTokens || 0) + Number(completionTokens || 0) + Number(reasoningTokens || 0))
       : null);
-  const contextLimitTokens = resolveContextLimitTokens(currentModel, data, modelUsage);
+  const contextLimitTokens = resolveContextLimitTokens(currentModel, data, modelUsage, getModelContextLimitTokens);
   const usedPercent = toNullablePercent(data?.usedPercent)
     ?? toNullablePercent(findFirstNumericByKey(data, ['usedPercent', 'contextUsagePercent', 'tokenUsagePercent']))
     ?? ((usedTotalTokens !== null && contextLimitTokens !== null && contextLimitTokens > 0)
@@ -266,13 +273,13 @@ function updateEstimateState(estimate, event, data) {
   return next;
 }
 
-function buildEstimatedSnapshot({ estimate, eventsPath, sessionId, pathModule }) {
+function buildEstimatedSnapshot({ estimate, eventsPath, sessionId, pathModule, getModelContextLimitTokens }) {
   const totalCompletionTokens = toNullableInt(estimate?.totalCompletionTokens);
   if (totalCompletionTokens === null || totalCompletionTokens <= 0) return null;
   const copilotSessionId = extractSessionIdFromEventsPath(pathModule, eventsPath) || sessionId;
   const model = normalizeText(estimate?.latestModel) || null;
   const contextLimitTokens = toNullableInt(estimate?.explicitContextLimitTokens)
-    ?? resolveContextLimitTokens(model, null, null);
+    ?? resolveContextLimitTokens(model, null, null, getModelContextLimitTokens);
   const usedPercent = (contextLimitTokens !== null && contextLimitTokens > 0)
     ? Math.round((totalCompletionTokens / contextLimitTokens) * 10000) / 100
     : null;
@@ -305,12 +312,12 @@ function buildEstimatedSnapshot({ estimate, eventsPath, sessionId, pathModule })
   };
 }
 
-function hydrateSnapshotFromEstimate(snapshot, estimate) {
+function hydrateSnapshotFromEstimate(snapshot, estimate, getModelContextLimitTokens = null) {
   if (!snapshot || typeof snapshot !== 'object') return snapshot;
   const model = normalizeText(snapshot.model) || normalizeText(estimate?.latestModel) || null;
   const contextLimitTokens = toNullableInt(snapshot.max_context_tokens)
     ?? toNullableInt(estimate?.explicitContextLimitTokens)
-    ?? resolveContextLimitTokens(model, null, null);
+    ?? resolveContextLimitTokens(model, null, null, getModelContextLimitTokens);
   const usedTotalTokens = toNullableInt(snapshot.used_total_tokens);
   const usedPercent = toNullablePercent(snapshot.used_percent)
     ?? ((usedTotalTokens !== null && contextLimitTokens !== null && contextLimitTokens > 0)
@@ -385,6 +392,7 @@ export function createContextSnapshotService({
   fs,
   path,
   resolveSessionStateRoot,
+  getModelContextLimitTokens = null,
 } = {}) {
   const contextCache = new Map();
 
@@ -431,7 +439,7 @@ export function createContextSnapshotService({
     if (cached && cached.eventsPath === eventsPath && cached.sizeBytes === sizeBytes && cached.mtimeMs === mtimeMs) {
       cached.cachedAt = Date.now();
       return {
-        snapshot: cached.snapshot || null,
+        snapshot: hydrateSnapshotFromEstimate(cached.snapshot, cached.estimate, getModelContextLimitTokens),
         eventsPath,
         error: cached.error || null,
       };
@@ -454,6 +462,7 @@ export function createContextSnapshotService({
       eventsPath,
       sessionId,
       pathModule: path,
+      getModelContextLimitTokens,
     }, canAppend ? {
       latest: cached?.latest || null,
       estimate: cached?.estimate || null,
@@ -465,12 +474,14 @@ export function createContextSnapshotService({
       eventsPath,
       sessionId,
       pathModule: path,
+      getModelContextLimitTokens,
     });
     const previousSnapshot = canAppend ? (cached?.snapshot || null) : null;
     const previousError = canAppend ? (cached?.error || null) : null;
     const nextSnapshot = hydrateSnapshotFromEstimate(
       latest?.snapshot || estimated?.snapshot || previousSnapshot,
       consumed?.estimate || null,
+      getModelContextLimitTokens,
     );
     const nextError = latest
       ? (latest.error || null)

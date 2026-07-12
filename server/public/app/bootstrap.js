@@ -193,6 +193,7 @@ let modelCatalogState = {
   defaultModel: FALLBACK_MODEL,
   reasoningByModel: {},
   reasoningEfforts: [],
+  modelMetadataByModel: {},
   stale: true,
   metadataValid: false,
   reasoningMetadataValid: false,
@@ -758,9 +759,13 @@ function updateModelCatalogState(payload) {
       ]))
       : {},
     reasoningEfforts: normalizeReasoningEffortList(payload?.reasoningEfforts || []),
+    modelMetadataByModel: payload?.modelMetadataByModel && typeof payload.modelMetadataByModel === 'object'
+      ? payload.modelMetadataByModel
+      : {},
     stale: !!payload?.stale,
     metadataValid: payload?.metadataValid === true,
     reasoningMetadataValid: payload?.reasoningMetadataValid === true,
+    catalogAgeWarning: payload?.catalogAgeWarning === true,
     warning: payload?.warning ? String(payload.warning) : null,
     error: payload?.error ? String(payload.error) : null,
     refreshedAt: payload?.refreshedAt || null,
@@ -811,6 +816,7 @@ function updateModelCatalogState(payload) {
   localStorage.setItem(MODEL_STORAGE_KEY, preferred);
   const preferredReasoningForMode = String(activeConversationPreferredReasoningByMode?.[selectedMode] || '').trim().toLowerCase();
   updateReasoningSelectorForModel(preferred, preferredReasoningForMode);
+  updateContextTierSelector(preferred);
   if (selectedMode) {
     activeConversationPreferredModelsByMode = withUpdatedModelPreference({
       preferredModelsByMode: activeConversationPreferredModelsByMode,
@@ -826,13 +832,16 @@ function updateModelCatalogState(payload) {
     localStorage.setItem(REASONING_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredReasoningByMode));
   }
 
-  if (modelCatalogState.warning && isModelMetadataHealthy(modelCatalogState)) {
+  if (modelCatalogState.catalogAgeWarning && isModelMetadataHealthy(modelCatalogState)) {
+    setModelBanner(`⚠️ ${modelCatalogState.warning || 'Model catalog may be out of date. Refresh models if selections look wrong.'}`);
+  } else if (modelCatalogState.warning && isModelMetadataHealthy(modelCatalogState)) {
     setModelBanner(`⚠️ ${modelCatalogState.warning}`);
   } else if (modelCatalogState.stale && isModelMetadataHealthy(modelCatalogState)) {
     setModelBanner('⚠️ Model list is cached from CLI; selection may be stale.');
   } else if (isModelMetadataHealthy(modelCatalogState)) {
     setModelBanner('');
   }
+
   syncModelMetadataBlocker();
 }
 
@@ -841,6 +850,65 @@ function selectedModelValue() {
   const value = String(select?.value || '').trim();
   if (value) return value;
   return modelCatalogState.currentModel || modelCatalogState.defaultModel || FALLBACK_MODEL;
+}
+
+function updateContextTierSelector(modelId) {
+  const select = document.getElementById('context-tier-select');
+  if (!select) return;
+  const metadata = modelCatalogState.modelMetadataByModel?.[modelId] || {};
+  const defaultLimit = Number(metadata.defaultContextLimitTokens);
+  const longLimit = Number(metadata.longContextLimitTokens);
+  const current = select.value;
+  select.innerHTML = '';
+  const defaultOption = document.createElement('option');
+  defaultOption.value = 'default';
+  defaultOption.textContent = Number.isFinite(defaultLimit) && defaultLimit > 0
+    ? `Context: default (${Math.round(defaultLimit / 1000)}K)`
+    : 'Context: default';
+  select.appendChild(defaultOption);
+  if (Number.isFinite(longLimit) && longLimit > 0) {
+    const longOption = document.createElement('option');
+    longOption.value = 'long_context';
+    longOption.textContent = `Context: long (${Math.round(longLimit / 1000)}K)`;
+    select.appendChild(longOption);
+  }
+  select.value = current === 'long_context' && select.querySelector('option[value="long_context"]')
+    ? 'long_context'
+    : 'default';
+  updateModelPricingDetails(modelId, select.value);
+}
+
+function updateModelPricingDetails(modelId, tier) {
+  const details = document.getElementById('model-pricing-details');
+  const summary = document.getElementById('model-pricing-summary');
+  const grid = document.getElementById('model-pricing-grid');
+  if (!details || !summary || !grid) return;
+  const metadata = modelCatalogState.modelMetadataByModel?.[modelId] || {};
+  const pricing = metadata?.pricing?.[tier === 'long_context' ? 'longContext' : 'default'];
+  if (!pricing || typeof pricing !== 'object') {
+    details.open = false;
+    details.style.display = 'none';
+    grid.replaceChildren();
+    return;
+  }
+  const perMillion = (value) => {
+    const price = Number(value);
+    const batchSize = Number(pricing.batchSize) || 1000000;
+    return Number.isFinite(price) ? (price * 1000000) / batchSize : null;
+  };
+  const input = perMillion(pricing.input);
+  summary.textContent = `${tier === 'long_context' ? 'Long context' : 'Default'} pricing${input !== null ? ` · ${input} credits / 1M input` : ''}`;
+  grid.replaceChildren();
+  for (const [label, value] of [['Input', pricing.input], ['Output', pricing.output], ['Cache read', pricing.cacheRead], ['Cache write', pricing.cacheWrite]]) {
+    const credits = perMillion(value);
+    if (credits === null) continue;
+    const labelEl = document.createElement('span');
+    labelEl.textContent = label;
+    const valueEl = document.createElement('b');
+    valueEl.textContent = String(credits);
+    grid.append(labelEl, valueEl);
+  }
+  details.style.display = grid.childElementCount ? '' : 'none';
 }
 
 function readStoredModelsByMode() {
@@ -978,9 +1046,18 @@ function initModelSelector() {
       });
       const preferredReasoning = String(activeConversationPreferredReasoningByMode?.[mode] || '').trim().toLowerCase();
       updateReasoningSelectorForModel(select.value, preferredReasoning);
+      updateContextTierSelector(select.value);
       void persistCurrentConversationPreferences().catch(() => {});
     });
   }
+
+}
+
+function initContextTierSelector() {
+  const select = document.getElementById('context-tier-select');
+  if (!select || select.dataset.bound === '1') return;
+  select.dataset.bound = '1';
+  select.addEventListener('change', () => updateModelPricingDetails(selectedModelValue(), select.value));
 }
 
 function initReasoningSelector() {
@@ -1052,9 +1129,16 @@ async function retryModelMetadataRefresh() {
   modelMetadataRetryInFlight = true;
   syncModelMetadataBlocker('Refreshing model metadata…');
   try {
-    const refreshed = await refreshModelVariantCatalog();
-    if (!refreshed) throw new Error('Model variant refresh failed');
+    let variantError = null;
+    try {
+      const refreshed = await refreshModelVariantCatalog();
+      if (!refreshed) variantError = new Error('Model variant refresh returned empty');
+    } catch (e) {
+      variantError = e;
+    }
     await refreshModelCatalog(true);
+    if (variantError) console.warn('[retryModelMetadataRefresh] variant refresh issue:', variantError.message);
+    if (modelCatalogState?.refreshedAt) console.log('[retryModelMetadataRefresh] refreshedAt:', modelCatalogState.refreshedAt);
     if (!isModelMetadataHealthy()) {
       throw new Error('Model metadata is still unavailable after refresh');
     }
@@ -1686,7 +1770,9 @@ let refreshViewVersion = 0;
 async function refreshCurrentView() {
   const capturedVersion = ++refreshViewVersion;
   const messagesEl = document.getElementById('messages');
+  const preserveBottom = isMessagesNearBottom();
   const scrollTop = messagesEl?.scrollTop || 0;
+  const stableSavedScrollTop = resolveStableScrollTopForLiveRefresh(messagesEl, scrollTop);
 
   await refreshConversations();
 
@@ -1706,7 +1792,10 @@ async function refreshCurrentView() {
   if (capturedVersion < refreshViewVersion) return;
   if (String(currentConvId || '').trim() !== currentId) return;
   if (r) {
-    applyLoadedConversationState(currentId, r, { restoreScroll: false });
+    applyLoadedConversationState(currentId, r, {
+      restoreScroll: !preserveBottom,
+      savedScrollTop: preserveBottom ? null : stableSavedScrollTop,
+    });
   } else {
     setRepoBrowserSessionInfo('', '');
     restoreInFlightThinking(null);
@@ -1715,12 +1804,10 @@ async function refreshCurrentView() {
   await loadRelayBoards();
   scheduleContextUsageRefresh(currentId, 0);
   if (messagesEl && String(currentConvId || '').trim() === currentId) {
-    const savedScrollTop = loadConversationScrollTop(currentId);
-    const nextScrollTop = Number.isFinite(savedScrollTop) ? savedScrollTop : scrollTop;
-    messagesEl.scrollTop = nextScrollTop;
-    if (Number.isFinite(nextScrollTop) && nextScrollTop >= 0) {
-      saveConversationScrollTop(currentId, nextScrollTop);
+    if (!preserveBottom && Number.isFinite(stableSavedScrollTop) && stableSavedScrollTop >= 0) {
+      messagesEl.scrollTop = stableSavedScrollTop;
     }
+    saveConversationScrollTop(currentId, messagesEl.scrollTop);
   }
   syncRefreshHistoryMenuState();
 }
@@ -2271,6 +2358,7 @@ async function initApp() {
   initModeSelector();
   initModelSelector();
   initReasoningSelector();
+  initContextTierSelector();
   const modelMetadataRetryBtn = document.getElementById('model-metadata-retry-btn');
   if (modelMetadataRetryBtn && modelMetadataRetryBtn.dataset.bound !== '1') {
     modelMetadataRetryBtn.dataset.bound = '1';

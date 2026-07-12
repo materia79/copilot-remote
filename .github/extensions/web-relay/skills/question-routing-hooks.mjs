@@ -38,6 +38,7 @@ export function createQuestionRoutingHooks({
   isAskUserTool,
   normalizeActivityText,
   formatToolActivity,
+  formatToolResultActivity,
   extractQuestionChoices,
   maxToolDetailLength = 140,
   getRelayTurnActive,
@@ -243,6 +244,23 @@ export function createQuestionRoutingHooks({
     return allowToolUse;
   }
 
+  async function onPostToolUse(request, result) {
+    if (!getRelayTurnActive()) return;
+    const activeMsg = getActiveMessage();
+    if (!activeMsg?.id) return;
+    const activityText = formatToolResultActivity(request, result, maxToolDetailLength);
+    if (!activityText || activityText === getLastActivityText()) return;
+    setLastActivityText(activityText);
+    await api("POST", "/api/activity", {
+      messageId: activeMsg.id,
+      conversationId: activeMsg.conversationId,
+      mode: activeMsg.relayMode || "agent",
+      text: activityText,
+    }).catch((error) => {
+      dbg("tool result activity publish failed", `msgId=${activeMsg.id}`, error?.message || String(error));
+    });
+  }
+
   async function onUserInputRequest(request) {
     const activeMsg = getActiveMessage();
     if (!getRelayTurnActive() || !activeMsg?.id) {
@@ -425,6 +443,7 @@ export function createQuestionRoutingHooks({
 
   return {
     onPreToolUse,
+    onPostToolUse,
     onUserInputRequest,
     onElicitationRequest,
   };

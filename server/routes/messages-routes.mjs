@@ -900,6 +900,7 @@ export function buildDequeuedRelayMessage({
     model: String(msg.model || '').trim() || defaultModel,
     modelVariantId: String(msg.model_variant_id || '').trim() || String(msg.model || '').trim() || null,
     reasoningEffort: String(msg.reasoning_effort || '').trim() || null,
+    contextTier: String(msg.context_tier || '').trim() || 'default',
     relayMode: normalizeRelayMode(msg.relay_mode) || defaultRelayMode,
     text: msg.text,
     attachments,
@@ -2939,6 +2940,7 @@ export function registerMessagesRoutes(app, deps) {
       newConversation,
       model,
       reasoningEffort,
+      contextTier,
       relayMode,
       mode,
       attachments: rawAttachments,
@@ -3000,6 +3002,10 @@ export function registerMessagesRoutes(app, deps) {
       });
     }
     const requestedReasoningEffort = reasoningResolution.effort || null;
+    const requestedContextTier = String(contextTier || 'default').trim().toLowerCase();
+    if (!['default', 'long_context'].includes(requestedContextTier)) {
+      return res.status(400).json({ error: 'Unsupported context tier' });
+    }
     if (!requestedRelayMode) return res.status(400).json({ error: 'Unsupported relay mode' });
     const shouldCreateConversation = !!newConversation || !conversationId;
     const conversationWorkspaceState = (!shouldCreateConversation && typeof resolveConversationWorkspaceState === 'function')
@@ -3159,6 +3165,7 @@ export function registerMessagesRoutes(app, deps) {
       requestedModel,
       requestedModelVariantId,
       requestedReasoningEffort,
+      requestedContextTier,
       requestedRelayMode,
       queueText,
       attachments.length ? JSON.stringify(attachments) : null,

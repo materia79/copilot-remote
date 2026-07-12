@@ -43,6 +43,10 @@ import { createRelayCliLauncherService } from './services/relay-cli-launcher-ser
 import { createSessionWorkerRegistry } from './services/session-worker-registry-service.mjs';
 import { createSessionWorkerSupervisor } from './services/session-worker-supervisor-service.mjs';
 import { createSessionWorkerProcessInspector } from './services/session-worker-process-service.mjs';
+import {
+  isModelCatalogRefreshStale,
+  latestModelCatalogRefresh,
+} from '../shared/model-catalog-freshness.mjs';
 import { launchSessionCli } from './services/session-worker-launch-service.mjs';
 import { createSshTunnelManager } from './services/ssh-tunnel-manager-service.mjs';
 import { createSessionWorkerWebSocketService } from './services/session-worker-websocket-service.mjs';
@@ -100,6 +104,7 @@ const DEFAULT_CONFIG = { authToken: '', port: 3333, pollIntervalMs: 3000, conver
 const DEFAULT_PROCESSING_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_MODEL = 'gpt-5.4-mini';
 const MODEL_CATALOG_STALE_MS = 2 * 60 * 1000;
+const MODEL_CATALOG_WARNING_MS = 10 * 60 * 1000;
 const SUPPORTED_RELAY_MODES = ['plan', 'ask', 'agent', 'autopilot'];
 const DEFAULT_RELAY_MODE = 'agent';
 const AUTO_MODEL_SENTINEL = 'auto';
@@ -379,7 +384,7 @@ let modelCatalog = {
   currentModel: DEFAULT_MODEL,
   defaultModel: DEFAULT_MODEL,
   source: 'bootstrap',
-  refreshedAt: new Date().toISOString(),
+  refreshedAt: null,
   error: null,
 };
 let modelSelectorSql = null;
@@ -902,6 +907,19 @@ function normalizeModelVariantRow(row = {}) {
     reasoningEffort: normalizedReasoningEffort,
     label,
     releaseStatus: String(row?.release_status || row?.releaseStatus || '').trim() || null,
+    contextLimitTokens: Number.isFinite(Number(row?.context_limit_tokens ?? row?.contextLimitTokens))
+      && Number(row?.context_limit_tokens ?? row?.contextLimitTokens) > 0
+      ? Math.round(Number(row?.context_limit_tokens ?? row?.contextLimitTokens))
+      : null,
+    longContextLimitTokens: Number.isFinite(Number(row?.long_context_limit_tokens ?? row?.longContextLimitTokens))
+      && Number(row?.long_context_limit_tokens ?? row?.longContextLimitTokens) > 0
+      ? Math.round(Number(row?.long_context_limit_tokens ?? row?.longContextLimitTokens))
+      : null,
+    pricing: (() => {
+      const value = row?.pricing_json ?? row?.pricing;
+      if (!value || typeof value === 'object') return value || null;
+      try { return JSON.parse(value); } catch { return null; }
+    })(),
     enabled,
     sortOrder: Number.isFinite(Number(row?.sort_order ?? row?.sortOrder))
       ? Math.max(0, Math.trunc(Number(row?.sort_order ?? row?.sortOrder)))
@@ -912,6 +930,8 @@ function normalizeModelVariantRow(row = {}) {
 
 function buildModelVariantEntries(baseModels = [], {
   defaultEnabled = true,
+  contextLimitsByModel = {},
+  modelMetadataByModel = {},
 } = {}) {
   const models = uniqueStringList(baseModels);
   const entries = [];
@@ -919,6 +939,11 @@ function buildModelVariantEntries(baseModels = [], {
   for (const baseModelId of models) {
     const provider = modelProviderForId(baseModelId);
     const label = modelDisplayLabel(baseModelId);
+    const contextLimitTokens = Number(contextLimitsByModel?.[baseModelId]);
+    const normalizedContextLimitTokens = Number.isFinite(contextLimitTokens) && contextLimitTokens > 0
+      ? Math.round(contextLimitTokens)
+      : null;
+    const metadata = modelMetadataByModel?.[baseModelId] || {};
     if (isReasoningVariantEligibleModel(baseModelId)) {
       for (const effort of SUPPORTED_REASONING_EFFORTS) {
         entries.push({
@@ -928,6 +953,9 @@ function buildModelVariantEntries(baseModels = [], {
           label,
           reasoningEffort: effort,
           releaseStatus: null,
+          contextLimitTokens: normalizedContextLimitTokens,
+          longContextLimitTokens: toNullableInt(metadata.longContextLimitTokens),
+          pricing: metadata.pricing || null,
           enabled: defaultEnabled ? 1 : 0,
           sortOrder: sortOrder++,
         });
@@ -941,18 +969,48 @@ function buildModelVariantEntries(baseModels = [], {
       label,
       reasoningEffort: null,
       releaseStatus: null,
+      contextLimitTokens: normalizedContextLimitTokens,
+      longContextLimitTokens: toNullableInt(metadata.longContextLimitTokens),
+      pricing: metadata.pricing || null,
       enabled: defaultEnabled ? 1 : 0,
       sortOrder: sortOrder++,
     });
   }
+
   return entries;
 }
 
+function normalizeModelMetadataByModel(value = {}) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const normalized = {};
+  for (const [rawModelId, rawMetadata] of Object.entries(value)) {
+    const modelId = canonicalizeModelId(rawModelId);
+    if (!isValidModelId(modelId) || !rawMetadata || typeof rawMetadata !== 'object') continue;
+    const defaultContextLimitTokens = toNullableInt(rawMetadata.defaultContextLimitTokens);
+    const longContextLimitTokens = toNullableInt(rawMetadata.longContextLimitTokens);
+    const pricing = rawMetadata.pricing && typeof rawMetadata.pricing === 'object' ? rawMetadata.pricing : null;
+    if (defaultContextLimitTokens === null && longContextLimitTokens === null && pricing === null) continue;
+    normalized[modelId] = { defaultContextLimitTokens, longContextLimitTokens, pricing };
+  }
+  return normalized;
+}
+
+function normalizeContextLimitsByModel(value = {}) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const normalized = {};
+  for (const [rawModelId, rawLimit] of Object.entries(value)) {
+    const modelId = canonicalizeModelId(rawModelId);
+    const limit = Number(rawLimit);
+    if (!isValidModelId(modelId) || !Number.isFinite(limit) || limit <= 0) continue;
+    normalized[modelId] = Math.round(limit);
+  }
+  return normalized;
+}
+
 function isModelCatalogRefreshedAtStale(refreshedAt) {
-  if (!refreshedAt) return true;
-  const parsed = Date.parse(refreshedAt);
-  if (!Number.isFinite(parsed)) return true;
-  return (Date.now() - parsed) > MODEL_CATALOG_STALE_MS;
+  return isModelCatalogRefreshStale(refreshedAt, {
+    staleAfterMs: MODEL_CATALOG_STALE_MS,
+  });
 }
 
 function hasValidReasoningByModel(reasoningByModel = {}) {
@@ -971,6 +1029,8 @@ function getModelCatalogState() {
   const modelRows = enabledRows.length ? enabledRows : listModelVariantRows().filter((row) => row.enabled);
   const allRows = listModelVariantRows();
   const reasoningByModel = {};
+  const contextLimitsByModel = {};
+  const modelMetadataByModel = {};
   const models = [];
   const seenModels = new Set();
   for (const row of modelRows) {
@@ -984,6 +1044,16 @@ function getModelCatalogState() {
     const current = reasoningByModel[baseModelId] || [];
     if (!current.includes(effort)) current.push(effort);
     reasoningByModel[baseModelId] = current;
+    if (row.contextLimitTokens !== null && row.contextLimitTokens > 0) {
+      contextLimitsByModel[baseModelId] = row.contextLimitTokens;
+    }
+    if (!modelMetadataByModel[baseModelId]) {
+      modelMetadataByModel[baseModelId] = {
+        defaultContextLimitTokens: row.contextLimitTokens,
+        longContextLimitTokens: row.longContextLimitTokens,
+        pricing: row.pricing,
+      };
+    }
   }
   const knownModelIds = new Set(Object.keys(reasoningByModel));
   for (const row of allRows) {
@@ -994,6 +1064,16 @@ function getModelCatalogState() {
     const current = reasoningByModel[baseModelId] || [];
     if (!current.includes(effort)) current.push(effort);
     reasoningByModel[baseModelId] = current;
+    if (row.contextLimitTokens !== null && row.contextLimitTokens > 0) {
+      contextLimitsByModel[baseModelId] = row.contextLimitTokens;
+    }
+    if (!modelMetadataByModel[baseModelId]) {
+      modelMetadataByModel[baseModelId] = {
+        defaultContextLimitTokens: row.contextLimitTokens,
+        longContextLimitTokens: row.longContextLimitTokens,
+        pricing: row.pricing,
+      };
+    }
   }
   for (const modelId of knownModelIds) {
     const efforts = uniqueStringList(
@@ -1021,11 +1101,14 @@ function getModelCatalogState() {
   const currentModel = String(currentResolved?.baseModelId || selectorState.currentModel || '').trim() || catalogModels[0] || DEFAULT_MODEL;
   const defaultModel = String(defaultResolved?.baseModelId || selectorState.defaultModel || '').trim() || currentModel || catalogModels[0] || DEFAULT_MODEL;
   const reasoningMetadataValid = hasValidReasoningByModel(reasoningByModel);
-  const catalogRefreshedAtStale = isModelCatalogRefreshedAtStale(selectorState.refreshedAt);
+  const inMemoryRefresh = modelCatalog.refreshedAt || null;
+  const refreshedAt = latestModelCatalogRefresh(selectorState.refreshedAt, inMemoryRefresh);
+  const catalogRefreshedAtStale = isModelCatalogRefreshedAtStale(refreshedAt);
   const metadataError = !reasoningMetadataValid || !!selectorState.error || modelRows.length === 0;
   const stale = metadataError;
   const metadataValid = !metadataError;
-  const ageWarning = catalogRefreshedAtStale
+  const catalogAgeMs = Date.now() - Date.parse(refreshedAt || 0);
+  const ageWarning = catalogRefreshedAtStale && Number.isFinite(catalogAgeMs) && catalogAgeMs > MODEL_CATALOG_WARNING_MS
     ? 'Model catalog may be out of date. Refresh models if selections look wrong.'
     : null;
   const warning = [selectorState.warning, ageWarning].filter(Boolean).join(' ').trim() || null;
@@ -1040,15 +1123,33 @@ function getModelCatalogState() {
     currentModel,
     defaultModel,
     source: selectorState.source,
-    refreshedAt: selectorState.refreshedAt,
+    refreshedAt,
     stale,
     metadataValid,
     reasoningMetadataValid,
     warning,
+    catalogAgeWarning: Boolean(ageWarning),
     error: selectorState.error,
     reasoningByModel,
     reasoningEfforts,
+    contextLimitsByModel,
+    modelMetadataByModel,
   };
+}
+
+function touchModelSelectorState({
+  source = 'snapshot',
+  error = null,
+  refreshedAt = new Date().toISOString(),
+} = {}) {
+  if (!modelSelectorSql?.upsertSelectorState?.run) return;
+  const timestamp = latestModelCatalogRefresh(refreshedAt) || new Date().toISOString();
+  modelSelectorSql.upsertSelectorState.run(
+    String(source || 'snapshot').trim() || 'snapshot',
+    timestamp,
+    error ? String(error).trim().slice(0, 300) : null,
+    timestamp,
+  );
 }
 
 function updateModelCatalog(snapshot = {}) {
@@ -1057,6 +1158,9 @@ function updateModelCatalog(snapshot = {}) {
   const incomingDefaultRaw = String(snapshot.defaultModel || '').trim();
   const incomingCurrent = isValidModelId(incomingCurrentRaw) ? incomingCurrentRaw : '';
   const incomingDefault = isValidModelId(incomingDefaultRaw) ? incomingDefaultRaw : '';
+  const contextLimitsByModel = normalizeContextLimitsByModel(snapshot.contextLimitsByModel);
+  const modelMetadataByModel = normalizeModelMetadataByModel(snapshot.modelMetadataByModel);
+  const receivedMetadata = incomingModels.length > 0 || Object.keys(contextLimitsByModel).length > 0 || Object.keys(modelMetadataByModel).length > 0;
   const merged = validatedModelIdList([
     ...curatedModelList(),
     ...incomingModels,
@@ -1076,20 +1180,40 @@ function updateModelCatalog(snapshot = {}) {
     currentModel,
     defaultModel,
     source: String(snapshot.source || modelCatalog.source || 'unknown').trim() || 'unknown',
-    refreshedAt: new Date().toISOString(),
+    refreshedAt: receivedMetadata ? new Date().toISOString() : modelCatalog.refreshedAt,
     error: snapshot.error ? String(snapshot.error).trim().slice(0, 300) : null,
   };
   if (modelSelectorSql?.upsertVariant?.run) {
     const existingBaseIds = new Set(listModelVariantRows().map((r) => r.baseModelId));
     const newBaseIds = models.filter((id) => !existingBaseIds.has(id));
     if (newBaseIds.length) {
-      const newEntries = buildModelVariantEntries(newBaseIds, { defaultEnabled: false });
+      const newEntries = buildModelVariantEntries(newBaseIds, { defaultEnabled: false, contextLimitsByModel, modelMetadataByModel });
       upsertModelVariantCatalogEntries(newEntries, {
         source: String(modelCatalog.source || 'snapshot').trim() || 'snapshot',
         error: modelCatalog.error || null,
         preserveEnabled: true,
       });
     }
+    const nowIso = new Date().toISOString();
+    for (const [modelId, contextLimitTokens] of Object.entries(contextLimitsByModel)) {
+      modelSelectorSql.updateContextLimitForBase.run(contextLimitTokens, nowIso, modelId);
+    }
+    for (const [modelId, metadata] of Object.entries(modelMetadataByModel)) {
+      modelSelectorSql.updateModelMetadataForBase.run(
+        metadata.defaultContextLimitTokens,
+        metadata.longContextLimitTokens,
+        metadata.pricing ? JSON.stringify(metadata.pricing) : null,
+        nowIso,
+        modelId,
+      );
+    }
+  }
+  if (receivedMetadata && modelSelectorSql?.upsertSelectorState?.run) {
+    touchModelSelectorState({
+      source: modelCatalog.source,
+      error: modelCatalog.error,
+      refreshedAt: modelCatalog.refreshedAt,
+    });
   }
   return getModelCatalogState();
 }
@@ -1191,6 +1315,15 @@ function listEnabledModelVariantRows() {
   return modelSelectorSql.listEnabledVariants.all().map((row) => normalizeModelVariantRow(row));
 }
 
+function getModelContextLimitTokens(modelId = '') {
+  const normalizedModelId = canonicalizeModelId(modelId);
+  if (!normalizedModelId) return null;
+  const row = listModelVariantRows().find((entry) => entry.baseModelId === normalizedModelId
+    && entry.contextLimitTokens !== null
+    && entry.contextLimitTokens > 0);
+  return row?.contextLimitTokens || null;
+}
+
 function parseModelVariantSelection(value) {
   const variantId = String(value || '').trim();
   if (!variantId) return null;
@@ -1272,6 +1405,9 @@ function upsertModelVariantCatalogEntries(entries = [], {
         entry.label || modelDisplayLabel(entry.baseModelId),
         entry.releaseStatus || null,
         entry.reasoningEffort || null,
+        entry.contextLimitTokens || null,
+        entry.longContextLimitTokens || null,
+        entry.pricing ? JSON.stringify(entry.pricing) : null,
         enabled,
         entry.sortOrder,
         nowIso,
@@ -1288,6 +1424,9 @@ function upsertModelVariantCatalogEntries(entries = [], {
           row.label || modelDisplayLabel(row.baseModelId),
           'unavailable',
           row.reasoningEffort || null,
+          row.contextLimitTokens || null,
+          row.longContextLimitTokens || null,
+          row.pricing ? JSON.stringify(row.pricing) : null,
           row.enabled ? 1 : 0,
           row.sortOrder,
           nowIso,
@@ -1392,19 +1531,19 @@ async function refreshModelVariantCatalogFromCli() {
   let source = 'rpc-snapshot';
   let modelIds = [];
   let reasoningEfforts = SUPPORTED_REASONING_EFFORTS.slice();
+  const hasAuthoritativeSnapshot = /^(web-relay-extension|standalone-relay):/.test(String(modelCatalog.source || ''));
   const refreshSelectionFromSnapshot = selectModelIdsForVariantRefresh({
-    snapshotModels: Array.isArray(modelCatalog.models) ? modelCatalog.models : [],
+    snapshotModels: hasAuthoritativeSnapshot && Array.isArray(modelCatalog.models) ? modelCatalog.models : [],
     currentModel: modelCatalog.currentModel,
     defaultModel: modelCatalog.defaultModel,
     helpModelIds: [],
   });
   source = refreshSelectionFromSnapshot.source;
   modelIds = refreshSelectionFromSnapshot.modelIds;
+  const genericHelpText = await runCopilotCliCommand(['help']).catch(() => '');
+  reasoningEfforts = parseReasoningEffortsFromHelpOutput(genericHelpText);
   if (!modelIds.length) {
-    const [configHelpText, genericHelpText] = await Promise.all([
-      runCopilotCliCommand(['help', 'config']),
-      runCopilotCliCommand(['help']),
-    ]);
+    const configHelpText = await runCopilotCliCommand(['help', 'config']);
     const helpModelIds = parseModelsFromHelpConfigOutput(configHelpText);
     const refreshSelectionFromHelp = selectModelIdsForVariantRefresh({
       snapshotModels: [],
@@ -1414,7 +1553,6 @@ async function refreshModelVariantCatalogFromCli() {
     });
     source = refreshSelectionFromHelp.source;
     modelIds = refreshSelectionFromHelp.modelIds;
-    reasoningEfforts = parseReasoningEffortsFromHelpOutput(genericHelpText);
   }
   const entries = [];
   let sortOrder = 0;
@@ -1525,6 +1663,7 @@ db.exec(`
     model               TEXT,
     model_variant_id    TEXT,
     reasoning_effort    TEXT,
+    context_tier        TEXT,
     relay_mode          TEXT NOT NULL DEFAULT 'agent',
     text                TEXT NOT NULL,
     attachments         TEXT,
@@ -1651,6 +1790,9 @@ db.exec(`
     label            TEXT NOT NULL,
     release_status   TEXT,
     reasoning_effort TEXT,
+    context_limit_tokens INTEGER,
+    long_context_limit_tokens INTEGER,
+    pricing_json     TEXT,
     enabled          INTEGER NOT NULL DEFAULT 1,
     sort_order       INTEGER NOT NULL DEFAULT 0,
     updated_at       TEXT NOT NULL
@@ -1902,6 +2044,9 @@ if (!queueColumns.includes('model_variant_id')) {
 if (!queueColumns.includes('reasoning_effort')) {
   db.exec(`ALTER TABLE queue ADD COLUMN reasoning_effort TEXT`);
 }
+if (!queueColumns.includes('context_tier')) {
+  db.exec(`ALTER TABLE queue ADD COLUMN context_tier TEXT`);
+}
 if (!queueColumns.includes('runtime_session_id')) {
   db.exec(`ALTER TABLE queue ADD COLUMN runtime_session_id TEXT`);
 }
@@ -2097,6 +2242,16 @@ const relayStreamEventColumns = db.prepare(`PRAGMA table_info(relay_stream_event
 if (relayStreamEventColumns.length && !relayStreamEventColumns.includes('subagent_run_id')) {
   db.exec(`ALTER TABLE relay_stream_events ADD COLUMN subagent_run_id TEXT`);
 }
+const modelVariantColumns = db.prepare(`PRAGMA table_info(model_variants)`).all().map((c) => c.name);
+if (modelVariantColumns.length && !modelVariantColumns.includes('context_limit_tokens')) {
+  db.exec(`ALTER TABLE model_variants ADD COLUMN context_limit_tokens INTEGER`);
+}
+if (modelVariantColumns.length && !modelVariantColumns.includes('long_context_limit_tokens')) {
+  db.exec(`ALTER TABLE model_variants ADD COLUMN long_context_limit_tokens INTEGER`);
+}
+if (modelVariantColumns.length && !modelVariantColumns.includes('pricing_json')) {
+  db.exec(`ALTER TABLE model_variants ADD COLUMN pricing_json TEXT`);
+}
 
 // ─── Prepared Statements ──────────────────────────────────────────────────────
 const stmts = {
@@ -2107,29 +2262,45 @@ const stmts = {
 
 modelSelectorSql = {
   listVariants: db.prepare(`
-    SELECT variant_id, base_model_id, provider, label, release_status, reasoning_effort, enabled, sort_order, updated_at
+    SELECT variant_id, base_model_id, provider, label, release_status, reasoning_effort, context_limit_tokens, long_context_limit_tokens, pricing_json, enabled, sort_order, updated_at
     FROM model_variants
     ORDER BY provider ASC, sort_order ASC, variant_id ASC
   `),
   listEnabledVariants: db.prepare(`
-    SELECT variant_id, base_model_id, provider, label, release_status, reasoning_effort, enabled, sort_order, updated_at
+    SELECT variant_id, base_model_id, provider, label, release_status, reasoning_effort, context_limit_tokens, long_context_limit_tokens, pricing_json, enabled, sort_order, updated_at
     FROM model_variants
     WHERE enabled = 1
     ORDER BY provider ASC, sort_order ASC, variant_id ASC
   `),
   upsertVariant: db.prepare(`
     INSERT INTO model_variants (
-      variant_id, base_model_id, provider, label, release_status, reasoning_effort, enabled, sort_order, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      variant_id, base_model_id, provider, label, release_status, reasoning_effort, context_limit_tokens, long_context_limit_tokens, pricing_json, enabled, sort_order, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(variant_id) DO UPDATE SET
       base_model_id = excluded.base_model_id,
       provider = excluded.provider,
       label = excluded.label,
       release_status = excluded.release_status,
       reasoning_effort = excluded.reasoning_effort,
+      context_limit_tokens = COALESCE(excluded.context_limit_tokens, model_variants.context_limit_tokens),
+      long_context_limit_tokens = COALESCE(excluded.long_context_limit_tokens, model_variants.long_context_limit_tokens),
+      pricing_json = COALESCE(excluded.pricing_json, model_variants.pricing_json),
       enabled = excluded.enabled,
       sort_order = excluded.sort_order,
       updated_at = excluded.updated_at
+  `),
+  updateContextLimitForBase: db.prepare(`
+    UPDATE model_variants
+    SET context_limit_tokens = ?, updated_at = ?
+    WHERE base_model_id = ?
+  `),
+  updateModelMetadataForBase: db.prepare(`
+    UPDATE model_variants
+    SET context_limit_tokens = COALESCE(?, context_limit_tokens),
+        long_context_limit_tokens = COALESCE(?, long_context_limit_tokens),
+        pricing_json = COALESCE(?, pricing_json),
+        updated_at = ?
+    WHERE base_model_id = ?
   `),
   disableAllVariants: db.prepare(`UPDATE model_variants SET enabled = 0, updated_at = ?`),
   enableVariant: db.prepare(`UPDATE model_variants SET enabled = 1, updated_at = ? WHERE variant_id = ?`),
@@ -2188,6 +2359,9 @@ modelSelectorSql = {
         entry.label || modelDisplayLabel(entry.baseModelId),
         entry.releaseStatus || null,
         entry.reasoningEffort || null,
+        entry.contextLimitTokens || null,
+        entry.longContextLimitTokens || null,
+        entry.pricing ? JSON.stringify(entry.pricing) : null,
         entry.enabled ? 1 : 0,
         entry.sortOrder,
         nowIso,
@@ -2217,6 +2391,9 @@ modelSelectorSql = {
           entry.label,
           entry.releaseStatus || null,
           entry.reasoningEffort || null,
+          entry.contextLimitTokens || null,
+          entry.longContextLimitTokens || null,
+          entry.pricing ? JSON.stringify(entry.pricing) : null,
           entry.enabled ? 1 : 0,
           entry.sortOrder,
           nowIso,
@@ -4324,6 +4501,7 @@ const contextSnapshotService = createContextSnapshotService({
   fs,
   path,
   resolveSessionStateRoot,
+  getModelContextLimitTokens,
 });
 const readContextFromSessionEvents = contextSnapshotService.readContextFromSessionEvents;
 

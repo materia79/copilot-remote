@@ -74,6 +74,8 @@ export function buildModelVariantCatalogPayload({
   rows = [],
   modelState = {},
   reasoningEfforts = [],
+  contextLimitsByModel = null,
+  modelMetadataByModel = null,
 } = {}) {
   const safeRows = Array.isArray(rows) ? rows : [];
   const enabledVariantIds = safeRows
@@ -82,6 +84,11 @@ export function buildModelVariantCatalogPayload({
   const reasoningByModel = modelState?.reasoningByModel && typeof modelState.reasoningByModel === 'object'
     ? modelState.reasoningByModel
     : buildReasoningByModelFromVariantRows(safeRows);
+  const effectiveContextLimitsByModel = contextLimitsByModel && typeof contextLimitsByModel === 'object'
+    ? contextLimitsByModel
+    : (modelState?.contextLimitsByModel && typeof modelState.contextLimitsByModel === 'object'
+      ? modelState.contextLimitsByModel
+      : {});
   return {
     variants: safeRows.map((row) => ({
       variantId: row.variantId,
@@ -90,6 +97,9 @@ export function buildModelVariantCatalogPayload({
       label: row.label,
       releaseStatus: row.releaseStatus || null,
       reasoningEffort: row.reasoningEffort || null,
+      contextLimitTokens: row.contextLimitTokens || null,
+      longContextLimitTokens: row.longContextLimitTokens || null,
+      pricing: row.pricing || null,
       enabled: !!row.enabled,
       sortOrder: row.sortOrder,
     })),
@@ -100,6 +110,10 @@ export function buildModelVariantCatalogPayload({
     warning: modelState?.warning || null,
     error: modelState?.error || null,
     reasoningEfforts: Array.isArray(reasoningEfforts) ? reasoningEfforts : [],
+    contextLimitsByModel: effectiveContextLimitsByModel,
+    modelMetadataByModel: modelMetadataByModel && typeof modelMetadataByModel === 'object'
+      ? modelMetadataByModel
+      : (modelState?.modelMetadataByModel || {}),
   };
 }
 
@@ -1311,6 +1325,7 @@ export function registerSessionsRoutes(app, deps) {
     parseSessionEventsToMessages,
     discoverSessionStateConversations,
     inFlightStateForConversation,
+    isDeletedSdkSession: (sdkSessionId) => !!stmts.getDeletedSdkSession.get(String(sdkSessionId || '').trim()),
   });
   const SHARED_PRESENCE_RATE_WINDOW_MS = 10_000;
   const SHARED_PRESENCE_RATE_LIMIT = 24;
@@ -2937,8 +2952,16 @@ export function registerSessionsRoutes(app, deps) {
     if (!conversationDraftPersistenceEnabled) {
       return res.status(404).json({ error: 'Conversation draft persistence is disabled' });
     }
-    const conversationId = String(req.params.id || '').trim();
-    if (!conversationId) return res.status(400).json({ error: 'Missing conversation id' });
+    const requestedId = String(req.params.id || '').trim();
+    if (!requestedId) return res.status(400).json({ error: 'Missing conversation id' });
+    const resolvedConversation = resolveConversationByIdOrSdkSessionId(requestedId);
+    const ensured = resolvedConversation
+      ? { ok: true, created: false, conversation: resolvedConversation }
+      : sessionHistoryRefreshService.ensureConversationForRefresh(requestedId);
+    if (!ensured?.ok) {
+      return res.status(Number(ensured?.statusCode || 404)).json({ error: ensured?.error || 'Conversation not found' });
+    }
+    const conversationId = String(ensured?.conversation?.id || requestedId).trim();
     const senderClientId = String(req.body?.clientId || '').trim() || null;
     const existing = stmts.getConvAnyStatus.get(conversationId);
     if (!existing || String(existing.status || '').trim() === 'deleted') {
@@ -3483,6 +3506,8 @@ export function registerSessionsRoutes(app, deps) {
       rows,
       modelState,
       reasoningEfforts: modelState.reasoningEfforts || [],
+      contextLimitsByModel: modelState.contextLimitsByModel || {},
+      modelMetadataByModel: modelState.modelMetadataByModel || {},
     });
   }
 
@@ -3536,9 +3561,12 @@ export function registerSessionsRoutes(app, deps) {
       defaultModel: modelState.defaultModel,
       reasoningByModel: modelState.reasoningByModel || {},
       reasoningEfforts: modelState.reasoningEfforts || [],
+      contextLimitsByModel: modelState.contextLimitsByModel || {},
+      modelMetadataByModel: modelState.modelMetadataByModel || {},
       stale: modelState.stale,
       metadataValid: modelState.metadataValid === true,
       reasoningMetadataValid: modelState.reasoningMetadataValid === true,
+      catalogAgeWarning: modelState.catalogAgeWarning === true,
       refreshedAt: modelState.refreshedAt,
       source: modelState.source,
       warning: modelState.warning,
@@ -3547,11 +3575,13 @@ export function registerSessionsRoutes(app, deps) {
   });
 
   app.post('/api/models/snapshot', auth, (req, res) => {
-    const { models, currentModel, defaultModel, source, error } = req.body || {};
+    const { models, currentModel, defaultModel, source, error, contextLimitsByModel, modelMetadataByModel } = req.body || {};
     const nextState = updateModelCatalog({
       models: Array.isArray(models) ? models : [],
       currentModel,
       defaultModel,
+      contextLimitsByModel,
+      modelMetadataByModel,
       source: source || 'relay-extension',
       error,
     });

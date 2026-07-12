@@ -1,5 +1,12 @@
 'use strict';
 
+import {
+  formatStoreMemoryActivity,
+  formatToolResultActivity,
+  parseToolPayload,
+  formatVoteMemoryActivity,
+} from '../../shared/tool-activity.mjs';
+
 export function createSessionTranscriptService({ fs, path, resolveSessionStateRoot }) {
   const TRANSCRIPT_CACHE_MAX = 128;
   const transcriptCache = new Map();
@@ -131,8 +138,10 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
   function summarizeToolDetail(toolName, args, result) {
     const name = String(toolName || '').trim();
     if (!name) return '';
-    const a = args && typeof args === 'object' ? args : null;
+    const parsedArgs = parseToolPayload(args);
+    const a = parsedArgs && typeof parsedArgs === 'object' ? parsedArgs : null;
     const r = result && typeof result === 'object' ? result : null;
+    const lowerName = name.toLowerCase();
 
     if (name === 'apply_patch') {
       if (typeof args === 'string') {
@@ -153,7 +162,12 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
     if (name === 'sql') return String(a?.description || '').trim();
     if (name === 'ask_user') return String(a?.question || '').trim();
     if (name === 'report_intent') return String(a?.intent || '').trim();
-    if (name === 'web_fetch') return String(a?.url || '').trim();
+    if (lowerName.includes('web_fetch') || lowerName.includes('web fetch')) {
+      return String(a?.url || '').trim();
+    }
+    if (lowerName.includes('web_search') || lowerName.includes('web search')) {
+      return String(a?.query || a?.prompt || '').trim();
+    }
     if (name === 'task') return String(a?.description || '').trim();
     return '';
   }
@@ -196,7 +210,16 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
         const toolName = String(toolNameByCallId.get(toolCallId) || data.toolName || '').trim();
         if (!turnId || !toolName || toolName === 'report_intent') continue;
         const detail = summarizeToolDetail(toolName, toolArgsByCallId.get(toolCallId), data.result);
-        appendTurnActivity(turnActivities, turnId, detail ? `Tool (${toolName}): ${detail}` : `Tool (${toolName})`);
+        const toolArgs = toolArgsByCallId.get(toolCallId);
+        if (toolName.toLowerCase().includes('store_memory')) {
+          appendTurnActivity(turnActivities, turnId, formatStoreMemoryActivity(toolName, toolArgs));
+        } else if (toolName.toLowerCase().includes('vote_memory')) {
+          appendTurnActivity(turnActivities, turnId, formatVoteMemoryActivity(toolName, toolArgs));
+        } else {
+          appendTurnActivity(turnActivities, turnId, detail ? `Tool (${toolName}): ${detail}` : `Tool (${toolName})`);
+        }
+        const resultActivity = formatToolResultActivity(toolName, data.result);
+        if (resultActivity) appendTurnActivity(turnActivities, turnId, resultActivity);
         continue;
       }
 

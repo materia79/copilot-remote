@@ -1,3 +1,9 @@
+import {
+  formatStoreMemoryActivity,
+  formatToolResultActivity as formatSharedToolResultActivity,
+  formatVoteMemoryActivity,
+} from "../../../../shared/tool-activity.mjs";
+
 export function normalizeActivityText(value, maxToolDetailLength = 140) {
   const text = String(value || "").trim();
   if (!text) return "";
@@ -81,6 +87,8 @@ export function extractToolDetail(request, maxToolDetailLength = 140) {
     args.intent ||
     args.pattern ||
     args.path ||
+    args.query ||
+    args.url ||
     args.command ||
     "",
     maxToolDetailLength,
@@ -100,11 +108,24 @@ export function formatToolActivity(request, maxToolDetailLength = 140) {
   const lower = rawName.toLowerCase();
   const detail = extractToolDetail(request, maxToolDetailLength);
 
+  if (lower.includes("store_memory")) {
+    return formatStoreMemoryActivity(rawName, toolArgsSnapshot(request));
+  }
+  if (lower.includes("vote_memory")) {
+    return formatVoteMemoryActivity(rawName, toolArgsSnapshot(request));
+  }
+
   if (lower.includes("search (glob)") || /(^|[.\s_-])glob($|[.\s_-])/.test(lower)) {
     return detail ? `Search (glob): ${detail}` : "Search (glob)";
   }
   if (lower.includes("search (grep)") || /(^|[.\s_-])(rg|grep)($|[.\s_-])/.test(lower)) {
     return detail ? `Search (grep): ${detail}` : "Search (grep)";
+  }
+  if (lower.includes("web_search") || lower.includes("web search")) {
+    return detail ? `Web Search: ${detail}` : "Web Search";
+  }
+  if (lower.includes("web_fetch") || lower.includes("web fetch")) {
+    return detail ? `Web Fetch: ${detail}` : "Web Fetch";
   }
   if (lower.includes("ask_user")) {
     return detail ? `Tool (ask_user): ${detail}` : "Tool (ask_user)";
@@ -113,6 +134,10 @@ export function formatToolActivity(request, maxToolDetailLength = 140) {
     return detail ? `● ${detail}` : "● Working…";
   }
   return detail ? `Tool (${rawName}): ${detail}` : `Tool (${rawName})`;
+}
+
+export function formatToolResultActivity(request, result, maxToolDetailLength = 140) {
+  return formatSharedToolResultActivity(extractToolName(request), result, maxToolDetailLength);
 }
 
 export function isAskUserTool(request) {

@@ -153,6 +153,23 @@ test('ensureConversationForRefresh bootstraps discovered-only session', () => {
   assert.equal(result.conversation.sdk_session_id, 'conv-2');
 });
 
+test('ensureConversationForRefresh rejects discovered tombstoned session', () => {
+  const db = makeDb();
+  const stmts = makeStmts(db);
+  const service = createSessionHistoryRefreshService({
+    db,
+    stmts,
+    discoverSessionStateConversations: () => ([
+      { sdkSessionId: 'conv-deleted', title: 'Deleted Session' },
+    ]),
+    isDeletedSdkSession: (sdkSessionId) => String(sdkSessionId || '').trim() === 'conv-deleted',
+  });
+  const result = service.ensureConversationForRefresh('conv-deleted');
+  assert.equal(result.ok, false);
+  assert.equal(result.statusCode, 404);
+  assert.equal(result.error, 'Conversation not found');
+});
+
 test('evaluateRefreshIdleState rejects busy queue and in-flight processing', () => {
   const db = makeDb();
   const stmts = makeStmts(db);

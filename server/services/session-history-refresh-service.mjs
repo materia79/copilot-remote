@@ -40,6 +40,7 @@ export function createSessionHistoryRefreshService({
   parseSessionEventsToMessages = null,
   discoverSessionStateConversations = null,
   inFlightStateForConversation = null,
+  isDeletedSdkSession = null,
 } = {}) {
   const countBusyQueueByConversation = db.prepare(`
     SELECT COUNT(*) AS cnt
@@ -132,6 +133,9 @@ export function createSessionHistoryRefreshService({
     const requestedId = normalizeId(conversationId);
     if (!requestedId) {
       return { ok: false, statusCode: 400, error: 'Missing conversation id' };
+    }
+    if (typeof isDeletedSdkSession === 'function' && isDeletedSdkSession(requestedId)) {
+      return { ok: false, statusCode: 404, error: 'Conversation not found' };
     }
     const existing = stmts.getConv.get(requestedId);
     if (existing) return { ok: true, created: false, conversation: existing };

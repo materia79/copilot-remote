@@ -459,3 +459,43 @@ test('GET /api/models reports invalid metadata when reasoning map is empty', asy
   assert.equal(response.body.stale, true);
   assert.deepEqual(response.body.reasoningByModel, {});
 });
+
+test('POST /api/models/snapshot forwards context limits and returns freshness metadata', async () => {
+  const rows = { current: [] };
+  const modelState = {
+    current: {
+      models: ['auto', 'gpt-5.6-terra'],
+      currentModel: 'gpt-5.6-terra',
+      defaultModel: 'gpt-5.6-terra',
+      reasoningByModel: { auto: ['none'], 'gpt-5.6-terra': ['none'] },
+      reasoningEfforts: ['none'],
+      contextLimitsByModel: { 'gpt-5.6-terra': 272000 },
+      stale: false,
+      metadataValid: true,
+      reasoningMetadataValid: true,
+      catalogAgeWarning: false,
+      refreshedAt: '2026-07-12T09:03:53.203Z',
+      source: 'web-relay-extension:poll',
+      warning: null,
+      error: null,
+    },
+  };
+  const { app } = createRuntimeDeps({ rows, modelState, onRefresh: async () => {} });
+  const handlers = app.routes.get('POST /api/models/snapshot');
+  const response = await callRoute(handlers, {
+    headers: {},
+    query: {},
+    params: {},
+    body: {
+      models: ['gpt-5.6-terra'],
+      currentModel: 'gpt-5.6-terra',
+      defaultModel: 'gpt-5.6-terra',
+      source: 'web-relay-extension:poll',
+      contextLimitsByModel: { 'gpt-5.6-terra': 272000 },
+    },
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body.contextLimitsByModel['gpt-5.6-terra'], 272000);
+  assert.equal(response.body.catalogAgeWarning, false);
+});

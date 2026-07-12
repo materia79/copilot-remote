@@ -614,6 +614,7 @@ function createMessageNode(msg, msgId = null, force = false) {
     : renderMarkdownPreview(msg.text || '', false);
   const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
   const activities = Array.isArray(msg.activities) ? msg.activities.filter(Boolean).slice(0, 48) : [];
+  if (activities.length) div.classList.add('msg-with-activity');
   const thoughts = Array.isArray(msg.thoughts) ? msg.thoughts.filter((t) => t && String(t.text || '').trim()) : [];
   const attachmentHtml = attachments.length ? renderAttachmentMarkup(attachments) : '';
   const activityHtml = activities.length ? renderActivityMarkup(activities) : '';
@@ -1842,6 +1843,7 @@ export async function sendMessage() {
     const msgTimestamp = new Date().toISOString();
     const selectedModel = document.getElementById('model-select').value || '';
     const selectedReasoningEffort = String(document.getElementById('reasoning-effort-select')?.value || '').trim().toLowerCase();
+    const selectedContextTier = String(document.getElementById('context-tier-select')?.value || 'default').trim();
     if (!selectedReasoningEffort) {
       showTransientRelayNotice('Select a reasoning effort after refreshing model metadata.');
       return;
@@ -1863,6 +1865,7 @@ export async function sendMessage() {
       text,
       model: selectedModel,
       reasoningEffort: selectedReasoningEffort,
+      contextTier: selectedContextTier,
       relayMode: selectedMode,
       conversationId: targetConversationId || undefined,
       newConversation: isNew || undefined,

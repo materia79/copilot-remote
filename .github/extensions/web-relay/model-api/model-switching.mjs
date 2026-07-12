@@ -1,4 +1,10 @@
 import { isValidModelId, normalizeModelIdCandidate } from "../../../../shared/model-id.mjs";
+import {
+  extractModelDescriptors,
+  normalizeContextLimitTokens,
+} from "../../../../shared/model-descriptors.mjs";
+
+export { extractModelDescriptors };
 
 export function createModelSwitchingService({
   api,
@@ -7,6 +13,7 @@ export function createModelSwitchingService({
   modelSnapshotMinIntervalMs,
 }) {
   let lastModelSnapshotMs = 0;
+  const cachedModelMetadataById = new Map();
   const MODEL_ALIAS_CANDIDATES = {
     "sonnet-4.6": ["sonnet-4.6", "claude-sonnet-4.6", "claude-sonnet-4-6", "anthropic/claude-sonnet-4.6"],
     "haiku-4.5": ["haiku-4.5", "claude-haiku-4.5", "claude-haiku-4-5", "anthropic/claude-haiku-4.5"],
@@ -37,49 +44,83 @@ export function createModelSwitchingService({
     return String(id || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
   }
 
-  function extractModelIds(value, out = []) {
-    const CONTAINER_KEYS = ["data", "models", "list", "available", "items", "entries", "result", "response"];
-    if (!value) return out;
-    if (typeof value === "string") {
-      const candidate = normalizeModelIdCandidate(value);
-      if (isValidModelId(candidate)) out.push(candidate);
-      return out;
+  function appendDescriptorsWithPriority(raw, found, priority) {
+    const descriptors = [];
+    extractModelDescriptors(raw, descriptors);
+    for (const descriptor of descriptors) {
+      found.push({ ...descriptor, __priority: priority });
     }
-    if (Array.isArray(value)) {
-      for (const item of value) extractModelIds(item, out);
-      return out;
+  }
+
+  async function getAvailableModels() {
+    const session = getSession();
+    const modelApi = session?.rpc?.model;
+    if (!modelApi && !session?.connection?.sendRequest) {
+      if (!cachedModelMetadataById.size) return [];
+      return [...cachedModelMetadataById.values()];
     }
-    if (typeof value === "object") {
-      for (const key of ["modelId", "id", "model"]) {
-        const candidate = normalizeModelIdCandidate(value[key]);
-        if (isValidModelId(candidate)) out.push(candidate);
+    const found = [];
+
+    const sendRequest = session?.connection?.sendRequest;
+    if (typeof sendRequest === "function") {
+      try {
+        const raw = await sendRequest.call(session.connection, "models.list", {});
+        appendDescriptorsWithPriority(raw, found, 3);
+      } catch {
+        // Keep going with session-scoped model APIs.
       }
-      for (const key of CONTAINER_KEYS) {
-        const next = value[key];
-        if (next !== undefined && next !== null) {
-          extractModelIds(next, out);
+    }
+
+    if (typeof modelApi?.list === "function") {
+      try {
+        const raw = await modelApi.list.call(modelApi, { skipCache: true });
+        appendDescriptorsWithPriority(raw, found, 2);
+      } catch {
+        // Continue with compatibility fallbacks below.
+      }
+    }
+
+    if (modelApi) {
+      for (const fnName of ["getAvailable", "available", "getAll", "list"]) {
+        const fn = modelApi[fnName];
+        if (typeof fn !== "function") continue;
+        try {
+          const raw = await fn.call(modelApi);
+          appendDescriptorsWithPriority(raw, found, 1);
+        } catch {
+          // Continue with other API shapes.
         }
       }
     }
-    return out;
+
+    found.sort((a, b) => Number(b?.__priority || 0) - Number(a?.__priority || 0));
+    const byModelId = new Map();
+    for (const entry of found) {
+      const modelId = normalizeModelIdCandidate(entry?.modelId);
+      if (!isValidModelId(modelId)) continue;
+      const existing = byModelId.get(modelId);
+      const cached = cachedModelMetadataById.get(modelId);
+      byModelId.set(modelId, {
+        modelId,
+        contextLimitTokens: existing?.contextLimitTokens
+          ?? normalizeContextLimitTokens(entry?.contextLimitTokens)
+          ?? cached?.contextLimitTokens
+          ?? null,
+        longContextLimitTokens: existing?.longContextLimitTokens
+          ?? normalizeContextLimitTokens(entry?.longContextLimitTokens)
+          ?? cached?.longContextLimitTokens
+          ?? null,
+        pricing: existing?.pricing || entry?.pricing || cached?.pricing || null,
+      });
+    }
+    const models = byModelId.size ? [...byModelId.values()] : [...cachedModelMetadataById.values()];
+    for (const entry of models) cachedModelMetadataById.set(entry.modelId, entry);
+    return models;
   }
 
   async function getAvailableModelIds() {
-    const modelApi = getSession()?.rpc?.model;
-    if (!modelApi) return [];
-
-    const found = [];
-    for (const fnName of ["list", "getAvailable", "available", "getAll"]) {
-      const fn = modelApi[fnName];
-      if (typeof fn !== "function") continue;
-      try {
-        const raw = await fn.call(modelApi);
-        extractModelIds(raw, found);
-      } catch {
-        // Continue with other API shapes.
-      }
-    }
-    return [...new Set(found.map((value) => String(value || "").trim()).filter(Boolean))];
+    const models = await getAvailableModels();
+    return models.map((entry) => entry.modelId);
   }
 
   async function getCurrentModelId() {
@@ -98,19 +139,34 @@ export function createModelSwitchingService({
 
     try {
       const currentModel = await getCurrentModelId();
-      const models = await getAvailableModelIds();
+      const availableModels = await getAvailableModels();
+      const models = availableModels.map((entry) => entry.modelId);
+      const contextLimitsByModel = Object.fromEntries(
+        availableModels
+          .filter((entry) => entry.contextLimitTokens !== null)
+          .map((entry) => [entry.modelId, entry.contextLimitTokens]),
+      );
+      const modelMetadataByModel = Object.fromEntries(
+        availableModels.map((entry) => [entry.modelId, {
+          defaultContextLimitTokens: entry.contextLimitTokens,
+          longContextLimitTokens: entry.longContextLimitTokens,
+          pricing: entry.pricing,
+        }]),
+      );
       const modelListWarning = (!models.length && !currentModel)
         ? "CLI did not expose a usable model list."
         : null;
       const payload = {
         source: `web-relay-extension:${reason}`,
         models,
+        contextLimitsByModel,
+        modelMetadataByModel,
         currentModel: currentModel || null,
         defaultModel: currentModel || models[0] || null,
         error: modelListWarning,
       };
       await api("POST", "/api/models/snapshot", payload);
-      dbg("model snapshot published", `reason=${reason}`, `models=${models.length}`, `current=${currentModel || "unknown"}`);
+      dbg("model snapshot published", `reason=${reason}`, `models=${models.length}`, `contextLimits=${Object.keys(contextLimitsByModel).length}`, `current=${currentModel || "unknown"}`);
     } catch (e) {
       dbg("model snapshot publish failed", `reason=${reason}`, e?.message || String(e));
       await api("POST", "/api/models/snapshot", {
@@ -138,12 +194,12 @@ export function createModelSwitchingService({
     return candidates[0] || target;
   }
 
-  async function setModelForMessage(model) {
+  async function setModelForMessage(model, contextTier = 'default') {
     const requested = String(model || "").trim();
     if (!requested) return { requested, current: await getCurrentModelId(), switched: false };
 
     const current = await getCurrentModelId();
-    if (canonicalModelId(current) === canonicalModelId(requested)) {
+    if (canonicalModelId(current) === canonicalModelId(requested) && contextTier === 'default') {
       return { requested, current, switched: true, after: current, via: "already-active" };
     }
 
@@ -156,7 +212,7 @@ export function createModelSwitchingService({
 
     for (const candidate of [targetModel, requested]) {
       try {
-        const result = await getSession()?.rpc?.model?.switchTo({ modelId: candidate });
+        const result = await getSession()?.rpc?.model?.switchTo({ modelId: candidate, contextTier });
         const after = normalizeModelId(result) || await getCurrentModelId();
         if (
           canonicalModelId(after) === canonicalModelId(requested) ||
@@ -175,6 +231,7 @@ export function createModelSwitchingService({
   }
 
   return {
+    getAvailableModels,
     getCurrentModelId,
     setModelForMessage,
     publishModelSnapshot,

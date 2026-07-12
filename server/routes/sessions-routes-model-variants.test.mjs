@@ -68,7 +68,9 @@ test('buildModelVariantCatalogPayload includes reasoningByModel from model state
     modelState: {
       reasoningByModel: { 'gpt-5.4': ['none', 'low'] },
       reasoningEfforts: ['none', 'low'],
+      contextLimitsByModel: { 'gpt-5.4': 256000 },
     },
   });
   assert.deepEqual(payload.reasoningByModel['gpt-5.4'], ['none', 'low']);
+  assert.equal(payload.contextLimitsByModel['gpt-5.4'], 256000);
 });

@@ -835,6 +835,14 @@ function isOverlaySidebarViewport() {
   return window.matchMedia('(max-width: 680px)').matches;
 }
 
+function syncMobileSidebarTopOffset() {
+  const header = document.getElementById('chat-header');
+  const top = isOverlaySidebarViewport() && header
+    ? Math.max(0, Math.ceil(header.getBoundingClientRect().bottom))
+    : 0;
+  document.documentElement.style.setProperty('--mobile-sidebar-top', `${top}px`);
+}
+
 function parseCssPx(value) {
   const numeric = Number.parseFloat(String(value || ''));
   return Number.isFinite(numeric) ? numeric : 0;
@@ -859,6 +867,13 @@ function measureSidebarHeaderMinWidthPx() {
   const statusDot = document.getElementById('cli-dot');
   if (isVisibleElement(statusDot)) {
     neededWidth += Math.ceil(statusDot.getBoundingClientRect().width || 0);
+    sectionCount += 1;
+  }
+
+  const newConversationButton = document.getElementById('new-conv-btn');
+  if (isVisibleElement(newConversationButton)) {
+    const buttonStyle = window.getComputedStyle(newConversationButton);
+    neededWidth += Math.ceil(parseCssPx(buttonStyle.minWidth));
     sectionCount += 1;
   }
 
@@ -1015,6 +1030,7 @@ function beginSidebarResize(pointerDownEvent) {
 }
 
 export function initSidebarLayout() {
+  syncMobileSidebarTopOffset();
   syncSidebarLayoutState();
   if (window.__sidebarLayoutBound) return;
   window.__sidebarLayoutBound = true;
@@ -1027,6 +1043,11 @@ export function initSidebarLayout() {
   const resync = () => syncSidebarLayoutState();
   window.addEventListener('resize', resync, { passive: true });
   window.addEventListener('orientationchange', resync, { passive: true });
+  const chatHeader = document.getElementById('chat-header');
+  if (chatHeader && typeof ResizeObserver === 'function') {
+    const observer = new ResizeObserver(syncMobileSidebarTopOffset);
+    observer.observe(chatHeader);
+  }
 }
 
 export function setCompactInFlight(value) {
@@ -1108,6 +1129,7 @@ export function syncViewportMetrics() {
   const messagesWidth = messagesEl ? Math.max(0, messagesEl.clientWidth || 0) : layoutWidth;
   document.documentElement.style.setProperty('--messages-height', `${Math.max(0, Math.round(messagesHeight))}px`);
   document.documentElement.style.setProperty('--messages-width', `${Math.max(0, Math.round(messagesWidth))}px`);
+  syncMobileSidebarTopOffset();
 }
 
 export let summaryModalState = {

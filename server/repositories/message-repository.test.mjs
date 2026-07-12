@@ -45,6 +45,7 @@ function createTestDb() {
       model TEXT,
       model_variant_id TEXT,
       reasoning_effort TEXT,
+      context_tier TEXT,
       relay_mode TEXT,
       text TEXT,
       attachments TEXT,

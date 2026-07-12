@@ -372,8 +372,9 @@
   }
 
   #new-conv-btn {
-    margin: 12px; padding: 10px 14px; background: var(--accent); color: #000;
+    margin: 0; padding: 10px 14px; background: var(--accent); color: #000;
     border: none; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: var(--fs-meta-md);
+    flex: 1 1 auto; min-width: 80px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   #new-conv-btn:hover { opacity: 0.85; }
 
@@ -795,6 +796,7 @@
   }
   .msg.user  { align-self: flex-end; align-items: flex-end; }
   .msg.assistant { align-self: flex-start; align-items: flex-start; }
+  .msg.msg-with-activity { width: 100%; }
   .msg-search-target .msg-bubble {
     outline: 2px solid var(--accent);
     outline-offset: 1px;
@@ -817,7 +819,8 @@
   .msg-bubble {
     display: inline-block; width: fit-content;
     padding: 12px 16px; border-radius: 16px; line-height: 1.5; font-size: var(--fs-core-chat-bubble);
-    max-width: 100%; min-width: 0; overflow-wrap: anywhere; word-break: break-word;
+    max-width: 100%; min-width: 0; box-sizing: border-box;
+    overflow-wrap: anywhere; word-break: break-word;
   }
   .msg-bubble.msg-bubble-media-only {
     display: inline-flex;
@@ -832,6 +835,7 @@
     border-bottom-right-radius: 4px;
   }
   .msg.assistant .msg-bubble { background: var(--bot-bg); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+  .msg.msg-with-activity .msg-bubble { width: 100%; }
   .msg-attachments {
     display: inline-flex; flex-direction: column; align-items: flex-start;
     gap: 8px; margin-top: 10px; width: fit-content; max-width: 100%;
@@ -914,7 +918,7 @@
   .thinking-bubble {
     background: var(--bot-bg); border: 1px solid var(--border); border-radius: 16px;
     border-bottom-left-radius: 4px; padding: 12px 18px;
-    max-width: 100%;
+    width: 100%; max-width: 100%; box-sizing: border-box;
     min-width: 0;
   }
   .thinking-bubble-header {
@@ -1068,6 +1072,7 @@
     border-left-width: 2px;
   }
   .msg-activity {
+    width: 100%; max-width: 100%; box-sizing: border-box;
     margin-top: 10px; border-top: 1px dashed var(--border); padding-top: 8px;
   }
   .msg-activity summary {
@@ -1077,14 +1082,15 @@
     word-break: break-word;
   }
   .msg-activity-list {
+    width: 100%; max-width: 100%; box-sizing: border-box;
     margin-top: 8px; display: flex; flex-direction: column; gap: 4px;
     min-width: 0;
   }
   .msg-activity-item {
     color: var(--muted);
     font-size: var(--fs-meta-sm);
-    min-width: 0;
-    white-space: normal;
+    width: 100%; max-width: 100%; box-sizing: border-box; min-width: 0;
+    white-space: pre-wrap;
     overflow-wrap: anywhere;
     word-break: break-word;
   }
@@ -1319,13 +1325,24 @@
     flex-shrink: 0; height: 46px;
   }
   #model-select,
-  #reasoning-effort-select {
+  #reasoning-effort-select,
+  #context-tier-select {
     background: var(--bg3); border: 1px solid var(--border); color: var(--text);
     border-radius: 12px; height: 46px; padding: 0 12px; font-size: var(--fs-core-control);
     min-width: 140px; outline: none;
   }
   #model-select:focus,
-  #reasoning-effort-select:focus { border-color: var(--accent); }
+  #reasoning-effort-select:focus,
+  #context-tier-select:focus { border-color: var(--accent); }
+  #model-pricing-details {
+    display: none; margin-top: 6px; color: var(--muted); font-size: var(--fs-meta-sm);
+  }
+  #model-pricing-details[open] { display: block; }
+  #model-pricing-details summary { cursor: pointer; color: var(--accent); width: fit-content; }
+  .model-pricing-grid {
+    display: grid; grid-template-columns: repeat(4, max-content); gap: 4px 12px; margin: 6px 0 0 14px;
+  }
+  .model-pricing-grid b { color: var(--text); font-weight: 600; }
   #mode-select {
     background: var(--bg3); border: 1px solid var(--border); color: var(--text);
     border-radius: 12px; height: 46px; padding: 0 12px; font-size: var(--fs-core-control);
@@ -2536,7 +2553,8 @@
   @media (max-width: 680px) {
     html { font-size: calc(clamp(12px, 3.4vw, 14px) * var(--font-scale, 1)); }
     #sidebar {
-      position: fixed; top: 0; left: 0; height: 100%; z-index: 20;
+      position: fixed; top: var(--mobile-sidebar-top, 0px); left: 0;
+      height: calc(var(--app-height, 100vh) - var(--mobile-sidebar-top, 0px)); z-index: 20;
       transform: translateX(-100%);
       width: 92vw;
       min-width: 92vw;
@@ -2575,7 +2593,7 @@
     }
     .thinking-bubble-header { margin-bottom: 6px; }
     .sidebar-header { padding: var(--sidebar-header-top-pad-mobile) 12px 12px; gap: 8px; }
-    #new-conv-btn { margin: 10px; padding: 9px 12px; border-radius: 8px; font-size: var(--fs-meta-md); }
+    #new-conv-btn { padding: 9px 12px; border-radius: 8px; font-size: var(--fs-meta-md); }
     #conv-list { padding: 0 5px 8px; }
     .conv-item { padding: 6px 11px; border-radius: 8px; }
     .conv-title {
@@ -2967,11 +2985,11 @@
   <div id="sidebar">
     <div class="sidebar-header">
       <span id="cli-dot" title="CLI status"></span>
+      <button id="new-conv-btn" onclick="newConversation()">+ New Conversation</button>
       <div id="sidebar-actions">
         <button id="install-btn" class="header-icon-btn" onclick="promptInstallApp()" title="Install app to home screen" aria-label="Install app">⬇</button>
       </div>
     </div>
-    <button id="new-conv-btn" onclick="newConversation()">+ New Conversation</button>
     <div id="conv-list"></div>
   </div>
   <div id="sidebar-resizer" role="separator" aria-orientation="vertical" aria-label="Resize conversations sidebar"></div>
@@ -3049,8 +3067,15 @@
         <select id="reasoning-effort-select" title="Reasoning effort" disabled>
           <option value="">Unavailable</option>
         </select>
+        <select id="context-tier-select" title="Context window">
+          <option value="default">Context: default</option>
+        </select>
         <button id="send-btn" onclick="sendMessage()">Send</button>
       </div>
+      <details id="model-pricing-details">
+        <summary id="model-pricing-summary"></summary>
+        <div id="model-pricing-grid" class="model-pricing-grid"></div>
+      </details>
     </div>
   </div>
 </div>
