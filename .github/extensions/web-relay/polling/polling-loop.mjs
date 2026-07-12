@@ -13,7 +13,11 @@ import {
   shouldForceFallbackQuestionBridge,
 } from "./question-text.mjs";
 import { answerCliPromptViaTmux, declineCliPromptViaTmux } from "../utils/tmux-input-bridge.mjs";
-import { extractRequestedSchema, schemaFields } from "../../../../shared/question-schema.mjs";
+import {
+  containsRequestedSchema,
+  extractRequestedSchema,
+  schemaFields,
+} from "../../../../shared/question-schema.mjs";
 
 function isImageAttachment(att) {
   const type = String(att?.type || "").toLowerCase();
@@ -50,6 +54,13 @@ export function evaluateSwitchRetry({
     shouldRetry: true,
     attempts: safeAttempts + 1,
   };
+}
+
+export function shouldUseTmuxAskUserFallback(request) {
+  // Structured requests are delivered through onElicitationRequest. A malformed
+  // schema must also stay on that path so a CLI validation retry cannot create
+  // an unstructured duplicate question card.
+  return !containsRequestedSchema(request);
 }
 
 function readImageBlobFromDataUrl(att) {
@@ -926,6 +937,11 @@ export function createPollingLoop({
           // This happens on Linux where the CLI shows its terminal prompt instead
           const pendingReq = !tmuxBridgeAttempted ? getPendingAskUserRequest?.() : null;
           if (pendingReq && !getLastAskUserBridge?.()) {
+            if (!shouldUseTmuxAskUserFallback(pendingReq)) {
+              dbg("ask_user tmux bridge: structured request skipped; waiting for elicitation callback", `msgId=${message.id}`);
+              setPendingAskUserRequest?.(null);
+              continue;
+            }
             const sessionId = getSessionId?.();
             if (sessionId) {
               tmuxBridgeAttempted = true;

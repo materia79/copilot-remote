@@ -34,6 +34,18 @@ function normalizeActivityEntry(value) {
   return { text, subagentRunId: null };
 }
 
+function normalizeThoughtEntry(value, index) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const text = String(value.text || '').trim();
+  if (!text) return null;
+  return {
+    reasoningId: String(value.reasoningId || '').trim() || `history-thought-${index + 1}`,
+    text,
+    done: value.done !== false,
+    subagentRunId: value.subagentRunId ? String(value.subagentRunId).trim() : null,
+  };
+}
+
 export function createSessionHistoryRefreshService({
   db,
   stmts,
@@ -106,6 +118,25 @@ export function createSessionHistoryRefreshService({
           activity.subagentRunId,
         );
       }
+      const thoughts = ensureArray(message?.thoughts)
+        .map((value, index) => normalizeThoughtEntry(value, index))
+        .filter(Boolean);
+      for (let index = 0; index < thoughts.length; index += 1) {
+        const thought = thoughts[index];
+        if (typeof stmts.insertThought?.run !== 'function') continue;
+        stmts.insertThought.run(
+          String(message?.sourceMessageId || messageId),
+          messageId,
+          conversationId,
+          String(message?.mode || 'agent').trim() || 'agent',
+          thought.reasoningId,
+          index + 1,
+          thought.text,
+          thought.done ? 1 : 0,
+          timestamp,
+          thought.subagentRunId,
+        );
+      }
     }
   }
 
@@ -124,6 +155,7 @@ export function createSessionHistoryRefreshService({
   const replaceRetrievableHistoryTx = db.transaction((conversationId, messages = []) => {
     deleteConversationMessages.run(conversationId);
     deleteConversationActivity.run(conversationId);
+    deleteConversationThoughts.run(conversationId);
     deleteConversationStreamEvents.run(conversationId);
     deleteConversationSubagentRuns.run(conversationId);
     insertRebuiltMessages(conversationId, messages);

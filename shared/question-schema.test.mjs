@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  containsRequestedSchema,
   extractRequestedSchema,
   normalizeSchema,
   schemaFields,
@@ -100,6 +101,18 @@ test('extractRequestedSchema finds schema nested in toolArgs JSON string', () =>
   const schema = extractRequestedSchema(request);
   assert.ok(schema);
   assert.deepEqual(schema.required, ['answer']);
+});
+
+test('containsRequestedSchema detects malformed nested schemas', () => {
+  const request = {
+    toolName: 'ask_user',
+    toolArgs: JSON.stringify({
+      message: 'm',
+      requestedSchema: { answer: { type: 'string' } },
+    }),
+  };
+  assert.equal(containsRequestedSchema(request), true);
+  assert.equal(extractRequestedSchema(request), null);
 });
 
 test('normalizeSchema returns null for non-object schemas', () => {

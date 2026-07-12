@@ -51,7 +51,8 @@ function makeDb() {
       seq INTEGER NOT NULL,
       text TEXT NOT NULL,
       done INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      subagent_run_id TEXT
     );
     CREATE TABLE relay_thought (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -63,7 +64,8 @@ function makeDb() {
       seq INTEGER NOT NULL,
       text TEXT NOT NULL,
       done INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      subagent_run_id TEXT
     );
     CREATE TABLE relay_questions (
       id TEXT PRIMARY KEY,
@@ -104,6 +106,10 @@ function makeStmts(db) {
     insertActivity: db.prepare(`
       INSERT INTO relay_activity (queue_message_id, response_message_id, conversation_id, relay_mode, text, created_at, subagent_run_id)
       VALUES (?, ?, ?, ?, ?, ?, ?)
+    `),
+    insertThought: db.prepare(`
+      INSERT INTO relay_thought (queue_message_id, response_message_id, conversation_id, relay_mode, reasoning_id, seq, text, done, created_at, subagent_run_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `),
     deleteConvActivity: db.prepare(`DELETE FROM relay_activity WHERE conversation_id = ?`),
     deleteConvThoughts: db.prepare(`DELETE FROM relay_thought WHERE conversation_id = ?`),
@@ -192,7 +198,7 @@ test('evaluateRefreshIdleState rejects busy queue and in-flight processing', () 
   assert.deepEqual(busyTurnService.evaluateRefreshIdleState('conv-3'), { idle: false, reason: 'turn-processing' });
 });
 
-test('persistRebuiltHistory stores messages and assistant activities', () => {
+test('persistRebuiltHistory stores messages, activities, and structured thoughts', () => {
   const db = makeDb();
   const stmts = makeStmts(db);
   db.prepare(`INSERT INTO conversations (id, title, sdk_session_id, created_at, updated_at) VALUES ('conv-4', 'Four', 'conv-4', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`).run();
@@ -200,7 +206,14 @@ test('persistRebuiltHistory stores messages and assistant activities', () => {
 
   const messages = [
     { id: 'u1', role: 'user', text: 'hello', timestamp: '2026-01-01T00:00:01Z' },
-    { id: 'a1', role: 'assistant', text: 'world', timestamp: '2026-01-01T00:00:02Z', activities: ['Tool (rg): foo'] },
+    {
+      id: 'a1',
+      role: 'assistant',
+      text: 'world',
+      timestamp: '2026-01-01T00:00:02Z',
+      activities: ['Tool (rg): foo'],
+      thoughts: [{ reasoningId: 'thought-1', text: 'First paragraph.\n\nSecond paragraph.', done: true }],
+    },
   ];
   const persisted = service.persistRebuiltHistory('conv-4', messages);
   assert.equal(persisted.insertedCount, 2);
@@ -214,6 +227,19 @@ test('persistRebuiltHistory stores messages and assistant activities', () => {
   assert.deepEqual(activityRows, [
     { queue_message_id: 'a1', response_message_id: 'a1', text: 'Tool (rg): foo' },
   ]);
+  const thoughtRows = db.prepare(`
+    SELECT queue_message_id, response_message_id, reasoning_id, seq, text, done
+    FROM relay_thought
+    WHERE conversation_id = 'conv-4'
+  `).all();
+  assert.deepEqual(thoughtRows, [{
+    queue_message_id: 'a1',
+    response_message_id: 'a1',
+    reasoning_id: 'thought-1',
+    seq: 1,
+    text: 'First paragraph.\n\nSecond paragraph.',
+    done: 1,
+  }]);
 });
 
 test('mapSdkEventsToMessages delegates to shared parser', () => {
@@ -254,6 +280,7 @@ test('replaceRetrievableHistory swaps messages atomically', () => {
       text: 'reply',
       timestamp: '2026-01-01T00:00:03Z',
       activities: [{ text: 'Tool (rg): scan', subagentRunId: 'sub-9' }],
+      thoughts: [{ reasoningId: 'rebuilt-thought', text: 'retained structure', done: true }],
     },
   ]);
 
@@ -269,12 +296,16 @@ test('replaceRetrievableHistory swaps messages atomically', () => {
     ORDER BY id ASC
   `).get();
   assert.deepEqual(activityRow, { text: 'Tool (rg): scan', subagent_run_id: 'sub-9' });
-  const thoughtCount = Number(db.prepare(`
-    SELECT COUNT(*) AS cnt
+  const thoughtRow = db.prepare(`
+    SELECT reasoning_id, text, response_message_id
     FROM relay_thought
     WHERE conversation_id = 'conv-5'
-  `).get()?.cnt || 0);
-  assert.equal(thoughtCount, 1);
+  `).get();
+  assert.deepEqual(thoughtRow, {
+    reasoning_id: 'rebuilt-thought',
+    text: 'retained structure',
+    response_message_id: 'new-a',
+  });
 });
 
 test('countRetrievableMessages reports stored message count', () => {

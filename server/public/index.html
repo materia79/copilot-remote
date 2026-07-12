@@ -1078,14 +1078,27 @@
   }
   .thinking-text.visible { display: block; }
   .thinking-text p { margin: 0; }
-  .thinking-thoughts {
+  .thinking-thoughts-panel {
     margin-bottom: 8px;
+    min-width: 0;
+    color: var(--muted);
+    font-size: var(--fs-meta-sm);
+  }
+  .thinking-thoughts-panel > summary {
+    cursor: pointer;
+    font-style: italic;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  .thinking-thoughts-list {
+    margin: 6px 0 0 12px;
     display: flex;
     flex-direction: column;
     gap: 4px;
     min-width: 0;
   }
-  .thinking-thoughts:empty { display: none; margin-bottom: 0; }
+  .thinking-thoughts-list:empty { display: none; }
+  .thinking-thoughts-panel:not(:has(.thinking-thoughts-list > *)) { display: none; }
   .thinking-activity {
     margin-top: 8px; font-size: var(--fs-meta-md); color: var(--muted);
     display: flex; flex-direction: column; gap: 4px;
@@ -1215,7 +1228,11 @@
     overflow-wrap: anywhere;
     word-break: break-word;
   }
-  .thinking-thought-body p { margin: 0; }
+  .thinking-thought-body > :first-child { margin-top: 0; }
+  .thinking-thought-body > :last-child { margin-bottom: 0; }
+  .thinking-thought-body p { margin: 0 0 8px; }
+  .thinking-thought-body ul, .thinking-thought-body ol { margin: 0 0 8px; padding-left: 22px; }
+  .thinking-thought-body pre { margin: 0 0 8px; }
   .msg-thoughts {
     margin-top: 10px;
     border-top: 1px dashed var(--border);
@@ -1245,7 +1262,11 @@
     overflow-wrap: anywhere;
     word-break: break-word;
   }
-  .msg-thought-item p { margin: 0; }
+  .msg-thought-item > :first-child { margin-top: 0; }
+  .msg-thought-item > :last-child { margin-bottom: 0; }
+  .msg-thought-item p { margin: 0 0 8px; }
+  .msg-thought-item ul, .msg-thought-item ol { margin: 0 0 8px; padding-left: 22px; }
+  .msg-thought-item pre { margin: 0 0 8px; }
   .dots span { display: inline-block; width: 6px; height: 6px; margin: 0 2px;
     border-radius: 50%; background: var(--muted); animation: bounce 1.2s infinite; }
   .dots span:nth-child(2) { animation-delay: 0.2s; }

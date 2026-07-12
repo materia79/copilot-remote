@@ -39,6 +39,7 @@ import { upsertRelayBoard, loadRelayBoards, renderRelayBoards } from './relay-bo
 import {
   showThinking,
   removeThinking,
+  collapseThinkingThoughts,
   renderThinkingActivities,
   appendThinkingActivity,
   appendThinkingThought,
@@ -227,6 +228,7 @@ export async function connectSocket(overrideDeps) {
   socket.on('assistant_message', ({ conversationId, message, messageId, sourceMessageId }) => {
     const isCurrentConversation = conversationId === currentConvId;
     const autoScroll = isCurrentConversation ? isMessagesAtBottom() : false;
+    collapseThinkingThoughts();
     removeThinking();
     if ((!message?.activities || !message.activities.length) && sourceMessageId) {
       const cached = relayActivities.get(sourceMessageId) || [];
@@ -410,6 +412,7 @@ export async function connectSocket(overrideDeps) {
       if (messageId) removeUserBubbleCancelButton(messageId);
     }
     if (conversationId === currentConvId && clearsProcessingStatus) {
+      collapseThinkingThoughts();
       removeThinking();
       void refreshCurrentView().catch(() => {});
       scheduleContextUsageRefresh(conversationId, 220);

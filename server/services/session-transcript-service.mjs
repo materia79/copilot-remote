@@ -65,6 +65,21 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
     map.set(key, list);
   }
 
+  function appendTurnThought(map, turnId, thought) {
+    const key = String(turnId || '').trim();
+    const text = String(thought?.text || '').trim();
+    if (!key || !text) return;
+    const list = map.get(key) || [];
+    if (list.some((entry) => entry.text === text)) return;
+    list.push({
+      reasoningId: `session-thought-${list.length + 1}`,
+      text,
+      done: true,
+      timestamp: String(thought?.timestamp || '').trim() || null,
+    });
+    map.set(key, list);
+  }
+
   function parseApplyPatchTarget(rawPatch) {
     const patch = String(rawPatch || '');
     if (!patch) return '';
@@ -177,6 +192,7 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
     const toolNameByCallId = new Map();
     const toolArgsByCallId = new Map();
     const turnActivities = new Map();
+    const turnThoughts = new Map();
     const sourceEvents = Array.isArray(events) ? events : [];
     for (const event of sourceEvents) {
       const data = event?.data && typeof event.data === 'object' ? event.data : null;
@@ -241,18 +257,20 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
         const toolRequests = Array.isArray(data.toolRequests) ? data.toolRequests : [];
         const turnId = String(data.turnId || '').trim();
         if (toolRequests.length > 0) {
-          // Preserve user-visible progress notes as foldable activity lines.
-          const thoughtText = text.length > 220 ? `${text.slice(0, 217).trim()}...` : text;
-          if (turnId) appendTurnActivity(turnActivities, turnId, `Thought: ${thoughtText}`);
+          // Tool-request messages are intermediate reasoning sections. Preserve their full
+          // markdown text as thoughts so history refresh does not flatten or truncate them.
+          appendTurnThought(turnThoughts, turnId, { text, timestamp });
           continue;
         }
         const activities = turnId ? (turnActivities.get(turnId) || []) : [];
+        const thoughts = turnId ? (turnThoughts.get(turnId) || []) : [];
         messages.push({
           id: String(data.messageId || event?.id || `assistant-${messages.length + 1}`),
           role: 'assistant',
           text,
           model: String(data.model || '').trim() || undefined,
           activities,
+          thoughts,
           timestamp,
         });
       }

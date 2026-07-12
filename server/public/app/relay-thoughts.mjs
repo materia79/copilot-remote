@@ -54,15 +54,6 @@ function sortThoughtEntries(a, b) {
   return a._order - b._order;
 }
 
-function shouldDropAsPrefix(current, next) {
-  if (!current || !next) return false;
-  if (!current.reasoningId || current.reasoningId !== next.reasoningId) return false;
-  const currentText = String(current.text || '');
-  const nextText = String(next.text || '');
-  if (!currentText || !nextText || currentText === nextText) return false;
-  return nextText.startsWith(currentText);
-}
-
 function toArray(value) {
   if (!value) return [];
   if (Array.isArray(value)) return value;
@@ -89,25 +80,14 @@ export function normalizeRelayThoughtList(thoughts = []) {
   }
 
   const ordered = [...byReasoningId.values(), ...passthrough].sort(sortThoughtEntries);
-  const deduped = [];
-  const seenText = new Set();
-  for (let index = 0; index < ordered.length; index += 1) {
-    const entry = ordered[index];
-    const textKey = String(entry.text || '').trim();
-    if (textKey && seenText.has(textKey)) continue;
-    const next = ordered[index + 1] || null;
-    if (shouldDropAsPrefix(entry, next)) continue;
-    if (textKey) seenText.add(textKey);
-    deduped.push({
-      reasoningId: entry.reasoningId,
-      seq: Number.isFinite(entry.seq) ? entry.seq : null,
-      text: entry.text,
-      done: !!entry.done,
-      timestamp: entry.timestamp || null,
-      subagentRunId: entry.subagentRunId || null,
-    });
-  }
-  return deduped;
+  return ordered.map((entry) => ({
+    reasoningId: entry.reasoningId,
+    seq: Number.isFinite(entry.seq) ? entry.seq : null,
+    text: entry.text,
+    done: !!entry.done,
+    timestamp: entry.timestamp || null,
+    subagentRunId: entry.subagentRunId || null,
+  }));
 }
 
 export function mergeRelayThoughts(persistedThoughts = [], cachedThoughts = []) {

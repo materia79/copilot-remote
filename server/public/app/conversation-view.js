@@ -737,17 +737,35 @@ export function decorateActivityText(text) {
 
 export function renderThoughtsMarkup(thoughts) {
   const items = (Array.isArray(thoughts) ? thoughts : [])
-    .map((t) => String(t?.text || '').trim())
-    .filter(Boolean);
+    .map((thought) => ({
+      reasoningId: String(thought?.reasoningId || '').trim(),
+      text: String(thought?.text || '').trim(),
+    }))
+    .filter((thought) => thought.text);
   if (!items.length) return '';
   const blocks = items
-    .map((text) => `<div class="msg-thought-item"><p>${escHtml(text).replace(/\n/g, '<br>')}</p></div>`)
+    .map((thought) => `<div class="msg-thought-item"${thought.reasoningId ? ` data-reasoning-id="${escHtml(thought.reasoningId)}"` : ''}>${renderMarkdownPreview(thought.text, false)}</div>`)
     .join('');
   return `
     <details class="msg-thoughts">
       <summary>💭 Thoughts (${items.length})</summary>
       <div class="msg-thoughts-list">${blocks}</div>
     </details>`;
+}
+
+function enhanceThoughtMarkup(root) {
+  if (!(root instanceof Element)) return;
+  rewriteLocalAssetUrlsInNode(root, { preferDrive: true });
+  linkifyWorkspaceMentionsInNode(root);
+  root.querySelectorAll('pre code').forEach((block) => {
+    if (globalThis.hljs?.highlightElement) globalThis.hljs.highlightElement(block);
+  });
+}
+
+function renderThoughtBody(body, text) {
+  if (!body) return;
+  body.innerHTML = renderMarkdownPreview(String(text || ''), false);
+  enhanceThoughtMarkup(body);
 }
 
 export function renderActivityMarkup(activities) {
@@ -784,7 +802,10 @@ export function showThinking(messageId = null, autoScroll = true) {
   div.innerHTML = `
     <div class="thinking-bubble">
       <div class="thinking-bubble-header">${stopBtnHtml}</div>
-      <div id="thinking-thoughts" class="thinking-thoughts"></div>
+      <details id="thinking-thoughts" class="thinking-thoughts-panel" open>
+        <summary>💭 Thoughts</summary>
+        <div class="thinking-thoughts-list"></div>
+      </details>
       <div id="thinking-text" class="thinking-text"></div>
       <div class="dots"><span></span><span></span><span></span></div>
       <div id="thinking-activity" class="thinking-activity"></div>
@@ -799,6 +820,7 @@ export function showThinking(messageId = null, autoScroll = true) {
     el.appendChild(div);
   }
   renderThinkingText(thinkingText);
+  renderThinkingThoughts();
   if (autoScroll) scrollBottom();
 }
 
@@ -806,6 +828,15 @@ export function removeThinking() {
   thinkingText = '';
   thinkingMessageId = null;
   document.getElementById('thinking-indicator')?.remove();
+}
+
+export function collapseThinkingThoughts() {
+  const panel = document.getElementById('thinking-thoughts');
+  if (!(panel instanceof HTMLDetailsElement)) return;
+  panel.open = false;
+  panel.querySelectorAll('.thinking-thought').forEach((row) => {
+    if (row instanceof HTMLDetailsElement) row.open = false;
+  });
 }
 
 function renderThinkingText(text) {
@@ -1173,6 +1204,7 @@ export function appendThinkingThought(reasoningId, text, done = false, subagentR
       if (!row) {
         row = document.createElement('details');
         row.className = 'thinking-thought';
+        row.open = !done;
         row.dataset.reasoningId = key;
         row.dataset.subagentRunId = subagentRunId;
         const summary = document.createElement('summary');
@@ -1185,19 +1217,21 @@ export function appendThinkingThought(reasoningId, text, done = false, subagentR
       const summaryEl = row.querySelector('summary');
       const bodyEl = row.querySelector('.thinking-thought-body');
       if (summaryEl) summaryEl.textContent = `💭 ${thoughtSummaryText(value)}`;
-      if (bodyEl) bodyEl.innerHTML = `<p>${escHtml(value).replace(/\n/g, '<br>')}</p>`;
+      renderThoughtBody(bodyEl, value);
       row.dataset.done = done ? '1' : '0';
+      row.open = !done;
       if (autoScroll) scrollBottom();
       return;
     }
   }
 
-  const box = document.getElementById('thinking-thoughts');
+  const box = document.querySelector('#thinking-thoughts > .thinking-thoughts-list');
   if (!box) return;
   let row = box.querySelector(`.thinking-thought[data-reasoning-id="${CSS.escape(key)}"]`);
   if (!row) {
     row = document.createElement('details');
     row.className = 'thinking-thought';
+    row.open = !done;
     row.dataset.reasoningId = key;
     if (subagentRunId) row.dataset.subagentRunId = subagentRunId;
     const summary = document.createElement('summary');
@@ -1210,13 +1244,14 @@ export function appendThinkingThought(reasoningId, text, done = false, subagentR
   const summaryEl = row.querySelector('summary');
   const bodyEl = row.querySelector('.thinking-thought-body');
   if (summaryEl) summaryEl.textContent = `💭 ${thoughtSummaryText(value)}`;
-  if (bodyEl) bodyEl.innerHTML = `<p>${escHtml(value).replace(/\n/g, '<br>')}</p>`;
+  renderThoughtBody(bodyEl, value);
   row.dataset.done = done ? '1' : '0';
+  row.open = !done;
   if (autoScroll) scrollBottom();
 }
 
 export function renderThinkingThoughts() {
-  const box = document.getElementById('thinking-thoughts');
+  const box = document.querySelector('#thinking-thoughts > .thinking-thoughts-list');
   if (!box) return;
   const thoughtMap = thinkingMessageId ? relayThoughts.get(thinkingMessageId) : null;
   if (!thoughtMap || !thoughtMap.size) return;
@@ -1654,6 +1689,14 @@ function buildMessageSnapshotKey(messages = [], meta = {}) {
       model: String(item?.model || '').trim(),
       mode: String(item?.mode || '').trim(),
       attachments: Array.isArray(item?.attachments) ? item.attachments.length : 0,
+      thoughts: (Array.isArray(item?.thoughts) ? item.thoughts : []).map((thought) => ({
+        reasoningId: String(thought?.reasoningId || '').trim(),
+        seq: Number.isFinite(Number(thought?.seq)) ? Number(thought.seq) : null,
+        text: String(thought?.text || ''),
+        done: !!thought?.done,
+        timestamp: String(thought?.timestamp || '').trim(),
+        subagentRunId: String(thought?.subagentRunId || '').trim(),
+      })),
     })),
   });
 }
