@@ -45,7 +45,9 @@ export function normalizeKnownCwdPath(value) {
 }
 
 export function clearLegacyKnownCwdHistoryStorage() {
-  localStorage.removeItem(LEGACY_KNOWN_CWD_HISTORY_KEY);
+  try {
+    localStorage.removeItem(LEGACY_KNOWN_CWD_HISTORY_KEY);
+  } catch {}
 }
 
 function buildKnownCwdOptions() {

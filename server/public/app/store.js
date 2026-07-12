@@ -1,3 +1,5 @@
+import { recordCliLifecycleEvent, recordRelayLifecycleEvent } from './status-store.mjs';
+
 function resolveAppBase() {
   const configuredBase = typeof window.__COPILOT_APP_CONFIG?.basePath === 'string'
     ? window.__COPILOT_APP_CONFIG.basePath.trim()
@@ -139,7 +141,11 @@ const SIDEBAR_COLLAPSED_DESKTOP_STORAGE_KEY = 'copilot_sidebar_collapsed_desktop
 let sidebarWidthPercent = SIDEBAR_WIDTH_PERCENT_FALLBACK;
 const CONVERSATION_SCROLL_STORAGE_PREFIX = 'copilot_message_scroll_';
 
-marked.setOptions({ breaks: true });
+if (globalThis.marked && typeof globalThis.marked.setOptions === 'function') {
+  globalThis.marked.setOptions({ breaks: true });
+} else {
+  console.warn('[store] marked unavailable; markdown rendering will use plain-text fallback.');
+}
 
 export function generateId() {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
@@ -553,6 +559,14 @@ export function isMessagesNearBottom(thresholdPx = null) {
   return distance <= threshold;
 }
 
+export function isMessagesAtBottom(epsilonPx = 1) {
+  const el = document.getElementById('messages');
+  if (!el) return true;
+  const epsilon = Math.max(0, Number.isFinite(Number(epsilonPx)) ? Number(epsilonPx) : 1);
+  const distance = Math.max(0, el.scrollHeight - el.clientHeight - el.scrollTop);
+  return distance <= epsilon;
+}
+
 export function scrollBottomAfterSend() {
   scrollBottom();
   requestAnimationFrame(() => {
@@ -693,12 +707,18 @@ export function updateCliStatus() {
 }
 
 export function setCliOnline(value) {
-  cliOnline = !!value;
+  const nextOnline = !!value;
+  const changed = cliOnline !== nextOnline;
+  cliOnline = nextOnline;
+  if (changed) recordCliLifecycleEvent(nextOnline);
   updateCliStatus();
 }
 
 export function setRelayOnline(value) {
-  relayOnline = !!value;
+  const nextOnline = !!value;
+  const changed = relayOnline !== nextOnline;
+  relayOnline = nextOnline;
+  if (changed) recordRelayLifecycleEvent(nextOnline);
   updateCliStatus();
 }
 
@@ -873,6 +893,13 @@ function measureSidebarHeaderMinWidthPx() {
   const newConversationButton = document.getElementById('new-conv-btn');
   if (isVisibleElement(newConversationButton)) {
     const buttonStyle = window.getComputedStyle(newConversationButton);
+    neededWidth += Math.ceil(parseCssPx(buttonStyle.minWidth));
+    sectionCount += 1;
+  }
+
+  const statusButton = document.getElementById('status-btn');
+  if (isVisibleElement(statusButton)) {
+    const buttonStyle = window.getComputedStyle(statusButton);
     neededWidth += Math.ceil(parseCssPx(buttonStyle.minWidth));
     sectionCount += 1;
   }

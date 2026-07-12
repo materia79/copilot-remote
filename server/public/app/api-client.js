@@ -1,6 +1,40 @@
 import { BASE, TOKEN, authHeaders, updateWorkspaceRootHints, applyContextUsageBar, readContextUsageRatio, currentConvId, conversations, setCliOnline, setActiveRuntimeSessionCount, setContextIndicatorMode, setServerPlatform } from './store.js';
 
+let networkRequestsEnabled = true;
+let fetchOutageActive = false;
+let lastFetchOutageSignature = '';
+
+function toErrorMessage(error) {
+  if (!error) return 'unknown error';
+  const message = String(error?.message || error || '').trim();
+  return message || 'unknown error';
+}
+
+function noteFetchSuccess() {
+  fetchOutageActive = false;
+  lastFetchOutageSignature = '';
+}
+
+function noteFetchFailure(url, error) {
+  if (!networkRequestsEnabled) return;
+  const signature = `${String(url || '').trim()}::${toErrorMessage(error)}`;
+  if (fetchOutageActive && signature === lastFetchOutageSignature) return;
+  fetchOutageActive = true;
+  lastFetchOutageSignature = signature;
+  console.error('Fetch error', toErrorMessage(error));
+}
+
+export function setNetworkRequestsEnabled(value) {
+  networkRequestsEnabled = !!value;
+  if (networkRequestsEnabled) noteFetchSuccess();
+}
+
+export function areNetworkRequestsEnabled() {
+  return networkRequestsEnabled;
+}
+
 export async function apiFetch(url, opts = {}) {
+  if (!networkRequestsEnabled) return null;
   try {
     const response = await fetch(`${BASE}${url}`, {
       headers: {
@@ -14,31 +48,58 @@ export async function apiFetch(url, opts = {}) {
       console.error('API error', response.status, url);
       return null;
     }
+    noteFetchSuccess();
     return response.json();
   } catch (error) {
-    console.error('Fetch error', error);
+    noteFetchFailure(url, error);
     return null;
   }
 }
 
-export async function verifyExistingSession() {
-  try {
-    const response = await fetch(`${BASE}/api/status`);
-    const payload = await response.json().catch(() => null);
-    if (response.ok && payload) {
-      updateWorkspaceRootHints(payload);
-      setContextIndicatorMode(payload?.contextIndicatorMode);
-      setCliOnline(!!payload?.cliOnline);
-      setActiveRuntimeSessionCount(payload?.activeRuntimeSessionCount);
-      if (payload?.platform) setServerPlatform(payload.platform);
-    }
+export async function verifyExistingSession(tokenCandidate = '') {
+  if (!networkRequestsEnabled) {
     return {
-      ok: response.ok,
-      status: response.status,
-      payload,
-      error: response.ok ? null : (payload?.error || 'Unauthorized'),
+      ok: false,
+      status: 0,
+      payload: null,
+      error: 'Network requests are paused',
     };
+  }
+  try {
+    const requestStatus = async (headers = null) => {
+      const response = await fetch(`${BASE}/api/status`, headers ? { headers } : undefined);
+      const payload = await response.json().catch(() => null);
+      if (response.ok && payload) {
+        updateWorkspaceRootHints(payload);
+        setContextIndicatorMode(payload?.contextIndicatorMode);
+        setCliOnline(!!payload?.cliOnline);
+        setActiveRuntimeSessionCount(payload?.activeRuntimeSessionCount);
+        if (payload?.platform) setServerPlatform(payload.platform);
+      }
+      if (response.ok) noteFetchSuccess();
+      return {
+        ok: response.ok,
+        status: response.status,
+        payload,
+        error: response.ok ? null : (payload?.error || 'Unauthorized'),
+      };
+    };
+
+    const cookieResult = await requestStatus();
+    if (cookieResult.ok) return cookieResult;
+    const normalizedToken = String(tokenCandidate || '').trim();
+    if (!normalizedToken) return cookieResult;
+    if (cookieResult.status !== 401) return cookieResult;
+    const tokenResult = await requestStatus({ Authorization: `Bearer ${normalizedToken}` });
+    if (tokenResult?.ok) {
+      return {
+        ...tokenResult,
+        source: 'token',
+      };
+    }
+    return tokenResult;
   } catch (error) {
+    noteFetchFailure('/api/status', error);
     return {
       ok: false,
       status: 0,
@@ -49,6 +110,14 @@ export async function verifyExistingSession() {
 }
 
 export async function verifyToken(token) {
+  if (!networkRequestsEnabled) {
+    return {
+      ok: false,
+      status: 0,
+      payload: null,
+      error: 'Network requests are paused',
+    };
+  }
   try {
     const response = await fetch(`${BASE}/api/status`, {
       headers: { Authorization: `Bearer ${token}` },
@@ -61,6 +130,7 @@ export async function verifyToken(token) {
       setActiveRuntimeSessionCount(payload?.activeRuntimeSessionCount);
       if (payload?.platform) setServerPlatform(payload.platform);
     }
+    if (response.ok) noteFetchSuccess();
     return {
       ok: response.ok,
       status: response.status,
@@ -68,6 +138,7 @@ export async function verifyToken(token) {
       error: response.ok ? null : (payload?.error || 'Unauthorized'),
     };
   } catch (error) {
+    noteFetchFailure('/api/status', error);
     return {
       ok: false,
       status: 0,
@@ -256,6 +327,24 @@ export async function createConversationShareLink(id) {
   return apiFetch(`/api/conversation/${encodeURIComponent(convId)}/share`, {
     method: 'POST',
   });
+}
+
+export async function loadServerStatusEventPage({ before = null, limit = 40 } = {}) {
+  const params = new URLSearchParams();
+  const pageSize = Math.max(1, Math.min(100, Math.trunc(Number(limit) || 40)));
+  params.set('limit', String(pageSize));
+  const beforeTimestamp = Number(before?.timestamp);
+  const beforeId = String(before?.id || '').trim();
+  if (Number.isFinite(beforeTimestamp) && beforeId) {
+    params.set('beforeTimestamp', String(Math.trunc(beforeTimestamp)));
+    params.set('beforeId', beforeId);
+  }
+  const payload = await apiFetch(`/api/status/events?${params.toString()}`);
+  return {
+    items: Array.isArray(payload?.items) ? payload.items : [],
+    hasMore: payload?.hasMore === true,
+    nextCursor: payload?.nextCursor || null,
+  };
 }
 
 export async function loadSharedConversation(shareToken, options = {}) {

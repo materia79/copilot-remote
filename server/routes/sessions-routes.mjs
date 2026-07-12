@@ -1257,6 +1257,7 @@ export function registerSessionsRoutes(app, deps) {
     resolveSessionStateRoot,
     markSharedViewerPresence,
     getSharedWatcherCount,
+    statusEventService,
     isSha256,
     uploadPathForSha,
   } = deps;
@@ -2582,6 +2583,22 @@ export function registerSessionsRoutes(app, deps) {
       aroundMessageId,
     });
     if (!payload) return res.status(404).json({ error: 'Shared conversation not found' });
+    const sharedAccess = statusEventService.recordSharedAccess({
+      shareToken: token,
+      viewerIp: extractClientIp(req),
+      conversationId: convId,
+      conversationTitle: conv.title,
+      sdkSessionId: conv.sdk_session_id,
+    });
+    if (sharedAccess.event) {
+      const details = sharedAccess.event.details;
+      console.log(
+        `SHARED ACCESS viewerIp=${details.viewerIp} conversationId=${details.conversationId} `
+        + `sdkSessionId=${details.sdkSessionId || '-'} title=${JSON.stringify(details.conversationTitle)} `
+        + `tokenPrefix=${details.shareTokenPrefix}`,
+      );
+      io.emit('shared_access', sharedAccess.event);
+    }
     const now = new Date().toISOString();
     stmts.touchConversationShare?.run(now, token);
     res.setHeader('Cache-Control', 'no-store');
@@ -2594,6 +2611,17 @@ export function registerSessionsRoutes(app, deps) {
         watcherCount: Number(getSharedWatcherCount?.(convId) || 0),
       },
     });
+  });
+
+  app.get('/api/status/events', auth, (req, res) => {
+    const beforeTimestamp = Number(req.query.beforeTimestamp);
+    const page = statusEventService.getEventsPage({
+      beforeTimestamp: Number.isFinite(beforeTimestamp) ? beforeTimestamp : null,
+      beforeId: String(req.query.beforeId || ''),
+      limit: req.query.limit,
+    });
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(page);
   });
 
   app.post('/api/shared/:token/presence', (req, res) => {

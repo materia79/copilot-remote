@@ -234,12 +234,16 @@ export function sanitizePreviewHtml(html) {
 export function renderMarkdownPreview(source, allowEmbeddedHtml) {
   const sourceText = String(source ?? '');
   const fallbackEscaped = `<p>${escHtml(sourceText).replace(/\n/g, '<br>')}</p>`;
+  const markdown = globalThis.marked;
+  if (!markdown || typeof markdown.parse !== 'function' || typeof markdown.Renderer !== 'function') {
+    return fallbackEscaped;
+  }
   if (allowEmbeddedHtml) {
-    const parsed = marked.parse(sourceText);
+    const parsed = markdown.parse(sourceText);
     if (typeof parsed !== 'string') return fallbackEscaped;
     return sanitizePreviewHtml(parsed);
   }
-  const renderer = new marked.Renderer();
+  const renderer = new markdown.Renderer();
   renderer.html = (htmlToken) => {
     if (typeof htmlToken === 'string') return escHtml(htmlToken);
     if (htmlToken && typeof htmlToken === 'object') {
@@ -247,7 +251,7 @@ export function renderMarkdownPreview(source, allowEmbeddedHtml) {
     }
     return '';
   };
-  const parsed = marked.parse(sourceText, { renderer });
+  const parsed = markdown.parse(sourceText, { renderer });
   if (typeof parsed !== 'string') return fallbackEscaped;
   return sanitizePreviewHtml(parsed);
 }

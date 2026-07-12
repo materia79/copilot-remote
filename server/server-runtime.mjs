@@ -27,6 +27,7 @@ import { registerAskUserRoutes } from './routes/ask-user-routes.mjs';
 import { registerRelayBoardRoutes } from './routes/relay-board-routes.mjs';
 import { registerCacheRoutes } from './routes/cache-routes.mjs';
 import { createDeleteArchiveService } from './services/delete-archive-service.mjs';
+import { createStatusEventService } from './services/status-event-service.mjs';
 import {
   normalizeDriveAbsolutePath as _normalizeDriveAbsolutePath,
   driveRootFromAbsolutePath as _driveRootFromAbsolutePath,
@@ -1977,6 +1978,17 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_conversation_shares_conversation
     ON conversation_shares(conversation_id, revoked_at, created_at DESC);
+
+  CREATE TABLE IF NOT EXISTS status_events (
+    id           TEXT PRIMARY KEY,
+    timestamp    INTEGER NOT NULL,
+    type         TEXT NOT NULL,
+    source       TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_status_events_timeline
+    ON status_events(timestamp DESC, id DESC);
 `);
 
 db.exec(`
@@ -2259,6 +2271,7 @@ const stmts = {
   ...createMessageRepository(db),
   ...createQuestionRepository(db),
 };
+const statusEventService = createStatusEventService(db);
 
 modelSelectorSql = {
   listVariants: db.prepare(`
@@ -5083,6 +5096,7 @@ const sharedRouteDeps = {
   requestRelayShutdown,
   markSharedViewerPresence,
   getSharedWatcherCount,
+  statusEventService,
 };
 registerMessagesRoutes(app, sharedRouteDeps);
 registerSessionsRoutes(app, sharedRouteDeps);

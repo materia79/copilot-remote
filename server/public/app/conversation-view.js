@@ -609,8 +609,15 @@ function createMessageNode(msg, msgId = null, force = false) {
   const usageStaleTag = usage?.stale
     ? ' <span class="msg-usage msg-usage-stale">stale</span>'
     : '';
+  const renderAssistantMarkdown = (text) => {
+    const markdown = globalThis.marked;
+    if (!markdown || typeof markdown.parse !== 'function') {
+      return `<p>${escHtml(String(text || '')).replace(/\n/g, '<br>')}</p>`;
+    }
+    return markdown.parse(String(text || ''));
+  };
   const content = msg.role === 'assistant'
-    ? marked.parse(msg.text || '')
+    ? renderAssistantMarkdown(msg.text || '')
     : renderMarkdownPreview(msg.text || '', false);
   const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
   const activities = Array.isArray(msg.activities) ? msg.activities.filter(Boolean).slice(0, 48) : [];
@@ -631,7 +638,7 @@ function createMessageNode(msg, msgId = null, force = false) {
     : '';
 
   div.innerHTML = `
-    <div class="${bubbleClass}">${content}${attachmentHtml}${thoughtsHtml}${activityHtml}${userBubbleActionsHtml}</div>
+    <div class="${bubbleClass}">${thoughtsHtml}${content}${attachmentHtml}${activityHtml}${userBubbleActionsHtml}</div>
     <div class="msg-label">${label}${modelTag}${reasoningTag}${modeTag}${autoTag}${usageTurnTag}${usageRemainingTag}${usageStaleTag} · ${fmtDate(msg.timestamp)}</div>`;
 
   const bubble = div.querySelector('.msg-bubble');
@@ -777,6 +784,7 @@ export function showThinking(messageId = null, autoScroll = true) {
   div.innerHTML = `
     <div class="thinking-bubble">
       <div class="thinking-bubble-header">${stopBtnHtml}</div>
+      <div id="thinking-thoughts" class="thinking-thoughts"></div>
       <div id="thinking-text" class="thinking-text"></div>
       <div class="dots"><span></span><span></span><span></span></div>
       <div id="thinking-activity" class="thinking-activity"></div>
@@ -1184,7 +1192,7 @@ export function appendThinkingThought(reasoningId, text, done = false, subagentR
     }
   }
 
-  const box = document.getElementById('thinking-activity');
+  const box = document.getElementById('thinking-thoughts');
   if (!box) return;
   let row = box.querySelector(`.thinking-thought[data-reasoning-id="${CSS.escape(key)}"]`);
   if (!row) {
@@ -1208,7 +1216,7 @@ export function appendThinkingThought(reasoningId, text, done = false, subagentR
 }
 
 export function renderThinkingThoughts() {
-  const box = document.getElementById('thinking-activity');
+  const box = document.getElementById('thinking-thoughts');
   if (!box) return;
   const thoughtMap = thinkingMessageId ? relayThoughts.get(thinkingMessageId) : null;
   if (!thoughtMap || !thoughtMap.size) return;
@@ -1655,7 +1663,8 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
   if (!el) return false;
   const ordered = sortConversationMessages(msgs || []);
   const snapshotKey = buildMessageSnapshotKey(ordered, meta);
-  if (snapshotKey && snapshotKey === lastRenderedMessageSnapshotKey) {
+  const statusViewMounted = !!el.querySelector('.status-view');
+  if (snapshotKey && snapshotKey === lastRenderedMessageSnapshotKey && !statusViewMounted) {
     renderRelayQuestions();
     renderRelayBoards();
     return false;

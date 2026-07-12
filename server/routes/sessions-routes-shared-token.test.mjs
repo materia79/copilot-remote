@@ -61,6 +61,17 @@ test('shared presence route applies rate limit responses', () => {
   assert.match(source, /return res\.status\(429\)\.json\(\{/);
 });
 
+test('shared access status event is created only after a successful shared payload is built', () => {
+  const filePath = fileURLToPath(new URL('./sessions-routes.mjs', import.meta.url));
+  const source = fs.readFileSync(filePath, 'utf8');
+  const sharedRouteStart = source.indexOf("app.get('/api/shared/:token'");
+  const sharedRouteEnd = source.indexOf("\n  });", sharedRouteStart);
+  const sharedRoute = source.slice(sharedRouteStart, sharedRouteEnd);
+  assert.ok(sharedRouteStart >= 0, 'shared read route must exist');
+  assert.match(sharedRoute, /if \(!payload\) return res\.status\(404\)\.json\(\{ error: 'Shared conversation not found' \}\);[\s\S]*statusEventService\.recordSharedAccess/);
+  assert.match(sharedRoute, /io\.emit\('shared_access', sharedAccess\.event\)/);
+});
+
 test('shared upload route handles stream errors explicitly', () => {
   const filePath = fileURLToPath(new URL('./sessions-routes.mjs', import.meta.url));
   const source = fs.readFileSync(filePath, 'utf8');

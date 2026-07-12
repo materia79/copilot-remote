@@ -24,7 +24,7 @@ import {
   showTransientRelayNotice,
   applyContextUsageBar,
   scrollBottom,
-  isMessagesNearBottom,
+  isMessagesAtBottom,
   setHistoryRefreshInFlight,
   isHistoryRefreshInFlight,
   setSummaryModalLoading,
@@ -68,6 +68,7 @@ import {
   scheduleContextUsageRefresh,
   loadSharedConversation,
   reportSharedViewerPresence,
+  setNetworkRequestsEnabled,
 } from './api-client.js';
 import { loadConversations, refreshConversations, openConversation, renderConvList, applyLoadedConversationState, initConversationListLazyLoading } from './journal-view.js';
 import { newConversation, deleteConv } from './journal-view.js';
@@ -107,7 +108,7 @@ import {
   closeMessageSearchModal,
 } from './message-search-view.js';
 
-import { initSocketHandlers, connectSocket } from './socket-handlers.js';
+import { initSocketHandlers, connectSocket, setSocketActivityEnabled } from './socket-handlers.js';
 import {
   initInstallButton,
   initFullscreenButton,
@@ -118,6 +119,8 @@ import {
   updatePwaAppName,
 } from './pwa-install.js';
 import { initFontScaling, updateFontScaleFromSelect } from './font-scaling.js';
+import { initClientDiagnostics } from './status-store.mjs';
+import { isStatusViewActive, toggleStatusView } from './status-view.mjs';
 import {
   initCwdPicker,
   openChangeCwdModal,
@@ -184,6 +187,10 @@ let liveConversationPollInFlight = false;
 let sharedViewerIdFallback = '';
 let sharedConversationRenderKey = '';
 let sharedConversationLastError = '';
+let networkLifecycleBound = false;
+let foregroundRecoveryTimer = null;
+let foregroundRecoveryInFlight = false;
+let appSharedMode = false;
 let viewportBaseHeight = window.innerHeight || document.documentElement.clientHeight || 0;
 let chatTitleEditingConversationId = null;
 let relayQuestionRenderHash = '';
@@ -224,6 +231,8 @@ let latestQueueStatus = {
   parkedCount: 0,
 };
 const SHARED_VIEWER_ID_STORAGE_KEY = 'copilot_shared_viewer_id';
+const AUTH_TOKEN_STORAGE_KEY = 'copilot_auth_token';
+const AUTH_COOKIE_NAME = 'copilot_auth';
 
 function resolveSharedTokenFromLocation() {
   const configured = String(window.__COPILOT_APP_CONFIG?.sharedToken || SHARED_CONVERSATION_TOKEN || '').trim().toLowerCase();
@@ -240,6 +249,67 @@ function isSharedReaderMode() {
 
 function getTokenFromUrl() {
   return new URLSearchParams(window.location.search).get('token');
+}
+
+function resolveAuthCookiePath() {
+  const configuredBase = typeof window.__COPILOT_APP_CONFIG?.basePath === 'string'
+    ? window.__COPILOT_APP_CONFIG.basePath.trim()
+    : '';
+  if (configuredBase && configuredBase !== '/') {
+    return configuredBase.startsWith('/')
+      ? configuredBase.replace(/\/+$/, '') || '/'
+      : `/${configuredBase.replace(/\/+$/, '')}`;
+  }
+  const pathname = String(window.location.pathname || '/');
+  const sharedIndex = pathname.indexOf('/shared/');
+  const base = sharedIndex >= 0
+    ? pathname.slice(0, sharedIndex).replace(/\/+$/, '')
+    : pathname.replace(/\/+$/, '');
+  return base || '/';
+}
+
+function syncClientAuthCookie(token) {
+  const value = String(token || '').trim();
+  const path = resolveAuthCookiePath();
+  if (!value) {
+    document.cookie = `${AUTH_COOKIE_NAME}=; Path=${path}; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax`;
+    return;
+  }
+  document.cookie = `${AUTH_COOKIE_NAME}=${encodeURIComponent(value)}; Path=${path}; Max-Age=2592000; SameSite=Lax`;
+}
+
+function loadPersistedAuthToken() {
+  let sessionValue = '';
+  try {
+    sessionValue = String(sessionStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || '').trim();
+  } catch {
+    sessionValue = '';
+  }
+  if (sessionValue) return sessionValue;
+  try {
+    return String(localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || '').trim();
+  } catch {
+    return '';
+  }
+}
+
+function persistAuthToken(token) {
+  const value = String(token || '').trim();
+  try {
+    if (!value) {
+      sessionStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+    } else {
+      sessionStorage.setItem(AUTH_TOKEN_STORAGE_KEY, value);
+    }
+  } catch {}
+  try {
+    if (!value) {
+      localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+    } else {
+      localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, value);
+    }
+  } catch {}
+  syncClientAuthCookie(value);
 }
 
 function stripTokenFromUrl() {
@@ -295,6 +365,71 @@ function stopSharedModeTimers() {
   sharedConversationRequestSeq = 0;
   sharedConversationAppliedSeq = 0;
   liveConversationPollInFlight = false;
+}
+
+function shouldRunForegroundNetworkWork() {
+  return document.visibilityState === 'visible' && !foregroundRecoveryInFlight;
+}
+
+function setForegroundNetworkWorkEnabled(enabled) {
+  const next = !!enabled;
+  setNetworkRequestsEnabled(next);
+  setSocketActivityEnabled(next);
+}
+
+async function runForegroundRecovery(reason = 'visible') {
+  if (document.visibilityState !== 'visible') return;
+  if (foregroundRecoveryInFlight) return;
+  foregroundRecoveryInFlight = true;
+  setForegroundNetworkWorkEnabled(true);
+  try {
+    if (appSharedMode) {
+      await refreshSharedConversation();
+      await pulseSharedViewerPresence();
+      return;
+    }
+    await refreshSessionWorkerStatus();
+    await refreshCurrentView();
+    await refreshModelCatalog(true);
+    await loadRelayQuestions(currentConvId);
+    await loadRelayBoards();
+  } catch (error) {
+    console.warn(`[foreground-recovery:${reason}]`, error?.message || error);
+  } finally {
+    foregroundRecoveryInFlight = false;
+  }
+}
+
+function scheduleForegroundRecovery(reason = 'visible') {
+  if (foregroundRecoveryTimer) clearTimeout(foregroundRecoveryTimer);
+  foregroundRecoveryTimer = setTimeout(() => {
+    foregroundRecoveryTimer = null;
+    void runForegroundRecovery(reason);
+  }, 1000);
+}
+
+function initNetworkLifecycleHandling() {
+  if (networkLifecycleBound) return;
+  networkLifecycleBound = true;
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+      setForegroundNetworkWorkEnabled(false);
+      return;
+    }
+    scheduleForegroundRecovery('visibility');
+  });
+  window.addEventListener('online', () => {
+    if (document.visibilityState === 'visible') scheduleForegroundRecovery('online');
+  });
+  window.addEventListener('offline', () => {
+    setForegroundNetworkWorkEnabled(false);
+  });
+  window.addEventListener('pageshow', () => {
+    if (document.visibilityState === 'visible') scheduleForegroundRecovery('pageshow');
+  });
+  window.addEventListener('pagehide', () => {
+    setForegroundNetworkWorkEnabled(false);
+  });
 }
 
 function syncThemeMenuLabel() {
@@ -451,7 +586,7 @@ async function refreshSharedConversation() {
   sharedConversationPollInFlight = true;
   const requestSeq = ++sharedConversationRequestSeq;
   const messagesEl = document.getElementById('messages');
-  const preserveBottom = isMessagesNearBottom();
+  const preserveBottom = isMessagesAtBottom();
   const savedScrollTop = messagesEl?.scrollTop || 0;
   try {
     const response = await loadSharedConversation(sharedToken, { limit: 120 });
@@ -512,9 +647,11 @@ async function initSharedConversationReader() {
   await pulseSharedViewerPresence();
   stopSharedModeTimers();
   sharedConversationPollTimer = setInterval(() => {
+    if (!shouldRunForegroundNetworkWork()) return;
     void refreshSharedConversation();
   }, 900);
   sharedPresencePollTimer = setInterval(() => {
+    if (!shouldRunForegroundNetworkWork()) return;
     void pulseSharedViewerPresence();
   }, 12_000);
 }
@@ -676,7 +813,12 @@ function clearModelMetadataHardFail() {
 }
 
 function readStoredReasoningByMode() {
-  const raw = String(localStorage.getItem(REASONING_BY_MODE_STORAGE_KEY) || '').trim();
+  let raw = '';
+  try {
+    raw = String(localStorage.getItem(REASONING_BY_MODE_STORAGE_KEY) || '').trim();
+  } catch {
+    raw = '';
+  }
   if (!raw) return {};
   try {
     const parsed = JSON.parse(raw);
@@ -691,6 +833,18 @@ function readStoredReasoningByMode() {
     return out;
   } catch {
     return {};
+  }
+}
+
+async function startAppWithErrorHandling() {
+  try {
+    await initApp();
+    return true;
+  } catch (error) {
+    console.error('[bootstrap] initApp failed', error);
+    showAuthGate();
+    showAuthError(`App initialization failed: ${String(error?.message || error || 'unknown error')}`);
+    return false;
   }
 }
 
@@ -1591,6 +1745,7 @@ function renderSessionInstructionDocs(docs) {
 function startRelayQuestionPolling() {
   if (relayQuestionPollTimer) return;
   relayQuestionPollTimer = setInterval(() => {
+    if (!shouldRunForegroundNetworkWork()) return;
     loadRelayQuestions(currentConvId).catch(() => {});
   }, 3000);
 }
@@ -1598,6 +1753,7 @@ function startRelayQuestionPolling() {
 function startRelayBoardPolling() {
   if (relayBoardPollTimer) return;
   relayBoardPollTimer = setInterval(() => {
+    if (!shouldRunForegroundNetworkWork()) return;
     loadRelayBoards().catch(() => {});
   }, 3000);
 }
@@ -1633,6 +1789,7 @@ async function refreshSessionWorkerStatus() {
 function startSessionWorkerStatusPolling() {
   if (sessionWorkerStatusPollTimer) return;
   sessionWorkerStatusPollTimer = setInterval(() => {
+    if (!shouldRunForegroundNetworkWork()) return;
     refreshSessionWorkerStatus().catch(() => {});
   }, 4000);
 }
@@ -1650,7 +1807,7 @@ async function pollAuthenticatedCurrentConversationLive() {
   liveConversationPollInFlight = true;
   try {
     const messagesEl = document.getElementById('messages');
-    const preserveBottom = isMessagesNearBottom();
+    const preserveBottom = isMessagesAtBottom();
     const savedScrollTop = messagesEl?.scrollTop || 0;
     const savedLoadedCount = loadConversationLoadedMessageCount(currentId);
     const requestLimit = Math.max(20, getConversationLoadedMessageCount() || 0, savedLoadedCount || 0);
@@ -1670,6 +1827,7 @@ async function pollAuthenticatedCurrentConversationLive() {
 function startLiveConversationPolling() {
   if (liveConversationPollTimer || isSharedReaderMode()) return;
   liveConversationPollTimer = setInterval(() => {
+    if (!shouldRunForegroundNetworkWork()) return;
     pollAuthenticatedCurrentConversationLive().catch(() => {});
   }, 900);
 }
@@ -1770,7 +1928,7 @@ let refreshViewVersion = 0;
 async function refreshCurrentView() {
   const capturedVersion = ++refreshViewVersion;
   const messagesEl = document.getElementById('messages');
-  const preserveBottom = isMessagesNearBottom();
+  const preserveBottom = isMessagesAtBottom();
   const scrollTop = messagesEl?.scrollTop || 0;
   const stableSavedScrollTop = resolveStableScrollTopForLiveRefresh(messagesEl, scrollTop);
 
@@ -2010,7 +2168,9 @@ function syncChatTitleControls() {
   if (!editing && editor && !editor.hidden) {
     editor.hidden = true;
   }
-  syncChatHeaderWorkspaceLabel();
+  if (!isStatusViewActive()) {
+    syncChatHeaderWorkspaceLabel();
+  }
   syncChatTitleWatcherIndicator();
 }
 
@@ -2155,7 +2315,11 @@ function showAuthGate() {
 }
 
 async function initApp() {
+  initClientDiagnostics();
   const sharedMode = isSharedReaderMode();
+  appSharedMode = sharedMode;
+  initNetworkLifecycleHandling();
+  setForegroundNetworkWorkEnabled(document.visibilityState === 'visible');
   const sharedThemeBtn = document.getElementById('chat-menu-shared-theme-toggle');
   initTheme();
   initThemeMenuToggle();
@@ -2400,8 +2564,10 @@ async function doAuth() {
   const result = await verifyToken(val);
   if (result?.ok) {
     setToken(val);
-    initApp();
+    persistAuthToken(val);
+    await startAppWithErrorHandling();
   } else {
+    if (result?.status === 401) persistAuthToken('');
     showAuthError(resolveAuthErrorMessage(result));
   }
 }
@@ -2423,25 +2589,48 @@ async function bootstrap() {
     initInstallButton();
   }
   if (sharedMode) {
-    await initApp();
+    await startAppWithErrorHandling();
     return;
   }
   const urlToken = getTokenFromUrl();
   if (urlToken) stripTokenFromUrl();
-  const existingSession = await verifyExistingSession();
+  const persistedToken = loadPersistedAuthToken();
+  const bootstrapToken = String(urlToken || persistedToken || '').trim();
+  const existingSession = await verifyExistingSession(bootstrapToken);
   if (existingSession?.ok) {
-    await initApp();
+    if (existingSession?.source === 'token' && bootstrapToken) {
+      setToken(bootstrapToken);
+      persistAuthToken(bootstrapToken);
+    } else {
+      setToken('');
+    }
+    await startAppWithErrorHandling();
     return;
   }
   if (urlToken) {
     const tokenResult = await verifyToken(urlToken);
     if (tokenResult?.ok) {
       setToken(urlToken);
-      await initApp();
+      persistAuthToken(urlToken);
+      await startAppWithErrorHandling();
       return;
     }
   }
+  if (!urlToken && persistedToken) {
+    const persistedResult = await verifyToken(persistedToken);
+    if (persistedResult?.ok) {
+      setToken(persistedToken);
+      persistAuthToken(persistedToken);
+      await startAppWithErrorHandling();
+      return;
+    }
+  }
+  if (existingSession?.status === 401 && persistedToken) {
+    persistAuthToken('');
+    setToken('');
+  }
   if (urlToken) document.getElementById('token-input').value = urlToken;
+  else if (persistedToken) document.getElementById('token-input').value = persistedToken;
   showAuthGate();
 }
 
@@ -2486,6 +2675,7 @@ window.registerPwaShell = registerPwaShell;
 window.newConversation = newConversation;
 window.deleteConv = deleteConv;
 window.openConversation = openConversation;
+window.toggleStatusView = toggleStatusView;
 window.refreshConversations = refreshConversations;
 window.renderConvList = renderConvList;
 window.handleAttachmentInput = handleAttachmentInput;

@@ -33,6 +33,7 @@ import { loadRelayBoards } from './relay-board-view.js';
 import { clearAttachments, setRepoBrowserSessionInfo, loadRepoBrowserTree } from './attachments-view.js';
 import { shouldApplyConversationLoad } from './activity-replay-state.mjs';
 import { createInfiniteLoader } from './infinite-loader.js';
+import { leaveStatusView } from './status-view.mjs';
 
 const PROCESSING_DOT_FRAMES = ['   ', '.  ', '.. ', '...'];
 const PROCESSING_DOT_INTERVAL_MS = 1000;
@@ -319,6 +320,8 @@ export function applyLoadedConversationState(id, response, { restoreScroll = fal
 }
 
 export async function openConversation(id, options = {}) {
+  const didLeaveStatusView = leaveStatusView();
+  document.getElementById('input-area')?.removeAttribute('hidden');
   const previousConversationId = String(currentConvId || '').trim();
   const nextConversationId = String(id || '').trim();
   if (previousConversationId && nextConversationId && previousConversationId !== nextConversationId) {
@@ -339,6 +342,10 @@ export async function openConversation(id, options = {}) {
   closeSidebar();
   clearAttachments();
   document.getElementById('chat-title').textContent = conversations[id]?.title || id;
+  if (didLeaveStatusView) {
+    restoreInFlightThinking(null);
+    renderMessages([]);
+  }
   window.syncChatTitleControls?.();
   updateSessionPill(conversations[id], null);
   updateCompactButton();
