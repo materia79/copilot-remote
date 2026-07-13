@@ -1261,7 +1261,6 @@ export function registerSessionsRoutes(app, deps) {
     isSha256,
     uploadPathForSha,
   } = deps;
-  const conversationDraftPersistenceEnabled = featureFlags?.CONVERSATION_DRAFT_PERSISTENCE_ENABLED === true;
   const sdkSessionSyncService = createSdkSessionSyncService(db);
   const SDK_DELETE_WAIT_TIMEOUT_MS = 12_000;
   const SDK_DELETE_POLL_MS = 200;
@@ -1814,9 +1813,9 @@ export function registerSessionsRoutes(app, deps) {
         messageCount: resolveMessageCount(r.sdk_session_id, r.message_count),
         preferredRelayMode: preferences.preferredRelayMode,
         preferredModelsByMode: preferences.preferredModelsByMode,
-        draftText: conversationDraftPersistenceEnabled ? String(r.draft_text || '') : '',
-        draftUpdatedAt: conversationDraftPersistenceEnabled ? (r.draft_updated_at || null) : null,
-        draftUpdatedByClientId: conversationDraftPersistenceEnabled ? (r.draft_updated_by_client_id || null) : null,
+        draftText: String(r.draft_text || ''),
+        draftUpdatedAt: r.draft_updated_at || null,
+        draftUpdatedByClientId: r.draft_updated_by_client_id || null,
       };
     });
 
@@ -2508,9 +2507,9 @@ export function registerSessionsRoutes(app, deps) {
       inFlight,
       preferredRelayMode: preferences.preferredRelayMode,
       preferredModelsByMode: preferences.preferredModelsByMode,
-      draftText: conversationDraftPersistenceEnabled ? String(conv.draft_text || '') : '',
-      draftUpdatedAt: conversationDraftPersistenceEnabled ? (conv.draft_updated_at || null) : null,
-      draftUpdatedByClientId: conversationDraftPersistenceEnabled ? (conv.draft_updated_by_client_id || null) : null,
+      draftText: String(conv.draft_text || ''),
+      draftUpdatedAt: conv.draft_updated_at || null,
+      draftUpdatedByClientId: conv.draft_updated_by_client_id || null,
       messages: history.messages,
       pageInfo: history.pageInfo,
       refreshed: true,
@@ -2891,9 +2890,9 @@ export function registerSessionsRoutes(app, deps) {
       inFlight,
       preferredRelayMode: preferences.preferredRelayMode,
       preferredModelsByMode: preferences.preferredModelsByMode,
-      draftText: conversationDraftPersistenceEnabled ? String(conv.draft_text || '') : '',
-      draftUpdatedAt: conversationDraftPersistenceEnabled ? (conv.draft_updated_at || null) : null,
-      draftUpdatedByClientId: conversationDraftPersistenceEnabled ? (conv.draft_updated_by_client_id || null) : null,
+      draftText: String(conv.draft_text || ''),
+      draftUpdatedAt: conv.draft_updated_at || null,
+      draftUpdatedByClientId: conv.draft_updated_by_client_id || null,
       messages: history.messages,
       pageInfo: history.pageInfo,
     });
@@ -2970,9 +2969,6 @@ export function registerSessionsRoutes(app, deps) {
   });
 
   app.patch('/api/conversation/:id/draft', auth, (req, res) => {
-    if (!conversationDraftPersistenceEnabled) {
-      return res.status(404).json({ error: 'Conversation draft persistence is disabled' });
-    }
     const requestedId = String(req.params.id || '').trim();
     if (!requestedId) return res.status(400).json({ error: 'Missing conversation id' });
     const resolvedConversation = resolveConversationByIdOrSdkSessionId(requestedId);

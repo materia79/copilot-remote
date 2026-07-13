@@ -88,7 +88,6 @@ import {
   getConversationLoadedMessageCount,
   loadOlderConversationMessages,
   syncComposerControlState,
-  setConversationDraftPersistenceEnabled,
   flushConversationDraft,
   initConversationHistoryLazyLoading,
   initBubbleActionHandlers,
@@ -1747,7 +1746,6 @@ async function refreshSessionWorkerStatus() {
   const previousWorkerStatus = String(previousWorkerState?.status || '').trim().toLowerCase();
   const status = await refreshWorkspaceRootHints();
   if (!status) return;
-  setConversationDraftPersistenceEnabled(status?.features?.CONVERSATION_DRAFT_PERSISTENCE_ENABLED === true);
   syncQueueStatusMenuEntry(status);
   if (setSessionWorkerStatesFromStatusPayload(status.sessionWorker)) {
     renderConvList();

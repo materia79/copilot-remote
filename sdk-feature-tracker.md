@@ -1,6 +1,6 @@
 # Copilot SDK Feature Tracker (relay/app)
 
-Updated: 2026-06-20
+Updated: 2026-07-13
 Scope: `server/` + `.github/extensions/web-relay/`
 
 ## Changelog
@@ -9,7 +9,7 @@ Scope: `server/` + `.github/extensions/web-relay/`
 - 2026-06-20: Wired SDK history-fetch polling to `session.getEvents()`; behavior is guarded when runtime lacks the method.
 - 2026-06-20: Added installable PWA shell support with a scoped manifest and versioned service worker.
 - 2026-06-20: Added session history refresh, default session workspace root settings, draft version conflict handling, and subagent lifecycle tracking.
-- 2026-06-17: Added feature-flagged conversation draft persistence.
+- 2026-07-13: Removed conversation draft persistence feature flag; draft persistence is now always-on.
 
 Status legend: **Implemented** | **Partial** | **Not implemented**
 
@@ -25,7 +25,7 @@ Status legend: **Implemented** | **Partial** | **Not implemented**
 | `CopilotClient.deleteSession()`                                                | Partial         | Implemented where available for cleanup/deletion flows, guarded for runtime support (`.github/extensions/web-relay/polling/polling-loop.mjs:542-544`, `server/services/delete-archive-service.mjs:12-23`).                                                                  |
 | `session.disconnect()`                                                         | Not implemented | No explicit disconnect lifecycle wired.                                                                                                                                                                                                                                     |
 | `session.abort()`                                                              | Implemented     | User stop control aborts active turn (`.github/extensions/web-relay/polling/polling-loop.mjs:575-590`; SDK `session.d.ts:248`).                                                                                                                                             |
-| Conversation draft persistence + conflict checks                               | Implemented     | Draft saves are feature-flagged and reject stale writes with 409 conflicts (`server/routes/sessions-routes.mjs:2358-2417`, `server/public/app/conversation-view.js`, `server/public/app/journal-view.js`, `server/public/app/conversation-draft-timestamp-utils.mjs:1-11`). |
+| Conversation draft persistence + conflict checks                               | Implemented     | Draft saves are always enabled and reject stale writes with 409 conflicts (`server/routes/sessions-routes.mjs`, `server/public/app/conversation-view.js`, `server/public/app/journal-view.js`, `server/public/app/conversation-draft-timestamp-utils.mjs:1-11`). |
 | Conversation history refresh / rebuild from SDK events                         | Implemented     | Relay can clear and rebuild retrievable history from SDK events, falling back to transcript data when needed (`server/services/session-history-refresh-service.mjs:37-220`, `server/routes/sessions-routes.mjs:1919-2091`).                                                 |
 | Default session workspace root / launch fallback                               | Implemented     | New session launches and workspace-root updates now honor a default CWD setting plus recent-root state (`server/services/workspace-root-defaults-service.mjs:1-34`, `server/routes/sessions-routes.mjs:2705-2726`, `server/server-runtime.mjs:3839-3938`).                  |
 
@@ -114,5 +114,4 @@ Status legend: **Implemented** | **Partial** | **Not implemented**
 | ----------------------------------- | ------------------------- | --------------------------------------------------------------------------------------- |
 | Native SDK chat fork at message X   | Not implemented (SDK gap) | No public primitive currently wired for true server-side branch/fork semantics.         |
 | Native SDK rewind-to-arbitrary-turn | Not implemented (SDK gap) | No public API currently wired for arbitrary rewind; CLI exposes last-turn `/rewind` UX. |
-
 

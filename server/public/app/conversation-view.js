@@ -66,7 +66,6 @@ const SUBAGENT_TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 
 let lastRenderedMessageSnapshotKey = '';
 let sendInFlight = false;
 const COMPOSER_DRAFT_DEBOUNCE_MS = 500;
-let conversationDraftPersistenceEnabled = false;
 const draftSaveTimerByConversation = new Map();
 const draftSavePromiseByConversation = new Map();
 const activeTurnsByConversation = new Map();
@@ -282,7 +281,6 @@ function upsertConversationDraftState(conversationId, {
 }
 
 async function persistConversationDraft(conversationId, draftText) {
-  if (!conversationDraftPersistenceEnabled) return null;
   const id = String(conversationId || '').trim();
   if (!id) return null;
   const text = String(draftText || '');
@@ -329,7 +327,6 @@ async function scheduleConversationDraftSave({
   draftText,
   immediate = false,
 } = {}) {
-  if (!conversationDraftPersistenceEnabled) return null;
   const id = String(conversationId || '').trim();
   if (!id) return null;
   const text = String(draftText || '');
@@ -345,10 +342,6 @@ async function scheduleConversationDraftSave({
     }, COMPOSER_DRAFT_DEBOUNCE_MS);
     draftSaveTimerByConversation.set(id, timer);
   });
-}
-
-export function setConversationDraftPersistenceEnabled(enabled) {
-  conversationDraftPersistenceEnabled = enabled === true;
 }
 
 export async function flushConversationDraft(conversationId = currentConvId) {
