@@ -5,10 +5,11 @@ For any user-facing question or clarification, use the ask_user tool so the web 
 When using ask_user, ALWAYS include a `choices` array with 2-6 answer options so the web relay can render clickable buttons. Example:
 ```json
 {
-  "question": "Which planet is known as the Red Planet?",
-  "choices": ["Mars", "Venus", "Jupiter", "Saturn"]
+  "question": "<QUIZ_QUESTION_TEXT>",
+  "choices": ["<CHOICE_A>", "<CHOICE_B>", "<CHOICE_C>", "<CHOICE_D>"]
 }
 ```
+At runtime, inject the question and choices from a random item in your quiz pool.
 Only omit choices when the question genuinely requires freeform text input (e.g., "What is your name?").
 
 In autopilot, still call ask_user when user input is truly blocking, because the relay bridge can surface the question even when the direct SDK question hook is bypassed.

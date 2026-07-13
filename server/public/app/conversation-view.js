@@ -38,6 +38,7 @@ import {
   markSubagentCancelInFlight,
   clearSubagentCancelInFlight,
   isSubagentCancelInFlight,
+  IS_SHARED_VIEW,
 } from './store.js';
 import { sendMessage as sendMessageApi, cancelConversationTurn, cancelQueuedConversationTurn, cancelSubagentRun, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi, updateConversationDraft as updateConversationDraftApi } from './api-client.js';
 import { linkifyWorkspaceMentionsInNode, renderMarkdownPreview, rewriteLocalAssetUrlsInNode } from './router.js';
@@ -62,6 +63,7 @@ const relayStreamStateByMessageId = new Map();
 const completedMessageIds = new Set();
 const bubbleCancelInFlight = new Set();
 const SUBAGENT_TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'dropped', 'done']);
+let lastRenderedMessageSnapshotKey = '';
 let sendInFlight = false;
 const COMPOSER_DRAFT_DEBOUNCE_MS = 500;
 let conversationDraftPersistenceEnabled = false;
@@ -234,6 +236,7 @@ function syncSendButtonState() {
       attachmentCount: selectedAttachments.length,
     }),
     sendInFlight,
+    modelMetadataBlocked: window.isModelMetadataBlocked?.() === true,
   });
   btn.disabled = state.disabled;
   btn.dataset.action = state.action;
@@ -379,6 +382,11 @@ export function hydrateConversationDraft(conversationId, {
   if (String(currentConvId || '').trim() !== id) return;
   const input = document.getElementById('msg-input');
   if (!input) return;
+  const isFocused = document.activeElement === input;
+  if (isFocused && input.value !== normalizedDraftText) {
+    syncSendButtonState();
+    return;
+  }
   if (input.value !== normalizedDraftText) {
     input.value = normalizedDraftText;
     autoResize(input);
@@ -409,7 +417,7 @@ export function applyIncomingConversationDraftUpdate({
   const input = document.getElementById('msg-input');
   if (!input) return;
   const isFocused = document.activeElement === input;
-  if (isFocused && input.value && input.value !== incomingDraftText) return;
+  if (isFocused && input.value !== incomingDraftText) return;
   if (input.value !== incomingDraftText) {
     input.value = incomingDraftText;
     autoResize(input);
@@ -568,21 +576,52 @@ function createMessageNode(msg, msgId = null, force = false) {
   div.dataset.messageTimestamp = String(msg?.timestamp || '').trim();
   if (fingerprint.sourceMessageId) div.dataset.sourceMessageId = fingerprint.sourceMessageId;
 
-  const label = msg.role === 'user' ? 'You' : 'Copilot';
+  const label = msg.role === 'user' ? 'You' : '';
   const { baseModelId, reasoningEffort } = splitVariantId(msg.model);
   const explicitReasoningEffort = String(msg?.reasoningEffort || '').trim().toLowerCase() || null;
   const resolvedReasoningEffort = explicitReasoningEffort || reasoningEffort;
+  const modelOrigin = String(msg?.modelOrigin || '').trim().toLowerCase();
   const modelTag = (msg.role === 'assistant' && baseModelId)
     ? ` <span class="msg-model">${escHtml(baseModelId)}</span>` : '';
   const reasoningTag = (msg.role === 'assistant' && resolvedReasoningEffort && resolvedReasoningEffort !== 'none')
     ? ` <span class="msg-reasoning">${escHtml(resolvedReasoningEffort)}</span>` : '';
   const modeTag = msg.mode
     ? ` <span class="msg-mode">${escHtml(msg.mode)}</span>` : '';
+  const autoTag = (msg.role === 'assistant' && modelOrigin === 'auto')
+    ? ' <span class="msg-auto">auto</span>' : '';
+  const usage = (msg.role === 'assistant' && msg?.usage && typeof msg.usage === 'object') ? msg.usage : null;
+  const deltaCredits = Number(usage?.premium?.deltaCredits ?? usage?.premium?.deltaUsed);
+  const deltaMonthlyPercent = Number(usage?.plan?.deltaMonthlyPercent);
+  const monthlyPercentRemaining = Number(usage?.plan?.percentRemaining);
+  const usageTurnParts = [];
+  if (Number.isFinite(deltaCredits) && deltaCredits > 0) {
+    usageTurnParts.push(`+${escHtml(String(deltaCredits))}`);
+  }
+  if (Number.isFinite(deltaMonthlyPercent) && deltaMonthlyPercent > 0) {
+    usageTurnParts.push(`${escHtml(deltaMonthlyPercent.toFixed(3))}%`);
+  }
+  const usageTurnTag = usageTurnParts.length
+    ? ` <span class="msg-usage">${usageTurnParts.join(' (')}${usageTurnParts.length > 1 ? ')' : ''}</span>`
+    : '';
+  const usageRemainingTag = Number.isFinite(monthlyPercentRemaining) && monthlyPercentRemaining > 0
+    ? ` <span class="msg-usage">month ${escHtml(monthlyPercentRemaining.toFixed(1))}% left</span>`
+    : '';
+  const usageStaleTag = usage?.stale
+    ? ' <span class="msg-usage msg-usage-stale">stale</span>'
+    : '';
+  const renderAssistantMarkdown = (text) => {
+    const markdown = globalThis.marked;
+    if (!markdown || typeof markdown.parse !== 'function') {
+      return `<p>${escHtml(String(text || '')).replace(/\n/g, '<br>')}</p>`;
+    }
+    return markdown.parse(String(text || ''));
+  };
   const content = msg.role === 'assistant'
-    ? marked.parse(msg.text || '')
+    ? renderAssistantMarkdown(msg.text || '')
     : renderMarkdownPreview(msg.text || '', false);
   const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
   const activities = Array.isArray(msg.activities) ? msg.activities.filter(Boolean).slice(0, 48) : [];
+  if (activities.length) div.classList.add('msg-with-activity');
   const thoughts = Array.isArray(msg.thoughts) ? msg.thoughts.filter((t) => t && String(t.text || '').trim()) : [];
   const attachmentHtml = attachments.length ? renderAttachmentMarkup(attachments) : '';
   const activityHtml = activities.length ? renderActivityMarkup(activities) : '';
@@ -594,13 +633,13 @@ function createMessageNode(msg, msgId = null, force = false) {
 
   const isQueuedUserMessage = msg.role === 'user' && msgId && pendingUserMessageIds.has(msgId);
   const isCancelInFlight = isQueuedUserMessage && bubbleCancelInFlight.has(msgId);
-  const userBubbleActionsHtml = isQueuedUserMessage
+  const userBubbleActionsHtml = (!IS_SHARED_VIEW && isQueuedUserMessage)
     ? `<div class="msg-bubble-actions"><button type="button" class="bubble-action-btn${isCancelInFlight ? ' stopping' : ''}" data-action="cancel-queued" data-message-id="${escHtml(msgId)}"${isCancelInFlight ? ' disabled' : ''}>${isCancelInFlight ? 'Cancelling…' : 'Cancel'}</button></div>`
     : '';
 
   div.innerHTML = `
-    <div class="${bubbleClass}">${content}${attachmentHtml}${thoughtsHtml}${activityHtml}${userBubbleActionsHtml}</div>
-    <div class="msg-label">${label}${modelTag}${reasoningTag}${modeTag} · ${fmtDate(msg.timestamp)}</div>`;
+    <div class="${bubbleClass}">${thoughtsHtml}${content}${attachmentHtml}${activityHtml}${userBubbleActionsHtml}</div>
+    <div class="msg-label">${label}${modelTag}${reasoningTag}${modeTag}${autoTag}${usageTurnTag}${usageRemainingTag}${usageStaleTag} · ${fmtDate(msg.timestamp)}</div>`;
 
   const bubble = div.querySelector('.msg-bubble');
   rewriteLocalAssetUrlsInNode(bubble, { preferDrive: msg.role === 'assistant' });
@@ -655,49 +694,78 @@ function prependMessageNodes(msgs) {
 export function decorateActivityText(text) {
   const value = String(text || '').trim();
   if (!value) return '';
-  if (/^[\u{1F300}-\u{1FAFF}\u2600-\u27BF]/u.test(value)) return value;
-  if (value.startsWith('● ')) return `🔄 ${value.slice(2).trim()}`;
-  if (/^Model selected:/i.test(value)) return `🧠 ${value}`;
-  if (/^Search \((glob|grep)\)/i.test(value)) return `🔍 ${value}`;
-  if (/^Tool \(ask_user\)/i.test(value)) return `❓ ${value}`;
-  if (/^Tool \(view\)/i.test(value)) return `👀 ${value}`;
-  if (/^Tool \(apply_patch\)/i.test(value)) return `🪡 ${value}`;
-  if (/^Tool \(powershell\)/i.test(value)) return `🪓 ${value}`;
-  if (/^Tool \(edit\)/i.test(value)) return `📝 ${value}`;
-  if (/^Tool \(read_file\)/i.test(value)) return `📄 ${value}`;
-  if (/^Tool \((grep_search|file_search)\)/i.test(value)) return `🔎 ${value}`;
-  if (/^Tool \(semantic_search\)/i.test(value)) return `🧭 ${value}`;
-  if (/^Tool \(vscode_listCodeUsages\)/i.test(value)) return `🔗 ${value}`;
-  if (/^Tool \(vscode_renameSymbol\)/i.test(value)) return `✏️ ${value}`;
-  if (/^Tool \(list_dir\)/i.test(value)) return `📂 ${value}`;
-  if (/^Tool \(create_directory\)/i.test(value)) return `📁 ${value}`;
-  if (/^Tool \((delete|remove)\)/i.test(value)) return `🗑️ ${value}`;
-  if (/^Tool \(execution_subagent\)/i.test(value)) return `🚀 ${value}`;
-  if (/^Tool \(get_errors\)/i.test(value)) return `🚨 ${value}`;
-  if (/^Tool \(debug_[^)]+\)/i.test(value)) return `🐞 ${value}`;
-  if (/^Tool \(fetch_webpage\)/i.test(value)) return `🌐 ${value}`;
-  if (/^Tool \(github_[^)]+\)/i.test(value)) return `🐙 ${value}`;
-  if (/^Tool \(run_in_terminal\)/i.test(value)) return `🖥️ ${value}`;
-  if (/^Tool \((create_file|write)\)/i.test(value)) return `🆕 ${value}`;
-  if (/^Tool \((bash|shell|terminal)\)/i.test(value)) return `🔧 ${value}`;
-  if (/^Tool \((sql|sqlite)\)/i.test(value)) return `🗄️ ${value}`;
-  if (/^Tool \(/i.test(value)) return `🛠️ ${value}`;
-  return `ℹ️ ${value}`;
+  const maskSharedPathSegments = (input) => {
+    const source = String(input || '');
+    const tokenMasked = source.replace(/@(file|folder):([^\s`]+)/gi, (_m, kind, rawPath) => {
+      const normalized = String(rawPath || '').replace(/\\/g, '/').replace(/\/+$/, '');
+      const segments = normalized.split('/').filter(Boolean);
+      const basename = segments[segments.length - 1] || normalized;
+      return `@${String(kind || '').toLowerCase()}:${basename}`;
+    });
+    return tokenMasked.replace(/([A-Za-z]:)?(?:[\\/~.]?[\\/])(?:[^\\/\s]+[\\/])+([^\\/\s]+)/g, (_m, _prefix, basename) => basename);
+  };
+  const sharedSafeValue = IS_SHARED_VIEW ? maskSharedPathSegments(value) : value;
+  if (/^[\u{1F300}-\u{1FAFF}\u2600-\u27BF]/u.test(sharedSafeValue)) return sharedSafeValue;
+  if (sharedSafeValue.startsWith('● ')) return `🔄 ${sharedSafeValue.slice(2).trim()}`;
+  if (/^Model selected:/i.test(sharedSafeValue)) return `🧠 ${sharedSafeValue}`;
+  if (/^Search \((glob|grep)\)/i.test(sharedSafeValue)) return `🔍 ${sharedSafeValue}`;
+  if (/^Tool \(ask_user\)/i.test(sharedSafeValue)) return `❓ ${sharedSafeValue}`;
+  if (/^Tool \(view\)/i.test(sharedSafeValue)) return `👀 ${sharedSafeValue}`;
+  if (/^Tool \(apply_patch\)/i.test(sharedSafeValue)) return `🪡 ${sharedSafeValue}`;
+  if (/^Tool \(powershell\)/i.test(sharedSafeValue)) return `🪓 ${sharedSafeValue}`;
+  if (/^Tool \(edit\)/i.test(sharedSafeValue)) return `📝 ${sharedSafeValue}`;
+  if (/^Tool \(read_file\)/i.test(sharedSafeValue)) return `📄 ${sharedSafeValue}`;
+  if (/^Tool \((grep_search|file_search)\)/i.test(sharedSafeValue)) return `🔎 ${sharedSafeValue}`;
+  if (/^Tool \(semantic_search\)/i.test(sharedSafeValue)) return `🧭 ${sharedSafeValue}`;
+  if (/^Tool \(vscode_listCodeUsages\)/i.test(sharedSafeValue)) return `🔗 ${sharedSafeValue}`;
+  if (/^Tool \(vscode_renameSymbol\)/i.test(sharedSafeValue)) return `✏️ ${sharedSafeValue}`;
+  if (/^Tool \(list_dir\)/i.test(sharedSafeValue)) return `📂 ${sharedSafeValue}`;
+  if (/^Tool \(create_directory\)/i.test(sharedSafeValue)) return `📁 ${sharedSafeValue}`;
+  if (/^Tool \((delete|remove)\)/i.test(sharedSafeValue)) return `🗑️ ${sharedSafeValue}`;
+  if (/^Tool \(execution_subagent\)/i.test(sharedSafeValue)) return `🚀 ${sharedSafeValue}`;
+  if (/^Tool \(get_errors\)/i.test(sharedSafeValue)) return `🚨 ${sharedSafeValue}`;
+  if (/^Tool \(debug_[^)]+\)/i.test(sharedSafeValue)) return `🐞 ${sharedSafeValue}`;
+  if (/^Tool \(fetch_webpage\)/i.test(sharedSafeValue)) return `🌐 ${sharedSafeValue}`;
+  if (/^Tool \(github_[^)]+\)/i.test(sharedSafeValue)) return `🐙 ${sharedSafeValue}`;
+  if (/^Tool \(run_in_terminal\)/i.test(sharedSafeValue)) return `🖥️ ${sharedSafeValue}`;
+  if (/^Tool \((create_file|write)\)/i.test(sharedSafeValue)) return `🆕 ${sharedSafeValue}`;
+  if (/^Tool \((bash|shell|terminal)\)/i.test(sharedSafeValue)) return `🔧 ${sharedSafeValue}`;
+  if (/^Tool \((sql|sqlite)\)/i.test(sharedSafeValue)) return `🗄️ ${sharedSafeValue}`;
+  if (/^Tool \(/i.test(sharedSafeValue)) return `🛠️ ${sharedSafeValue}`;
+  return `ℹ️ ${sharedSafeValue}`;
 }
 
 export function renderThoughtsMarkup(thoughts) {
   const items = (Array.isArray(thoughts) ? thoughts : [])
-    .map((t) => String(t?.text || '').trim())
-    .filter(Boolean);
+    .map((thought) => ({
+      reasoningId: String(thought?.reasoningId || '').trim(),
+      text: String(thought?.text || '').trim(),
+    }))
+    .filter((thought) => thought.text);
   if (!items.length) return '';
   const blocks = items
-    .map((text) => `<div class="msg-thought-item"><p>${escHtml(text).replace(/\n/g, '<br>')}</p></div>`)
+    .map((thought) => `<div class="msg-thought-item"${thought.reasoningId ? ` data-reasoning-id="${escHtml(thought.reasoningId)}"` : ''}>${renderMarkdownPreview(thought.text, false)}</div>`)
     .join('');
   return `
     <details class="msg-thoughts">
       <summary>💭 Thoughts (${items.length})</summary>
       <div class="msg-thoughts-list">${blocks}</div>
     </details>`;
+}
+
+function enhanceThoughtMarkup(root) {
+  if (!(root instanceof Element)) return;
+  rewriteLocalAssetUrlsInNode(root, { preferDrive: true });
+  linkifyWorkspaceMentionsInNode(root);
+  root.querySelectorAll('pre code').forEach((block) => {
+    if (globalThis.hljs?.highlightElement) globalThis.hljs.highlightElement(block);
+  });
+}
+
+function renderThoughtBody(body, text) {
+  if (!body) return;
+  body.innerHTML = renderMarkdownPreview(String(text || ''), false);
+  enhanceThoughtMarkup(body);
 }
 
 export function renderActivityMarkup(activities) {
@@ -728,18 +796,21 @@ export function showThinking(messageId = null, autoScroll = true) {
   div.id = 'thinking-indicator';
   if (nextMessageId) div.dataset.messageId = nextMessageId;
   const isCancelInFlight = nextMessageId && bubbleCancelInFlight.has(nextMessageId);
-  const stopBtnHtml = nextMessageId
+  const stopBtnHtml = (!IS_SHARED_VIEW && nextMessageId)
     ? `<button type="button" class="bubble-action-btn${isCancelInFlight ? ' stopping' : ''}" data-action="stop-turn" data-message-id="${escHtml(nextMessageId)}"${isCancelInFlight ? ' disabled' : ''}>${isCancelInFlight ? 'Stopping…' : 'Stop'}</button>`
     : '';
   div.innerHTML = `
     <div class="thinking-bubble">
       <div class="thinking-bubble-header">${stopBtnHtml}</div>
+      <details id="thinking-thoughts" class="thinking-thoughts-panel" open>
+        <summary>💭 Thoughts</summary>
+        <div class="thinking-thoughts-list"></div>
+      </details>
       <div id="thinking-text" class="thinking-text"></div>
       <div class="dots"><span></span><span></span><span></span></div>
       <div id="thinking-activity" class="thinking-activity"></div>
       <div class="subagent-bubbles-container" data-subagent-bubbles-root="1"></div>
-    </div>
-    <div class="msg-label">Copilot</div>`;
+    </div>`;
   const target = nextMessageId ? el.querySelector(`[data-message-id="${nextMessageId}"]`) : null;
   if (target && target.parentNode === el) {
     const next = target.nextSibling;
@@ -749,6 +820,7 @@ export function showThinking(messageId = null, autoScroll = true) {
     el.appendChild(div);
   }
   renderThinkingText(thinkingText);
+  renderThinkingThoughts();
   if (autoScroll) scrollBottom();
 }
 
@@ -756,6 +828,15 @@ export function removeThinking() {
   thinkingText = '';
   thinkingMessageId = null;
   document.getElementById('thinking-indicator')?.remove();
+}
+
+export function collapseThinkingThoughts() {
+  const panel = document.getElementById('thinking-thoughts');
+  if (!(panel instanceof HTMLDetailsElement)) return;
+  panel.open = false;
+  panel.querySelectorAll('.thinking-thought').forEach((row) => {
+    if (row instanceof HTMLDetailsElement) row.open = false;
+  });
 }
 
 function renderThinkingText(text) {
@@ -805,7 +886,7 @@ export function renderThinkingActivities() {
   }
 }
 
-export function restoreInFlightThinking(inFlight) {
+export function restoreInFlightThinking(inFlight, autoScroll = true) {
   clearRelayStreamState();
   const messageId = String(inFlight?.messageId || '').trim();
   const status = String(inFlight?.status || '').trim().toLowerCase();
@@ -853,7 +934,7 @@ export function restoreInFlightThinking(inFlight) {
     });
   }
   thinkingText = '';
-  showThinking(messageId);
+  showThinking(messageId, autoScroll);
   renderThinkingActivities();
   renderThinkingThoughts();
   renderRestoredSubagentBubbles(messageId);
@@ -861,7 +942,7 @@ export function restoreInFlightThinking(inFlight) {
   if (streamState) {
     rememberRelayStreamState(messageId, streamState.seq, streamState.done || !!inFlight?.streamDone);
     if (!isOpaqueRelayText(streamState.text)) {
-      updateThinkingText(streamState.text, messageId, streamState.done || !!inFlight?.streamDone);
+      updateThinkingText(streamState.text, messageId, streamState.done || !!inFlight?.streamDone, autoScroll);
     }
     return;
   }
@@ -1053,6 +1134,11 @@ function updateSubagentStopButton(subagentRunId, isStopping = false, statusOverr
   if (!id) return;
   const btn = document.querySelector(`.subagent-stop-btn[data-action="stop-subagent"][data-subagent-run-id="${CSS.escape(id)}"]`);
   if (!btn) return;
+  if (IS_SHARED_VIEW) {
+    btn.hidden = true;
+    btn.disabled = true;
+    return;
+  }
   const status = normalizeSubagentBubbleStatus(statusOverride || getSubagentStatus(id));
   const terminal = isSubagentTerminalStatus(status);
   const stopping = !!isStopping;
@@ -1118,6 +1204,7 @@ export function appendThinkingThought(reasoningId, text, done = false, subagentR
       if (!row) {
         row = document.createElement('details');
         row.className = 'thinking-thought';
+        row.open = !done;
         row.dataset.reasoningId = key;
         row.dataset.subagentRunId = subagentRunId;
         const summary = document.createElement('summary');
@@ -1130,19 +1217,21 @@ export function appendThinkingThought(reasoningId, text, done = false, subagentR
       const summaryEl = row.querySelector('summary');
       const bodyEl = row.querySelector('.thinking-thought-body');
       if (summaryEl) summaryEl.textContent = `💭 ${thoughtSummaryText(value)}`;
-      if (bodyEl) bodyEl.innerHTML = `<p>${escHtml(value).replace(/\n/g, '<br>')}</p>`;
+      renderThoughtBody(bodyEl, value);
       row.dataset.done = done ? '1' : '0';
+      row.open = !done;
       if (autoScroll) scrollBottom();
       return;
     }
   }
 
-  const box = document.getElementById('thinking-activity');
+  const box = document.querySelector('#thinking-thoughts > .thinking-thoughts-list');
   if (!box) return;
   let row = box.querySelector(`.thinking-thought[data-reasoning-id="${CSS.escape(key)}"]`);
   if (!row) {
     row = document.createElement('details');
     row.className = 'thinking-thought';
+    row.open = !done;
     row.dataset.reasoningId = key;
     if (subagentRunId) row.dataset.subagentRunId = subagentRunId;
     const summary = document.createElement('summary');
@@ -1155,13 +1244,14 @@ export function appendThinkingThought(reasoningId, text, done = false, subagentR
   const summaryEl = row.querySelector('summary');
   const bodyEl = row.querySelector('.thinking-thought-body');
   if (summaryEl) summaryEl.textContent = `💭 ${thoughtSummaryText(value)}`;
-  if (bodyEl) bodyEl.innerHTML = `<p>${escHtml(value).replace(/\n/g, '<br>')}</p>`;
+  renderThoughtBody(bodyEl, value);
   row.dataset.done = done ? '1' : '0';
+  row.open = !done;
   if (autoScroll) scrollBottom();
 }
 
 export function renderThinkingThoughts() {
-  const box = document.getElementById('thinking-activity');
+  const box = document.querySelector('#thinking-thoughts > .thinking-thoughts-list');
   if (!box) return;
   const thoughtMap = thinkingMessageId ? relayThoughts.get(thinkingMessageId) : null;
   if (!thoughtMap || !thoughtMap.size) return;
@@ -1578,18 +1668,57 @@ export function getRenderedConversationMessageFingerprints(limit = 24) {
   }));
 }
 
+function buildMessageSnapshotKey(messages = [], meta = {}) {
+  const conversationId = String(meta.conversationId || currentConvId || '').trim();
+  const pageInfo = meta.pageInfo && typeof meta.pageInfo === 'object' ? meta.pageInfo : null;
+  const hasMoreOlder = typeof meta.hasMoreOlder === 'boolean'
+    ? meta.hasMoreOlder
+    : (typeof meta.hasMoreHistory === 'boolean' ? meta.hasMoreHistory : !!pageInfo?.hasMoreOlder || !!pageInfo?.hasMore);
+  const hasMoreNewer = typeof meta.hasMoreNewer === 'boolean'
+    ? meta.hasMoreNewer
+    : !!pageInfo?.hasMoreNewer;
+  return JSON.stringify({
+    conversationId,
+    hasMoreOlder: !!hasMoreOlder,
+    hasMoreNewer: !!hasMoreNewer,
+    messages: (Array.isArray(messages) ? messages : []).map((item) => ({
+      id: String(item?.id || '').trim(),
+      role: String(item?.role || '').trim(),
+      text: String(item?.text || ''),
+      timestamp: String(item?.timestamp || '').trim(),
+      model: String(item?.model || '').trim(),
+      mode: String(item?.mode || '').trim(),
+      attachments: Array.isArray(item?.attachments) ? item.attachments.length : 0,
+      thoughts: (Array.isArray(item?.thoughts) ? item.thoughts : []).map((thought) => ({
+        reasoningId: String(thought?.reasoningId || '').trim(),
+        seq: Number.isFinite(Number(thought?.seq)) ? Number(thought.seq) : null,
+        text: String(thought?.text || ''),
+        done: !!thought?.done,
+        timestamp: String(thought?.timestamp || '').trim(),
+        subagentRunId: String(thought?.subagentRunId || '').trim(),
+      })),
+    })),
+  });
+}
+
 export function renderMessages(msgs, scroll = true, meta = {}) {
   const el = getMessagesElement();
-  if (!el) return;
+  if (!el) return false;
   const ordered = sortConversationMessages(msgs || []);
+  const snapshotKey = buildMessageSnapshotKey(ordered, meta);
+  const statusViewMounted = !!el.querySelector('.status-view');
+  if (snapshotKey && snapshotKey === lastRenderedMessageSnapshotKey && !statusViewMounted) {
+    renderRelayQuestions();
+    renderRelayBoards();
+    return false;
+  }
   const messageById = new Map(
     ordered
       .map((item) => [String(item?.id || '').trim(), item])
       .filter(([id]) => !!id),
   );
   if (!ordered.length) {
-    el.innerHTML = `<div id="pull-refresh-indicator" aria-hidden="true"><span>↻ Pull down to refresh</span></div>
-      <div class="empty-state">
+    el.innerHTML = `<div class="empty-state">
       <div class="icon">${currentConvId ? '💬' : '🚀'}</div>
       <h3>${currentConvId ? 'No messages yet' : 'New Conversation'}</h3>
       <p>${currentConvId ? 'Start the conversation below' : 'Type your first message below'}</p>
@@ -1597,7 +1726,8 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
     resetConversationHistoryState();
     renderRelayQuestions();
     renderRelayBoards();
-    return;
+    lastRenderedMessageSnapshotKey = snapshotKey;
+    return true;
   }
   const conversationId = String(meta.conversationId || currentConvId || '').trim();
   const pageInfo = meta.pageInfo && typeof meta.pageInfo === 'object' ? meta.pageInfo : null;
@@ -1626,7 +1756,7 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
     || ordered[ordered.length - 1]?.timestamp
     || '',
   ).trim();
-  el.innerHTML = `<div id="pull-refresh-indicator" aria-hidden="true"><span>↻ Pull down to refresh</span></div>${hasMoreOlder ? buildHistoryLoadMoreMarkup(false) : ''}`;
+  el.innerHTML = hasMoreOlder ? buildHistoryLoadMoreMarkup(false) : '';
   setConversationHistoryState({
     conversationId,
     hasMoreOlder,
@@ -1656,6 +1786,7 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
   for (const m of ordered) appendMessage(m, false, m.id || null, true, getMessageThreadAnchor(m, messageById), false);
   renderRelayQuestions();
   renderRelayBoards();
+  lastRenderedMessageSnapshotKey = snapshotKey;
   if (scroll) scrollBottom();
   requestAnimationFrame(() => {
     const box = getMessagesElement();
@@ -1664,6 +1795,7 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
     const forwardDistance = Math.max(0, box.scrollHeight - box.clientHeight - box.scrollTop);
     void conversationFutureLoader.handleBoundaryDistance(forwardDistance);
   });
+  return true;
 }
 
 export async function loadOlderConversationMessages() {
@@ -1740,6 +1872,10 @@ export async function sendMessage() {
   if (!(await validateSelectedConversationBeforeSend())) {
     return;
   }
+  if (window.isModelMetadataBlocked?.()) {
+    showTransientRelayNotice('Model metadata is unavailable. Refresh models to continue.');
+    return;
+  }
   const targetConversationId = String(currentConvId || '').trim() || null;
   if (hasPendingUserMessageDuplicate(targetConversationId, text)) {
     showTransientRelayNotice('That message is already pending.');
@@ -1758,6 +1894,12 @@ export async function sendMessage() {
     const isNew = !targetConversationId;
     const msgTimestamp = new Date().toISOString();
     const selectedModel = document.getElementById('model-select').value || '';
+    const selectedReasoningEffort = String(document.getElementById('reasoning-effort-select')?.value || '').trim().toLowerCase();
+    const selectedContextTier = String(document.getElementById('context-tier-select')?.value || 'default').trim();
+    if (!selectedReasoningEffort) {
+      showTransientRelayNotice('Select a reasoning effort after refreshing model metadata.');
+      return;
+    }
     const selectedMode = document.getElementById('mode-select').value || 'agent';
     const titleSeed = text || (attachments[0]?.name || 'Attachment');
     clientMessageId = generateId();
@@ -1774,6 +1916,8 @@ export async function sendMessage() {
       clientId: CLIENT_ID,
       text,
       model: selectedModel,
+      reasoningEffort: selectedReasoningEffort,
+      contextTier: selectedContextTier,
       relayMode: selectedMode,
       conversationId: targetConversationId || undefined,
       newConversation: isNew || undefined,

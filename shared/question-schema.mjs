@@ -39,6 +39,33 @@ function parseMaybeJson(value) {
 }
 
 /**
+ * Return true when a request carries a requestedSchema, even when the schema
+ * is invalid. Callers use this to avoid treating a failed structured request
+ * as a legacy text prompt while the SDK validates or retries it.
+ */
+export function containsRequestedSchema(source) {
+  if (!source) return false;
+  const seen = new Set();
+  const queue = [source];
+  let depth = 0;
+  while (queue.length && depth < 5000) {
+    depth += 1;
+    const current = parseMaybeJson(queue.shift());
+    if (!isPlainObject(current)) continue;
+    if (seen.has(current)) continue;
+    seen.add(current);
+    if (current.requestedSchema !== undefined) return true;
+    for (const key of [
+      'toolArgs', 'arguments', 'args', 'input', 'payload', 'body', 'request',
+      'toolInput', 'toolCall', 'data',
+    ]) {
+      if (current[key] !== undefined) queue.push(current[key]);
+    }
+  }
+  return false;
+}
+
+/**
  * Locate a `requestedSchema` object inside an arbitrary request/toolArgs shape.
  * Returns the normalized schema object or null.
  */

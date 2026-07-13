@@ -11,6 +11,61 @@ import { renderLinkedPlainText } from './router.js';
 import { schemaFieldsFromQuestion } from './question-schema-view.mjs';
 
 let relayQuestionRenderHash = '';
+const relayQuestionStructuredDrafts = new Map();
+const RELAY_QUESTION_AUTO_SCROLL_THRESHOLD_PX = 80;
+
+function distanceFromBottom(el) {
+  if (!el) return Number.POSITIVE_INFINITY;
+  return Math.max(0, el.scrollHeight - el.clientHeight - el.scrollTop);
+}
+
+function captureFocusedQuestionControl(messagesEl) {
+  const active = document.activeElement;
+  if (!active || typeof active.closest !== 'function') return null;
+  if (!messagesEl?.contains(active)) return null;
+  const questionNode = active.closest('.relay-question-container');
+  if (!questionNode) return null;
+  const questionId = String(questionNode.dataset.questionId || '').trim();
+  if (!questionId) return null;
+  return {
+    questionId,
+    controlId: String(active.id || '').trim(),
+    controlName: String(active.getAttribute?.('name') || '').trim(),
+    controlKey: String(active.dataset?.relayFocusKey || '').trim(),
+    tagName: String(active.tagName || '').toLowerCase(),
+    type: String(active.type || '').toLowerCase(),
+    selectionStart: Number.isInteger(active.selectionStart) ? active.selectionStart : null,
+    selectionEnd: Number.isInteger(active.selectionEnd) ? active.selectionEnd : null,
+  };
+}
+
+function restoreFocusedQuestionControl(messagesEl, snapshot) {
+  if (!messagesEl || !snapshot?.questionId) return;
+  const questionNode = messagesEl.querySelector(`.relay-question-container[data-question-id="${CSS.escape(snapshot.questionId)}"]`);
+  if (!questionNode) return;
+  let target = null;
+  if (snapshot.controlId) {
+    target = questionNode.querySelector(`#${CSS.escape(snapshot.controlId)}`);
+  }
+  if (!target && snapshot.controlName) {
+    target = questionNode.querySelector(`[name="${CSS.escape(snapshot.controlName)}"]`);
+  }
+  if (!target && snapshot.controlKey) {
+    target = questionNode.querySelector(`[data-relay-focus-key="${CSS.escape(snapshot.controlKey)}"]`);
+  }
+  if (!target) return;
+  if (typeof target.focus === 'function') {
+    target.focus({ preventScroll: true });
+  }
+  const isTextControl = target.tagName === 'TEXTAREA' || (target.tagName === 'INPUT' && ['text', 'email', 'url', 'search', 'tel'].includes(String(target.type || '').toLowerCase()));
+  if (!isTextControl) return;
+  const hasSelection = Number.isInteger(snapshot.selectionStart) && Number.isInteger(snapshot.selectionEnd);
+  if (!hasSelection || typeof target.setSelectionRange !== 'function') return;
+  const max = String(target.value || '').length;
+  const start = Math.max(0, Math.min(snapshot.selectionStart, max));
+  const end = Math.max(0, Math.min(snapshot.selectionEnd, max));
+  target.setSelectionRange(start, end);
+}
 
 export function upsertRelayQuestion(question) {
   if (!question || !question.id) return;
@@ -32,6 +87,12 @@ export async function loadRelayQuestions(conversationId) {
     const question = next.get(questionId);
     if (!question || question.status !== 'pending') {
       relayQuestionDrafts.delete(questionId);
+    }
+  }
+  for (const questionId of relayQuestionStructuredDrafts.keys()) {
+    const question = next.get(questionId);
+    if (!question || question.status !== 'pending') {
+      relayQuestionStructuredDrafts.delete(questionId);
     }
   }
   relayQuestions.clear();
@@ -119,6 +180,9 @@ export async function openPendingQuestionFromBanner() {
 export function renderRelayQuestions() {
   const el = document.getElementById('messages');
   if (!el) return;
+  const previousScrollTop = el.scrollTop;
+  const shouldAutoScroll = distanceFromBottom(el) <= RELAY_QUESTION_AUTO_SCROLL_THRESHOLD_PX;
+  const focusedControl = captureFocusedQuestionControl(el);
   const questions = Array.from(relayQuestions.values())
     .filter((q) => q && q.conversationId === currentConvId && q.status === 'pending')
     .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
@@ -139,8 +203,18 @@ export function renderRelayQuestions() {
   if (relayQuestionRenderHash === nextHash && existingCards.length === questions.length) return;
   relayQuestionRenderHash = nextHash;
 
+  for (const node of existingCards) {
+    const questionId = String(node?.dataset?.questionId || '').trim();
+    const question = relayQuestions.get(questionId);
+    const fields = schemaFieldsFromQuestion(question);
+    if (!questionId || !fields.length) continue;
+    relayQuestionStructuredDrafts.set(questionId, collectStructuredAnswer(question));
+  }
   existingCards.forEach((node) => node.remove());
-  if (!questions.length) return;
+  if (!questions.length) {
+    if (!shouldAutoScroll) el.scrollTop = previousScrollTop;
+    return;
+  }
 
   for (const question of questions) {
     const wrapper = document.createElement('div');
@@ -161,7 +235,7 @@ export function renderRelayQuestions() {
       const choiceHtml = choices.length
         ? (question.status === 'pending'
             ? `<div class="relay-question-choices">${
-                choices.map((choice) => `<button class="relay-question-choice" data-choice="${escHtml(choice)}" onclick="submitRelayQuestionChoice('${question.id}', this.dataset.choice)">${escHtml(choice)}</button>`).join('')
+                choices.map((choice) => `<button class="relay-question-choice" data-choice="${escHtml(choice)}" data-relay-focus-key="choice-${escHtml(choice)}" onclick="submitRelayQuestionChoice('${question.id}', this.dataset.choice)">${escHtml(choice)}</button>`).join('')
               }</div>`
             : `<div class="relay-question-choices">${
                 choices.map((choice) => `<button class="relay-question-choice" disabled>${escHtml(choice)}</button>`).join('')
@@ -198,7 +272,12 @@ export function renderRelayQuestions() {
     el.appendChild(wrapper);
   }
 
-  window.scrollBottom?.();
+  restoreFocusedQuestionControl(el, focusedControl);
+  if (shouldAutoScroll) {
+    window.scrollBottom?.();
+  } else {
+    el.scrollTop = previousScrollTop;
+  }
 }
 
 function fieldDomId(questionId, index) {
@@ -209,14 +288,19 @@ function renderMultiFieldForm(question) {
   const fields = schemaFieldsFromQuestion(question);
   if (!fields.length) return '';
   const disabled = question.status !== 'pending';
+  const draft = relayQuestionStructuredDrafts.get(question.id);
   const submitted = question.structuredAnswer && typeof question.structuredAnswer === 'object'
     ? question.structuredAnswer
     : {};
+  const hasSubmitted = Object.keys(submitted).length > 0;
+  const sourceValues = hasSubmitted && question.status !== 'pending'
+    ? submitted
+    : (draft && typeof draft === 'object' ? draft : submitted);
 
   const fieldHtml = fields.map((field, index) => {
     const id = fieldDomId(question.id, index);
-    const current = Object.prototype.hasOwnProperty.call(submitted, field.name)
-      ? submitted[field.name]
+    const current = Object.prototype.hasOwnProperty.call(sourceValues, field.name)
+      ? sourceValues[field.name]
       : (field.hasDefault ? field.default : undefined);
     const requiredMark = field.required ? ' <span class="relay-field-required">*</span>' : '';
     const descHtml = field.description
@@ -251,7 +335,8 @@ function renderFieldControl(field, id, current, disabled) {
     return `<div class="relay-field-multi" id="${id}">${
       field.choices.map((choice, ci) => {
         const checked = selected.includes(String(choice.value)) ? ' checked' : '';
-        return `<label class="relay-field-check"><input type="checkbox" data-choice-value="${escHtml(String(choice.value))}" value="${escHtml(String(choice.value))}"${checked}${dis}> ${escHtml(choice.label)}</label>`;
+        const focusKey = `multi-${field.name}-${choice.value}`;
+        return `<label class="relay-field-check"><input type="checkbox" data-choice-value="${escHtml(String(choice.value))}" data-relay-focus-key="${escHtml(focusKey)}" value="${escHtml(String(choice.value))}"${checked}${dis}> ${escHtml(choice.label)}</label>`;
       }).join('')
     }</div>`;
   }
@@ -352,6 +437,7 @@ export async function submitRelayStructuredAnswer(questionId) {
       return;
     }
     relayQuestionDrafts.delete(questionId);
+    relayQuestionStructuredDrafts.delete(questionId);
     if (r.question) relayQuestions.set(questionId, r.question);
     updatePendingQuestionBanner();
     window.renderConvList?.();
@@ -386,6 +472,7 @@ export async function submitRelayQuestionAnswer(questionId, presetAnswer = null)
       : await answerRelayQuestion(questionId, answer, sdkSessionId || null);
     if (!r?.question) throw new Error('Failed to submit relay question answer');
     relayQuestionDrafts.delete(questionId);
+    relayQuestionStructuredDrafts.delete(questionId);
     relayQuestions.set(questionId, r.question);
     updatePendingQuestionBanner();
     window.renderConvList?.();

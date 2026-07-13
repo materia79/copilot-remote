@@ -20,13 +20,15 @@ import {
   updateSessionPill,
   clearPendingUserMessage,
   hasPendingUserMessageDuplicate,
-  isMessagesNearBottom,
+  isMessagesAtBottom,
   upsertSubagentRun,
   addSubagentActivity,
   addSubagentThought,
   clearSubagentCancelInFlight,
+  setConversationWatcherCount,
 } from './store.js';
 import { scheduleContextUsageRefresh } from './api-client.js';
+import { publishStatusEvent } from './status-store.mjs';
 import { renderConvList, refreshConversations, openConversation } from './journal-view.js';
 import {
   upsertRelayQuestion,
@@ -37,6 +39,7 @@ import { upsertRelayBoard, loadRelayBoards, renderRelayBoards } from './relay-bo
 import {
   showThinking,
   removeThinking,
+  collapseThinkingThoughts,
   renderThinkingActivities,
   appendThinkingActivity,
   appendThinkingThought,
@@ -61,6 +64,9 @@ const FALLBACK_MODE = 'agent';
 
 /** @type {import('socket.io-client').Socket | null} */
 let socket = null;
+let socketActivityEnabled = true;
+let lastSocketErrorSignature = '';
+let lastSocketErrorAt = 0;
 
 /** @type {SocketHandlerDeps | null} */
 let deps = null;
@@ -71,6 +77,7 @@ let deps = null;
  * @property {() => (void | Promise<void>)} refreshSessionWorkerStatus
  * @property {(force?: boolean) => (void | Promise<void>)} refreshModelCatalog
  * @property {(payload?: object) => void} updateModelCatalogState
+ * @property {() => (void | Promise<void>)} reconcileOpenModelVariantModal
  * @property {(payload?: object) => void} applyConversationWorkspaceRootUpdate
  * @property {(conversationId: string, title: string, updatedAt?: string | number | null) => void} applyConversationTitleUpdate
  * @property {() => void} syncChatTitleControls
@@ -89,6 +96,16 @@ export function getSocket() {
   return socket;
 }
 
+export function setSocketActivityEnabled(value) {
+  socketActivityEnabled = !!value;
+  if (!socket) return;
+  if (!socketActivityEnabled) {
+    if (socket.connected || socket.active) socket.disconnect();
+    return;
+  }
+  if (!socket.connected) socket.connect();
+}
+
 function requireDeps() {
   if (!deps) {
     throw new Error('socket-handlers: call initSocketHandlers() before connectSocket()');
@@ -105,15 +122,33 @@ export async function connectSocket(overrideDeps) {
     refreshSessionWorkerStatus,
     refreshModelCatalog,
     updateModelCatalogState,
+    reconcileOpenModelVariantModal = async () => {},
     applyConversationWorkspaceRootUpdate,
     applyConversationTitleUpdate,
     syncChatTitleControls,
     applyConversationPreferencesForConversation,
   } = requireDeps();
 
-  socket = io({ path: `${BASE}/socket.io/`, auth: TOKEN ? { token: TOKEN, clientId: CLIENT_ID } : { clientId: CLIENT_ID } });
+  if (socket) {
+    if (socketActivityEnabled && !socket.connected) socket.connect();
+    return socket;
+  }
+
+  socket = io({
+    path: `${BASE}/socket.io/`,
+    auth: TOKEN ? { token: TOKEN, clientId: CLIENT_ID } : { clientId: CLIENT_ID },
+    autoConnect: false,
+    reconnection: true,
+    reconnectionDelay: 1000,
+    reconnectionDelayMax: 10000,
+    randomizationFactor: 0.5,
+    timeout: 10000,
+    transports: ['websocket', 'polling'],
+  });
 
   socket.on('connect', () => {
+    lastSocketErrorSignature = '';
+    lastSocketErrorAt = 0;
     console.log('Socket connected');
     clearMessageSearchRuntimeState();
     setRelayOnline(true);
@@ -125,7 +160,14 @@ export async function connectSocket(overrideDeps) {
   });
   socket.on('connect_error', (e) => {
     setRelayOnline(false);
-    console.error('Socket error:', e.message);
+    const message = String(e?.message || 'unknown').trim() || 'unknown';
+    const signature = `socket-error:${message}`;
+    const now = Date.now();
+    if (signature !== lastSocketErrorSignature || (now - lastSocketErrorAt) > 8000) {
+      lastSocketErrorSignature = signature;
+      lastSocketErrorAt = now;
+      console.error('Socket error:', message);
+    }
   });
   socket.on('disconnect', () => {
     setRelayOnline(false);
@@ -139,6 +181,10 @@ export async function connectSocket(overrideDeps) {
   });
   socket.on('models_updated', (payload) => {
     updateModelCatalogState(payload || {});
+    void reconcileOpenModelVariantModal();
+  });
+  socket.on('shared_access', (event) => {
+    publishStatusEvent(event);
   });
   socket.on('workspace_root_changed', (payload) => {
     updateWorkspaceRootHints(payload || {});
@@ -181,7 +227,8 @@ export async function connectSocket(overrideDeps) {
   });
   socket.on('assistant_message', ({ conversationId, message, messageId, sourceMessageId }) => {
     const isCurrentConversation = conversationId === currentConvId;
-    const autoScroll = isCurrentConversation ? isMessagesNearBottom() : false;
+    const autoScroll = isCurrentConversation ? isMessagesAtBottom() : false;
+    collapseThinkingThoughts();
     removeThinking();
     if ((!message?.activities || !message.activities.length) && sourceMessageId) {
       const cached = relayActivities.get(sourceMessageId) || [];
@@ -234,14 +281,14 @@ export async function connectSocket(overrideDeps) {
       addSubagentActivity(entry.subagentRunId, entry.text);
     }
     if (conversationId === currentConvId) {
-      const autoScroll = isMessagesNearBottom();
+      const autoScroll = isMessagesAtBottom();
       appendThinkingActivity(entry.text, entry.subagentRunId, autoScroll);
     }
   });
   socket.on('relay_stream', ({ conversationId, messageId, text, done, seq }) => {
     if (!messageId) return;
     if (conversationId !== currentConvId) return;
-    const autoScroll = isMessagesNearBottom();
+    const autoScroll = isMessagesAtBottom();
     applyRelayStreamEvent({
       messageId,
       text: String(text || ''),
@@ -261,7 +308,7 @@ export async function connectSocket(overrideDeps) {
       addSubagentThought(subagentRunId, { reasoningId: key, text: String(text || ''), done: !!done });
     }
     if (conversationId === currentConvId) {
-      const autoScroll = isMessagesNearBottom();
+      const autoScroll = isMessagesAtBottom();
       appendThinkingThought(key, String(text || ''), !!done, subagentRunId, autoScroll);
     }
   });
@@ -313,6 +360,10 @@ export async function connectSocket(overrideDeps) {
   socket.on('conversation_draft_updated', (payload = {}) => {
     applyIncomingConversationDraftUpdate(payload || {});
   });
+  socket.on('conversation_watchers', ({ conversationId, watcherCount }) => {
+    setConversationWatcherCount(conversationId, watcherCount);
+    deps?.syncChatTitleControls?.();
+  });
   socket.on('conversation_session_bound', async ({ conversationId, sdkSessionId, runtimeSessionId }) => {
     const id = String(conversationId || '').trim();
     if (!id) return;
@@ -349,7 +400,7 @@ export async function connectSocket(overrideDeps) {
       }
     }
     if (conversationId === currentConvId && normalizedStatus === 'processing') {
-      const autoScroll = isMessagesNearBottom();
+      const autoScroll = isMessagesAtBottom();
       showThinking(messageId || null, autoScroll);
       renderThinkingActivities();
       if (messageId) removeUserBubbleCancelButton(messageId);
@@ -361,6 +412,7 @@ export async function connectSocket(overrideDeps) {
       if (messageId) removeUserBubbleCancelButton(messageId);
     }
     if (conversationId === currentConvId && clearsProcessingStatus) {
+      collapseThinkingThoughts();
       removeThinking();
       void refreshCurrentView().catch(() => {});
       scheduleContextUsageRefresh(conversationId, 220);
@@ -395,4 +447,9 @@ export async function connectSocket(overrideDeps) {
       updateCompactButton();
     }
   });
+
+  if (socketActivityEnabled) {
+    socket.connect();
+  }
+  return socket;
 }

@@ -373,3 +373,129 @@ test('payload helper keeps unavailable-enabled variants selectable after id chan
   assert.equal(payload.warning, null);
   assert.equal(payload.source, 'rpc-snapshot');
 });
+
+test('GET /api/models exposes metadata validity flags and strict reasoning map', async () => {
+  const rows = {
+    current: [
+      {
+        variantId: 'gpt-5.4-none',
+        baseModelId: 'gpt-5.4',
+        provider: 'openai',
+        label: 'GPT-5.4',
+        releaseStatus: null,
+        reasoningEffort: 'none',
+        enabled: true,
+        sortOrder: 0,
+      },
+      {
+        variantId: 'gpt-5.4-low',
+        baseModelId: 'gpt-5.4',
+        provider: 'openai',
+        label: 'GPT-5.4',
+        releaseStatus: null,
+        reasoningEffort: 'low',
+        enabled: true,
+        sortOrder: 1,
+      },
+    ],
+  };
+  const modelState = {
+    current: {
+      models: ['auto', 'gpt-5.4'],
+      currentModel: 'gpt-5.4',
+      defaultModel: 'gpt-5.4',
+      reasoningByModel: {
+        auto: ['none', 'low'],
+        'gpt-5.4': ['none', 'low'],
+      },
+      reasoningEfforts: ['none', 'low'],
+      stale: false,
+      metadataValid: true,
+      reasoningMetadataValid: true,
+      refreshedAt: '2026-07-05T12:00:00.000Z',
+      source: 'rpc-snapshot',
+      warning: null,
+      error: null,
+    },
+  };
+
+  const { app } = createRuntimeDeps({ rows, modelState, onRefresh: async () => {} });
+  const handlers = app.routes.get('GET /api/models');
+  assert.ok(handlers, 'models route should be registered');
+  const response = await callRoute(handlers, { headers: {}, body: {}, query: {}, params: {} });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body.metadataValid, true);
+  assert.equal(response.body.reasoningMetadataValid, true);
+  assert.deepEqual(response.body.reasoningByModel['gpt-5.4'], ['none', 'low']);
+});
+
+test('GET /api/models reports invalid metadata when reasoning map is empty', async () => {
+  const rows = { current: [] };
+  const modelState = {
+    current: {
+      models: ['auto'],
+      currentModel: 'gpt-5.4-mini',
+      defaultModel: 'gpt-5.4-mini',
+      reasoningByModel: {},
+      reasoningEfforts: [],
+      stale: true,
+      metadataValid: false,
+      reasoningMetadataValid: false,
+      refreshedAt: null,
+      source: 'bootstrap',
+      warning: 'No model variants are enabled. Using fallback.',
+      error: null,
+    },
+  };
+
+  const { app } = createRuntimeDeps({ rows, modelState, onRefresh: async () => {} });
+  const handlers = app.routes.get('GET /api/models');
+  const response = await callRoute(handlers, { headers: {}, body: {}, query: {}, params: {} });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body.metadataValid, false);
+  assert.equal(response.body.reasoningMetadataValid, false);
+  assert.equal(response.body.stale, true);
+  assert.deepEqual(response.body.reasoningByModel, {});
+});
+
+test('POST /api/models/snapshot forwards context limits and returns freshness metadata', async () => {
+  const rows = { current: [] };
+  const modelState = {
+    current: {
+      models: ['auto', 'gpt-5.6-terra'],
+      currentModel: 'gpt-5.6-terra',
+      defaultModel: 'gpt-5.6-terra',
+      reasoningByModel: { auto: ['none'], 'gpt-5.6-terra': ['none'] },
+      reasoningEfforts: ['none'],
+      contextLimitsByModel: { 'gpt-5.6-terra': 272000 },
+      stale: false,
+      metadataValid: true,
+      reasoningMetadataValid: true,
+      catalogAgeWarning: false,
+      refreshedAt: '2026-07-12T09:03:53.203Z',
+      source: 'web-relay-extension:poll',
+      warning: null,
+      error: null,
+    },
+  };
+  const { app } = createRuntimeDeps({ rows, modelState, onRefresh: async () => {} });
+  const handlers = app.routes.get('POST /api/models/snapshot');
+  const response = await callRoute(handlers, {
+    headers: {},
+    query: {},
+    params: {},
+    body: {
+      models: ['gpt-5.6-terra'],
+      currentModel: 'gpt-5.6-terra',
+      defaultModel: 'gpt-5.6-terra',
+      source: 'web-relay-extension:poll',
+      contextLimitsByModel: { 'gpt-5.6-terra': 272000 },
+    },
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body.contextLimitsByModel['gpt-5.6-terra'], 272000);
+  assert.equal(response.body.catalogAgeWarning, false);
+});

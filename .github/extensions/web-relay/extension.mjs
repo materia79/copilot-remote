@@ -17,6 +17,7 @@ import { createDebugLogger } from "./runtime/debug-log.mjs";
 import { createApiClient } from "./runtime/api-client.mjs";
 import {
   formatToolActivity,
+  formatToolResultActivity,
   isAskUserTool,
   normalizeActivityText,
   extractQuestionChoices,
@@ -608,6 +609,7 @@ const questionRoutingHooks = createQuestionRoutingHooks({
   isAskUserTool,
   normalizeActivityText,
   formatToolActivity,
+  formatToolResultActivity,
   extractQuestionChoices,
   maxToolDetailLength: MAX_TOOL_DETAIL_LENGTH,
   getRelayTurnActive: () => relayTurnActive,
@@ -903,6 +905,7 @@ session = await joinSessionWithRetry({
     },
     onPostToolUse: async (request, result) => {
       await subagentLifecycleHandlers.onPostToolUse(request, result);
+      await questionRoutingHooks.onPostToolUse(request, result);
     },
     onSessionEnd: async () => {
       dbg("onSessionEnd fired");

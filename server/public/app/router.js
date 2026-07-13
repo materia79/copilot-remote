@@ -232,12 +232,28 @@ export function sanitizePreviewHtml(html) {
 }
 
 export function renderMarkdownPreview(source, allowEmbeddedHtml) {
-  if (allowEmbeddedHtml) {
-    return sanitizePreviewHtml(marked.parse(String(source || '')));
+  const sourceText = String(source ?? '');
+  const fallbackEscaped = `<p>${escHtml(sourceText).replace(/\n/g, '<br>')}</p>`;
+  const markdown = globalThis.marked;
+  if (!markdown || typeof markdown.parse !== 'function' || typeof markdown.Renderer !== 'function') {
+    return fallbackEscaped;
   }
-  const renderer = new marked.Renderer();
-  renderer.html = (html) => escHtml(html);
-  return sanitizePreviewHtml(marked.parse(String(source || ''), { renderer }));
+  if (allowEmbeddedHtml) {
+    const parsed = markdown.parse(sourceText);
+    if (typeof parsed !== 'string') return fallbackEscaped;
+    return sanitizePreviewHtml(parsed);
+  }
+  const renderer = new markdown.Renderer();
+  renderer.html = (htmlToken) => {
+    if (typeof htmlToken === 'string') return escHtml(htmlToken);
+    if (htmlToken && typeof htmlToken === 'object') {
+      return escHtml(htmlToken.raw ?? htmlToken.text ?? '');
+    }
+    return '';
+  };
+  const parsed = markdown.parse(sourceText, { renderer });
+  if (typeof parsed !== 'string') return fallbackEscaped;
+  return sanitizePreviewHtml(parsed);
 }
 
 export function eventTargetElement(event) {

@@ -34,12 +34,25 @@ function normalizeActivityEntry(value) {
   return { text, subagentRunId: null };
 }
 
+function normalizeThoughtEntry(value, index) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const text = String(value.text || '').trim();
+  if (!text) return null;
+  return {
+    reasoningId: String(value.reasoningId || '').trim() || `history-thought-${index + 1}`,
+    text,
+    done: value.done !== false,
+    subagentRunId: value.subagentRunId ? String(value.subagentRunId).trim() : null,
+  };
+}
+
 export function createSessionHistoryRefreshService({
   db,
   stmts,
   parseSessionEventsToMessages = null,
   discoverSessionStateConversations = null,
   inFlightStateForConversation = null,
+  isDeletedSdkSession = null,
 } = {}) {
   const countBusyQueueByConversation = db.prepare(`
     SELECT COUNT(*) AS cnt
@@ -86,6 +99,9 @@ export function createSessionHistoryRefreshService({
         String(message?.mode || '').trim() || null,
         null,
         timestamp,
+        null,
+        role === 'assistant' ? (String(message?.model || '').trim() || null) : null,
+        null,
       );
       if (role !== 'assistant') continue;
       const activities = ensureArray(message?.activities)
@@ -100,6 +116,25 @@ export function createSessionHistoryRefreshService({
           activity.text,
           timestamp,
           activity.subagentRunId,
+        );
+      }
+      const thoughts = ensureArray(message?.thoughts)
+        .map((value, index) => normalizeThoughtEntry(value, index))
+        .filter(Boolean);
+      for (let index = 0; index < thoughts.length; index += 1) {
+        const thought = thoughts[index];
+        if (typeof stmts.insertThought?.run !== 'function') continue;
+        stmts.insertThought.run(
+          String(message?.sourceMessageId || messageId),
+          messageId,
+          conversationId,
+          String(message?.mode || 'agent').trim() || 'agent',
+          thought.reasoningId,
+          index + 1,
+          thought.text,
+          thought.done ? 1 : 0,
+          timestamp,
+          thought.subagentRunId,
         );
       }
     }
@@ -120,6 +155,7 @@ export function createSessionHistoryRefreshService({
   const replaceRetrievableHistoryTx = db.transaction((conversationId, messages = []) => {
     deleteConversationMessages.run(conversationId);
     deleteConversationActivity.run(conversationId);
+    deleteConversationThoughts.run(conversationId);
     deleteConversationStreamEvents.run(conversationId);
     deleteConversationSubagentRuns.run(conversationId);
     insertRebuiltMessages(conversationId, messages);
@@ -129,6 +165,9 @@ export function createSessionHistoryRefreshService({
     const requestedId = normalizeId(conversationId);
     if (!requestedId) {
       return { ok: false, statusCode: 400, error: 'Missing conversation id' };
+    }
+    if (typeof isDeletedSdkSession === 'function' && isDeletedSdkSession(requestedId)) {
+      return { ok: false, statusCode: 404, error: 'Conversation not found' };
     }
     const existing = stmts.getConv.get(requestedId);
     if (existing) return { ok: true, created: false, conversation: existing };

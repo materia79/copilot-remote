@@ -13,7 +13,11 @@ import {
   shouldForceFallbackQuestionBridge,
 } from "./question-text.mjs";
 import { answerCliPromptViaTmux, declineCliPromptViaTmux } from "../utils/tmux-input-bridge.mjs";
-import { extractRequestedSchema, schemaFields } from "../../../../shared/question-schema.mjs";
+import {
+  containsRequestedSchema,
+  extractRequestedSchema,
+  schemaFields,
+} from "../../../../shared/question-schema.mjs";
 
 function isImageAttachment(att) {
   const type = String(att?.type || "").toLowerCase();
@@ -50,6 +54,13 @@ export function evaluateSwitchRetry({
     shouldRetry: true,
     attempts: safeAttempts + 1,
   };
+}
+
+export function shouldUseTmuxAskUserFallback(request) {
+  // Structured requests are delivered through onElicitationRequest. A malformed
+  // schema must also stay on that path so a CLI validation retry cannot create
+  // an unstructured duplicate question card.
+  return !containsRequestedSchema(request);
 }
 
 function readImageBlobFromDataUrl(att) {
@@ -384,6 +395,22 @@ export function createPollingLoop({
   let lastAbortControlCheckAt = 0;
   let activeTurnMessageId = "";
   let iterationPromise = null;
+  const isAutoRequestedModel = (value) => String(value || "").trim().toLowerCase() === "auto";
+  const requestedManualModelOrNull = (message) => {
+    const requested = String(message?.model || "").trim();
+    if (!requested || isAutoRequestedModel(requested)) return null;
+    return requested;
+  };
+  const resolveResponseModel = async (message, { finalEvent = null, unknownForAuto = false } = {}) => {
+    const currentModel = String(await getCurrentModelId() || "").trim();
+    if (currentModel) return currentModel;
+    const eventModel = String(finalEvent?.data?.model || finalEvent?.data?.modelId || "").trim();
+    if (eventModel) return eventModel;
+    const requestedManualModel = requestedManualModelOrNull(message);
+    if (requestedManualModel) return requestedManualModel;
+    if (unknownForAuto && isAutoRequestedModel(message?.model)) return "unknown";
+    return null;
+  };
 
   async function waitForRelayQuestionAnswer(questionId, timeoutMs = DEFAULT_QUESTION_TIMEOUT_MS, pollIntervalMs = 1500) {
     const started = Date.now();
@@ -725,7 +752,7 @@ export function createPollingLoop({
         messageId: message.id,
         conversationId: message.conversationId,
         text: "I couldn't process this turn because session routing is unavailable in the relay runtime. Please retry after the relay extension is fully initialized.",
-        model: await getCurrentModelId() || message.model || null,
+        model: await resolveResponseModel(message),
       }).catch(async () => {
         await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
       });
@@ -761,7 +788,7 @@ export function createPollingLoop({
           text: detail
             ? `System note: I could not process this turn because the bound SDK session is unavailable (${detail}).`
             : "System note: I could not process this turn because the bound SDK session is unavailable.",
-          model: await getCurrentModelId() || message.model || null,
+          model: await resolveResponseModel(message),
         }).catch(async () => {
           await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
         });
@@ -804,8 +831,8 @@ export function createPollingLoop({
     let sendAndWaitStartedAtMs = 0;
 
     try {
-      if (message.model) {
-        const modelSwitch = await setModelForMessage(message.model);
+      if (message.model && !isAutoRequestedModel(message.model)) {
+        const modelSwitch = await setModelForMessage(message.model, message.contextTier);
         const activeModel = modelSwitch.after || modelSwitch.current || "unknown";
         const switchText = modelSwitch.switched
           ? `Model selected: requested=${message.model} active=${activeModel} via=${modelSwitch.via || "switchTo"}`
@@ -818,6 +845,13 @@ export function createPollingLoop({
           text: switchText,
         }).catch(() => {});
         dbg("model switch", switchText);
+      } else if (isAutoRequestedModel(message.model)) {
+        await api("POST", "/api/activity", {
+          messageId: message.id,
+          conversationId: message.conversationId,
+          mode: message.relayMode || "agent",
+          text: "Model selected: requested=auto active=auto via=sdk-auto",
+        }).catch(() => {});
       }
 
       const prompt = await buildPromptWithRelayContext(message);
@@ -903,6 +937,11 @@ export function createPollingLoop({
           // This happens on Linux where the CLI shows its terminal prompt instead
           const pendingReq = !tmuxBridgeAttempted ? getPendingAskUserRequest?.() : null;
           if (pendingReq && !getLastAskUserBridge?.()) {
+            if (!shouldUseTmuxAskUserFallback(pendingReq)) {
+              dbg("ask_user tmux bridge: structured request skipped; waiting for elicitation callback", `msgId=${message.id}`);
+              setPendingAskUserRequest?.(null);
+              continue;
+            }
             const sessionId = getSessionId?.();
             if (sessionId) {
               tmuxBridgeAttempted = true;
@@ -999,7 +1038,7 @@ export function createPollingLoop({
       dbg("session.sendAndWait: completed for msgId", message.id, sendAndWaitDurationMs ? `durationMs=${sendAndWaitDurationMs}` : "");
 
       const text = stripPromptContextPrefix(extractFinalText(finalEvent), message, "", prompt);
-      const model = await getCurrentModelId() || finalEvent?.data?.model || finalEvent?.data?.modelId || message.model || null;
+      const model = await resolveResponseModel(message, { finalEvent, unknownForAuto: true });
       const bridgedViaAskUser = !!getLastAskUserBridge?.();
       const pendingAskUserReq = !bridgedViaAskUser ? getPendingAskUserRequest?.() : null;
       const boardPayload = buildPlanReadyBoardPayload({
@@ -1035,6 +1074,7 @@ export function createPollingLoop({
                   : `Thanks — I received your answer: "${bridged.answer}". I hit a problem while resuming the turn from it.`
               ),
               model,
+              modelOrigin: isAutoRequestedModel(message?.model) ? "auto" : "manual",
             });
             await session.log("✅ ask_user safety-net bridge: relay question card shown, answer received, turn resumed", { ephemeral: true });
             return true;
@@ -1080,6 +1120,7 @@ export function createPollingLoop({
                   : `Thanks — I received your answer: "${bridged.answer}". I hit a problem while resuming the turn from it.`
               ),
               model,
+              modelOrigin: isAutoRequestedModel(message?.model) ? "auto" : "manual",
             });
             await session.log("✅ Converted plain-text question into relay bridge card and resumed the turn", { ephemeral: true });
             return true;
@@ -1105,7 +1146,13 @@ export function createPollingLoop({
           dbg("sendAndWait returned empty content; finalizing from streamed text msgId", message.id, `len=${streamedText.length}`);
           await session.log("⚠️ Empty final envelope text — using streamed text as final reply", { level: "warn" });
           await pushRelayStream(streamedText, true);
-          await api("POST", "/api/response", { messageId: message.id, conversationId: message.conversationId, text: streamedText, model });
+          await api("POST", "/api/response", {
+            messageId: message.id,
+            conversationId: message.conversationId,
+            text: streamedText,
+            model,
+            modelOrigin: isAutoRequestedModel(message?.model) ? "auto" : "manual",
+          });
         } else {
           dbg("sendAndWait returned empty content; re-queueing msgId", message.id, emptyHandling.reason || "empty-final-text");
           await session.log("⚠️ Empty assistant response envelope — re-queuing instead of sending fallback", { level: "warn" });
@@ -1113,7 +1160,13 @@ export function createPollingLoop({
         }
       } else {
         await pushRelayStream(text || lastStreamedSent, true);
-        await api("POST", "/api/response", { messageId: message.id, conversationId: message.conversationId, text, model });
+        await api("POST", "/api/response", {
+          messageId: message.id,
+          conversationId: message.conversationId,
+          text,
+          model,
+          modelOrigin: isAutoRequestedModel(message?.model) ? "auto" : "manual",
+        });
         await session.log(`✅ Sent response to web (${text.length} chars)`, { ephemeral: true });
       }
     } catch (e) {
@@ -1139,7 +1192,7 @@ export function createPollingLoop({
           conversationId: message.conversationId,
           text: failureText,
           terminalError: terminalFailure || undefined,
-          model: await getCurrentModelId() || message.model || null,
+          model: await resolveResponseModel(message, { unknownForAuto: true }),
         }).catch(async (responseError) => {
           dbg("terminal response publish failed for msgId", message.id, responseError?.message || String(responseError));
           await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
@@ -1153,7 +1206,7 @@ export function createPollingLoop({
           messageId: message.id,
           conversationId: message.conversationId,
           terminalError: e.terminalFailure,
-          model: await getCurrentModelId() || message.model || null,
+          model: await resolveResponseModel(message, { unknownForAuto: true }),
         }).catch(async () => {
           await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
         });

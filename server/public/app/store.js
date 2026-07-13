@@ -1,3 +1,5 @@
+import { recordCliLifecycleEvent, recordRelayLifecycleEvent } from './status-store.mjs';
+
 function resolveAppBase() {
   const configuredBase = typeof window.__COPILOT_APP_CONFIG?.basePath === 'string'
     ? window.__COPILOT_APP_CONFIG.basePath.trim()
@@ -5,17 +7,42 @@ function resolveAppBase() {
   if (configuredBase && configuredBase !== '/') {
     return configuredBase.startsWith('/') ? configuredBase.replace(/\/+$/, '') : `/${configuredBase.replace(/\/+$/, '')}`;
   }
-  return window.location.pathname.replace(/\/+$/, '');
+  const pathname = String(window.location.pathname || '/');
+  const sharedIndex = pathname.indexOf('/shared/');
+  if (sharedIndex >= 0) return pathname.slice(0, sharedIndex).replace(/\/+$/, '');
+  return pathname.replace(/\/+$/, '');
 }
 
 export const BASE = resolveAppBase();
+function extractSharedTokenFromPathname(pathname) {
+  const path = String(pathname || '/');
+  const match = path.match(/\/shared\/([^/?#]+)\/?$/i);
+  if (!match) return '';
+  return String(match[1] || '').trim().toLowerCase();
+}
+
+function resolveSharedConversationToken() {
+  const configured = String(window.__COPILOT_APP_CONFIG?.sharedToken || '').trim().toLowerCase();
+  if (configured) return configured;
+  return extractSharedTokenFromPathname(window.location.pathname);
+}
+export const SHARED_CONVERSATION_TOKEN = resolveSharedConversationToken();
+export const IS_SHARED_VIEW = !!SHARED_CONVERSATION_TOKEN;
 export let TOKEN = '';
 export let socket = null;
 export let currentConvId = null;
-export let CLIENT_ID = sessionStorage.getItem('copilot_client_id');
+let clientIdStorageValue = '';
+try {
+  clientIdStorageValue = sessionStorage.getItem('copilot_client_id') || '';
+} catch {
+  clientIdStorageValue = '';
+}
+export let CLIENT_ID = clientIdStorageValue;
 if (!CLIENT_ID) {
   CLIENT_ID = generateId();
-  sessionStorage.setItem('copilot_client_id', CLIENT_ID);
+  try {
+    sessionStorage.setItem('copilot_client_id', CLIENT_ID);
+  } catch {}
 }
 
 export const seenMessageIds = new Set();
@@ -53,6 +80,7 @@ export let relayQuestions = new Map();
 export let relayBoards = new Map();
 export let relayActivities = new Map();
 export let relayThoughts = new Map();
+export let conversationWatcherCounts = new Map();
 export let sessionWorkerStates = new Map();
 export let subagentRuns = new Map();
 export const subagentCancelInFlight = new Set();
@@ -103,12 +131,6 @@ export let contextIndicatorMode = 'bar';
 export let compactInFlight = false;
 export let deferredInstallPrompt = null;
 export let viewportBaseHeight = window.innerHeight || document.documentElement.clientHeight || 0;
-export let pullRefreshState = {
-  active: false,
-  ready: false,
-  startY: 0,
-  refreshing: false,
-};
 export let historyRefreshInFlight = false;
 const SIDEBAR_WIDTH_PERCENT_MIN = 10;
 const SIDEBAR_WIDTH_PERCENT_MAX = 50;
@@ -119,7 +141,11 @@ const SIDEBAR_COLLAPSED_DESKTOP_STORAGE_KEY = 'copilot_sidebar_collapsed_desktop
 let sidebarWidthPercent = SIDEBAR_WIDTH_PERCENT_FALLBACK;
 const CONVERSATION_SCROLL_STORAGE_PREFIX = 'copilot_message_scroll_';
 
-marked.setOptions({ breaks: true });
+if (globalThis.marked && typeof globalThis.marked.setOptions === 'function') {
+  globalThis.marked.setOptions({ breaks: true });
+} else {
+  console.warn('[store] marked unavailable; markdown rendering will use plain-text fallback.');
+}
 
 export function generateId() {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
@@ -134,6 +160,23 @@ export function setCurrentConv(id) {
   if (id) localStorage.setItem('copilot_last_conv', id);
   else localStorage.removeItem('copilot_last_conv');
   updateCompactButton();
+}
+
+export function setConversationWatcherCount(conversationId, count) {
+  const id = String(conversationId || '').trim();
+  if (!id) return;
+  const next = Number.isFinite(Number(count)) ? Math.max(0, Math.trunc(Number(count))) : 0;
+  if (next <= 0) {
+    conversationWatcherCounts.delete(id);
+    return;
+  }
+  conversationWatcherCounts.set(id, next);
+}
+
+export function getConversationWatcherCount(conversationId) {
+  const id = String(conversationId || '').trim();
+  if (!id) return 0;
+  return Number(conversationWatcherCounts.get(id) || 0);
 }
 
 function conversationScrollStorageKey(conversationId) {
@@ -504,7 +547,8 @@ function resolveMessagesNearBottomThreshold(el, thresholdPx = null) {
   }
   const viewportHeight = Number(el?.clientHeight || 0);
   if (!Number.isFinite(viewportHeight) || viewportHeight <= 0) return 0;
-  return Math.max(0, Math.floor(viewportHeight * 0.5));
+  const relativeThreshold = Math.floor(viewportHeight * 0.08);
+  return Math.min(48, Math.max(12, relativeThreshold));
 }
 
 export function isMessagesNearBottom(thresholdPx = null) {
@@ -513,6 +557,14 @@ export function isMessagesNearBottom(thresholdPx = null) {
   const distance = Math.max(0, el.scrollHeight - el.clientHeight - el.scrollTop);
   const threshold = resolveMessagesNearBottomThreshold(el, thresholdPx);
   return distance <= threshold;
+}
+
+export function isMessagesAtBottom(epsilonPx = 1) {
+  const el = document.getElementById('messages');
+  if (!el) return true;
+  const epsilon = Math.max(0, Number.isFinite(Number(epsilonPx)) ? Number(epsilonPx) : 1);
+  const distance = Math.max(0, el.scrollHeight - el.clientHeight - el.scrollTop);
+  return distance <= epsilon;
 }
 
 export function scrollBottomAfterSend() {
@@ -546,6 +598,7 @@ export function autoResize(el) {
 
 export function updateSessionPill(conversation, runtimeSession) {
   const title = document.getElementById('chat-title');
+  const usageLine = document.getElementById('chat-title-session-usage');
   const sdkSessionId = String(
     runtimeSession?.sdkSessionId
     || runtimeSession?.sdk_session_id
@@ -558,17 +611,57 @@ export function updateSessionPill(conversation, runtimeSession) {
       delete title.dataset.copilotSessionId;
       title.title = '';
     }
+    if (usageLine) {
+      usageLine.textContent = '';
+      usageLine.hidden = true;
+    }
     return;
   }
   if (title) {
     title.dataset.copilotSessionId = sdkSessionId;
     title.title = `Copilot session ${sdkSessionId} (click to copy)`;
   }
+
+  const usageSummary = runtimeSession?.sessionUsageSummary
+    || runtimeSession?.session_usage_summary
+    || conversation?.sessionUsageSummary
+    || conversation?.session_usage_summary
+    || null;
+  const aicUsed = Number(usageSummary?.aicUsed ?? usageSummary?.aic_used);
+  const premiumRequests = Number(usageSummary?.totalPremiumRequests ?? usageSummary?.total_premium_requests);
+  const planCreditsUsed = Number(usageSummary?.planCreditsUsed ?? usageSummary?.plan_credits_used);
+  const planMonthlyPercentUsed = Number(usageSummary?.planMonthlyPercentUsed ?? usageSummary?.plan_monthly_percent_used);
+  if (!usageLine) return;
+  const parts = [];
+  if (Number.isFinite(aicUsed) && aicUsed >= 0) {
+    parts.push(`Session: ${aicUsed.toFixed(2)} AIC used`);
+  } else if (Number.isFinite(planCreditsUsed) && planCreditsUsed > 0) {
+    parts.push(`Session plan: ${planCreditsUsed.toFixed(3)} credits used`);
+  }
+  if (Number.isFinite(planMonthlyPercentUsed) && planMonthlyPercentUsed > 0) {
+    parts.push(`${planMonthlyPercentUsed.toFixed(3)}% monthly plan`);
+  }
+  if (Number.isFinite(premiumRequests) && premiumRequests >= 0) {
+    parts.push(`${Math.trunc(premiumRequests)} premium request${Math.trunc(premiumRequests) === 1 ? '' : 's'}`);
+  }
+  if (!parts.length) {
+    usageLine.textContent = '';
+    usageLine.hidden = true;
+    return;
+  }
+  usageLine.textContent = parts.join(' · ');
+  usageLine.hidden = false;
 }
 
 export function updateCompactButton() {
   const btn = document.getElementById('chat-menu-compact');
   if (!btn) return;
+  if (btn.hidden || btn.getAttribute('aria-hidden') === 'true') {
+    btn.disabled = true;
+    btn.tabIndex = -1;
+    btn.setAttribute('aria-disabled', 'true');
+    return;
+  }
   const conv = currentConvId ? conversations[currentConvId] : null;
   const canCompact = !!(currentConvId && conv && !conv.archived && !compactInFlight);
   btn.disabled = !canCompact;
@@ -614,12 +707,18 @@ export function updateCliStatus() {
 }
 
 export function setCliOnline(value) {
-  cliOnline = !!value;
+  const nextOnline = !!value;
+  const changed = cliOnline !== nextOnline;
+  cliOnline = nextOnline;
+  if (changed) recordCliLifecycleEvent(nextOnline);
   updateCliStatus();
 }
 
 export function setRelayOnline(value) {
-  relayOnline = !!value;
+  const nextOnline = !!value;
+  const changed = relayOnline !== nextOnline;
+  relayOnline = nextOnline;
+  if (changed) recordRelayLifecycleEvent(nextOnline);
   updateCliStatus();
 }
 
@@ -756,6 +855,14 @@ function isOverlaySidebarViewport() {
   return window.matchMedia('(max-width: 680px)').matches;
 }
 
+function syncMobileSidebarTopOffset() {
+  const header = document.getElementById('chat-header');
+  const top = isOverlaySidebarViewport() && header
+    ? Math.max(0, Math.ceil(header.getBoundingClientRect().bottom))
+    : 0;
+  document.documentElement.style.setProperty('--mobile-sidebar-top', `${top}px`);
+}
+
 function parseCssPx(value) {
   const numeric = Number.parseFloat(String(value || ''));
   return Number.isFinite(numeric) ? numeric : 0;
@@ -780,6 +887,20 @@ function measureSidebarHeaderMinWidthPx() {
   const statusDot = document.getElementById('cli-dot');
   if (isVisibleElement(statusDot)) {
     neededWidth += Math.ceil(statusDot.getBoundingClientRect().width || 0);
+    sectionCount += 1;
+  }
+
+  const newConversationButton = document.getElementById('new-conv-btn');
+  if (isVisibleElement(newConversationButton)) {
+    const buttonStyle = window.getComputedStyle(newConversationButton);
+    neededWidth += Math.ceil(parseCssPx(buttonStyle.minWidth));
+    sectionCount += 1;
+  }
+
+  const statusButton = document.getElementById('status-btn');
+  if (isVisibleElement(statusButton)) {
+    const buttonStyle = window.getComputedStyle(statusButton);
+    neededWidth += Math.ceil(parseCssPx(buttonStyle.minWidth));
     sectionCount += 1;
   }
 
@@ -936,6 +1057,7 @@ function beginSidebarResize(pointerDownEvent) {
 }
 
 export function initSidebarLayout() {
+  syncMobileSidebarTopOffset();
   syncSidebarLayoutState();
   if (window.__sidebarLayoutBound) return;
   window.__sidebarLayoutBound = true;
@@ -948,6 +1070,11 @@ export function initSidebarLayout() {
   const resync = () => syncSidebarLayoutState();
   window.addEventListener('resize', resync, { passive: true });
   window.addEventListener('orientationchange', resync, { passive: true });
+  const chatHeader = document.getElementById('chat-header');
+  if (chatHeader && typeof ResizeObserver === 'function') {
+    const observer = new ResizeObserver(syncMobileSidebarTopOffset);
+    observer.observe(chatHeader);
+  }
 }
 
 export function setCompactInFlight(value) {
@@ -963,6 +1090,12 @@ export function setHistoryRefreshInFlight(value) {
   historyRefreshInFlight = !!value;
   const refreshBtn = document.getElementById('chat-menu-refresh-history');
   if (refreshBtn) {
+    if (refreshBtn.hidden || refreshBtn.getAttribute('aria-hidden') === 'true') {
+      refreshBtn.disabled = true;
+      refreshBtn.tabIndex = -1;
+      refreshBtn.setAttribute('aria-disabled', 'true');
+      return;
+    }
     refreshBtn.disabled = historyRefreshInFlight;
     refreshBtn.textContent = historyRefreshInFlight ? '🔄️ Refreshing…' : '🔄️ Refresh history';
   }
@@ -1023,25 +1156,7 @@ export function syncViewportMetrics() {
   const messagesWidth = messagesEl ? Math.max(0, messagesEl.clientWidth || 0) : layoutWidth;
   document.documentElement.style.setProperty('--messages-height', `${Math.max(0, Math.round(messagesHeight))}px`);
   document.documentElement.style.setProperty('--messages-width', `${Math.max(0, Math.round(messagesWidth))}px`);
-}
-
-export function setPullRefreshIndicator(distance, label, ready = false) {
-  const el = document.getElementById('pull-refresh-indicator');
-  if (!el) return;
-  const span = el.querySelector('span');
-  if (span) span.textContent = label;
-  el.classList.add('visible');
-  el.classList.toggle('ready', !!ready);
-  el.style.transform = `translateY(${Math.min(distance / 2, 28)}px)`;
-}
-
-export function resetPullRefreshIndicator() {
-  const el = document.getElementById('pull-refresh-indicator');
-  if (!el) return;
-  const span = el.querySelector('span');
-  if (span) span.textContent = 'Pull down to refresh';
-  el.classList.remove('visible', 'ready');
-  el.style.transform = '';
+  syncMobileSidebarTopOffset();
 }
 
 export let summaryModalState = {

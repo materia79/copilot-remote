@@ -24,8 +24,7 @@ import {
   showTransientRelayNotice,
   applyContextUsageBar,
   scrollBottom,
-  setPullRefreshIndicator,
-  resetPullRefreshIndicator,
+  isMessagesAtBottom,
   setHistoryRefreshInFlight,
   isHistoryRefreshInFlight,
   setSummaryModalLoading,
@@ -44,6 +43,11 @@ import {
   saveConversationScrollTop,
   getSessionWorkerState,
   resolveConversationUiState,
+  summaryModalState,
+  IS_SHARED_VIEW,
+  SHARED_CONVERSATION_TOKEN,
+  getConversationWatcherCount,
+  generateId,
 } from './store.js';
 import {
   verifyExistingSession,
@@ -59,8 +63,12 @@ import {
   refreshConversationHistory,
   updateConversationTitle,
   updateConversationPreferences,
+  createConversationShareLink,
   updateDefaultSessionWorkspaceRoot,
   scheduleContextUsageRefresh,
+  loadSharedConversation,
+  reportSharedViewerPresence,
+  setNetworkRequestsEnabled,
 } from './api-client.js';
 import { loadConversations, refreshConversations, openConversation, renderConvList, applyLoadedConversationState, initConversationListLazyLoading } from './journal-view.js';
 import { newConversation, deleteConv } from './journal-view.js';
@@ -100,7 +108,7 @@ import {
   closeMessageSearchModal,
 } from './message-search-view.js';
 
-import { initSocketHandlers, connectSocket } from './socket-handlers.js';
+import { initSocketHandlers, connectSocket, setSocketActivityEnabled } from './socket-handlers.js';
 import {
   initInstallButton,
   initFullscreenButton,
@@ -111,6 +119,8 @@ import {
   updatePwaAppName,
 } from './pwa-install.js';
 import { initFontScaling, updateFontScaleFromSelect } from './font-scaling.js';
+import { initClientDiagnostics } from './status-store.mjs';
+import { isStatusViewActive, toggleStatusView } from './status-view.mjs';
 import {
   initCwdPicker,
   openChangeCwdModal,
@@ -122,6 +132,7 @@ import {
   bindTapAction,
   bindMenuAction,
 } from './cwd-picker.js';
+import { initTmuxInspectorView, closeTmuxInspectorView } from './tmux-inspector-view.js';
 import {
   initTheme,
   updateTheme,
@@ -145,9 +156,13 @@ import {
 } from './action-confirmations.js';
 
 const MODEL_STORAGE_KEY = 'copilot_selected_model';
+const REASONING_STORAGE_KEY = 'copilot_selected_reasoning_effort';
 const MODE_STORAGE_KEY = 'copilot_selected_mode';
 const MODELS_BY_MODE_STORAGE_KEY = 'copilot_selected_models_by_mode';
+const REASONING_BY_MODE_STORAGE_KEY = 'copilot_selected_reasoning_by_mode';
+const AUTO_MODEL_OPTION = 'auto';
 const FALLBACK_MODEL = 'gpt-5.4-mini';
+const FALLBACK_REASONING_EFFORT = 'none';
 const FALLBACK_MODE = 'agent';
 const PROVIDER_LABELS = {
   openai: 'OpenAI',
@@ -162,6 +177,20 @@ const LOCAL_PROCESSING_STALE_MS = 5 * 60 * 1000;
 let relayQuestionPollTimer = null;
 let relayBoardPollTimer = null;
 let sessionWorkerStatusPollTimer = null;
+let sharedConversationPollTimer = null;
+let sharedPresencePollTimer = null;
+let sharedConversationPollInFlight = false;
+let sharedConversationRequestSeq = 0;
+let sharedConversationAppliedSeq = 0;
+let liveConversationPollTimer = null;
+let liveConversationPollInFlight = false;
+let sharedViewerIdFallback = '';
+let sharedConversationRenderKey = '';
+let sharedConversationLastError = '';
+let networkLifecycleBound = false;
+let foregroundRecoveryTimer = null;
+let foregroundRecoveryInFlight = false;
+let appSharedMode = false;
 let viewportBaseHeight = window.innerHeight || document.documentElement.clientHeight || 0;
 let chatTitleEditingConversationId = null;
 let relayQuestionRenderHash = '';
@@ -169,13 +198,23 @@ let modelCatalogState = {
   models: [FALLBACK_MODEL],
   currentModel: FALLBACK_MODEL,
   defaultModel: FALLBACK_MODEL,
-  stale: false,
+  reasoningByModel: {},
+  reasoningEfforts: [],
+  modelMetadataByModel: {},
+  stale: true,
+  metadataValid: false,
+  reasoningMetadataValid: false,
   warning: null,
+  error: null,
   refreshedAt: null,
 };
+let lastHealthyModelCatalogState = null;
+let modelMetadataBlocked = true;
+let modelMetadataRetryInFlight = false;
 let modelVariantCatalogState = {
   variants: [],
   enabledVariantIds: [],
+  reasoningByModel: {},
   source: null,
   refreshedAt: null,
   warning: null,
@@ -183,22 +222,74 @@ let modelVariantCatalogState = {
   reasoningEfforts: [],
 };
 let activeConversationPreferredModelsByMode = {};
+let activeConversationPreferredReasoningByMode = {};
 let suppressConversationPreferenceSync = false;
 let conversationPreferenceWriteVersion = 0;
-let pullRefreshState = {
-  active: false,
-  ready: false,
-  startY: 0,
-  refreshing: false,
-};
 let latestQueueStatus = {
   pendingCount: 0,
   processingCount: 0,
   parkedCount: 0,
 };
+const SHARED_VIEWER_ID_STORAGE_KEY = 'copilot_shared_viewer_id';
+const AUTH_TOKEN_STORAGE_KEY = 'copilot_auth_token';
+const AUTH_COOKIE_NAME = 'copilot_auth';
+
+function resolveSharedTokenFromLocation() {
+  const configured = String(window.__COPILOT_APP_CONFIG?.sharedToken || SHARED_CONVERSATION_TOKEN || '').trim().toLowerCase();
+  if (configured) return configured;
+  const pathToken = String(window.location.pathname || '').match(/\/shared\/([^/?#]+)\/?$/i);
+  if (!pathToken) return '';
+  return String(pathToken[1] || '').trim().toLowerCase();
+}
+
+function isSharedReaderMode() {
+  if (IS_SHARED_VIEW) return true;
+  return !!resolveSharedTokenFromLocation();
+}
 
 function getTokenFromUrl() {
   return new URLSearchParams(window.location.search).get('token');
+}
+
+function resolveAuthCookiePath() {
+  const configuredBase = typeof window.__COPILOT_APP_CONFIG?.basePath === 'string'
+    ? window.__COPILOT_APP_CONFIG.basePath.trim()
+    : '';
+  if (configuredBase && configuredBase !== '/') {
+    return configuredBase.startsWith('/')
+      ? configuredBase.replace(/\/+$/, '') || '/'
+      : `/${configuredBase.replace(/\/+$/, '')}`;
+  }
+  const pathname = String(window.location.pathname || '/');
+  const sharedIndex = pathname.indexOf('/shared/');
+  const base = sharedIndex >= 0
+    ? pathname.slice(0, sharedIndex).replace(/\/+$/, '')
+    : pathname.replace(/\/+$/, '');
+  return base || '/';
+}
+
+function clearLegacyClientAuthCookie() {
+  const path = resolveAuthCookiePath();
+  document.cookie = `${AUTH_COOKIE_NAME}=; Path=${path}; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax`;
+}
+
+function consumeLegacyPersistedAuthToken() {
+  let sessionValue = '';
+  let localValue = '';
+  try {
+    sessionValue = String(sessionStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || '').trim();
+    sessionStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+  } catch {
+    sessionValue = '';
+  }
+  try {
+    localValue = String(localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || '').trim();
+    localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+  } catch {
+    localValue = '';
+  }
+  clearLegacyClientAuthCookie();
+  return sessionValue || localValue;
 }
 
 function stripTokenFromUrl() {
@@ -209,6 +300,7 @@ function stripTokenFromUrl() {
 }
 
 function ensureTrailingSlashPath() {
+  if (isSharedReaderMode()) return false;
   const url = new URL(window.location.href);
   const path = url.pathname || '/';
   if (path === '/' || path.endsWith('/')) return false;
@@ -219,8 +311,341 @@ function ensureTrailingSlashPath() {
   return true;
 }
 
+function sharedViewerId() {
+  let viewerId = '';
+  try {
+    viewerId = String(sessionStorage.getItem(SHARED_VIEWER_ID_STORAGE_KEY) || '').trim();
+  } catch {
+    viewerId = sharedViewerIdFallback;
+  }
+  if (!viewerId) {
+    viewerId = generateId();
+    sharedViewerIdFallback = viewerId;
+    try {
+      sessionStorage.setItem(SHARED_VIEWER_ID_STORAGE_KEY, viewerId);
+    } catch {}
+  }
+  return viewerId;
+}
+
+function stopSharedModeTimers() {
+  if (sharedConversationPollTimer) {
+    clearInterval(sharedConversationPollTimer);
+    sharedConversationPollTimer = null;
+  }
+  if (sharedPresencePollTimer) {
+    clearInterval(sharedPresencePollTimer);
+    sharedPresencePollTimer = null;
+  }
+  if (liveConversationPollTimer) {
+    clearInterval(liveConversationPollTimer);
+    liveConversationPollTimer = null;
+  }
+  sharedConversationPollInFlight = false;
+  sharedConversationRequestSeq = 0;
+  sharedConversationAppliedSeq = 0;
+  liveConversationPollInFlight = false;
+}
+
+function shouldRunForegroundNetworkWork() {
+  return document.visibilityState === 'visible' && !foregroundRecoveryInFlight;
+}
+
+function setForegroundNetworkWorkEnabled(enabled) {
+  const next = !!enabled;
+  setNetworkRequestsEnabled(next);
+  setSocketActivityEnabled(next);
+}
+
+async function runForegroundRecovery(reason = 'visible') {
+  if (document.visibilityState !== 'visible') return;
+  if (foregroundRecoveryInFlight) return;
+  foregroundRecoveryInFlight = true;
+  setForegroundNetworkWorkEnabled(true);
+  try {
+    if (appSharedMode) {
+      await refreshSharedConversation();
+      await pulseSharedViewerPresence();
+      return;
+    }
+    await refreshSessionWorkerStatus();
+    await refreshCurrentView();
+    await refreshModelCatalog(true);
+    await loadRelayQuestions(currentConvId);
+    await loadRelayBoards();
+  } catch (error) {
+    console.warn(`[foreground-recovery:${reason}]`, error?.message || error);
+  } finally {
+    foregroundRecoveryInFlight = false;
+  }
+}
+
+function scheduleForegroundRecovery(reason = 'visible') {
+  if (foregroundRecoveryTimer) clearTimeout(foregroundRecoveryTimer);
+  foregroundRecoveryTimer = setTimeout(() => {
+    foregroundRecoveryTimer = null;
+    void runForegroundRecovery(reason);
+  }, 1000);
+}
+
+function initNetworkLifecycleHandling() {
+  if (networkLifecycleBound) return;
+  networkLifecycleBound = true;
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+      setForegroundNetworkWorkEnabled(false);
+      return;
+    }
+    scheduleForegroundRecovery('visibility');
+  });
+  window.addEventListener('online', () => {
+    if (document.visibilityState === 'visible') scheduleForegroundRecovery('online');
+  });
+  window.addEventListener('offline', () => {
+    setForegroundNetworkWorkEnabled(false);
+  });
+  window.addEventListener('pageshow', () => {
+    if (document.visibilityState === 'visible') scheduleForegroundRecovery('pageshow');
+  });
+  window.addEventListener('pagehide', () => {
+    setForegroundNetworkWorkEnabled(false);
+  });
+}
+
+function syncThemeMenuLabel() {
+  const button = document.getElementById('chat-menu-shared-theme-toggle');
+  if (!button) return;
+  const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+  button.textContent = isLight ? '🌙 Night mode' : '☀️ Day mode';
+}
+
+function initThemeMenuToggle() {
+  const themeBtn = document.getElementById('chat-menu-shared-theme-toggle');
+  if (!themeBtn) return;
+  themeBtn.hidden = false;
+  syncThemeMenuLabel();
+  if (themeBtn.dataset.bound === '1') return;
+  themeBtn.dataset.bound = '1';
+  bindMenuAction(themeBtn, (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+    updateTheme(isLight ? 'dark' : 'light');
+    syncThemeMenuLabel();
+    closeChatActionsMenu();
+  });
+}
+
+function disableSharedControl(element, {
+  title = 'Shared conversation (read-only)',
+  hide = false,
+} = {}) {
+  if (!element) return;
+  element.disabled = true;
+  element.setAttribute('aria-disabled', 'true');
+  if (title) element.title = title;
+  if (hide) element.hidden = true;
+}
+
+function hideSharedMenuEntry(element) {
+  if (!element) return;
+  element.hidden = true;
+  element.setAttribute('aria-hidden', 'true');
+  if ('disabled' in element) element.disabled = true;
+  if ('tabIndex' in element) element.tabIndex = -1;
+}
+
+function applySharedReaderUi() {
+  document.body.classList.add('shared-reader-mode', 'sidebar-collapsed');
+  closeSidebar();
+  const sidebar = document.getElementById('sidebar');
+  const sidebarResizer = document.getElementById('sidebar-resizer');
+  const sidebarToggle = document.getElementById('sidebar-toggle');
+  const newConversationBtn = document.getElementById('new-conv-btn');
+  const searchBtn = document.getElementById('message-search-btn');
+  const contextBtn = document.getElementById('context-btn');
+  const fullscreenBtn = document.getElementById('fullscreen-btn');
+  const input = document.getElementById('msg-input');
+  const sendBtn = document.getElementById('send-btn');
+  const attachBtn = document.getElementById('attach-btn');
+  const emojiBtn = document.getElementById('emoji-btn');
+  const repoDesktopBtn = document.getElementById('repo-browser-desktop-btn');
+  const repoInputBtn = document.getElementById('repo-browser-input-btn');
+  const repoFabBtn = document.getElementById('repo-browser-fab');
+  const modelSelect = document.getElementById('model-select');
+  const effortSelect = document.getElementById('reasoning-effort-select');
+  const modeSelect = document.getElementById('mode-select');
+  const chatMenuBtn = document.getElementById('chat-actions-menu-btn');
+  const chatMenu = document.getElementById('chat-actions-menu');
+  const sharedThemeBtn = document.getElementById('chat-menu-shared-theme-toggle');
+  const installBtn = document.getElementById('install-btn');
+  const activeElement = document.activeElement;
+  if (chatMenu && activeElement instanceof Element && chatMenu.contains(activeElement)) {
+    activeElement.blur();
+  }
+  closeChatActionsMenu();
+  if (sidebar) sidebar.hidden = true;
+  if (sidebarResizer) sidebarResizer.hidden = true;
+  if (sidebarToggle) sidebarToggle.hidden = true;
+  if (newConversationBtn) newConversationBtn.hidden = true;
+  disableSharedControl(searchBtn);
+  disableSharedControl(contextBtn);
+  if (fullscreenBtn) fullscreenBtn.hidden = true;
+  if (input) {
+    input.readOnly = true;
+    input.disabled = true;
+    input.placeholder = 'Shared conversation (read-only)';
+  }
+  disableSharedControl(sendBtn);
+  disableSharedControl(attachBtn);
+  disableSharedControl(emojiBtn);
+  disableSharedControl(repoDesktopBtn, { hide: true });
+  disableSharedControl(repoInputBtn);
+  if (repoFabBtn) repoFabBtn.hidden = true;
+  disableSharedControl(installBtn, { hide: true, title: 'PWA install is unavailable for shared conversations' });
+  if (modelSelect) modelSelect.hidden = true;
+  if (effortSelect) effortSelect.hidden = true;
+  if (modeSelect) modeSelect.hidden = true;
+  if (chatMenu && sharedThemeBtn) {
+    for (const child of Array.from(chatMenu.children)) {
+      if (child !== sharedThemeBtn) hideSharedMenuEntry(child);
+    }
+    sharedThemeBtn.hidden = false;
+    sharedThemeBtn.removeAttribute('aria-hidden');
+    sharedThemeBtn.disabled = false;
+    sharedThemeBtn.tabIndex = 0;
+    syncThemeMenuLabel();
+  } else if (chatMenuBtn) {
+    chatMenuBtn.hidden = true;
+  }
+  if (chatMenuBtn && !sharedThemeBtn) chatMenuBtn.hidden = true;
+}
+
+function syncChatTitleWatcherIndicator() {
+  const indicator = document.getElementById('chat-title-watch-indicator');
+  if (!indicator) return;
+  if (isSharedReaderMode()) {
+    indicator.hidden = true;
+    return;
+  }
+  const convId = String(currentConvId || '').trim();
+  const watcherCount = convId ? getConversationWatcherCount(convId) : 0;
+  indicator.hidden = watcherCount <= 0;
+  indicator.title = watcherCount > 0 ? `${watcherCount} watcher${watcherCount === 1 ? '' : 's'} currently reading this conversation` : '';
+}
+
+function computeSharedConversationRenderKey(response = null) {
+  const messages = Array.isArray(response?.messages) ? response.messages : [];
+  const ids = messages.map((message) => `${String(message?.id || '').trim()}:${String(message?.timestamp || '').trim()}`).join('|');
+  const inFlight = response?.inFlight || null;
+  return [
+    String(response?.id || '').trim(),
+    String(response?.updatedAt || '').trim(),
+    messages.length,
+    ids,
+    String(inFlight?.messageId || '').trim(),
+    String(inFlight?.status || '').trim(),
+    String(inFlight?.lastStreamSeq || '').trim(),
+    inFlight?.streamDone ? '1' : '0',
+  ].join('::');
+}
+
+function resolveStableScrollTopForLiveRefresh(messagesEl, capturedScrollTop) {
+  const captured = Number(capturedScrollTop);
+  const current = Number(messagesEl?.scrollTop);
+  if (!Number.isFinite(current)) return Number.isFinite(captured) ? captured : 0;
+  if (!Number.isFinite(captured)) return current;
+  if (Math.abs(current - captured) > 2) return current;
+  return captured;
+}
+
+async function refreshSharedConversation() {
+  if (sharedConversationPollInFlight) return;
+  const sharedToken = resolveSharedTokenFromLocation();
+  if (!sharedToken) return;
+  sharedConversationPollInFlight = true;
+  const requestSeq = ++sharedConversationRequestSeq;
+  const messagesEl = document.getElementById('messages');
+  const preserveBottom = isMessagesAtBottom();
+  const savedScrollTop = messagesEl?.scrollTop || 0;
+  try {
+    const response = await loadSharedConversation(sharedToken, { limit: 120 });
+    if (requestSeq < sharedConversationAppliedSeq) return;
+    if (!response?.ok) {
+      const message = String(response?.error || 'Could not load shared conversation.').trim();
+      if (message && message !== sharedConversationLastError) {
+        setModelBanner(`⚠️ ${message}`);
+        sharedConversationLastError = message;
+      }
+      return;
+    }
+    if (sharedConversationLastError) {
+      sharedConversationLastError = '';
+      setModelBanner('');
+    }
+    const convId = String(response.id || '').trim();
+    if (!convId) return;
+    setCurrentConv(convId);
+    conversations[convId] = {
+      ...(conversations[convId] || {}),
+      id: convId,
+      title: String(response.title || 'Shared conversation').trim() || 'Shared conversation',
+      updatedAt: response.updatedAt || new Date().toISOString(),
+      messageCount: Array.isArray(response.messages) ? response.messages.length : 0,
+      sdkSessionId: null,
+      runtimeSessionId: null,
+    };
+    const titleEl = document.getElementById('chat-title');
+    if (titleEl) titleEl.textContent = conversations[convId].title;
+    const renderKey = computeSharedConversationRenderKey(response);
+    if (renderKey && renderKey === sharedConversationRenderKey) {
+      sharedConversationAppliedSeq = requestSeq;
+      return;
+    }
+    sharedConversationRenderKey = renderKey;
+    const stableSavedScrollTop = resolveStableScrollTopForLiveRefresh(messagesEl, savedScrollTop);
+    applyLoadedConversationState(convId, response, {
+      restoreScroll: !preserveBottom,
+      savedScrollTop: preserveBottom ? null : stableSavedScrollTop,
+      followLiveUpdates: preserveBottom,
+    });
+    sharedConversationAppliedSeq = requestSeq;
+    syncViewportMetrics();
+  } finally {
+    sharedConversationPollInFlight = false;
+  }
+}
+
+async function pulseSharedViewerPresence() {
+  const sharedToken = resolveSharedTokenFromLocation();
+  if (!sharedToken) return;
+  await reportSharedViewerPresence(sharedToken, sharedViewerId()).catch(() => {});
+}
+
+async function initSharedConversationReader() {
+  applySharedReaderUi();
+  await refreshSharedConversation();
+  await pulseSharedViewerPresence();
+  stopSharedModeTimers();
+  sharedConversationPollTimer = setInterval(() => {
+    if (!shouldRunForegroundNetworkWork()) return;
+    void refreshSharedConversation();
+  }, 900);
+  sharedPresencePollTimer = setInterval(() => {
+    if (!shouldRunForegroundNetworkWork()) return;
+    void pulseSharedViewerPresence();
+  }, 12_000);
+}
+
 function showAuthError(msg) {
   document.getElementById('auth-error').textContent = msg;
+}
+
+function resolveAuthErrorMessage(result = null) {
+  if (result?.status === 401) return 'Invalid token';
+  if (result?.status === 403) return 'Access denied';
+  if (result?.status > 0) return `Authentication failed (${result.status})`;
+  return String(result?.error || 'Could not reach the relay').trim() || 'Could not reach the relay';
 }
 
 function syncPwaVersionMenuEntry() {
@@ -301,10 +726,149 @@ function humanizeModelLabel(modelId = '') {
 }
 
 function modelOptionLabel(modelVariantId = '') {
+  if (String(modelVariantId || '').trim().toLowerCase() === AUTO_MODEL_OPTION) return 'Auto';
   const { baseModelId, reasoningEffort } = splitVariantId(modelVariantId);
   if (!baseModelId) return modelVariantId;
   const baseLabel = humanizeModelLabel(baseModelId);
   return reasoningEffort ? `${baseLabel} (${reasoningEffort})` : baseLabel;
+}
+
+function normalizeReasoningEffortList(efforts = []) {
+  const values = Array.isArray(efforts)
+    ? efforts.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean)
+    : [];
+  return Array.from(new Set(values));
+}
+
+function isModelMetadataHealthy(payload = modelCatalogState) {
+  if (!payload || typeof payload !== 'object') return false;
+  if (payload.metadataValid === false) return false;
+  if (payload.stale) return false;
+  const reasoningByModel = payload.reasoningByModel && typeof payload.reasoningByModel === 'object'
+    ? payload.reasoningByModel
+    : {};
+  const modelIds = Object.keys(reasoningByModel).filter((modelId) => modelId !== AUTO_MODEL_OPTION);
+  if (!modelIds.length) return false;
+  return modelIds.every((modelId) => {
+    const efforts = reasoningByModel[modelId];
+    return Array.isArray(efforts) && efforts.length > 0;
+  });
+}
+
+function syncModelMetadataBlocker(message = '') {
+  const blocker = document.getElementById('model-metadata-blocker');
+  const text = document.getElementById('model-metadata-blocker-text');
+  const retryBtn = document.getElementById('model-metadata-retry-btn');
+  const blocked = modelMetadataBlocked || !isModelMetadataHealthy();
+  if (text) {
+    text.textContent = String(message || '').trim()
+      || 'Model metadata is unavailable. Refresh to choose a model and reasoning effort.';
+  }
+  if (retryBtn) retryBtn.disabled = modelMetadataRetryInFlight;
+  blocker?.classList.toggle('visible', blocked);
+  const modelSelect = document.getElementById('model-select');
+  const reasoningSelect = document.getElementById('reasoning-effort-select');
+  if (modelSelect) {
+    modelSelect.disabled = blocked;
+    modelSelect.title = blocked ? 'Model metadata unavailable' : 'Model';
+  }
+  if (reasoningSelect) {
+    reasoningSelect.disabled = blocked;
+    reasoningSelect.title = blocked ? 'Reasoning metadata unavailable' : 'Reasoning effort';
+  }
+  window.syncComposerControlState?.();
+}
+
+function applyModelMetadataHardFail(message = '') {
+  modelMetadataBlocked = true;
+  syncModelMetadataBlocker(message);
+  setModelBanner(`⚠️ ${String(message || 'Model metadata is unavailable.').trim()}`);
+}
+
+function clearModelMetadataHardFail() {
+  modelMetadataBlocked = false;
+  syncModelMetadataBlocker('');
+  if (!modelCatalogState.warning && !modelCatalogState.stale) {
+    setModelBanner('');
+  }
+}
+
+function readStoredReasoningByMode() {
+  let raw = '';
+  try {
+    raw = String(localStorage.getItem(REASONING_BY_MODE_STORAGE_KEY) || '').trim();
+  } catch {
+    raw = '';
+  }
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const out = {};
+    for (const [mode, effort] of Object.entries(parsed)) {
+      const modeKey = String(mode || '').trim();
+      const effortValue = String(effort || '').trim().toLowerCase();
+      if (!modeKey || !effortValue) continue;
+      out[modeKey] = effortValue;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+async function startAppWithErrorHandling() {
+  try {
+    await initApp();
+    return true;
+  } catch (error) {
+    console.error('[bootstrap] initApp failed', error);
+    showAuthGate();
+    showAuthError(`App initialization failed: ${String(error?.message || error || 'unknown error')}`);
+    return false;
+  }
+}
+
+function reasoningOptionsForModel(modelId = '') {
+  if (!isModelMetadataHealthy()) return [];
+  const key = String(modelId || '').trim().toLowerCase();
+  return normalizeReasoningEffortList(modelCatalogState.reasoningByModel?.[key] || []);
+}
+
+function selectedReasoningEffortValue() {
+  const select = document.getElementById('reasoning-effort-select');
+  const value = String(select?.value || '').trim().toLowerCase();
+  if (value) return value;
+  return FALLBACK_REASONING_EFFORT;
+}
+
+function updateReasoningSelectorForModel(modelId, preferredEffort = '') {
+  const select = document.getElementById('reasoning-effort-select');
+  if (!select) return;
+  const options = reasoningOptionsForModel(modelId);
+  const selectedBefore = String(select.value || '').trim().toLowerCase();
+  select.innerHTML = '';
+  if (!options.length) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = 'Unavailable';
+    select.appendChild(opt);
+    select.value = '';
+    return;
+  }
+  for (const effort of options) {
+    const opt = document.createElement('option');
+    opt.value = effort;
+    opt.textContent = effort;
+    select.appendChild(opt);
+  }
+  const preferred = String(preferredEffort || '').trim().toLowerCase();
+  const resolved = [preferred, selectedBefore, localStorage.getItem(REASONING_STORAGE_KEY)]
+    .map((value) => String(value || '').trim().toLowerCase())
+    .find((value) => value && options.includes(value))
+    || options[0];
+  select.value = resolved;
+  localStorage.setItem(REASONING_STORAGE_KEY, resolved);
 }
 
 function updateModelCatalogState(payload) {
@@ -316,16 +880,59 @@ function updateModelCatalogState(payload) {
   const currentModel = String(payload?.currentModel || models[0] || '').trim();
   const defaultModel = String(payload?.defaultModel || models[0] || '').trim();
   const nextModels = Array.from(new Set(models.filter(Boolean)));
+  if (!nextModels.includes(AUTO_MODEL_OPTION)) nextModels.unshift(AUTO_MODEL_OPTION);
   if (!nextModels.length) nextModels.push(FALLBACK_MODEL);
 
-  modelCatalogState = {
+  const nextState = {
     models: nextModels,
     currentModel: currentModel || nextModels[0] || FALLBACK_MODEL,
     defaultModel: defaultModel || nextModels[0] || FALLBACK_MODEL,
+    reasoningByModel: payload?.reasoningByModel && typeof payload.reasoningByModel === 'object'
+      ? Object.fromEntries(Object.entries(payload.reasoningByModel).map(([modelId, efforts]) => [
+        String(modelId || '').trim().toLowerCase(),
+        normalizeReasoningEffortList(efforts),
+      ]))
+      : {},
+    reasoningEfforts: normalizeReasoningEffortList(payload?.reasoningEfforts || []),
+    modelMetadataByModel: payload?.modelMetadataByModel && typeof payload.modelMetadataByModel === 'object'
+      ? payload.modelMetadataByModel
+      : {},
     stale: !!payload?.stale,
+    metadataValid: payload?.metadataValid === true,
+    reasoningMetadataValid: payload?.reasoningMetadataValid === true,
+    catalogAgeWarning: payload?.catalogAgeWarning === true,
     warning: payload?.warning ? String(payload.warning) : null,
+    error: payload?.error ? String(payload.error) : null,
     refreshedAt: payload?.refreshedAt || null,
   };
+
+  const nextHealthy = isModelMetadataHealthy(nextState);
+  const currentlyHealthy = isModelMetadataHealthy(modelCatalogState);
+  if (!nextHealthy && !currentlyHealthy && isModelMetadataHealthy(lastHealthyModelCatalogState)) {
+    modelCatalogState = { ...lastHealthyModelCatalogState };
+    clearModelMetadataHardFail();
+    setModelBanner('⚠️ Model metadata refresh failed; restored last known good catalog.');
+    syncModelMetadataBlocker();
+    return;
+  }
+  if (!nextHealthy && currentlyHealthy) {
+    setModelBanner('⚠️ Model metadata refresh failed; keeping last known good catalog.');
+    syncModelMetadataBlocker();
+    return;
+  }
+
+  modelCatalogState = nextState;
+
+  if (!nextHealthy) {
+    applyModelMetadataHardFail(
+      modelCatalogState.error
+        ? `Model metadata error: ${modelCatalogState.error}`
+        : (modelCatalogState.warning || 'Model metadata is stale or incomplete.'),
+    );
+  } else {
+    lastHealthyModelCatalogState = modelCatalogState;
+    clearModelMetadataHardFail();
+  }
 
   const selectedBefore = select.value;
   const selectedMode = String(document.getElementById('mode-select')?.value || '').trim();
@@ -342,6 +949,9 @@ function updateModelCatalogState(payload) {
     .find((value) => value && nextModels.includes(value)) || nextModels[0];
   select.value = preferred;
   localStorage.setItem(MODEL_STORAGE_KEY, preferred);
+  const preferredReasoningForMode = String(activeConversationPreferredReasoningByMode?.[selectedMode] || '').trim().toLowerCase();
+  updateReasoningSelectorForModel(preferred, preferredReasoningForMode);
+  updateContextTierSelector(preferred);
   if (selectedMode) {
     activeConversationPreferredModelsByMode = withUpdatedModelPreference({
       preferredModelsByMode: activeConversationPreferredModelsByMode,
@@ -350,15 +960,24 @@ function updateModelCatalogState(payload) {
       supportedModes: Array.from(document.getElementById('mode-select')?.options || []).map((option) => option.value),
     });
     localStorage.setItem(MODELS_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredModelsByMode));
+    activeConversationPreferredReasoningByMode = {
+      ...activeConversationPreferredReasoningByMode,
+      [selectedMode]: selectedReasoningEffortValue(),
+    };
+    localStorage.setItem(REASONING_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredReasoningByMode));
   }
 
-  if (modelCatalogState.warning) {
+  if (modelCatalogState.catalogAgeWarning && isModelMetadataHealthy(modelCatalogState)) {
+    setModelBanner(`⚠️ ${modelCatalogState.warning || 'Model catalog may be out of date. Refresh models if selections look wrong.'}`);
+  } else if (modelCatalogState.warning && isModelMetadataHealthy(modelCatalogState)) {
     setModelBanner(`⚠️ ${modelCatalogState.warning}`);
-  } else if (modelCatalogState.stale) {
+  } else if (modelCatalogState.stale && isModelMetadataHealthy(modelCatalogState)) {
     setModelBanner('⚠️ Model list is cached from CLI; selection may be stale.');
-  } else {
+  } else if (isModelMetadataHealthy(modelCatalogState)) {
     setModelBanner('');
   }
+
+  syncModelMetadataBlocker();
 }
 
 function selectedModelValue() {
@@ -366,6 +985,65 @@ function selectedModelValue() {
   const value = String(select?.value || '').trim();
   if (value) return value;
   return modelCatalogState.currentModel || modelCatalogState.defaultModel || FALLBACK_MODEL;
+}
+
+function updateContextTierSelector(modelId) {
+  const select = document.getElementById('context-tier-select');
+  if (!select) return;
+  const metadata = modelCatalogState.modelMetadataByModel?.[modelId] || {};
+  const defaultLimit = Number(metadata.defaultContextLimitTokens);
+  const longLimit = Number(metadata.longContextLimitTokens);
+  const current = select.value;
+  select.innerHTML = '';
+  const defaultOption = document.createElement('option');
+  defaultOption.value = 'default';
+  defaultOption.textContent = Number.isFinite(defaultLimit) && defaultLimit > 0
+    ? `Context: default (${Math.round(defaultLimit / 1000)}K)`
+    : 'Context: default';
+  select.appendChild(defaultOption);
+  if (Number.isFinite(longLimit) && longLimit > 0) {
+    const longOption = document.createElement('option');
+    longOption.value = 'long_context';
+    longOption.textContent = `Context: long (${Math.round(longLimit / 1000)}K)`;
+    select.appendChild(longOption);
+  }
+  select.value = current === 'long_context' && select.querySelector('option[value="long_context"]')
+    ? 'long_context'
+    : 'default';
+  updateModelPricingDetails(modelId, select.value);
+}
+
+function updateModelPricingDetails(modelId, tier) {
+  const details = document.getElementById('model-pricing-details');
+  const summary = document.getElementById('model-pricing-summary');
+  const grid = document.getElementById('model-pricing-grid');
+  if (!details || !summary || !grid) return;
+  const metadata = modelCatalogState.modelMetadataByModel?.[modelId] || {};
+  const pricing = metadata?.pricing?.[tier === 'long_context' ? 'longContext' : 'default'];
+  if (!pricing || typeof pricing !== 'object') {
+    details.open = false;
+    details.style.display = 'none';
+    grid.replaceChildren();
+    return;
+  }
+  const perMillion = (value) => {
+    const price = Number(value);
+    const batchSize = Number(pricing.batchSize) || 1000000;
+    return Number.isFinite(price) ? (price * 1000000) / batchSize : null;
+  };
+  const input = perMillion(pricing.input);
+  summary.textContent = `${tier === 'long_context' ? 'Long context' : 'Default'} pricing${input !== null ? ` · ${input} credits / 1M input` : ''}`;
+  grid.replaceChildren();
+  for (const [label, value] of [['Input', pricing.input], ['Output', pricing.output], ['Cache read', pricing.cacheRead], ['Cache write', pricing.cacheWrite]]) {
+    const credits = perMillion(value);
+    if (credits === null) continue;
+    const labelEl = document.createElement('span');
+    labelEl.textContent = label;
+    const valueEl = document.createElement('b');
+    valueEl.textContent = String(credits);
+    grid.append(labelEl, valueEl);
+  }
+  details.style.display = grid.childElementCount ? '' : 'none';
 }
 
 function readStoredModelsByMode() {
@@ -396,6 +1074,7 @@ async function persistCurrentConversationPreferences() {
   if (!modeSelect || !modelSelect) return;
   const mode = String(modeSelect.value || '').trim() || FALLBACK_MODE;
   const model = String(modelSelect.value || '').trim();
+  const reasoningEffort = selectedReasoningEffortValue();
   const supportedModes = modeOptions();
   activeConversationPreferredModelsByMode = withUpdatedModelPreference({
     preferredModelsByMode: activeConversationPreferredModelsByMode,
@@ -406,6 +1085,12 @@ async function persistCurrentConversationPreferences() {
   localStorage.setItem(MODELS_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredModelsByMode));
   localStorage.setItem(MODE_STORAGE_KEY, mode);
   if (model) localStorage.setItem(MODEL_STORAGE_KEY, model);
+  if (reasoningEffort) localStorage.setItem(REASONING_STORAGE_KEY, reasoningEffort);
+  activeConversationPreferredReasoningByMode = {
+    ...activeConversationPreferredReasoningByMode,
+    [mode]: reasoningEffort || FALLBACK_REASONING_EFFORT,
+  };
+  localStorage.setItem(REASONING_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredReasoningByMode));
 
   const writeVersion = ++conversationPreferenceWriteVersion;
   const response = await updateConversationPreferences(convId, {
@@ -446,13 +1131,20 @@ function applyConversationPreferences({
   suppressConversationPreferenceSync = true;
   modeSelect.value = selection.mode;
   if (selection.model) modelSelect.value = selection.model;
+  const modeReasoning = String(activeConversationPreferredReasoningByMode?.[selection.mode] || '').trim().toLowerCase();
+  updateReasoningSelectorForModel(selection.model || modelSelect.value, modeReasoning);
   suppressConversationPreferenceSync = false;
 
   activeConversationPreferredModelsByMode = {
     ...readStoredModelsByMode(),
     ...selection.preferredModelsByMode,
   };
+  activeConversationPreferredReasoningByMode = {
+    ...readStoredReasoningByMode(),
+    ...activeConversationPreferredReasoningByMode,
+  };
   localStorage.setItem(MODELS_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredModelsByMode));
+  localStorage.setItem(REASONING_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredReasoningByMode));
   localStorage.setItem(MODE_STORAGE_KEY, selection.mode);
   if (selection.model) localStorage.setItem(MODEL_STORAGE_KEY, selection.model);
 }
@@ -487,9 +1179,36 @@ function initModelSelector() {
         model: select.value,
         supportedModes: modeOptions(),
       });
+      const preferredReasoning = String(activeConversationPreferredReasoningByMode?.[mode] || '').trim().toLowerCase();
+      updateReasoningSelectorForModel(select.value, preferredReasoning);
+      updateContextTierSelector(select.value);
       void persistCurrentConversationPreferences().catch(() => {});
     });
   }
+
+}
+
+function initContextTierSelector() {
+  const select = document.getElementById('context-tier-select');
+  if (!select || select.dataset.bound === '1') return;
+  select.dataset.bound = '1';
+  select.addEventListener('change', () => updateModelPricingDetails(selectedModelValue(), select.value));
+}
+
+function initReasoningSelector() {
+  const select = document.getElementById('reasoning-effort-select');
+  if (!select || select.dataset.bound === '1') return;
+  select.dataset.bound = '1';
+  select.addEventListener('change', () => {
+    if (suppressConversationPreferenceSync) return;
+    const mode = String(document.getElementById('mode-select')?.value || '').trim() || FALLBACK_MODE;
+    activeConversationPreferredReasoningByMode = {
+      ...activeConversationPreferredReasoningByMode,
+      [mode]: selectedReasoningEffortValue(),
+    };
+    localStorage.setItem(REASONING_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredReasoningByMode));
+    void persistCurrentConversationPreferences().catch(() => {});
+  });
 }
 
 function initModeSelector() {
@@ -515,6 +1234,8 @@ function initModeSelector() {
         modelSelect.value = modeModel;
         suppressConversationPreferenceSync = false;
       }
+      const modeReasoning = String(activeConversationPreferredReasoningByMode?.[mode] || '').trim().toLowerCase();
+      updateReasoningSelectorForModel(modelSelect.value, modeReasoning);
     }
     void persistCurrentConversationPreferences().catch(() => {});
   });
@@ -523,11 +1244,46 @@ function initModeSelector() {
 function refreshModelCatalog(force = false) {
   return loadModelCatalog().then((r) => {
     if (!r) {
-      if (force) setModelBanner('⚠️ Could not refresh live model list; using current selection.');
-      return;
+      if (isModelMetadataHealthy(modelCatalogState) || isModelMetadataHealthy(lastHealthyModelCatalogState)) {
+        setModelBanner('⚠️ Could not refresh model metadata; using last known good catalog.');
+        syncModelMetadataBlocker();
+        return null;
+      }
+      applyModelMetadataHardFail(force
+        ? 'Could not refresh live model metadata.'
+        : 'Could not load model metadata.');
+      return null;
     }
     updateModelCatalogState(r);
+    return r;
   });
+}
+
+async function retryModelMetadataRefresh() {
+  if (modelMetadataRetryInFlight) return;
+  modelMetadataRetryInFlight = true;
+  syncModelMetadataBlocker('Refreshing model metadata…');
+  try {
+    let variantError = null;
+    try {
+      const refreshed = await refreshModelVariantCatalog();
+      if (!refreshed) variantError = new Error('Model variant refresh returned empty');
+    } catch (e) {
+      variantError = e;
+    }
+    await refreshModelCatalog(true);
+    if (variantError) console.warn('[retryModelMetadataRefresh] variant refresh issue:', variantError.message);
+    if (modelCatalogState?.refreshedAt) console.log('[retryModelMetadataRefresh] refreshedAt:', modelCatalogState.refreshedAt);
+    if (!isModelMetadataHealthy()) {
+      throw new Error('Model metadata is still unavailable after refresh');
+    }
+    showTransientRelayNotice('Model metadata refreshed.');
+  } catch (error) {
+    applyModelMetadataHardFail(error?.message || 'Model metadata refresh failed.');
+  } finally {
+    modelMetadataRetryInFlight = false;
+    syncModelMetadataBlocker();
+  }
 }
 
 function applyModelVariantCatalogState(payload) {
@@ -575,6 +1331,12 @@ function applyModelVariantCatalogState(payload) {
   modelVariantCatalogState = {
     variants,
     enabledVariantIds: Array.from(enabledVariantIds),
+    reasoningByModel: payload?.reasoningByModel && typeof payload.reasoningByModel === 'object'
+      ? Object.fromEntries(Object.entries(payload.reasoningByModel).map(([modelId, efforts]) => [
+        String(modelId || '').trim().toLowerCase(),
+        normalizeReasoningEffortList(efforts),
+      ]))
+      : {},
     source: String(payload?.source || '').trim() || null,
     refreshedAt: payload?.refreshedAt || null,
     warning: payload?.warning ? String(payload.warning) : null,
@@ -583,6 +1345,52 @@ function applyModelVariantCatalogState(payload) {
       ? payload.reasoningEfforts.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean)
       : [],
   };
+}
+
+function buildReasoningEffortsByBaseModel(variants = [], reasoningByModel = {}) {
+  const map = new Map();
+  for (const entry of variants) {
+    const baseModelId = String(entry.baseModelId || '').trim().toLowerCase();
+    if (!baseModelId) continue;
+    if (!map.has(baseModelId)) {
+      map.set(baseModelId, {
+        label: entry.label,
+        efforts: new Set(),
+      });
+    }
+    const effort = String(entry.reasoningEffort || '').trim().toLowerCase();
+    if (effort) map.get(baseModelId).efforts.add(effort);
+  }
+  for (const [baseModelId, efforts] of Object.entries(reasoningByModel || {})) {
+    const key = String(baseModelId || '').trim().toLowerCase();
+    if (!key) continue;
+    if (!map.has(key)) {
+      map.set(key, { label: humanizeModelLabel(key), efforts: new Set() });
+    }
+    for (const effort of Array.isArray(efforts) ? efforts : []) {
+      const normalized = String(effort || '').trim().toLowerCase();
+      if (normalized) map.get(key).efforts.add(normalized);
+    }
+  }
+  return map;
+}
+
+function renderReasoningEffortChipRow(efforts = []) {
+  const list = Array.from(efforts).sort();
+  if (!list.length) {
+    return '<span class="model-reasoning-chip model-reasoning-chip-muted">standard</span>';
+  }
+  return list.map((effort) => `<span class="model-reasoning-chip">${escHtml(effort)}</span>`).join('');
+}
+
+async function reconcileOpenModelVariantModal() {
+  const modal = document.getElementById('summary-modal');
+  if (!modal?.classList.contains('visible')) return;
+  if (summaryModalState.kind !== 'select-models') return;
+  const payload = await loadModelVariantCatalog();
+  if (!payload) return;
+  applyModelVariantCatalogState(payload);
+  renderModelVariantCatalogBody();
 }
 
 function renderModelVariantCatalogBody() {
@@ -622,6 +1430,10 @@ function renderModelVariantCatalogBody() {
     modelVariantCatalogState.warning ? `⚠️ ${escHtml(modelVariantCatalogState.warning)}` : '',
     modelVariantCatalogState.error ? `⚠️ ${escHtml(modelVariantCatalogState.error)}` : '',
   ].filter(Boolean);
+  const reasoningByBaseModel = buildReasoningEffortsByBaseModel(
+    modelVariantCatalogState.variants,
+    modelVariantCatalogState.reasoningByModel,
+  );
   const groupsHtml = providerOrder.map((providerKey) => {
     const providerLabel = PROVIDER_LABELS[providerKey] || providerKey;
     const rows = grouped.get(providerKey) || [];
@@ -641,28 +1453,51 @@ function renderModelVariantCatalogBody() {
       if (a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
       return a.variantId.localeCompare(b.variantId);
     });
-    const rowsHtml = rows.map((row) => {
-      const checked = selected.has(row.variantId);
-      const label = row.label || humanizeModelLabel(row.baseModelId) || row.baseModelId;
-      const effortChip = row.reasoningEffort ? ` <span style="font-size:0.72rem;color:var(--muted)">(${escHtml(row.reasoningEffort)})</span>` : '';
-      const unavailable = row.releaseStatus === 'unavailable';
-      const statusChip = unavailable
-        ? ' <span style="font-size:0.72rem;color:var(--warn,#f7c873)">unavailable (kept)</span>'
-        : '';
+    const byBaseModel = new Map();
+    for (const row of rows) {
+      const baseModelId = String(row.baseModelId || '').trim().toLowerCase();
+      if (!byBaseModel.has(baseModelId)) byBaseModel.set(baseModelId, []);
+      byBaseModel.get(baseModelId).push(row);
+    }
+    const baseModelBlocks = Array.from(byBaseModel.entries()).map(([baseModelId, variantRows]) => {
+      const meta = reasoningByBaseModel.get(baseModelId) || { label: humanizeModelLabel(baseModelId), efforts: new Set() };
+      const label = meta.label || humanizeModelLabel(baseModelId) || baseModelId;
+      const variantRowsHtml = variantRows.map((row) => {
+        const checked = selected.has(row.variantId);
+        const effortChip = row.reasoningEffort
+          ? ` <span class="model-reasoning-chip">${escHtml(row.reasoningEffort)}</span>`
+          : '';
+        const unavailable = row.releaseStatus === 'unavailable';
+        const statusChip = unavailable
+          ? ' <span class="model-reasoning-chip model-reasoning-chip-warn">unavailable</span>'
+          : '';
+        return `
+          <label class="model-variant-row">
+            <input class="model-variant-checkbox" type="checkbox" data-variant-id="${escHtml(row.variantId)}" ${checked ? 'checked' : ''}>
+            <span class="model-variant-row-copy">
+              <span class="model-variant-row-title">${escHtml(row.variantId)}${effortChip}${statusChip}</span>
+            </span>
+          </label>
+        `;
+      }).join('');
       return `
-        <label style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px dashed var(--border);font-size:0.84rem">
-          <input class="model-variant-checkbox" type="checkbox" data-variant-id="${escHtml(row.variantId)}" ${checked ? 'checked' : ''}>
-          <span style="display:flex;flex-direction:column;gap:2px">
-            <span>${escHtml(label)}${effortChip}${statusChip}</span>
-            <code style="font-size:0.72rem;color:var(--muted)">${escHtml(row.variantId)}</code>
-          </span>
-        </label>
+        <div class="model-base-group">
+          <div class="model-base-header">
+            <div class="model-base-title">${escHtml(label)}</div>
+            <div class="model-base-reasoning">
+              <span class="model-base-reasoning-label">Reasoning</span>
+              ${renderReasoningEffortChipRow(meta.efforts)}
+            </div>
+            <code class="model-base-id">${escHtml(baseModelId)}</code>
+          </div>
+          <div class="model-variant-list">${variantRowsHtml}</div>
+        </div>
       `;
     }).join('');
     return `
-      <section style="border:1px solid var(--border);border-radius:10px;padding:10px 12px;background:var(--bg3);display:flex;flex-direction:column;gap:6px">
-        <div style="font-weight:600">${escHtml(providerLabel)}</div>
-        ${rowsHtml || '<div style="color:var(--muted);font-size:0.82rem">No models</div>'}
+      <section class="model-provider-group">
+        <div class="model-provider-title">${escHtml(providerLabel)}</div>
+        ${baseModelBlocks || '<div class="model-provider-empty">No models</div>'}
       </section>
     `;
   }).join('');
@@ -673,6 +1508,9 @@ function renderModelVariantCatalogBody() {
       </div>
       <div style="font-size:0.78rem;color:var(--muted)">
         Variants marked unavailable are preserved from earlier selections so updates do not reset your models.
+      </div>
+      <div style="font-size:0.78rem;color:var(--muted)">
+        Each model shows all supported reasoning efforts above its selectable variants.
       </div>
       ${warnings.map((line) => `<div style="font-size:0.78rem;color:var(--warn,#f7c873)">${line}</div>`).join('')}
       <div style="display:grid;gap:10px">${groupsHtml || '<div style="color:var(--muted)">No models discovered yet. Click Refresh.</div>'}</div>
@@ -888,6 +1726,7 @@ function renderSessionInstructionDocs(docs) {
 function startRelayQuestionPolling() {
   if (relayQuestionPollTimer) return;
   relayQuestionPollTimer = setInterval(() => {
+    if (!shouldRunForegroundNetworkWork()) return;
     loadRelayQuestions(currentConvId).catch(() => {});
   }, 3000);
 }
@@ -895,11 +1734,17 @@ function startRelayQuestionPolling() {
 function startRelayBoardPolling() {
   if (relayBoardPollTimer) return;
   relayBoardPollTimer = setInterval(() => {
+    if (!shouldRunForegroundNetworkWork()) return;
     loadRelayBoards().catch(() => {});
   }, 3000);
 }
 
 async function refreshSessionWorkerStatus() {
+  const currentId = String(currentConvId || '').trim();
+  const currentConversation = currentId ? conversations[currentId] : null;
+  const currentSdkSessionId = String(currentConversation?.sdkSessionId || currentConversation?.sdk_session_id || '').trim();
+  const previousWorkerState = currentSdkSessionId ? getSessionWorkerState(currentSdkSessionId) : null;
+  const previousWorkerStatus = String(previousWorkerState?.status || '').trim().toLowerCase();
   const status = await refreshWorkspaceRootHints();
   if (!status) return;
   setConversationDraftPersistenceEnabled(status?.features?.CONVERSATION_DRAFT_PERSISTENCE_ENABLED === true);
@@ -908,13 +1753,65 @@ async function refreshSessionWorkerStatus() {
     renderConvList();
   }
   updateCliStatus();
+  const nextWorkerState = currentSdkSessionId ? getSessionWorkerState(currentSdkSessionId) : null;
+  const transitionedToOffline = (
+    ['starting', 'ready', 'processing'].includes(previousWorkerStatus)
+    && !nextWorkerState
+  );
+  const hasSessionUsageSummary = !!(
+    currentConversation?.sessionUsageSummary
+    || currentConversation?.session_usage_summary
+  );
+  if (transitionedToOffline && currentId && !hasSessionUsageSummary) {
+    refreshCurrentView().catch(() => {});
+  }
 }
 
 function startSessionWorkerStatusPolling() {
   if (sessionWorkerStatusPollTimer) return;
   sessionWorkerStatusPollTimer = setInterval(() => {
+    if (!shouldRunForegroundNetworkWork()) return;
     refreshSessionWorkerStatus().catch(() => {});
   }, 4000);
+}
+
+async function pollAuthenticatedCurrentConversationLive() {
+  if (liveConversationPollInFlight) return;
+  if (isSharedReaderMode()) return;
+  const currentId = String(currentConvId || '').trim();
+  if (!currentId) return;
+  const currentConversation = conversations[currentId] || null;
+  const isProcessing = String(currentConversation?.localTurnStatus || '').trim().toLowerCase() === 'processing'
+    || !!document.getElementById('thinking-indicator');
+  if (!isProcessing) return;
+
+  liveConversationPollInFlight = true;
+  try {
+    const messagesEl = document.getElementById('messages');
+    const preserveBottom = isMessagesAtBottom();
+    const savedScrollTop = messagesEl?.scrollTop || 0;
+    const savedLoadedCount = loadConversationLoadedMessageCount(currentId);
+    const requestLimit = Math.max(20, getConversationLoadedMessageCount() || 0, savedLoadedCount || 0);
+    const response = await loadConversation(currentId, { limit: requestLimit });
+    if (!response) return;
+    if (String(currentConvId || '').trim() !== currentId) return;
+    const stableSavedScrollTop = resolveStableScrollTopForLiveRefresh(messagesEl, savedScrollTop);
+    applyLoadedConversationState(currentId, response, {
+      restoreScroll: !preserveBottom,
+      savedScrollTop: preserveBottom ? null : stableSavedScrollTop,
+      followLiveUpdates: preserveBottom,
+    });
+  } finally {
+    liveConversationPollInFlight = false;
+  }
+}
+
+function startLiveConversationPolling() {
+  if (liveConversationPollTimer || isSharedReaderMode()) return;
+  liveConversationPollTimer = setInterval(() => {
+    if (!shouldRunForegroundNetworkWork()) return;
+    pollAuthenticatedCurrentConversationLive().catch(() => {});
+  }, 900);
 }
 
 function setupViewportTracking() {
@@ -945,16 +1842,6 @@ function setupViewportTracking() {
   }
 }
 
-function initPullToRefresh() {
-  const el = document.getElementById('messages');
-  if (!el || el.dataset.pullRefreshBound === '1') return;
-  el.dataset.pullRefreshBound = '1';
-  el.addEventListener('touchstart', onMessagesTouchStart, { passive: true });
-  el.addEventListener('touchmove', onMessagesTouchMove, { passive: false });
-  el.addEventListener('touchend', onMessagesTouchEnd, { passive: true });
-  el.addEventListener('touchcancel', onMessagesTouchEnd, { passive: true });
-}
-
 function initMessageScrollPersistence() {
   const el = document.getElementById('messages');
   if (!el || el.dataset.scrollPersistenceBound === '1') return;
@@ -964,42 +1851,6 @@ function initMessageScrollPersistence() {
     if (!convId) return;
     saveConversationScrollTop(convId, el.scrollTop);
   }, { passive: true });
-}
-
-function onMessagesTouchStart(event) {
-  const el = event.currentTarget;
-  if (!el || el.scrollTop > 0 || pullRefreshState.refreshing) return;
-  const touch = event.touches?.[0];
-  if (!touch) return;
-
-  pullRefreshState = {
-    active: true,
-    ready: false,
-    startY: touch.clientY,
-    refreshing: pullRefreshState.refreshing,
-  };
-  setPullRefreshIndicator(0, 'Pull down to refresh');
-}
-
-function onMessagesTouchMove(event) {
-  if (!pullRefreshState.active) return;
-  const el = event.currentTarget;
-  if (!el || el.scrollTop > 0) {
-    resetPullRefreshIndicator();
-    return;
-  }
-  const touch = event.touches?.[0];
-  if (!touch) return;
-  const delta = touch.clientY - pullRefreshState.startY;
-  if (delta <= 0) {
-    resetPullRefreshIndicator();
-    return;
-  }
-  const distance = Math.min(delta, 120);
-  const ready = distance >= 72;
-  pullRefreshState.ready = ready;
-  setPullRefreshIndicator(distance, ready ? 'Release to refresh' : 'Pull down to refresh', ready);
-  if (delta > 6) event.preventDefault();
 }
 
 async function runConversationHistoryRefresh({ source = 'menu' } = {}) {
@@ -1054,34 +1905,14 @@ async function runConversationHistoryRefresh({ source = 'menu' } = {}) {
   }
 }
 
-async function onMessagesTouchEnd() {
-  if (!pullRefreshState.active) return;
-  const shouldRefresh = pullRefreshState.ready && !pullRefreshState.refreshing;
-  pullRefreshState.active = false;
-  pullRefreshState.ready = false;
-  if (!shouldRefresh) {
-    resetPullRefreshIndicator();
-    return;
-  }
-  pullRefreshState.refreshing = true;
-  setPullRefreshIndicator(72, 'Refreshing…', true);
-  try {
-    const refreshed = await runConversationHistoryRefresh({ source: 'pull' });
-    if (!refreshed) {
-      await refreshCurrentView();
-    }
-  } finally {
-    pullRefreshState.refreshing = false;
-    resetPullRefreshIndicator();
-  }
-}
-
 let refreshViewVersion = 0;
 
 async function refreshCurrentView() {
   const capturedVersion = ++refreshViewVersion;
   const messagesEl = document.getElementById('messages');
+  const preserveBottom = isMessagesAtBottom();
   const scrollTop = messagesEl?.scrollTop || 0;
+  const stableSavedScrollTop = resolveStableScrollTopForLiveRefresh(messagesEl, scrollTop);
 
   await refreshConversations();
 
@@ -1101,7 +1932,11 @@ async function refreshCurrentView() {
   if (capturedVersion < refreshViewVersion) return;
   if (String(currentConvId || '').trim() !== currentId) return;
   if (r) {
-    applyLoadedConversationState(currentId, r, { restoreScroll: false });
+    applyLoadedConversationState(currentId, r, {
+      restoreScroll: !preserveBottom,
+      savedScrollTop: preserveBottom ? null : stableSavedScrollTop,
+      followLiveUpdates: preserveBottom,
+    });
   } else {
     setRepoBrowserSessionInfo('', '');
     restoreInFlightThinking(null);
@@ -1110,12 +1945,10 @@ async function refreshCurrentView() {
   await loadRelayBoards();
   scheduleContextUsageRefresh(currentId, 0);
   if (messagesEl && String(currentConvId || '').trim() === currentId) {
-    const savedScrollTop = loadConversationScrollTop(currentId);
-    const nextScrollTop = Number.isFinite(savedScrollTop) ? savedScrollTop : scrollTop;
-    messagesEl.scrollTop = nextScrollTop;
-    if (Number.isFinite(nextScrollTop) && nextScrollTop >= 0) {
-      saveConversationScrollTop(currentId, nextScrollTop);
+    if (!preserveBottom && Number.isFinite(stableSavedScrollTop) && stableSavedScrollTop >= 0) {
+      messagesEl.scrollTop = stableSavedScrollTop;
     }
+    saveConversationScrollTop(currentId, messagesEl.scrollTop);
   }
   syncRefreshHistoryMenuState();
 }
@@ -1194,6 +2027,7 @@ function toggleChatActionsMenu() {
   const trigger = document.getElementById('chat-actions-menu-btn');
   if (!menu || !trigger || trigger.hidden || trigger.disabled) return;
   syncRefreshHistoryMenuState();
+  syncThemeMenuLabel();
   const willOpen = !!menu.hidden;
   menu.hidden = !willOpen;
   trigger.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
@@ -1238,6 +2072,12 @@ function canRefreshConversationHistory(conversationId) {
 function syncRefreshHistoryMenuState() {
   const button = document.getElementById('chat-menu-refresh-history');
   if (!button) return;
+  if (button.hidden || button.getAttribute('aria-hidden') === 'true') {
+    button.disabled = true;
+    button.tabIndex = -1;
+    button.setAttribute('aria-disabled', 'true');
+    return;
+  }
   if (isHistoryRefreshInFlight()) {
     button.disabled = true;
     button.title = 'Refreshing conversation history';
@@ -1267,6 +2107,7 @@ function syncChatTitleControls() {
   const { title, editBtn, editor, input } = getChatTitleElements();
   const convId = String(currentConvId || '').trim();
   const killBtn = document.getElementById('chat-menu-kill-session');
+  const sharedMode = isSharedReaderMode();
   const conversation = convId ? (conversations[convId] || null) : null;
   const sdkSessionId = String(conversation?.sdkSessionId || '').trim();
   if (title) {
@@ -1295,8 +2136,8 @@ function syncChatTitleControls() {
     editBtn.disabled = !convId || editing;
   }
   if (killBtn) {
-    killBtn.disabled = !convId || !sdkSessionId;
-    killBtn.hidden = !convId;
+    killBtn.disabled = sharedMode || !convId || !sdkSessionId;
+    killBtn.hidden = sharedMode || !convId;
   }
   if (editor) {
     editor.hidden = !editing;
@@ -1310,7 +2151,10 @@ function syncChatTitleControls() {
   if (!editing && editor && !editor.hidden) {
     editor.hidden = true;
   }
-  syncChatHeaderWorkspaceLabel();
+  if (!isStatusViewActive()) {
+    syncChatHeaderWorkspaceLabel();
+  }
+  syncChatTitleWatcherIndicator();
 }
 
 function openChatTitleEditor() {
@@ -1423,6 +2267,7 @@ initSocketHandlers({
   refreshSessionWorkerStatus,
   refreshModelCatalog,
   updateModelCatalogState,
+  reconcileOpenModelVariantModal,
   applyConversationWorkspaceRootUpdate,
   applyConversationTitleUpdate,
   syncChatTitleControls,
@@ -1441,6 +2286,11 @@ initActionConfirmations({
   refreshSessionWorkerStatus,
   exposeOnWindow: false,
 });
+initTmuxInspectorView({
+  bindMenuAction,
+  lockChatActionsMenuShield,
+  closeChatActionsMenu,
+});
 
 function showAuthGate() {
   document.getElementById('auth-gate').style.display = 'flex';
@@ -1448,15 +2298,30 @@ function showAuthGate() {
 }
 
 async function initApp() {
+  initClientDiagnostics();
+  const sharedMode = isSharedReaderMode();
+  appSharedMode = sharedMode;
+  initNetworkLifecycleHandling();
+  setForegroundNetworkWorkEnabled(document.visibilityState === 'visible');
+  const sharedThemeBtn = document.getElementById('chat-menu-shared-theme-toggle');
   initTheme();
+  initThemeMenuToggle();
+  if (sharedThemeBtn && sharedMode) sharedThemeBtn.hidden = false;
   initFontScaling();
-  clearLegacyKnownCwdHistoryStorage();
+  if (!sharedMode) {
+    clearLegacyKnownCwdHistoryStorage();
+  }
   syncPwaVersionMenuEntry();
   syncQueueStatusMenuEntry();
-  syncSuspendHostVisibility();
+  if (!sharedMode) {
+    syncSuspendHostVisibility();
+    activeConversationPreferredReasoningByMode = readStoredReasoningByMode();
+  }
   setupViewportTracking();
   window.addEventListener('pagehide', () => {
+    stopSharedModeTimers();
     void flushConversationDraft(currentConvId);
+    closeTmuxInspectorView();
   });
   document.getElementById('auth-gate').style.display = 'none';
   document.getElementById('app').classList.add('visible');
@@ -1467,90 +2332,119 @@ async function initApp() {
     event.stopPropagation();
     toggleChatActionsMenu();
   });
-  const chatMenuEditBtn = document.getElementById('chat-menu-edit-title');
-  const chatMenuUsageBtn = document.getElementById('chat-menu-usage');
-  bindMenuAction(chatMenuUsageBtn, (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    lockChatActionsMenuShield(350);
-    closeChatActionsMenu();
-    showUsage().catch((error) => {
-      alert(error?.message || 'Failed to load usage');
+  if (!sharedMode) {
+    const chatMenuEditBtn = document.getElementById('chat-menu-edit-title');
+    const chatMenuUsageBtn = document.getElementById('chat-menu-usage');
+    bindMenuAction(chatMenuUsageBtn, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      showUsage().catch((error) => {
+        alert(error?.message || 'Failed to load usage');
+      });
     });
-  });
-  bindMenuAction(chatMenuEditBtn, (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    lockChatActionsMenuShield(350);
-    closeChatActionsMenu();
-    openChatTitleEditor();
-  });
-  const chatMenuCompactBtn = document.getElementById('chat-menu-compact');
-  bindMenuAction(chatMenuCompactBtn, (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    lockChatActionsMenuShield(350);
-    closeChatActionsMenu();
-    compactCurrentConversation().catch((error) => {
-      alert(error?.message || 'Failed to compact conversation');
+    bindMenuAction(chatMenuEditBtn, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      openChatTitleEditor();
     });
-  });
-  const chatMenuRefreshHistoryBtn = document.getElementById('chat-menu-refresh-history');
-  bindMenuAction(chatMenuRefreshHistoryBtn, (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    lockChatActionsMenuShield(350);
-    closeChatActionsMenu();
-    runConversationHistoryRefresh({ source: 'menu' }).catch(() => {});
-  });
-  const chatMenuSelectModelsBtn = document.getElementById('chat-menu-select-models');
-  bindMenuAction(chatMenuSelectModelsBtn, (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    lockChatActionsMenuShield(350);
-    closeChatActionsMenu();
-    openSelectModelsModal().catch((error) => {
-      alert(error?.message || 'Failed to open model selector');
+    const chatMenuCompactBtn = document.getElementById('chat-menu-compact');
+    if (chatMenuCompactBtn && !chatMenuCompactBtn.hidden && !chatMenuCompactBtn.disabled) {
+      bindMenuAction(chatMenuCompactBtn, (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        lockChatActionsMenuShield(350);
+        closeChatActionsMenu();
+        compactCurrentConversation().catch((error) => {
+          alert(error?.message || 'Failed to compact conversation');
+        });
+      });
+    }
+    const chatMenuShareConversationBtn = document.getElementById('chat-menu-share-conversation');
+    bindMenuAction(chatMenuShareConversationBtn, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      const convId = String(currentConvId || '').trim();
+      if (!convId) {
+        showTransientRelayNotice('Select a conversation first.');
+        return;
+      }
+      createConversationShareLink(convId).then(async (result) => {
+        const shareUrl = String(result?.shareUrl || '').trim();
+        if (!shareUrl) {
+          showTransientRelayNotice(result?.error || 'Could not create share link.');
+          return;
+        }
+        const copied = await copyTextToClipboard(shareUrl);
+        showTransientRelayNotice(copied ? 'Share link copied to clipboard.' : shareUrl);
+      }).catch((error) => {
+        showTransientRelayNotice(error?.message || 'Could not create share link.');
+      });
     });
-  });
-  const chatMenuChangeCwdBtn = document.getElementById('chat-menu-change-cwd');
-  bindMenuAction(chatMenuChangeCwdBtn, (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    lockChatActionsMenuShield(350);
-    closeChatActionsMenu();
-    openChangeCwdModal();
-  });
-  const chatMenuSettingsBtn = document.getElementById('chat-menu-settings');
-  bindMenuAction(chatMenuSettingsBtn, (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    lockChatActionsMenuShield(350);
-    closeChatActionsMenu();
-    openSettingsModal();
-  });
-  const chatMenuRestartRelayBtn = document.getElementById('chat-menu-restart-relay');
-  bindMenuAction(chatMenuRestartRelayBtn, (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    lockChatActionsMenuShield(350);
-    closeChatActionsMenu();
-    openRestartRelayConfirmation();
-  });
-  const chatMenuEmptyQueueBtn = document.getElementById('chat-menu-empty-queue');
-  bindMenuAction(chatMenuEmptyQueueBtn, (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    openEmptyQueueConfirmation();
-  });
-  const chatMenuKillBtn = document.getElementById('chat-menu-kill-session');
-  bindMenuAction(chatMenuKillBtn, (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    lockChatActionsMenuShield(350);
-    closeChatActionsMenu();
-    openKillSessionConfirmation();
-  });
+    const chatMenuRefreshHistoryBtn = document.getElementById('chat-menu-refresh-history');
+    if (chatMenuRefreshHistoryBtn && !chatMenuRefreshHistoryBtn.hidden && !chatMenuRefreshHistoryBtn.disabled) {
+      bindMenuAction(chatMenuRefreshHistoryBtn, (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        lockChatActionsMenuShield(350);
+        closeChatActionsMenu();
+        runConversationHistoryRefresh({ source: 'menu' }).catch(() => {});
+      });
+    }
+    const chatMenuSelectModelsBtn = document.getElementById('chat-menu-select-models');
+    bindMenuAction(chatMenuSelectModelsBtn, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      openSelectModelsModal().catch((error) => {
+        alert(error?.message || 'Failed to open model selector');
+      });
+    });
+    const chatMenuChangeCwdBtn = document.getElementById('chat-menu-change-cwd');
+    bindMenuAction(chatMenuChangeCwdBtn, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      openChangeCwdModal();
+    });
+    const chatMenuSettingsBtn = document.getElementById('chat-menu-settings');
+    bindMenuAction(chatMenuSettingsBtn, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      openSettingsModal();
+    });
+    const chatMenuRestartRelayBtn = document.getElementById('chat-menu-restart-relay');
+    bindMenuAction(chatMenuRestartRelayBtn, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      openRestartRelayConfirmation();
+    });
+    const chatMenuEmptyQueueBtn = document.getElementById('chat-menu-empty-queue');
+    bindMenuAction(chatMenuEmptyQueueBtn, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      openEmptyQueueConfirmation();
+    });
+    const chatMenuKillBtn = document.getElementById('chat-menu-kill-session');
+    bindMenuAction(chatMenuKillBtn, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      openKillSessionConfirmation();
+    });
+  }
   const sidebarToggleBtn = document.getElementById('sidebar-toggle');
   bindTapAction(sidebarToggleBtn, (event) => {
     event.preventDefault();
@@ -1599,15 +2493,33 @@ async function initApp() {
       closeChatTitleEditor();
     });
   }
+  if (sharedMode) {
+    initFullscreenButton();
+    initConversationHistoryLazyLoading();
+    initBubbleActionHandlers();
+    initMessageScrollPersistence();
+    syncChatTitleControls();
+    await initSharedConversationReader();
+    return;
+  }
   initModeSelector();
   initModelSelector();
+  initReasoningSelector();
+  initContextTierSelector();
+  const modelMetadataRetryBtn = document.getElementById('model-metadata-retry-btn');
+  if (modelMetadataRetryBtn && modelMetadataRetryBtn.dataset.bound !== '1') {
+    modelMetadataRetryBtn.dataset.bound = '1';
+    modelMetadataRetryBtn.addEventListener('click', () => {
+      void retryModelMetadataRefresh();
+    });
+  }
+  syncModelMetadataBlocker();
   const status = await refreshWorkspaceRootHints();
   syncQueueStatusMenuEntry(status);
   setSessionWorkerStatesFromStatusPayload(status?.sessionWorker || null);
   await refreshModelCatalog(true);
   initFullscreenButton();
   initInstallButton();
-  initPullToRefresh();
   syncRefreshHistoryMenuState();
   initChatTitleCopy();
   initEmojiPicker();
@@ -1621,6 +2533,7 @@ async function initApp() {
   startRelayQuestionPolling();
   startRelayBoardPolling();
   startSessionWorkerStatusPolling();
+  startLiveConversationPolling();
   await loadConversations();
   await loadRelayQuestions(currentConvId);
   await loadRelayBoards();
@@ -1629,38 +2542,70 @@ async function initApp() {
 }
 
 async function doAuth() {
-  const val = document.getElementById('token-input').value.trim() || getTokenFromUrl();
+  const tokenInput = document.getElementById('token-input');
+  const val = tokenInput.value.trim() || getTokenFromUrl();
   if (!val) return showAuthError('Please enter a token');
-  const ok = await verifyToken(val);
-  if (ok) {
-    setToken(val);
-    initApp();
+  const result = await verifyToken(val);
+  if (result?.ok) {
+    setToken('');
+    tokenInput.value = '';
+    await startAppWithErrorHandling();
   } else {
-    showAuthError('Invalid token');
+    showAuthError(resolveAuthErrorMessage(result));
   }
 }
 
 
 async function bootstrap() {
   if (ensureTrailingSlashPath()) return;
-  await applyPwaManifestFromSettings();
-  registerPwaShell();
-  initInstallButton();
+  const sharedMode = isSharedReaderMode();
+  if (sharedMode && navigator.serviceWorker?.getRegistrations) {
+    navigator.serviceWorker.getRegistrations()
+      .then((registrations) => Promise.all(registrations.map((registration) => registration.unregister().catch(() => false))))
+      .catch(() => {});
+  }
+  if (!sharedMode) {
+    await applyPwaManifestFromSettings();
+  }
+  if (!sharedMode) {
+    registerPwaShell();
+    initInstallButton();
+  }
+  if (sharedMode) {
+    await startAppWithErrorHandling();
+    return;
+  }
   const urlToken = getTokenFromUrl();
   if (urlToken) stripTokenFromUrl();
-  if (await verifyExistingSession()) {
-    await initApp();
+  const persistedToken = consumeLegacyPersistedAuthToken();
+  const bootstrapToken = String(urlToken || persistedToken || '').trim();
+  const existingSession = await verifyExistingSession(bootstrapToken);
+  if (existingSession?.ok) {
+    setToken('');
+    await startAppWithErrorHandling();
     return;
   }
   if (urlToken) {
-    const ok = await verifyToken(urlToken);
-    if (ok) {
-      setToken(urlToken);
-      await initApp();
+    const tokenResult = await verifyToken(urlToken);
+    if (tokenResult?.ok) {
+      setToken('');
+      await startAppWithErrorHandling();
       return;
     }
   }
+  if (!urlToken && persistedToken) {
+    const persistedResult = await verifyToken(persistedToken);
+    if (persistedResult?.ok) {
+      setToken('');
+      await startAppWithErrorHandling();
+      return;
+    }
+  }
+  if (existingSession?.status === 401 && persistedToken) {
+    setToken('');
+  }
   if (urlToken) document.getElementById('token-input').value = urlToken;
+  else if (persistedToken) document.getElementById('token-input').value = persistedToken;
   showAuthGate();
 }
 
@@ -1691,8 +2636,11 @@ window.refreshRepoBrowser = refreshRepoBrowser;
 window.initModeSelector = initModeSelector;
 window.initModelSelector = initModelSelector;
 window.refreshModelCatalog = refreshModelCatalog;
+window.retryModelMetadataRefresh = retryModelMetadataRefresh;
+window.isModelMetadataBlocked = () => modelMetadataBlocked || !isModelMetadataHealthy();
 window.saveSelectedModelsFromModal = saveSelectedModelsFromModal;
 window.selectedModelValue = selectedModelValue;
+window.selectedReasoningEffortValue = selectedReasoningEffortValue;
 window.getPreferredModelSelection = () => selectedModelValue();
 window.applyConversationPreferences = applyConversationPreferencesForConversation;
 window.applyModelCatalogState = updateModelCatalogState;
@@ -1702,6 +2650,7 @@ window.registerPwaShell = registerPwaShell;
 window.newConversation = newConversation;
 window.deleteConv = deleteConv;
 window.openConversation = openConversation;
+window.toggleStatusView = toggleStatusView;
 window.refreshConversations = refreshConversations;
 window.renderConvList = renderConvList;
 window.handleAttachmentInput = handleAttachmentInput;

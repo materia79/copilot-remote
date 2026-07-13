@@ -1,4 +1,4 @@
-import { BASE, showTransientRelayNotice } from './store.js';
+import { BASE, IS_SHARED_VIEW, showTransientRelayNotice } from './store.js';
 
 const THEME_COLOR_BASE = '#0d1117';
 const THEME_COLOR_IMMERSIVE = '#161b22';
@@ -132,6 +132,13 @@ function getInstallHelpMessage() {
 export function updateInstallButton() {
   const btn = document.getElementById('install-btn');
   if (!btn) return;
+  if (IS_SHARED_VIEW) {
+    btn.disabled = true;
+    btn.hidden = true;
+    btn.setAttribute('aria-disabled', 'true');
+    btn.title = 'PWA install is unavailable for shared conversations';
+    return;
+  }
   syncInstalledAppUiState();
 
   if (isInstalledAppMode()) {
@@ -146,6 +153,7 @@ export function updateInstallButton() {
 }
 
 export async function promptInstallApp() {
+  if (IS_SHARED_VIEW) return;
   if (!deferredInstallPrompt) {
     await new Promise((resolve) => setTimeout(resolve, 350));
   }
@@ -167,6 +175,10 @@ export async function promptInstallApp() {
 }
 
 export function initInstallButton() {
+  if (IS_SHARED_VIEW) {
+    updateInstallButton();
+    return;
+  }
   if (window.__installButtonBound) {
     updateInstallButton();
     initInstalledFullscreenGestureBridge();
@@ -435,6 +447,7 @@ export function updatePwaAppName(rawValue) {
 }
 
 export function registerPwaShell() {
+  if (IS_SHARED_VIEW) return;
   if (!('serviceWorker' in navigator)) return;
   const scopeBase = BASE;
   const scopeRoot = `${scopeBase}/`;

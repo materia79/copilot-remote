@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { buildModelVariantCatalogPayload } from './sessions-routes.mjs';
+import { buildModelVariantCatalogPayload, buildReasoningByModelFromVariantRows } from './sessions-routes.mjs';
 
 test('buildModelVariantCatalogPayload keeps enabled unavailable variants and warning metadata', () => {
   const payload = buildModelVariantCatalogPayload({
@@ -40,4 +40,37 @@ test('buildModelVariantCatalogPayload keeps enabled unavailable variants and war
   assert.equal(payload.variants[0].releaseStatus, 'unavailable');
   assert.equal(payload.source, 'rpc-snapshot');
   assert.deepEqual(payload.reasoningEfforts, ['none', 'low', 'medium']);
+});
+
+test('buildReasoningByModelFromVariantRows aggregates efforts per base model', () => {
+  const map = buildReasoningByModelFromVariantRows([
+    { baseModelId: 'gpt-5.4', reasoningEffort: 'none' },
+    { baseModelId: 'gpt-5.4', reasoningEffort: 'low' },
+    { baseModelId: 'claude-sonnet-4.6', reasoningEffort: 'medium' },
+  ]);
+  assert.deepEqual(map['gpt-5.4'], ['none', 'low']);
+  assert.deepEqual(map['claude-sonnet-4.6'], ['medium']);
+});
+
+test('buildModelVariantCatalogPayload includes reasoningByModel from model state', () => {
+  const payload = buildModelVariantCatalogPayload({
+    rows: [
+      {
+        variantId: 'gpt-5.4-none',
+        baseModelId: 'gpt-5.4',
+        provider: 'openai',
+        label: 'GPT-5.4',
+        reasoningEffort: 'none',
+        enabled: true,
+        sortOrder: 0,
+      },
+    ],
+    modelState: {
+      reasoningByModel: { 'gpt-5.4': ['none', 'low'] },
+      reasoningEfforts: ['none', 'low'],
+      contextLimitsByModel: { 'gpt-5.4': 256000 },
+    },
+  });
+  assert.deepEqual(payload.reasoningByModel['gpt-5.4'], ['none', 'low']);
+  assert.equal(payload.contextLimitsByModel['gpt-5.4'], 256000);
 });

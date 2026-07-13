@@ -27,6 +27,7 @@ import { registerAskUserRoutes } from './routes/ask-user-routes.mjs';
 import { registerRelayBoardRoutes } from './routes/relay-board-routes.mjs';
 import { registerCacheRoutes } from './routes/cache-routes.mjs';
 import { createDeleteArchiveService } from './services/delete-archive-service.mjs';
+import { createStatusEventService } from './services/status-event-service.mjs';
 import {
   normalizeDriveAbsolutePath as _normalizeDriveAbsolutePath,
   driveRootFromAbsolutePath as _driveRootFromAbsolutePath,
@@ -43,9 +44,16 @@ import { createRelayCliLauncherService } from './services/relay-cli-launcher-ser
 import { createSessionWorkerRegistry } from './services/session-worker-registry-service.mjs';
 import { createSessionWorkerSupervisor } from './services/session-worker-supervisor-service.mjs';
 import { createSessionWorkerProcessInspector } from './services/session-worker-process-service.mjs';
+import {
+  isModelCatalogRefreshStale,
+  latestModelCatalogRefresh,
+} from '../shared/model-catalog-freshness.mjs';
 import { launchSessionCli } from './services/session-worker-launch-service.mjs';
 import { createSshTunnelManager } from './services/ssh-tunnel-manager-service.mjs';
 import { createSessionWorkerWebSocketService } from './services/session-worker-websocket-service.mjs';
+import { createTmuxInspectorAccessPolicy } from './services/tmux-inspector-access-policy.mjs';
+import { createTmuxInspectorStreamService } from './services/tmux-inspector-stream-service.mjs';
+import { createTmuxInspectorSocketService } from './services/tmux-inspector-socket-service.mjs';
 import {
   resolveDefaultSessionWorkspaceRootState as resolveDefaultSessionWorkspaceRootStateFromService,
   resolveLaunchWorkspaceRootPath,
@@ -97,8 +105,10 @@ const DEFAULT_CONFIG = { authToken: '', port: 3333, pollIntervalMs: 3000, conver
 const DEFAULT_PROCESSING_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_MODEL = 'gpt-5.4-mini';
 const MODEL_CATALOG_STALE_MS = 2 * 60 * 1000;
+const MODEL_CATALOG_WARNING_MS = 10 * 60 * 1000;
 const SUPPORTED_RELAY_MODES = ['plan', 'ask', 'agent', 'autopilot'];
 const DEFAULT_RELAY_MODE = 'agent';
+const AUTO_MODEL_SENTINEL = 'auto';
 const SUPPORTED_CONVERSATION_SESSION_MODES = ['isolated', 'shared'];
 const DEFAULT_CONVERSATION_SESSION_MODE = 'isolated';
 const MAX_UPLOAD_ATTACHMENTS = 6;
@@ -324,6 +334,7 @@ const runtimeTimers = {
   staleRecovery: null,
   questionExpiry: null,
   pendingWorkerPrime: null,
+  sharedViewerPrune: null,
   shutdownDrain: null,
 };
 
@@ -367,13 +378,14 @@ function socketIoPath() {
 // Remote path prefix when served behind a reverse proxy subpath.
 // Trailing slashes are stripped. Empty string means root.
 const remotePath = normalizeRemotePath(config.remotePath);
+const COOKIE_PATH = remotePath || '/';
 
 let modelCatalog = {
   models: [DEFAULT_MODEL],
   currentModel: DEFAULT_MODEL,
   defaultModel: DEFAULT_MODEL,
   source: 'bootstrap',
-  refreshedAt: new Date().toISOString(),
+  refreshedAt: null,
   error: null,
 };
 let modelSelectorSql = null;
@@ -896,6 +908,19 @@ function normalizeModelVariantRow(row = {}) {
     reasoningEffort: normalizedReasoningEffort,
     label,
     releaseStatus: String(row?.release_status || row?.releaseStatus || '').trim() || null,
+    contextLimitTokens: Number.isFinite(Number(row?.context_limit_tokens ?? row?.contextLimitTokens))
+      && Number(row?.context_limit_tokens ?? row?.contextLimitTokens) > 0
+      ? Math.round(Number(row?.context_limit_tokens ?? row?.contextLimitTokens))
+      : null,
+    longContextLimitTokens: Number.isFinite(Number(row?.long_context_limit_tokens ?? row?.longContextLimitTokens))
+      && Number(row?.long_context_limit_tokens ?? row?.longContextLimitTokens) > 0
+      ? Math.round(Number(row?.long_context_limit_tokens ?? row?.longContextLimitTokens))
+      : null,
+    pricing: (() => {
+      const value = row?.pricing_json ?? row?.pricing;
+      if (!value || typeof value === 'object') return value || null;
+      try { return JSON.parse(value); } catch { return null; }
+    })(),
     enabled,
     sortOrder: Number.isFinite(Number(row?.sort_order ?? row?.sortOrder))
       ? Math.max(0, Math.trunc(Number(row?.sort_order ?? row?.sortOrder)))
@@ -906,6 +931,8 @@ function normalizeModelVariantRow(row = {}) {
 
 function buildModelVariantEntries(baseModels = [], {
   defaultEnabled = true,
+  contextLimitsByModel = {},
+  modelMetadataByModel = {},
 } = {}) {
   const models = uniqueStringList(baseModels);
   const entries = [];
@@ -913,6 +940,11 @@ function buildModelVariantEntries(baseModels = [], {
   for (const baseModelId of models) {
     const provider = modelProviderForId(baseModelId);
     const label = modelDisplayLabel(baseModelId);
+    const contextLimitTokens = Number(contextLimitsByModel?.[baseModelId]);
+    const normalizedContextLimitTokens = Number.isFinite(contextLimitTokens) && contextLimitTokens > 0
+      ? Math.round(contextLimitTokens)
+      : null;
+    const metadata = modelMetadataByModel?.[baseModelId] || {};
     if (isReasoningVariantEligibleModel(baseModelId)) {
       for (const effort of SUPPORTED_REASONING_EFFORTS) {
         entries.push({
@@ -922,6 +954,9 @@ function buildModelVariantEntries(baseModels = [], {
           label,
           reasoningEffort: effort,
           releaseStatus: null,
+          contextLimitTokens: normalizedContextLimitTokens,
+          longContextLimitTokens: toNullableInt(metadata.longContextLimitTokens),
+          pricing: metadata.pricing || null,
           enabled: defaultEnabled ? 1 : 0,
           sortOrder: sortOrder++,
         });
@@ -935,25 +970,187 @@ function buildModelVariantEntries(baseModels = [], {
       label,
       reasoningEffort: null,
       releaseStatus: null,
+      contextLimitTokens: normalizedContextLimitTokens,
+      longContextLimitTokens: toNullableInt(metadata.longContextLimitTokens),
+      pricing: metadata.pricing || null,
       enabled: defaultEnabled ? 1 : 0,
       sortOrder: sortOrder++,
     });
   }
+
   return entries;
+}
+
+function normalizeModelMetadataByModel(value = {}) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const normalized = {};
+  for (const [rawModelId, rawMetadata] of Object.entries(value)) {
+    const modelId = canonicalizeModelId(rawModelId);
+    if (!isValidModelId(modelId) || !rawMetadata || typeof rawMetadata !== 'object') continue;
+    const defaultContextLimitTokens = toNullableInt(rawMetadata.defaultContextLimitTokens);
+    const longContextLimitTokens = toNullableInt(rawMetadata.longContextLimitTokens);
+    const pricing = rawMetadata.pricing && typeof rawMetadata.pricing === 'object' ? rawMetadata.pricing : null;
+    if (defaultContextLimitTokens === null && longContextLimitTokens === null && pricing === null) continue;
+    normalized[modelId] = { defaultContextLimitTokens, longContextLimitTokens, pricing };
+  }
+  return normalized;
+}
+
+function normalizeContextLimitsByModel(value = {}) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const normalized = {};
+  for (const [rawModelId, rawLimit] of Object.entries(value)) {
+    const modelId = canonicalizeModelId(rawModelId);
+    const limit = Number(rawLimit);
+    if (!isValidModelId(modelId) || !Number.isFinite(limit) || limit <= 0) continue;
+    normalized[modelId] = Math.round(limit);
+  }
+  return normalized;
+}
+
+function isModelCatalogRefreshedAtStale(refreshedAt) {
+  return isModelCatalogRefreshStale(refreshedAt, {
+    staleAfterMs: MODEL_CATALOG_STALE_MS,
+  });
+}
+
+function hasValidReasoningByModel(reasoningByModel = {}) {
+  if (!reasoningByModel || typeof reasoningByModel !== 'object') return false;
+  const modelIds = Object.keys(reasoningByModel).filter((modelId) => modelId !== AUTO_MODEL_SENTINEL);
+  if (!modelIds.length) return false;
+  return modelIds.every((modelId) => {
+    const efforts = reasoningByModel[modelId];
+    return Array.isArray(efforts) && efforts.length > 0;
+  });
 }
 
 function getModelCatalogState() {
   const selectorState = getModelVariantSelectorState();
+  const enabledRows = listEnabledModelVariantRows();
+  const modelRows = enabledRows.length ? enabledRows : listModelVariantRows().filter((row) => row.enabled);
+  const allRows = listModelVariantRows();
+  const reasoningByModel = {};
+  const contextLimitsByModel = {};
+  const modelMetadataByModel = {};
+  const models = [];
+  const seenModels = new Set();
+  for (const row of modelRows) {
+    const baseModelId = String(row?.baseModelId || '').trim();
+    if (!baseModelId) continue;
+    if (!seenModels.has(baseModelId)) {
+      seenModels.add(baseModelId);
+      models.push(baseModelId);
+    }
+    const effort = normalizeReasoningEffort(row?.reasoningEffort || 'none') || 'none';
+    const current = reasoningByModel[baseModelId] || [];
+    if (!current.includes(effort)) current.push(effort);
+    reasoningByModel[baseModelId] = current;
+    if (row.contextLimitTokens !== null && row.contextLimitTokens > 0) {
+      contextLimitsByModel[baseModelId] = row.contextLimitTokens;
+    }
+    if (!modelMetadataByModel[baseModelId]) {
+      modelMetadataByModel[baseModelId] = {
+        defaultContextLimitTokens: row.contextLimitTokens,
+        longContextLimitTokens: row.longContextLimitTokens,
+        pricing: row.pricing,
+      };
+    }
+  }
+  const knownModelIds = new Set(Object.keys(reasoningByModel));
+  for (const row of allRows) {
+    const baseModelId = String(row?.baseModelId || '').trim();
+    if (!baseModelId) continue;
+    knownModelIds.add(baseModelId);
+    const effort = normalizeReasoningEffort(row?.reasoningEffort || 'none') || 'none';
+    const current = reasoningByModel[baseModelId] || [];
+    if (!current.includes(effort)) current.push(effort);
+    reasoningByModel[baseModelId] = current;
+    if (row.contextLimitTokens !== null && row.contextLimitTokens > 0) {
+      contextLimitsByModel[baseModelId] = row.contextLimitTokens;
+    }
+    if (!modelMetadataByModel[baseModelId]) {
+      modelMetadataByModel[baseModelId] = {
+        defaultContextLimitTokens: row.contextLimitTokens,
+        longContextLimitTokens: row.longContextLimitTokens,
+        pricing: row.pricing,
+      };
+    }
+  }
+  for (const modelId of knownModelIds) {
+    const efforts = uniqueStringList(
+      (reasoningByModel[modelId] || [])
+        .map((value) => normalizeReasoningEffort(value))
+        .filter(Boolean),
+    );
+    reasoningByModel[modelId] = efforts;
+  }
+  const autoEfforts = uniqueStringList(
+    Object.entries(reasoningByModel)
+      .filter(([modelId]) => modelId !== AUTO_MODEL_SENTINEL)
+      .flatMap(([, list]) => Array.isArray(list) ? list : [])
+      .map((value) => normalizeReasoningEffort(value))
+      .filter(Boolean),
+  );
+  if (autoEfforts.length) {
+    reasoningByModel[AUTO_MODEL_SENTINEL] = autoEfforts;
+  } else {
+    delete reasoningByModel[AUTO_MODEL_SENTINEL];
+  }
+  const catalogModels = [AUTO_MODEL_SENTINEL, ...models.filter((value) => value.toLowerCase() !== AUTO_MODEL_SENTINEL)];
+  const currentResolved = parseModelVariantSelection(selectorState.currentModel);
+  const defaultResolved = parseModelVariantSelection(selectorState.defaultModel);
+  const currentModel = String(currentResolved?.baseModelId || selectorState.currentModel || '').trim() || catalogModels[0] || DEFAULT_MODEL;
+  const defaultModel = String(defaultResolved?.baseModelId || selectorState.defaultModel || '').trim() || currentModel || catalogModels[0] || DEFAULT_MODEL;
+  const reasoningMetadataValid = hasValidReasoningByModel(reasoningByModel);
+  const inMemoryRefresh = modelCatalog.refreshedAt || null;
+  const refreshedAt = latestModelCatalogRefresh(selectorState.refreshedAt, inMemoryRefresh);
+  const catalogRefreshedAtStale = isModelCatalogRefreshedAtStale(refreshedAt);
+  const metadataError = !reasoningMetadataValid || !!selectorState.error || modelRows.length === 0;
+  const stale = metadataError;
+  const metadataValid = !metadataError;
+  const catalogAgeMs = Date.now() - Date.parse(refreshedAt || 0);
+  const ageWarning = catalogRefreshedAtStale && Number.isFinite(catalogAgeMs) && catalogAgeMs > MODEL_CATALOG_WARNING_MS
+    ? 'Model catalog may be out of date. Refresh models if selections look wrong.'
+    : null;
+  const warning = [selectorState.warning, ageWarning].filter(Boolean).join(' ').trim() || null;
+  const reasoningEfforts = uniqueStringList(
+    Object.values(reasoningByModel)
+      .flatMap((list) => Array.isArray(list) ? list : [])
+      .map((value) => normalizeReasoningEffort(value))
+      .filter(Boolean),
+  );
   return {
-    models: selectorState.models,
-    currentModel: selectorState.currentModel,
-    defaultModel: selectorState.defaultModel,
+    models: catalogModels,
+    currentModel,
+    defaultModel,
     source: selectorState.source,
-    refreshedAt: selectorState.refreshedAt,
-    stale: false,
-    warning: selectorState.warning,
+    refreshedAt,
+    stale,
+    metadataValid,
+    reasoningMetadataValid,
+    warning,
+    catalogAgeWarning: Boolean(ageWarning),
     error: selectorState.error,
+    reasoningByModel,
+    reasoningEfforts,
+    contextLimitsByModel,
+    modelMetadataByModel,
   };
+}
+
+function touchModelSelectorState({
+  source = 'snapshot',
+  error = null,
+  refreshedAt = new Date().toISOString(),
+} = {}) {
+  if (!modelSelectorSql?.upsertSelectorState?.run) return;
+  const timestamp = latestModelCatalogRefresh(refreshedAt) || new Date().toISOString();
+  modelSelectorSql.upsertSelectorState.run(
+    String(source || 'snapshot').trim() || 'snapshot',
+    timestamp,
+    error ? String(error).trim().slice(0, 300) : null,
+    timestamp,
+  );
 }
 
 function updateModelCatalog(snapshot = {}) {
@@ -962,6 +1159,9 @@ function updateModelCatalog(snapshot = {}) {
   const incomingDefaultRaw = String(snapshot.defaultModel || '').trim();
   const incomingCurrent = isValidModelId(incomingCurrentRaw) ? incomingCurrentRaw : '';
   const incomingDefault = isValidModelId(incomingDefaultRaw) ? incomingDefaultRaw : '';
+  const contextLimitsByModel = normalizeContextLimitsByModel(snapshot.contextLimitsByModel);
+  const modelMetadataByModel = normalizeModelMetadataByModel(snapshot.modelMetadataByModel);
+  const receivedMetadata = incomingModels.length > 0 || Object.keys(contextLimitsByModel).length > 0 || Object.keys(modelMetadataByModel).length > 0;
   const merged = validatedModelIdList([
     ...curatedModelList(),
     ...incomingModels,
@@ -981,74 +1181,128 @@ function updateModelCatalog(snapshot = {}) {
     currentModel,
     defaultModel,
     source: String(snapshot.source || modelCatalog.source || 'unknown').trim() || 'unknown',
-    refreshedAt: new Date().toISOString(),
+    refreshedAt: receivedMetadata ? new Date().toISOString() : modelCatalog.refreshedAt,
     error: snapshot.error ? String(snapshot.error).trim().slice(0, 300) : null,
   };
   if (modelSelectorSql?.upsertVariant?.run) {
     const existingBaseIds = new Set(listModelVariantRows().map((r) => r.baseModelId));
     const newBaseIds = models.filter((id) => !existingBaseIds.has(id));
     if (newBaseIds.length) {
-      const newEntries = buildModelVariantEntries(newBaseIds, { defaultEnabled: false });
+      const newEntries = buildModelVariantEntries(newBaseIds, { defaultEnabled: false, contextLimitsByModel, modelMetadataByModel });
       upsertModelVariantCatalogEntries(newEntries, {
         source: String(modelCatalog.source || 'snapshot').trim() || 'snapshot',
         error: modelCatalog.error || null,
         preserveEnabled: true,
       });
     }
+    const nowIso = new Date().toISOString();
+    for (const [modelId, contextLimitTokens] of Object.entries(contextLimitsByModel)) {
+      modelSelectorSql.updateContextLimitForBase.run(contextLimitTokens, nowIso, modelId);
+    }
+    for (const [modelId, metadata] of Object.entries(modelMetadataByModel)) {
+      modelSelectorSql.updateModelMetadataForBase.run(
+        metadata.defaultContextLimitTokens,
+        metadata.longContextLimitTokens,
+        metadata.pricing ? JSON.stringify(metadata.pricing) : null,
+        nowIso,
+        modelId,
+      );
+    }
+  }
+  if (receivedMetadata && modelSelectorSql?.upsertSelectorState?.run) {
+    touchModelSelectorState({
+      source: modelCatalog.source,
+      error: modelCatalog.error,
+      refreshedAt: modelCatalog.refreshedAt,
+    });
   }
   return getModelCatalogState();
+}
+
+function getSupportedReasoningEffortsForModel(model = '') {
+  const modelId = String(model || '').trim().toLowerCase();
+  if (!modelId || modelId === AUTO_MODEL_SENTINEL) return [];
+  const state = getModelCatalogState();
+  return Array.isArray(state.reasoningByModel?.[modelId])
+    ? state.reasoningByModel[modelId].map((value) => normalizeReasoningEffort(value)).filter(Boolean)
+    : [];
+}
+
+function resolveRequestedReasoningEffort(model, requestedReasoningEffort = '') {
+  const modelId = String(model || '').trim().toLowerCase();
+  if (modelId === AUTO_MODEL_SENTINEL) {
+    return { ok: true, effort: null, supported: getSupportedReasoningEffortsForModel(AUTO_MODEL_SENTINEL) };
+  }
+  const supported = getSupportedReasoningEffortsForModel(modelId);
+  const requested = normalizeReasoningEffort(requestedReasoningEffort);
+  if (!supported.length) {
+    return { ok: false, error: 'Reasoning metadata unavailable for model', supported };
+  }
+  if (!requested) {
+    return { ok: false, error: 'Reasoning effort is required', supported };
+  }
+  if (!supported.includes(requested)) {
+    return { ok: false, error: 'Unsupported reasoning effort', supported };
+  }
+  return { ok: true, effort: requested, supported };
 }
 
 function resolveRequestedModel(model) {
   const requested = String(model || '').trim();
   const state = getModelCatalogState();
-  const fallbackVariant = state.currentModel || state.defaultModel || buildModelVariantId(DEFAULT_MODEL, isReasoningVariantEligibleModel(DEFAULT_MODEL) ? 'none' : null);
-  const fallbackResolution = parseModelVariantSelection(fallbackVariant);
-  const fallbackModel = fallbackResolution?.baseModelId || DEFAULT_MODEL;
+  const availableModels = Array.isArray(state.models) ? state.models : [];
+  const fallbackModel = String(state.currentModel || state.defaultModel || DEFAULT_MODEL).trim() || DEFAULT_MODEL;
+  const fallbackVariant = fallbackModel.toLowerCase() === AUTO_MODEL_SENTINEL
+    ? AUTO_MODEL_SENTINEL
+    : fallbackModel;
+
   if (!requested) {
     return {
       ok: true,
       model: fallbackModel,
-      modelVariantId: fallbackResolution?.variantId || fallbackVariant,
-      reasoningEffort: fallbackResolution?.reasoningEffort || null,
+      modelVariantId: fallbackVariant,
+      reasoningEffort: null,
       warning: null,
     };
   }
-  const resolved = parseModelVariantSelection(requested);
-  if (!resolved) {
-    return { ok: false, error: 'Unsupported model variant', available: state.models };
-  }
-  let resolvedVariantId = resolved.variantId;
-  let resolvedBaseModelId = resolved.baseModelId;
-  let resolvedReasoningEffort = resolved.reasoningEffort;
-  if (!state.models.includes(resolvedVariantId)) {
-    const sameBase = state.models.filter((entry) => {
-      const parsed = parseModelVariantSelection(entry);
-      return parsed && parsed.baseModelId === resolvedBaseModelId;
-    });
-    if (sameBase.length) {
-      const noneVariant = sameBase.find((entry) => /-none$/i.test(entry)) || sameBase[0];
-      const parsedNone = parseModelVariantSelection(noneVariant);
-      if (parsedNone) {
-        resolvedVariantId = parsedNone.variantId;
-        resolvedBaseModelId = parsedNone.baseModelId;
-        resolvedReasoningEffort = parsedNone.reasoningEffort;
-      }
-    }
-  }
-  if (state.models.includes(resolvedVariantId)) {
+
+  if (requested.toLowerCase() === AUTO_MODEL_SENTINEL) {
     return {
       ok: true,
-      model: resolvedBaseModelId,
-      modelVariantId: resolvedVariantId,
-      reasoningEffort: resolvedReasoningEffort,
+      model: AUTO_MODEL_SENTINEL,
+      modelVariantId: AUTO_MODEL_SENTINEL,
+      reasoningEffort: null,
       warning: null,
     };
   }
+
+  const requestedModel = requested.toLowerCase();
+  if (availableModels.includes(requestedModel)) {
+    return {
+      ok: true,
+      model: requestedModel,
+      modelVariantId: requestedModel,
+      reasoningEffort: null,
+      warning: null,
+    };
+  }
+
+  const parsedVariant = parseModelVariantSelection(requested);
+  if (!parsedVariant) {
+    return { ok: false, error: 'Unsupported model', available: availableModels };
+  }
+  if (!availableModels.includes(parsedVariant.baseModelId)) {
+    return { ok: false, error: 'Unsupported model', available: availableModels };
+  }
+  const parsedEffort = normalizeReasoningEffort(parsedVariant.reasoningEffort || '');
   return {
-    ok: false,
-    error: 'Unsupported model',
-    available: state.models,
+    ok: true,
+    model: parsedVariant.baseModelId,
+    modelVariantId: parsedEffort
+      ? buildModelVariantId(parsedVariant.baseModelId, parsedEffort)
+      : parsedVariant.variantId,
+    reasoningEffort: parsedEffort || null,
+    warning: null,
   };
 }
 
@@ -1060,6 +1314,15 @@ function listModelVariantRows() {
 function listEnabledModelVariantRows() {
   if (!modelSelectorSql?.listEnabledVariants?.all) return [];
   return modelSelectorSql.listEnabledVariants.all().map((row) => normalizeModelVariantRow(row));
+}
+
+function getModelContextLimitTokens(modelId = '') {
+  const normalizedModelId = canonicalizeModelId(modelId);
+  if (!normalizedModelId) return null;
+  const row = listModelVariantRows().find((entry) => entry.baseModelId === normalizedModelId
+    && entry.contextLimitTokens !== null
+    && entry.contextLimitTokens > 0);
+  return row?.contextLimitTokens || null;
 }
 
 function parseModelVariantSelection(value) {
@@ -1143,6 +1406,9 @@ function upsertModelVariantCatalogEntries(entries = [], {
         entry.label || modelDisplayLabel(entry.baseModelId),
         entry.releaseStatus || null,
         entry.reasoningEffort || null,
+        entry.contextLimitTokens || null,
+        entry.longContextLimitTokens || null,
+        entry.pricing ? JSON.stringify(entry.pricing) : null,
         enabled,
         entry.sortOrder,
         nowIso,
@@ -1159,6 +1425,9 @@ function upsertModelVariantCatalogEntries(entries = [], {
           row.label || modelDisplayLabel(row.baseModelId),
           'unavailable',
           row.reasoningEffort || null,
+          row.contextLimitTokens || null,
+          row.longContextLimitTokens || null,
+          row.pricing ? JSON.stringify(row.pricing) : null,
           row.enabled ? 1 : 0,
           row.sortOrder,
           nowIso,
@@ -1263,19 +1532,19 @@ async function refreshModelVariantCatalogFromCli() {
   let source = 'rpc-snapshot';
   let modelIds = [];
   let reasoningEfforts = SUPPORTED_REASONING_EFFORTS.slice();
+  const hasAuthoritativeSnapshot = /^(web-relay-extension|standalone-relay):/.test(String(modelCatalog.source || ''));
   const refreshSelectionFromSnapshot = selectModelIdsForVariantRefresh({
-    snapshotModels: Array.isArray(modelCatalog.models) ? modelCatalog.models : [],
+    snapshotModels: hasAuthoritativeSnapshot && Array.isArray(modelCatalog.models) ? modelCatalog.models : [],
     currentModel: modelCatalog.currentModel,
     defaultModel: modelCatalog.defaultModel,
     helpModelIds: [],
   });
   source = refreshSelectionFromSnapshot.source;
   modelIds = refreshSelectionFromSnapshot.modelIds;
+  const genericHelpText = await runCopilotCliCommand(['help']).catch(() => '');
+  reasoningEfforts = parseReasoningEffortsFromHelpOutput(genericHelpText);
   if (!modelIds.length) {
-    const [configHelpText, genericHelpText] = await Promise.all([
-      runCopilotCliCommand(['help', 'config']),
-      runCopilotCliCommand(['help']),
-    ]);
+    const configHelpText = await runCopilotCliCommand(['help', 'config']);
     const helpModelIds = parseModelsFromHelpConfigOutput(configHelpText);
     const refreshSelectionFromHelp = selectModelIdsForVariantRefresh({
       snapshotModels: [],
@@ -1285,7 +1554,6 @@ async function refreshModelVariantCatalogFromCli() {
     });
     source = refreshSelectionFromHelp.source;
     modelIds = refreshSelectionFromHelp.modelIds;
-    reasoningEfforts = parseReasoningEffortsFromHelpOutput(genericHelpText);
   }
   const entries = [];
   let sortOrder = 0;
@@ -1379,6 +1647,9 @@ db.exec(`
     model           TEXT,
     mode            TEXT,
     attachments     TEXT,
+    model_requested TEXT,
+    model_actual    TEXT,
+    model_origin    TEXT,
     timestamp       TEXT NOT NULL,
     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
   );
@@ -1393,6 +1664,7 @@ db.exec(`
     model               TEXT,
     model_variant_id    TEXT,
     reasoning_effort    TEXT,
+    context_tier        TEXT,
     relay_mode          TEXT NOT NULL DEFAULT 'agent',
     text                TEXT NOT NULL,
     attachments         TEXT,
@@ -1414,6 +1686,32 @@ db.exec(`
   );
 
   CREATE INDEX IF NOT EXISTS idx_queue_status ON queue(status, timestamp);
+
+  CREATE TABLE IF NOT EXISTS message_usage_snapshots (
+    response_message_id TEXT PRIMARY KEY,
+    queue_message_id TEXT,
+    conversation_id TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'live',
+    stale INTEGER NOT NULL DEFAULT 0,
+    premium_remaining REAL,
+    premium_entitlement REAL,
+    premium_used_percent REAL,
+    premium_delta_used REAL,
+    chat_remaining REAL,
+    chat_entitlement REAL,
+    chat_used_percent REAL,
+    chat_delta_used REAL,
+    plan_remaining REAL,
+    plan_entitlement REAL,
+    plan_used_percent REAL,
+    plan_delta_used REAL,
+    captured_at TEXT NOT NULL,
+    FOREIGN KEY (response_message_id) REFERENCES messages(id) ON DELETE CASCADE,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_message_usage_conv_time ON message_usage_snapshots(conversation_id, captured_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_message_usage_queue_id ON message_usage_snapshots(queue_message_id);
 
   CREATE TABLE IF NOT EXISTS runtime_sessions (
     id              TEXT PRIMARY KEY,
@@ -1493,6 +1791,9 @@ db.exec(`
     label            TEXT NOT NULL,
     release_status   TEXT,
     reasoning_effort TEXT,
+    context_limit_tokens INTEGER,
+    long_context_limit_tokens INTEGER,
+    pricing_json     TEXT,
     enabled          INTEGER NOT NULL DEFAULT 1,
     sort_order       INTEGER NOT NULL DEFAULT 0,
     updated_at       TEXT NOT NULL
@@ -1665,6 +1966,29 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_upload_refs_conv ON upload_refs(conversation_id, file_sha256);
   CREATE INDEX IF NOT EXISTS idx_upload_refs_sha ON upload_refs(file_sha256);
+
+  CREATE TABLE IF NOT EXISTS conversation_shares (
+    token            TEXT PRIMARY KEY,
+    conversation_id  TEXT NOT NULL,
+    created_at       TEXT NOT NULL,
+    last_accessed_at TEXT,
+    revoked_at       TEXT,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_conversation_shares_conversation
+    ON conversation_shares(conversation_id, revoked_at, created_at DESC);
+
+  CREATE TABLE IF NOT EXISTS status_events (
+    id           TEXT PRIMARY KEY,
+    timestamp    INTEGER NOT NULL,
+    type         TEXT NOT NULL,
+    source       TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_status_events_timeline
+    ON status_events(timestamp DESC, id DESC);
 `);
 
 db.exec(`
@@ -1712,6 +2036,15 @@ if (!messageColumns.includes('attachments')) {
 if (!messageColumns.includes('mode')) {
   db.exec(`ALTER TABLE messages ADD COLUMN mode TEXT`);
 }
+if (!messageColumns.includes('model_requested')) {
+  db.exec(`ALTER TABLE messages ADD COLUMN model_requested TEXT`);
+}
+if (!messageColumns.includes('model_actual')) {
+  db.exec(`ALTER TABLE messages ADD COLUMN model_actual TEXT`);
+}
+if (!messageColumns.includes('model_origin')) {
+  db.exec(`ALTER TABLE messages ADD COLUMN model_origin TEXT`);
+}
 
 const queueColumns = db.prepare(`PRAGMA table_info(queue)`).all().map((c) => c.name);
 if (!queueColumns.includes('model')) {
@@ -1722,6 +2055,9 @@ if (!queueColumns.includes('model_variant_id')) {
 }
 if (!queueColumns.includes('reasoning_effort')) {
   db.exec(`ALTER TABLE queue ADD COLUMN reasoning_effort TEXT`);
+}
+if (!queueColumns.includes('context_tier')) {
+  db.exec(`ALTER TABLE queue ADD COLUMN context_tier TEXT`);
 }
 if (!queueColumns.includes('runtime_session_id')) {
   db.exec(`ALTER TABLE queue ADD COLUMN runtime_session_id TEXT`);
@@ -1918,6 +2254,16 @@ const relayStreamEventColumns = db.prepare(`PRAGMA table_info(relay_stream_event
 if (relayStreamEventColumns.length && !relayStreamEventColumns.includes('subagent_run_id')) {
   db.exec(`ALTER TABLE relay_stream_events ADD COLUMN subagent_run_id TEXT`);
 }
+const modelVariantColumns = db.prepare(`PRAGMA table_info(model_variants)`).all().map((c) => c.name);
+if (modelVariantColumns.length && !modelVariantColumns.includes('context_limit_tokens')) {
+  db.exec(`ALTER TABLE model_variants ADD COLUMN context_limit_tokens INTEGER`);
+}
+if (modelVariantColumns.length && !modelVariantColumns.includes('long_context_limit_tokens')) {
+  db.exec(`ALTER TABLE model_variants ADD COLUMN long_context_limit_tokens INTEGER`);
+}
+if (modelVariantColumns.length && !modelVariantColumns.includes('pricing_json')) {
+  db.exec(`ALTER TABLE model_variants ADD COLUMN pricing_json TEXT`);
+}
 
 // ─── Prepared Statements ──────────────────────────────────────────────────────
 const stmts = {
@@ -1925,32 +2271,49 @@ const stmts = {
   ...createMessageRepository(db),
   ...createQuestionRepository(db),
 };
+const statusEventService = createStatusEventService(db);
 
 modelSelectorSql = {
   listVariants: db.prepare(`
-    SELECT variant_id, base_model_id, provider, label, release_status, reasoning_effort, enabled, sort_order, updated_at
+    SELECT variant_id, base_model_id, provider, label, release_status, reasoning_effort, context_limit_tokens, long_context_limit_tokens, pricing_json, enabled, sort_order, updated_at
     FROM model_variants
     ORDER BY provider ASC, sort_order ASC, variant_id ASC
   `),
   listEnabledVariants: db.prepare(`
-    SELECT variant_id, base_model_id, provider, label, release_status, reasoning_effort, enabled, sort_order, updated_at
+    SELECT variant_id, base_model_id, provider, label, release_status, reasoning_effort, context_limit_tokens, long_context_limit_tokens, pricing_json, enabled, sort_order, updated_at
     FROM model_variants
     WHERE enabled = 1
     ORDER BY provider ASC, sort_order ASC, variant_id ASC
   `),
   upsertVariant: db.prepare(`
     INSERT INTO model_variants (
-      variant_id, base_model_id, provider, label, release_status, reasoning_effort, enabled, sort_order, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      variant_id, base_model_id, provider, label, release_status, reasoning_effort, context_limit_tokens, long_context_limit_tokens, pricing_json, enabled, sort_order, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(variant_id) DO UPDATE SET
       base_model_id = excluded.base_model_id,
       provider = excluded.provider,
       label = excluded.label,
       release_status = excluded.release_status,
       reasoning_effort = excluded.reasoning_effort,
+      context_limit_tokens = COALESCE(excluded.context_limit_tokens, model_variants.context_limit_tokens),
+      long_context_limit_tokens = COALESCE(excluded.long_context_limit_tokens, model_variants.long_context_limit_tokens),
+      pricing_json = COALESCE(excluded.pricing_json, model_variants.pricing_json),
       enabled = excluded.enabled,
       sort_order = excluded.sort_order,
       updated_at = excluded.updated_at
+  `),
+  updateContextLimitForBase: db.prepare(`
+    UPDATE model_variants
+    SET context_limit_tokens = ?, updated_at = ?
+    WHERE base_model_id = ?
+  `),
+  updateModelMetadataForBase: db.prepare(`
+    UPDATE model_variants
+    SET context_limit_tokens = COALESCE(?, context_limit_tokens),
+        long_context_limit_tokens = COALESCE(?, long_context_limit_tokens),
+        pricing_json = COALESCE(?, pricing_json),
+        updated_at = ?
+    WHERE base_model_id = ?
   `),
   disableAllVariants: db.prepare(`UPDATE model_variants SET enabled = 0, updated_at = ?`),
   enableVariant: db.prepare(`UPDATE model_variants SET enabled = 1, updated_at = ? WHERE variant_id = ?`),
@@ -2009,6 +2372,9 @@ modelSelectorSql = {
         entry.label || modelDisplayLabel(entry.baseModelId),
         entry.releaseStatus || null,
         entry.reasoningEffort || null,
+        entry.contextLimitTokens || null,
+        entry.longContextLimitTokens || null,
+        entry.pricing ? JSON.stringify(entry.pricing) : null,
         entry.enabled ? 1 : 0,
         entry.sortOrder,
         nowIso,
@@ -2038,6 +2404,9 @@ modelSelectorSql = {
           entry.label,
           entry.releaseStatus || null,
           entry.reasoningEffort || null,
+          entry.contextLimitTokens || null,
+          entry.longContextLimitTokens || null,
+          entry.pricing ? JSON.stringify(entry.pricing) : null,
           entry.enabled ? 1 : 0,
           entry.sortOrder,
           nowIso,
@@ -2079,6 +2448,30 @@ const sessionWorkerProcessInspector = createSessionWorkerProcessInspector({
   execFileSyncImpl: execFileSync,
 });
 function buildSessionWorkerLaunchEnv() {
+  const normalizePathValue = (value) => {
+    const text = String(value || '').trim();
+    return text || null;
+  };
+  const resolveBootstrapPath = () => {
+    const explicit = normalizePathValue(process.env.COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH)
+      || normalizePathValue(process.env.COPILOT_EXTENSION_BOOTSTRAP_PATH);
+    if (explicit && fs.existsSync(explicit)) return explicit;
+
+    const distDir = normalizePathValue(process.env.COPILOT_CLI_DIST_DIR);
+    if (distDir) {
+      const candidate = path.join(distDir, 'preloads', 'extension_bootstrap.mjs');
+      if (fs.existsSync(candidate)) return candidate;
+    }
+
+    const configuredSdkPath = normalizePathValue(config.sdkPath);
+    if (configuredSdkPath) {
+      const versionDir = path.resolve(path.dirname(configuredSdkPath), '..');
+      const candidate = path.join(versionDir, 'preloads', 'extension_bootstrap.mjs');
+      if (fs.existsSync(candidate)) return candidate;
+    }
+    return null;
+  };
+
   const next = { ...process.env };
   if (!String(next.GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS || '').trim()) {
     next.GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS = 'true';
@@ -2098,6 +2491,14 @@ function buildSessionWorkerLaunchEnv() {
   if (!String(next.COPILOT_WEB_RELAY_LOG_DIR || '').trim()) {
     next.COPILOT_WEB_RELAY_LOG_DIR = path.join(__dirname, 'logs');
   }
+  const cliExecutable = normalizePathValue(config.cliPath);
+  if (cliExecutable && !String(next.COPILOT_WEB_RELAY_CLI_EXECUTABLE || '').trim()) {
+    next.COPILOT_WEB_RELAY_CLI_EXECUTABLE = cliExecutable;
+  }
+  const bootstrapPath = resolveBootstrapPath();
+  if (bootstrapPath && !String(next.COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH || '').trim()) {
+    next.COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH = bootstrapPath;
+  }
   return next;
 }
 const sessionWorkerLaunchEnv = buildSessionWorkerLaunchEnv();
@@ -2106,16 +2507,18 @@ const relayCliLauncherService = createRelayCliLauncherService({
   env: sessionWorkerLaunchEnv,
   log: (message) => console.log(`${runtimeLogPrefix()}${message}`),
 });
-async function spawnSessionWorkerCli(targetSessionId) {
+async function spawnSessionWorkerCli(targetSessionId, { allowProcessReuse = true } = {}) {
   const normalizedTargetSessionId = String(targetSessionId || '').trim();
   if (!normalizedTargetSessionId) {
     throw new Error('missing-target-session-id');
   }
-  const liveWorker = sessionWorkerProcessInspector.findProcessForSession(normalizedTargetSessionId);
-  if (liveWorker?.processId) {
-    const workerId = `worker-${normalizedTargetSessionId.slice(0, 8)}`;
-    console.log(`${runtimeLogPrefix()}worker launcher: reused ${workerId} session=${normalizedTargetSessionId.slice(0, 8)} pid=${liveWorker.processId}`);
-    return { workerId, pid: liveWorker.processId };
+  if (allowProcessReuse) {
+    const liveWorker = sessionWorkerProcessInspector.findProcessForSession(normalizedTargetSessionId);
+    if (liveWorker?.processId) {
+      const workerId = `worker-${normalizedTargetSessionId.slice(0, 8)}`;
+      console.log(`${runtimeLogPrefix()}worker launcher: reused ${workerId} session=${normalizedTargetSessionId.slice(0, 8)} pid=${liveWorker.processId}`);
+      return { workerId, pid: liveWorker.processId };
+    }
   }
   const resolvedWorkspaceRoot = resolveLaunchWorkspaceRootForSession(normalizedTargetSessionId);
   const launched = await launchSessionCli({
@@ -2126,6 +2529,7 @@ async function spawnSessionWorkerCli(targetSessionId) {
     spawnImpl: spawn,
     execFileSyncImpl: execFileSync,
     processInspector: sessionWorkerProcessInspector,
+    allowProcessReuse,
   });
   const workerPid = Number.isInteger(Number(launched?.pid)) ? Number(launched.pid) : null;
   const workerId = `worker-${normalizedTargetSessionId.slice(0, 8)}`;
@@ -2136,7 +2540,7 @@ async function spawnSessionWorkerCli(targetSessionId) {
 }
 const sessionWorkerSupervisor = createSessionWorkerSupervisor({
   registry: sessionWorkerRegistry,
-  spawnWorker: async (sdkSessionId) => spawnSessionWorkerCli(sdkSessionId),
+  spawnWorker: async (sdkSessionId, options = {}) => spawnSessionWorkerCli(sdkSessionId, options),
   diagnosticPlanReference: () => path.join(currentWorkspaceRootPath(), '.cursor', 'plans', 'worker-startup-monitoring-plan.md'),
   log: (message) => console.warn(`${runtimeLogPrefix()}${message}`),
 });
@@ -2717,6 +3121,7 @@ function parseCookies(header) {
     const idx = part.indexOf('=');
     if (idx < 0) continue;
     const key = part.slice(0, idx).trim();
+    if (!key || Object.prototype.hasOwnProperty.call(cookies, key)) continue;
     const value = part.slice(idx + 1).trim();
     cookies[key] = decodeURIComponent(value);
   }
@@ -2743,7 +3148,7 @@ function ensureSessionId(req, res) {
   if (!sessionId) {
     sessionId = uuidv4();
     if (res) {
-      appendSetCookie(res, `${SESSION_COOKIE}=${encodeURIComponent(sessionId)}; Path=/; SameSite=Lax`);
+      appendSetCookie(res, `${SESSION_COOKIE}=${encodeURIComponent(sessionId)}; Path=${COOKIE_PATH}; SameSite=Lax`);
     }
   }
   return sessionId;
@@ -3932,6 +4337,7 @@ function fetchUsageSummary(cb) {
         const snap = data?.quota_snapshots || {};
         const premium = snap.premium_interactions || {};
         const chat = snap.chat || {};
+        const planSnapshot = snap.plan || data?.plan || data?.copilot_plan_quota || {};
         cb(null, {
           plan: data?.copilot_plan,
           resetDate: data?.quota_reset_date,
@@ -3939,12 +4345,19 @@ function fetchUsageSummary(cb) {
             unlimited: chat.unlimited ?? true,
             remaining: chat.remaining ?? null,
             entitlement: chat.entitlement ?? null,
+            percentRemaining: chat.percent_remaining ?? null,
           },
           premiumInteractions: {
             unlimited: premium.unlimited ?? false,
             remaining: Math.round(premium.quota_remaining ?? premium.remaining ?? 0),
             entitlement: premium.entitlement ?? 1500,
             percentRemaining: premium.percent_remaining ?? null,
+          },
+          planQuota: {
+            unlimited: planSnapshot.unlimited ?? false,
+            remaining: planSnapshot.quota_remaining ?? planSnapshot.remaining ?? null,
+            entitlement: planSnapshot.entitlement ?? null,
+            percentRemaining: planSnapshot.percent_remaining ?? null,
           },
         });
       })
@@ -4027,8 +4440,11 @@ function computePwaShellVersion() {
   return formatPwaVersionTimestamp(sourceMs);
 }
 
-function renderIndexHtmlWithPwaVersion() {
-  const appConfig = JSON.stringify({ basePath: remotePath });
+function renderIndexHtmlWithPwaVersion(appConfigOverrides = {}) {
+  const appConfig = JSON.stringify({
+    basePath: remotePath,
+    ...(appConfigOverrides && typeof appConfigOverrides === 'object' ? appConfigOverrides : {}),
+  });
   const version = computePwaShellVersion();
   const source = fs.readFileSync(INDEX_HTML_PATH, 'utf8');
   return source
@@ -4059,8 +4475,19 @@ function loadPwaManifestTemplate() {
   return fallback;
 }
 
-function buildScopedPwaManifest() {
+function buildScopedPwaManifest({ shared = false } = {}) {
   const manifest = loadPwaManifestTemplate();
+  if (shared) {
+    return {
+      ...manifest,
+      id: './__copilot_remote_shared__',
+      start_url: './',
+      scope: './',
+      display_override: ['browser'],
+      display: 'browser',
+      prefer_related_applications: false,
+    };
+  }
   return {
     ...manifest,
     id: './__copilot_remote_pwa__',
@@ -4082,10 +4509,12 @@ const sessionTranscriptService = createSessionTranscriptService({
 });
 const readSessionTranscriptMessages = sessionTranscriptService.readSessionTranscriptMessages;
 const parseSessionEventsToMessages = sessionTranscriptService.parseSessionEventsToMessages;
+const readSessionUsageSummary = sessionTranscriptService.readSessionUsageSummary;
 const contextSnapshotService = createContextSnapshotService({
   fs,
   path,
   resolveSessionStateRoot,
+  getModelContextLimitTokens,
 });
 const readContextFromSessionEvents = contextSnapshotService.readContextFromSessionEvents;
 
@@ -4099,6 +4528,162 @@ httpServer.prependListener('upgrade', (req, _socket, _head) => {
   rewriteSocketIoRequestPath(req, remotePath);
 });
 const io         = new Server(httpServer, { cors: { origin: '*' }, path: socketIoPath() });
+const SHARED_VIEWER_STALE_MS = 45_000;
+const SHARED_VIEWER_MAX_PER_CONVERSATION = Number.isFinite(Number(config.sharedPresenceMaxPerConversation))
+  ? Math.max(1, Math.trunc(Number(config.sharedPresenceMaxPerConversation)))
+  : 200;
+const SHARED_VIEWER_MAX_GLOBAL = Number.isFinite(Number(config.sharedPresenceMaxGlobal))
+  ? Math.max(SHARED_VIEWER_MAX_PER_CONVERSATION, Math.trunc(Number(config.sharedPresenceMaxGlobal)))
+  : 5_000;
+const sharedViewersByConversation = new Map();
+
+function sanitizeSharedViewerId(value) {
+  const id = String(value || '').trim().replace(/[^a-zA-Z0-9:_-]+/g, '');
+  if (!id) return '';
+  return id.slice(0, 128);
+}
+
+function getSharedWatcherCount(conversationId) {
+  const convId = String(conversationId || '').trim();
+  if (!convId) return 0;
+  const viewers = sharedViewersByConversation.get(convId);
+  return viewers instanceof Map ? viewers.size : 0;
+}
+
+function emitConversationWatcherCount(conversationId) {
+  const convId = String(conversationId || '').trim();
+  if (!convId) return 0;
+  const watcherCount = getSharedWatcherCount(convId);
+  io.emit('conversation_watchers', { conversationId: convId, watcherCount });
+  return watcherCount;
+}
+
+function pruneSharedViewersMap(viewers, now = Date.now()) {
+  if (!(viewers instanceof Map) || viewers.size === 0) return false;
+  let changed = false;
+  for (const [key, entry] of viewers.entries()) {
+    const lastSeenAt = Number(entry?.lastSeenAt || 0);
+    if (!Number.isFinite(lastSeenAt) || (now - lastSeenAt) > SHARED_VIEWER_STALE_MS) {
+      viewers.delete(key);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function evictOldestSharedViewerFromMap(viewers) {
+  if (!(viewers instanceof Map) || viewers.size === 0) return false;
+  let oldestKey = '';
+  let oldestSeenAt = Number.POSITIVE_INFINITY;
+  for (const [key, entry] of viewers.entries()) {
+    const seenAt = Number(entry?.lastSeenAt || 0);
+    const normalizedSeenAt = Number.isFinite(seenAt) ? seenAt : 0;
+    if (normalizedSeenAt < oldestSeenAt) {
+      oldestSeenAt = normalizedSeenAt;
+      oldestKey = key;
+    }
+  }
+  if (!oldestKey) return false;
+  viewers.delete(oldestKey);
+  return true;
+}
+
+function countSharedViewerEntries() {
+  let total = 0;
+  for (const viewers of sharedViewersByConversation.values()) {
+    if (viewers instanceof Map) total += viewers.size;
+  }
+  return total;
+}
+
+function evictOldestSharedViewerGlobally() {
+  let targetConversationId = '';
+  let targetKey = '';
+  let oldestSeenAt = Number.POSITIVE_INFINITY;
+  for (const [conversationId, viewers] of sharedViewersByConversation.entries()) {
+    if (!(viewers instanceof Map) || viewers.size === 0) continue;
+    for (const [key, entry] of viewers.entries()) {
+      const seenAt = Number(entry?.lastSeenAt || 0);
+      const normalizedSeenAt = Number.isFinite(seenAt) ? seenAt : 0;
+      if (normalizedSeenAt < oldestSeenAt) {
+        oldestSeenAt = normalizedSeenAt;
+        targetConversationId = String(conversationId || '').trim();
+        targetKey = key;
+      }
+    }
+  }
+  if (!targetConversationId || !targetKey) return '';
+  const viewers = sharedViewersByConversation.get(targetConversationId);
+  if (!(viewers instanceof Map)) return '';
+  viewers.delete(targetKey);
+  if (viewers.size <= 0) sharedViewersByConversation.delete(targetConversationId);
+  return targetConversationId;
+}
+
+function pruneSharedViewerPresence() {
+  const now = Date.now();
+  const changedConversations = [];
+  for (const [conversationId, viewers] of sharedViewersByConversation.entries()) {
+    if (!(viewers instanceof Map) || viewers.size === 0) {
+      sharedViewersByConversation.delete(conversationId);
+      continue;
+    }
+    const before = viewers.size;
+    pruneSharedViewersMap(viewers, now);
+    if (viewers.size === 0) {
+      sharedViewersByConversation.delete(conversationId);
+    }
+    if (before !== viewers.size) {
+      changedConversations.push(String(conversationId || '').trim());
+    }
+  }
+  for (const conversationId of changedConversations) {
+    emitConversationWatcherCount(conversationId);
+  }
+}
+
+function markSharedViewerPresence({ conversationId, token, viewerId } = {}) {
+  const convId = String(conversationId || '').trim();
+  const shareToken = String(token || '').trim();
+  const viewer = sanitizeSharedViewerId(viewerId);
+  if (!convId || !shareToken || !viewer) return { ok: false, watcherCount: 0 };
+  const key = `${shareToken}:${viewer}`;
+  let viewers = sharedViewersByConversation.get(convId);
+  if (!(viewers instanceof Map)) {
+    viewers = new Map();
+    sharedViewersByConversation.set(convId, viewers);
+  }
+  const now = Date.now();
+  pruneSharedViewersMap(viewers, now);
+  const isNewViewer = !viewers.has(key);
+  if (isNewViewer) {
+    while (viewers.size >= SHARED_VIEWER_MAX_PER_CONVERSATION) {
+      if (!evictOldestSharedViewerFromMap(viewers)) break;
+    }
+    if (viewers.size >= SHARED_VIEWER_MAX_PER_CONVERSATION) {
+      emitConversationWatcherCount(convId);
+      return { ok: false, watcherCount: viewers.size, capped: true };
+    }
+    while (countSharedViewerEntries() >= SHARED_VIEWER_MAX_GLOBAL) {
+      const evictedConversationId = evictOldestSharedViewerGlobally();
+      if (!evictedConversationId) break;
+      if (evictedConversationId !== convId) emitConversationWatcherCount(evictedConversationId);
+    }
+    if (countSharedViewerEntries() >= SHARED_VIEWER_MAX_GLOBAL) {
+      emitConversationWatcherCount(convId);
+      return { ok: false, watcherCount: viewers.size, capped: true };
+    }
+  }
+  const before = viewers.size;
+  viewers.set(key, { lastSeenAt: now });
+  const watcherCount = viewers.size;
+  if (before !== watcherCount) {
+    emitConversationWatcherCount(convId);
+  } else {
+    io.emit('conversation_watchers', { conversationId: convId, watcherCount });
+  }
+  return { ok: true, watcherCount, capped: false };
+}
 async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'worker-ready' } = {}) {
   const requesterSessionId = String(sessionId || '').trim();
   if (!requesterSessionId) return { message: null, reason: 'missing-session-id' };
@@ -4266,6 +4851,21 @@ const sessionWorkerWebSocketService = createSessionWorkerWebSocketService({
   pollIntervalMs: 500,
   logger: console,
 });
+const tmuxInspectorAccessPolicy = createTmuxInspectorAccessPolicy({
+  sessionWorkerRegistry,
+  sessionWorkerSupervisor,
+});
+const tmuxInspectorStreamService = createTmuxInspectorStreamService({
+  platform: process.platform,
+  pollIntervalMs: 250,
+  historyLines: 400,
+  isSessionAllowed: (sdkSessionId) => tmuxInspectorAccessPolicy.evaluateSession(sdkSessionId),
+});
+const tmuxInspectorSocketService = createTmuxInspectorSocketService({
+  streamService: tmuxInspectorStreamService,
+  accessPolicy: tmuxInspectorAccessPolicy,
+  logger: console,
+});
 
 async function primePendingSessionWorkers(reason = 'pending-worker-prime') {
   if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED !== true) return 0;
@@ -4306,7 +4906,8 @@ app.get('/socket.io/socket.io.js', (req, res, next) => {
 });
 app.get('/manifest.webmanifest', (req, res, next) => {
   try {
-    const manifest = buildScopedPwaManifest();
+    const shared = String(req.query?.shared || '').trim() === '1';
+    const manifest = buildScopedPwaManifest({ shared });
     res.setHeader('Cache-Control', 'no-store');
     res.type('application/manifest+json').send(JSON.stringify(manifest, null, 2));
   } catch (error) {
@@ -4323,6 +4924,18 @@ app.get(['/', '/index.html'], (req, res, next) => {
   try {
     const html = renderIndexHtmlWithPwaVersion();
     res.setHeader('Cache-Control', 'no-store');
+    res.type('html').send(html);
+  } catch (error) {
+    next(error);
+  }
+});
+app.get(['/shared/:token', '/shared/:token/'], (req, res, next) => {
+  try {
+    const rawToken = String(req.params?.token || '').trim().toLowerCase();
+    const shareToken = /^[a-f0-9]{32,128}$/.test(rawToken) ? rawToken : '';
+    const html = renderIndexHtmlWithPwaVersion({ sharedToken: shareToken });
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
     res.type('html').send(html);
   } catch (error) {
     next(error);
@@ -4345,6 +4958,7 @@ const runtimeState = {
   get relayShutdown() { return getRelayShutdownState(); },
   get activeBridgeOwner() { return relayBridgeOwnerService.getOwner(); },
   get workerWebSocketStatus() { return sessionWorkerWebSocketService.status(); },
+  get tmuxInspectorStatus() { return tmuxInspectorSocketService.status(); },
   get featureFlags() { return featureFlags; },
   get sessionWorkerSupervisor() { return sessionWorkerSupervisor; },
 };
@@ -4426,6 +5040,7 @@ const sharedRouteDeps = {
   addMsIso,
   computeRetryDelayMs,
   resolveRequestedModel,
+  resolveRequestedReasoningEffort,
   normalizeRelayMode,
   DEFAULT_RELAY_MODE,
   DEFAULT_MODEL,
@@ -4455,6 +5070,7 @@ const sharedRouteDeps = {
   discoverSessionStateConversations,
   readSessionTranscriptMessages,
   parseSessionEventsToMessages,
+  readSessionUsageSummary,
   collectOrphanedUploadsFromConversation,
   deleteOrphanedUploads,
   fs,
@@ -4478,6 +5094,9 @@ const sharedRouteDeps = {
   relayRestartOrchestrator,
   resolveSessionStateRoot,
   requestRelayShutdown,
+  markSharedViewerPresence,
+  getSharedWatcherCount,
+  statusEventService,
 };
 registerMessagesRoutes(app, sharedRouteDeps);
 registerSessionsRoutes(app, sharedRouteDeps);
@@ -4547,6 +5166,8 @@ function expirePendingQuestions() {
 }
 runtimeTimers.questionExpiry = setInterval(expirePendingQuestions, 10_000);
 expirePendingQuestions();
+runtimeTimers.sharedViewerPrune = setInterval(pruneSharedViewerPresence, 5_000);
+if (typeof runtimeTimers.sharedViewerPrune.unref === 'function') runtimeTimers.sharedViewerPrune.unref();
 const runtimeBindingsBootstrapped = bootstrapRuntimeSessionBindings();
 if (runtimeBindingsBootstrapped > 0) {
   console.log(`${runtimeLogPrefix()}Runtime sessions bootstrapped: ${runtimeBindingsBootstrapped}`);
@@ -4560,6 +5181,9 @@ function runtimeLogPrefix() {
 // ─── Auth Middleware ──────────────────────────────────────────────────────────
 function auth(req, res, next) {
   const cookies = parseCookies(req.headers.cookie);
+  const secureAttr = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase() === 'https'
+    ? '; Secure'
+    : '';
   const token =
     (req.headers['authorization'] || '').replace(/^Bearer\s+/i, '') ||
     req.query.token ||
@@ -4567,12 +5191,12 @@ function auth(req, res, next) {
     cookies[AUTH_COOKIE];
   if (token === config.authToken) {
     if (res && cookies[AUTH_COOKIE] !== config.authToken) {
-      const secureAttr = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase() === 'https'
-        ? '; Secure'
-        : '';
-      appendSetCookie(res, `${AUTH_COOKIE}=${encodeURIComponent(config.authToken)}; Path=/; Max-Age=2592000; SameSite=Lax; HttpOnly${secureAttr}`);
+      appendSetCookie(res, `${AUTH_COOKIE}=${encodeURIComponent(config.authToken)}; Path=${COOKIE_PATH}; Max-Age=2592000; SameSite=Lax; HttpOnly${secureAttr}`);
     }
     return next();
+  }
+  if (res && cookies[AUTH_COOKIE]) {
+    appendSetCookie(res, `${AUTH_COOKIE}=; Path=${COOKIE_PATH}; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax; HttpOnly${secureAttr}`);
   }
   res.status(401).json({ error: 'Unauthorized' });
 }
@@ -4823,7 +5447,7 @@ io.use((socket, next) => {
 
 io.engine.on('initial_headers', (headers, req) => {
   const sessionId = ensureSessionId(req);
-  headers['Set-Cookie'] = `${SESSION_COOKIE}=${encodeURIComponent(sessionId)}; Path=/; SameSite=Lax`;
+  headers['Set-Cookie'] = `${SESSION_COOKIE}=${encodeURIComponent(sessionId)}; Path=${COOKIE_PATH}; SameSite=Lax`;
 });
 
 io.on('connection', (socket) => {
@@ -4831,6 +5455,7 @@ io.on('connection', (socket) => {
   socket.data.sessionId = socket.handshake.auth?.clientId || socket.handshake.query?.clientId || cookies[SESSION_COOKIE] || null;
   // Send current CLI status immediately on connect
   socket.emit('cli_status', { online: cliOnline });
+  tmuxInspectorSocketService.registerSocket(socket);
 });
 
 // ─── SSH Reverse Tunnel ────────────────────────────────────────────────────────
@@ -4856,6 +5481,7 @@ function clearRuntimeTimers() {
   runtimeTimers.staleRecovery = null;
   runtimeTimers.questionExpiry = null;
   runtimeTimers.pendingWorkerPrime = null;
+  runtimeTimers.sharedViewerPrune = null;
   runtimeTimers.shutdownDrain = null;
 }
 
@@ -4872,6 +5498,7 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
   console.log(`${runtimeLogPrefix()}Runtime shutdown started (${reason}, exitCode=${runtimeShutdownExitCode})`);
   clearRuntimeTimers();
   sessionWorkerWebSocketService.stop();
+  tmuxInspectorSocketService.stop();
   stopWorkspaceFileWatcher();
   sshTunnelManager.stop();
   try { relaySingletonGuard.release(); } catch (error) {

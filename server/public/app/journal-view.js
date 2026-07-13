@@ -18,6 +18,7 @@ import {
   loadConversationScrollTop,
   loadConversationLoadedMessageCount,
   saveConversationScrollTop,
+  IS_SHARED_VIEW,
 } from './store.js';
 import {
   loadConversations as loadConversationsApi,
@@ -32,6 +33,7 @@ import { loadRelayBoards } from './relay-board-view.js';
 import { clearAttachments, setRepoBrowserSessionInfo, loadRepoBrowserTree } from './attachments-view.js';
 import { shouldApplyConversationLoad } from './activity-replay-state.mjs';
 import { createInfiniteLoader } from './infinite-loader.js';
+import { leaveStatusView } from './status-view.mjs';
 
 const PROCESSING_DOT_FRAMES = ['   ', '.  ', '.. ', '...'];
 const PROCESSING_DOT_INTERVAL_MS = 1000;
@@ -256,7 +258,11 @@ export function renderConvList() {
   scheduleConversationListBoundaryCheck();
 }
 
-export function applyLoadedConversationState(id, response, { restoreScroll = false, savedScrollTop = null } = {}) {
+export function applyLoadedConversationState(id, response, {
+  restoreScroll = false,
+  savedScrollTop = null,
+  followLiveUpdates = !restoreScroll,
+} = {}) {
   if (!response) {
     setRepoBrowserSessionInfo('', '');
     restoreInFlightThinking(null);
@@ -282,6 +288,7 @@ export function applyLoadedConversationState(id, response, { restoreScroll = fal
     runtimeWorkspaceRootName: response.runtimeWorkspaceRootName ?? existingConversation.runtimeWorkspaceRootName ?? null,
     currentWorkspaceRootPath: response.currentWorkspaceRootPath ?? existingConversation.currentWorkspaceRootPath ?? null,
     currentWorkspaceRootName: response.currentWorkspaceRootName ?? existingConversation.currentWorkspaceRootName ?? null,
+    sessionUsageSummary: response.sessionUsageSummary ?? existingConversation.sessionUsageSummary ?? null,
     messageCount: Array.isArray(response.messages)
       ? Math.max(existingConversation.messageCount || 0, response.messages.length)
       : (existingConversation.messageCount || 0),
@@ -295,16 +302,16 @@ export function applyLoadedConversationState(id, response, { restoreScroll = fal
   if (repoBrowserState.open && repoBrowserState.activeRoot === 'workspace') {
     void loadRepoBrowserTree();
   }
-  renderMessages(response.messages, !restoreScroll, response);
+  const didRenderMessages = renderMessages(response.messages, !restoreScroll, response);
   hydrateConversationDraft(id, {
     draftText: response.draftText,
     draftUpdatedAt: response.draftUpdatedAt,
     draftUpdatedByClientId: response.draftUpdatedByClientId,
   });
-  restoreInFlightThinking(response.inFlight || null);
+  restoreInFlightThinking(response.inFlight || null, followLiveUpdates);
   updateSessionPill(conversations[id], response.runtimeSession || null);
   window.syncChatTitleControls?.();
-  if (!restoreScroll) return;
+  if (!restoreScroll || !didRenderMessages) return;
   const el = document.getElementById('messages');
   if (!el) return;
   if (Number.isFinite(savedScrollTop)) {
@@ -317,6 +324,8 @@ export function applyLoadedConversationState(id, response, { restoreScroll = fal
 }
 
 export async function openConversation(id, options = {}) {
+  const didLeaveStatusView = leaveStatusView();
+  document.getElementById('input-area')?.removeAttribute('hidden');
   const previousConversationId = String(currentConvId || '').trim();
   const nextConversationId = String(id || '').trim();
   if (previousConversationId && nextConversationId && previousConversationId !== nextConversationId) {
@@ -337,6 +346,10 @@ export async function openConversation(id, options = {}) {
   closeSidebar();
   clearAttachments();
   document.getElementById('chat-title').textContent = conversations[id]?.title || id;
+  if (didLeaveStatusView) {
+    restoreInFlightThinking(null);
+    renderMessages([]);
+  }
   window.syncChatTitleControls?.();
   updateSessionPill(conversations[id], null);
   updateCompactButton();
@@ -401,6 +414,10 @@ export async function openConversation(id, options = {}) {
 }
 
 export async function newConversation() {
+  if (IS_SHARED_VIEW) {
+    showTransientRelayNotice('Shared conversations are read-only.');
+    return;
+  }
   if (newConversationInFlight) return;
   newConversationInFlight = true;
   try {

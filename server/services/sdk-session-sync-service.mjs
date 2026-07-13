@@ -57,6 +57,14 @@ export function createSdkSessionSyncService(db) {
     WHERE id = ?
   `);
 
+  const migrateQueueOwnerSessionId = db.prepare(`
+    UPDATE queue
+    SET owner_sdk_session_id = ?
+    WHERE status = 'pending'
+      AND owner_sdk_session_id = ?
+      AND conversation_id = ?
+  `);
+
   const insertRuntimeSession = db.prepare(`
     INSERT INTO runtime_sessions (
       id, conversation_id, strategy, runtime_key, model, status, created_at, last_used_at, sdk_session_id
@@ -125,6 +133,9 @@ export function createSdkSessionSyncService(db) {
     }
 
     updateConversationSdkSession.run(sdkSessionId, nowIso, conversationId);
+    if (placeholderConversationBinding) {
+      migrateQueueOwnerSessionId.run(sdkSessionId, conversationId, conversationId);
+    }
 
     let runtimeSessionId = null;
     let createdRuntimeSession = false;

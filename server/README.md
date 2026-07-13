@@ -27,6 +27,10 @@ for debugging without changing the Windows launch path. Worker processes now lau
 relay repository root so the project-local `web-relay` extension is always discoverable; the
 session's actual target workspace is still passed via `COPILOT_WORKSPACE_ROOT` / `INIT_CWD`.
 
+The web client now includes a read-only **Inspect tmux console** action in the conversation
+three-dot menu. It streams only from active relay session workers and only while the viewer
+is actively watching that session.
+
 > **Single-owner rule:** Use either extension-managed relay transport **or** standalone `relay.mjs`, never both at the same time.
 > Agent/runtime restart policy is defined in `.github/copilot-instructions.md`.
 
@@ -441,7 +445,7 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/response` | (CLI) Submit response for a message |
 | GET | `/api/restart-orchestrator` | Read relay restart orchestrator state |
 | POST | `/api/restart-orchestrator/request` | Queue a restart transaction for a target SDK session |
-| POST | `/api/activity` | (CLI) Push in-flight tool activity for current message |
+| POST | `/api/activity` | (CLI) Push in-flight tool activity for current message; web search/fetch entries may include bounded queries, URLs, and output previews, while `store_memory`/`vote_memory` entries include available memory metadata |
 | POST | `/api/stream` | (CLI) Push in-flight assistant text stream for current pending message |
 | POST | `/api/relay/pause` | Pause dequeueing and drop currently queued messages |
 | POST | `/api/relay/resume` | Resume dequeueing after pause |

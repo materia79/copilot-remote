@@ -1,5 +1,12 @@
 'use strict';
 
+import {
+  formatStoreMemoryActivity,
+  formatToolResultActivity,
+  parseToolPayload,
+  formatVoteMemoryActivity,
+} from '../../shared/tool-activity.mjs';
+
 export function createSessionTranscriptService({ fs, path, resolveSessionStateRoot }) {
   const TRANSCRIPT_CACHE_MAX = 128;
   const transcriptCache = new Map();
@@ -55,6 +62,21 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
       return;
     }
     list.push(value);
+    map.set(key, list);
+  }
+
+  function appendTurnThought(map, turnId, thought) {
+    const key = String(turnId || '').trim();
+    const text = String(thought?.text || '').trim();
+    if (!key || !text) return;
+    const list = map.get(key) || [];
+    if (list.some((entry) => entry.text === text)) return;
+    list.push({
+      reasoningId: `session-thought-${list.length + 1}`,
+      text,
+      done: true,
+      timestamp: String(thought?.timestamp || '').trim() || null,
+    });
     map.set(key, list);
   }
 
@@ -131,8 +153,10 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
   function summarizeToolDetail(toolName, args, result) {
     const name = String(toolName || '').trim();
     if (!name) return '';
-    const a = args && typeof args === 'object' ? args : null;
+    const parsedArgs = parseToolPayload(args);
+    const a = parsedArgs && typeof parsedArgs === 'object' ? parsedArgs : null;
     const r = result && typeof result === 'object' ? result : null;
+    const lowerName = name.toLowerCase();
 
     if (name === 'apply_patch') {
       if (typeof args === 'string') {
@@ -153,7 +177,12 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
     if (name === 'sql') return String(a?.description || '').trim();
     if (name === 'ask_user') return String(a?.question || '').trim();
     if (name === 'report_intent') return String(a?.intent || '').trim();
-    if (name === 'web_fetch') return String(a?.url || '').trim();
+    if (lowerName.includes('web_fetch') || lowerName.includes('web fetch')) {
+      return String(a?.url || '').trim();
+    }
+    if (lowerName.includes('web_search') || lowerName.includes('web search')) {
+      return String(a?.query || a?.prompt || '').trim();
+    }
     if (name === 'task') return String(a?.description || '').trim();
     return '';
   }
@@ -163,6 +192,7 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
     const toolNameByCallId = new Map();
     const toolArgsByCallId = new Map();
     const turnActivities = new Map();
+    const turnThoughts = new Map();
     const sourceEvents = Array.isArray(events) ? events : [];
     for (const event of sourceEvents) {
       const data = event?.data && typeof event.data === 'object' ? event.data : null;
@@ -196,7 +226,16 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
         const toolName = String(toolNameByCallId.get(toolCallId) || data.toolName || '').trim();
         if (!turnId || !toolName || toolName === 'report_intent') continue;
         const detail = summarizeToolDetail(toolName, toolArgsByCallId.get(toolCallId), data.result);
-        appendTurnActivity(turnActivities, turnId, detail ? `Tool (${toolName}): ${detail}` : `Tool (${toolName})`);
+        const toolArgs = toolArgsByCallId.get(toolCallId);
+        if (toolName.toLowerCase().includes('store_memory')) {
+          appendTurnActivity(turnActivities, turnId, formatStoreMemoryActivity(toolName, toolArgs));
+        } else if (toolName.toLowerCase().includes('vote_memory')) {
+          appendTurnActivity(turnActivities, turnId, formatVoteMemoryActivity(toolName, toolArgs));
+        } else {
+          appendTurnActivity(turnActivities, turnId, detail ? `Tool (${toolName}): ${detail}` : `Tool (${toolName})`);
+        }
+        const resultActivity = formatToolResultActivity(toolName, data.result);
+        if (resultActivity) appendTurnActivity(turnActivities, turnId, resultActivity);
         continue;
       }
 
@@ -218,23 +257,61 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
         const toolRequests = Array.isArray(data.toolRequests) ? data.toolRequests : [];
         const turnId = String(data.turnId || '').trim();
         if (toolRequests.length > 0) {
-          // Preserve user-visible progress notes as foldable activity lines.
-          const thoughtText = text.length > 220 ? `${text.slice(0, 217).trim()}...` : text;
-          if (turnId) appendTurnActivity(turnActivities, turnId, `Thought: ${thoughtText}`);
+          // Tool-request messages are intermediate reasoning sections. Preserve their full
+          // markdown text as thoughts so history refresh does not flatten or truncate them.
+          appendTurnThought(turnThoughts, turnId, { text, timestamp });
           continue;
         }
         const activities = turnId ? (turnActivities.get(turnId) || []) : [];
+        const thoughts = turnId ? (turnThoughts.get(turnId) || []) : [];
         messages.push({
           id: String(data.messageId || event?.id || `assistant-${messages.length + 1}`),
           role: 'assistant',
           text,
           model: String(data.model || '').trim() || undefined,
           activities,
+          thoughts,
           timestamp,
         });
       }
     }
     return messages;
+  }
+
+  function toFiniteNumber(value) {
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric : null;
+  }
+
+  function parseSessionUsageSummaryFromEvents(events = []) {
+    const sourceEvents = Array.isArray(events) ? events : [];
+    let latest = null;
+    for (const event of sourceEvents) {
+      if (String(event?.type || '').trim() !== 'session.shutdown') continue;
+      const data = event?.data && typeof event.data === 'object' ? event.data : null;
+      if (!data) continue;
+      latest = { event, data };
+    }
+    if (!latest) return null;
+    const shutdownAt = String(latest.event?.timestamp || '').trim() || null;
+    const totalNanoAiu = toFiniteNumber(latest.data?.totalNanoAiu);
+    const totalPremiumRequests = toFiniteNumber(latest.data?.totalPremiumRequests);
+    const totalApiDurationMs = toFiniteNumber(latest.data?.totalApiDurationMs);
+    const requestCount = toFiniteNumber(latest.data?.modelMetrics && typeof latest.data.modelMetrics === 'object'
+      ? Object.values(latest.data.modelMetrics).reduce((sum, metric) => {
+        const count = toFiniteNumber(metric?.requests?.count);
+        return sum + Number(count || 0);
+      }, 0)
+      : null);
+    const aicUsed = totalNanoAiu != null ? (totalNanoAiu / 1_000_000_000) : null;
+    return {
+      shutdownAt,
+      totalNanoAiu,
+      aicUsed,
+      totalPremiumRequests,
+      totalApiDurationMs,
+      requestCount,
+    };
   }
 
   function readSessionTranscriptMessages(sessionId, options = {}) {
@@ -278,19 +355,48 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
       events.push(event);
     }
     const messages = parseSessionEventsToMessages(events);
+    const usageSummary = parseSessionUsageSummaryFromEvents(events);
 
     cacheTranscript(sid, {
       mtimeMs,
       sizeBytes,
       cachedAt: Date.now(),
       messages,
+      usageSummary,
     });
     const windowed = sliceMessages(messages, options);
     return options.withMeta === true ? windowed : windowed.messages;
   }
 
+  function readSessionUsageSummary(sessionId) {
+    const sid = String(sessionId || '').trim();
+    if (!sid) return null;
+    const root = resolveSessionStateRoot();
+    const eventsPath = path.join(root, sid, 'events.jsonl');
+    if (!fs.existsSync(eventsPath)) return null;
+    let stat = null;
+    try {
+      stat = fs.statSync(eventsPath);
+    } catch {
+      return null;
+    }
+
+    const mtimeMs = Number(stat?.mtimeMs || 0);
+    const sizeBytes = Number(stat?.size || 0);
+    const cached = transcriptCache.get(sid);
+    if (cached && cached.mtimeMs === mtimeMs && cached.sizeBytes === sizeBytes) {
+      cached.cachedAt = Date.now();
+      return cached.usageSummary || null;
+    }
+
+    // Reuse transcript read path to refresh cache and extract summary.
+    void readSessionTranscriptMessages(sid, { limit: 1 });
+    return transcriptCache.get(sid)?.usageSummary || null;
+  }
+
   return {
     parseSessionEventsToMessages,
     readSessionTranscriptMessages,
+    readSessionUsageSummary,
   };
 }

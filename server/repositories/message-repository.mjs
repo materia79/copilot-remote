@@ -6,7 +6,7 @@ export function createMessageRepository(db) {
         getMessages:    db.prepare(`SELECT * FROM messages WHERE conversation_id = ? ORDER BY timestamp ASC`),
         getLatestConversationModel: db.prepare(`SELECT model FROM messages WHERE conversation_id = ? AND model IS NOT NULL AND model != '' ORDER BY timestamp DESC LIMIT 1`),
         getRecentMessagesDesc: db.prepare(`SELECT role, text, timestamp FROM messages WHERE conversation_id = ? ORDER BY timestamp DESC LIMIT ?`),
-        insertMsg:      db.prepare(`INSERT INTO messages (id, conversation_id, role, text, model, mode, attachments, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`),
+        insertMsg:      db.prepare(`INSERT INTO messages (id, conversation_id, role, text, model, mode, attachments, timestamp, model_requested, model_actual, model_origin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
         searchMessagesCount: db.prepare(`
           SELECT COUNT(*) AS cnt
           FROM messages_fts fts
@@ -37,9 +37,62 @@ export function createMessageRepository(db) {
           ORDER BY score ASC, m.timestamp DESC, m.id DESC
           LIMIT ? OFFSET ?
         `),
+        upsertMessageUsageSnapshot: db.prepare(`
+          INSERT INTO message_usage_snapshots (
+            response_message_id,
+            queue_message_id,
+            conversation_id,
+            source,
+            stale,
+            premium_remaining,
+            premium_entitlement,
+            premium_used_percent,
+            premium_delta_used,
+            chat_remaining,
+            chat_entitlement,
+            chat_used_percent,
+            chat_delta_used,
+            plan_remaining,
+            plan_entitlement,
+            plan_used_percent,
+            plan_delta_used,
+            captured_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(response_message_id) DO UPDATE SET
+            queue_message_id = excluded.queue_message_id,
+            conversation_id = excluded.conversation_id,
+            source = excluded.source,
+            stale = excluded.stale,
+            premium_remaining = excluded.premium_remaining,
+            premium_entitlement = excluded.premium_entitlement,
+            premium_used_percent = excluded.premium_used_percent,
+            premium_delta_used = excluded.premium_delta_used,
+            chat_remaining = excluded.chat_remaining,
+            chat_entitlement = excluded.chat_entitlement,
+            chat_used_percent = excluded.chat_used_percent,
+            chat_delta_used = excluded.chat_delta_used,
+            plan_remaining = excluded.plan_remaining,
+            plan_entitlement = excluded.plan_entitlement,
+            plan_used_percent = excluded.plan_used_percent,
+            plan_delta_used = excluded.plan_delta_used,
+            captured_at = excluded.captured_at
+        `),
+        getLatestMessageUsageSnapshotByConversation: db.prepare(`
+          SELECT *
+          FROM message_usage_snapshots
+          WHERE conversation_id = ?
+          ORDER BY captured_at DESC
+          LIMIT 1
+        `),
+        listMessageUsageSnapshotsByConversation: db.prepare(`
+          SELECT *
+          FROM message_usage_snapshots
+          WHERE conversation_id = ?
+          ORDER BY captured_at ASC
+        `),
 
         // queue
-        insertQ:        db.prepare(`INSERT INTO queue (id, conversation_id, runtime_session_id, is_new_conversation, model, model_variant_id, reasoning_effort, relay_mode, text, attachments, status, timestamp, retry_count, next_attempt_at, owner_sdk_session_id, owner_assigned_at, owner_lease_expires_at, owner_last_claimed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, NULL, ?, ?, ?, ?)`),
+        insertQ:        db.prepare(`INSERT INTO queue (id, conversation_id, runtime_session_id, is_new_conversation, model, model_variant_id, reasoning_effort, context_tier, relay_mode, text, attachments, status, timestamp, retry_count, next_attempt_at, owner_sdk_session_id, owner_assigned_at, owner_lease_expires_at, owner_last_claimed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, NULL, ?, ?, ?, ?)`),
         findPending:    db.prepare(`SELECT * FROM queue WHERE status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY retry_count ASC, CASE WHEN next_attempt_at IS NULL THEN 0 ELSE 1 END ASC, COALESCE(next_attempt_at, timestamp) ASC, timestamp ASC LIMIT 1`),
         findPendingForWorker: db.prepare(`
           SELECT q.*

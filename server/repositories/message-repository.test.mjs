@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import Database from 'better-sqlite3';
 import { createMessageRepository } from './message-repository.mjs';
+import { mapUsageSnapshotRow } from '../routes/sessions-routes.mjs';
 
 function createTestDb() {
   const db = new Database(':memory:');
@@ -28,6 +29,9 @@ function createTestDb() {
       model TEXT,
       mode TEXT,
       attachments TEXT,
+      model_requested TEXT,
+      model_actual TEXT,
+      model_origin TEXT,
       timestamp TEXT
     );
 
@@ -41,6 +45,7 @@ function createTestDb() {
       model TEXT,
       model_variant_id TEXT,
       reasoning_effort TEXT,
+      context_tier TEXT,
       relay_mode TEXT,
       text TEXT,
       attachments TEXT,
@@ -59,6 +64,27 @@ function createTestDb() {
       parked_target_session_id TEXT,
       parked_transaction_id TEXT,
       parked_reason TEXT
+    );
+
+    CREATE TABLE message_usage_snapshots (
+      response_message_id TEXT PRIMARY KEY,
+      queue_message_id TEXT,
+      conversation_id TEXT NOT NULL,
+      source TEXT NOT NULL DEFAULT 'live',
+      stale INTEGER NOT NULL DEFAULT 0,
+      premium_remaining REAL,
+      premium_entitlement REAL,
+      premium_used_percent REAL,
+      premium_delta_used REAL,
+      chat_remaining REAL,
+      chat_entitlement REAL,
+      chat_used_percent REAL,
+      chat_delta_used REAL,
+      plan_remaining REAL,
+      plan_entitlement REAL,
+      plan_used_percent REAL,
+      plan_delta_used REAL,
+      captured_at TEXT NOT NULL
     );
 
     CREATE TABLE uploaded_files (
@@ -197,4 +223,28 @@ test('repository lists due pending worker owners from queue and bindings', () =>
 
   const owners = repo.listPendingWorkerOwnerSessionIds.all(now, 10).map((row) => row.sdk_session_id);
   assert.deepEqual(owners, ['owner-sdk', 'runtime-sdk']);
+});
+
+test('mapUsageSnapshotRow exposes turn delta credits and monthly remaining context', () => {
+  const mapped = mapUsageSnapshotRow({
+    source: 'live',
+    stale: 0,
+    captured_at: '2026-07-05T12:00:00.000Z',
+    premium_remaining: 980,
+    premium_entitlement: 1000,
+    premium_used_percent: 2,
+    premium_delta_used: 20,
+    chat_remaining: null,
+    chat_entitlement: null,
+    chat_used_percent: null,
+    chat_delta_used: null,
+    plan_remaining: 90,
+    plan_entitlement: 100,
+    plan_used_percent: 10,
+    plan_delta_used: 5,
+  });
+
+  assert.equal(mapped.premium.deltaCredits, 20);
+  assert.equal(mapped.plan.deltaMonthlyPercent, 5);
+  assert.equal(mapped.plan.percentRemaining, 90);
 });

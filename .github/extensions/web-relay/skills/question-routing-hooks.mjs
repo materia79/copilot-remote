@@ -1,5 +1,6 @@
 import { extractToolName, parseMaybeJson, toolArgsSnapshot } from "./tool-activity.mjs";
 import {
+  containsRequestedSchema,
   extractRequestedSchema,
   schemaFields,
   validateStructuredAnswer,
@@ -31,6 +32,10 @@ function extractReportIntentText(request) {
   return "";
 }
 
+export function shouldStageTmuxFallback(request) {
+  return !containsRequestedSchema(request);
+}
+
 export function createQuestionRoutingHooks({
   api,
   dbg,
@@ -38,6 +43,7 @@ export function createQuestionRoutingHooks({
   isAskUserTool,
   normalizeActivityText,
   formatToolActivity,
+  formatToolResultActivity,
   extractQuestionChoices,
   maxToolDetailLength = 140,
   getRelayTurnActive,
@@ -202,7 +208,15 @@ export function createQuestionRoutingHooks({
       dbg("onPreToolUse: detected ask_user tool", `msgId=${activeMsg.id}`, "waiting for onUserInputRequest callback...");
       dbg("onPreToolUse: ask_user request keys=", Object.keys(request || {}).join(","), "toolArgs=", JSON.stringify(request?.toolArgs)?.slice(0, 300), "choices=", JSON.stringify(extractedChoices));
       setLastAskUserBridge(null);
-      setPendingAskUserRequest?.(request);
+      if (shouldStageTmuxFallback(request)) {
+        setPendingAskUserRequest?.(request);
+      } else {
+        // Structured requests are exclusively owned by onElicitationRequest.
+        // This also prevents invalid schemas from becoming text fallback cards
+        // before the CLI rejects and retries the tool call.
+        setPendingAskUserRequest?.(null);
+        dbg("onPreToolUse: structured ask_user skips tmux fallback", `msgId=${activeMsg.id}`);
+      }
       await api("POST", "/api/activity", {
         messageId: activeMsg.id,
         conversationId: activeMsg.conversationId,
@@ -241,6 +255,23 @@ export function createQuestionRoutingHooks({
     }
 
     return allowToolUse;
+  }
+
+  async function onPostToolUse(request, result) {
+    if (!getRelayTurnActive()) return;
+    const activeMsg = getActiveMessage();
+    if (!activeMsg?.id) return;
+    const activityText = formatToolResultActivity(request, result, maxToolDetailLength);
+    if (!activityText || activityText === getLastActivityText()) return;
+    setLastActivityText(activityText);
+    await api("POST", "/api/activity", {
+      messageId: activeMsg.id,
+      conversationId: activeMsg.conversationId,
+      mode: activeMsg.relayMode || "agent",
+      text: activityText,
+    }).catch((error) => {
+      dbg("tool result activity publish failed", `msgId=${activeMsg.id}`, error?.message || String(error));
+    });
   }
 
   async function onUserInputRequest(request) {
@@ -425,6 +456,7 @@ export function createQuestionRoutingHooks({
 
   return {
     onPreToolUse,
+    onPostToolUse,
     onUserInputRequest,
     onElicitationRequest,
   };

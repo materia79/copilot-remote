@@ -65,6 +65,10 @@ The Copilot CLI extension that bridges local CLI sessions with the web relay ser
 - Hooks Copilot SDK tool invocations
 - Streams tool call details (name, arguments, status) to the relay
 - Relays tool results back to the browser UI for real-time activity display
+- Web Search and Web Fetch activity includes bounded query/URL details and output previews
+- `store_memory` activity includes the available `subject`, `fact`, `citations`, `reason`, and `scope` metadata with preserved field content and line breaks
+- `vote_memory` activity includes the available `fact`, `direction`, `reason`, and `scope` metadata with preserved field content and line breaks
+- Activity is persisted by the relay and is therefore available to authorized shared viewers and replayed history
 
 ### Tmux Input Bridge (`utils/tmux-input-bridge.mjs`)
 

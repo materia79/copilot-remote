@@ -24,12 +24,42 @@ test('buildTmuxWorkerShellCommand injects only relay env needed for workers', ()
   assert.match(command, /GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS='true'/);
   assert.match(command, /COPILOT_WEB_RELAY_SERVER_DIR='\/repo\/server'/);
   assert.match(command, /INIT_CWD='\/workspace'/);
+  assert.match(command, /SESSION_ID='abc-123'/);
   assert.doesNotMatch(command, /IGNORED_VAR/);
   assert.match(command, /exec script -q -c/);
   assert.match(command, /gh copilot -- --allow-all --session-id/);
   assert.match(command, /abc-123/);
   assert.match(command, /\/dev\/null/);
   assert.doesNotMatch(command, /GH_FORCE_TTY/);
+});
+
+test('buildTmuxWorkerShellCommand forwards extension bootstrap env vars', () => {
+  const command = buildTmuxWorkerShellCommand('abc-123', {
+    EXTENSION_PATH: '/repo/server/relay-extension.mjs',
+    COPILOT_SDK_PATH: '/cache/copilot/copilot-sdk',
+    SESSION_ID: 'stale-session',
+  });
+  assert.match(command, /EXTENSION_PATH='\/repo\/server\/relay-extension\.mjs'/);
+  assert.match(command, /COPILOT_SDK_PATH='\/cache\/copilot\/copilot-sdk'/);
+  assert.match(command, /SESSION_ID='abc-123'/);
+  assert.doesNotMatch(command, /SESSION_ID='stale-session'/);
+});
+
+test('buildTmuxWorkerShellCommand prefers bootstrap launch when configured', () => {
+  const command = buildTmuxWorkerShellCommand('abc-123', {
+    COPILOT_WEB_RELAY_CLI_EXECUTABLE: '/usr/bin/copilot',
+    COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH: '/cache/copilot/preloads/extension_bootstrap.mjs',
+    EXTENSION_PATH: '/repo/server/relay-extension.mjs',
+  });
+
+  assert.match(command, /COPILOT_WEB_RELAY_CLI_EXECUTABLE='\/usr\/bin\/copilot'/);
+  assert.match(command, /COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH='\/cache\/copilot\/preloads\/extension_bootstrap\.mjs'/);
+  assert.match(command, /EXTENSION_PATH='\/repo\/server\/relay-extension\.mjs'/);
+  assert.match(command, /\/usr\/bin\/copilot/);
+  assert.match(command, /extension_bootstrap\.mjs/);
+  assert.match(command, /--allow-all --session-id/);
+  assert.match(command, /abc-123/);
+  assert.doesNotMatch(command, /gh copilot -- --allow-all --session-id/);
 });
 
 test('killTmuxSession returns false when tmux kill races after session exists', () => {
@@ -144,6 +174,173 @@ test('launchSessionCli falls back to detached spawn when tmux is unavailable', a
   assert.equal(spawnCalls[0]?.options?.env?.COPILOT_WORKSPACE_ROOT, '/repo');
   assert.equal(spawnCalls[0]?.options?.env?.INIT_CWD, '/repo');
   assert.equal(spawnCalls[0]?.options?.env?.PWD, '/relay');
+  assert.equal(spawnCalls[0]?.options?.env?.SESSION_ID, 'abc-123');
+});
+
+test('launchSessionCli keeps gh fallback when cli executable is set without bootstrap', async () => {
+  const spawnCalls = [];
+  const launched = await launchSessionCli({
+    targetSessionId: 'abc-123',
+    processCwd: '/relay',
+    workspaceRoot: '/repo',
+    env: {
+      PATH: process.env.PATH || '',
+      COPILOT_WEB_RELAY_CLI_EXECUTABLE: '/usr/bin/copilot',
+    },
+    platform: 'linux',
+    execFileSyncImpl(command) {
+      if (command === 'tmux') throw new Error('missing tmux');
+      throw new Error(`unexpected command: ${command}`);
+    },
+    processInspector: {
+      findProcessForSession() {
+        return null;
+      },
+    },
+    spawnImpl(command, args, options) {
+      spawnCalls.push({ command, args, options });
+      return {
+        pid: 4242,
+        unref() {},
+      };
+    },
+  });
+
+  assert.equal(launched.launchMode, 'detached');
+  assert.equal(launched.pid, 4242);
+  assert.equal(spawnCalls[0]?.command, 'gh');
+  assert.deepEqual(spawnCalls[0]?.args, [
+    'copilot',
+    '--',
+    '--allow-all',
+    '--session-id',
+    'abc-123',
+  ]);
+});
+
+test('launchSessionCli uses bootstrap command on posix when configured', async () => {
+  const spawnCalls = [];
+  const launched = await launchSessionCli({
+    targetSessionId: 'abc-123',
+    processCwd: '/relay',
+    workspaceRoot: '/repo',
+    env: {
+      PATH: process.env.PATH || '',
+      COPILOT_WEB_RELAY_CLI_EXECUTABLE: '/usr/bin/copilot',
+      COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH: '/cache/copilot/preloads/extension_bootstrap.mjs',
+      EXTENSION_PATH: '/repo/server/relay-extension.mjs',
+    },
+    platform: 'linux',
+    execFileSyncImpl(command) {
+      if (command === 'tmux') throw new Error('missing tmux');
+      throw new Error(`unexpected command: ${command}`);
+    },
+    processInspector: {
+      findProcessForSession() {
+        return null;
+      },
+    },
+    spawnImpl(command, args, options) {
+      spawnCalls.push({ command, args, options });
+      return {
+        pid: 4242,
+        unref() {},
+      };
+    },
+  });
+
+  assert.equal(launched.launchMode, 'detached');
+  assert.equal(launched.pid, 4242);
+  assert.equal(spawnCalls[0]?.command, '/usr/bin/copilot');
+  assert.deepEqual(spawnCalls[0]?.args, [
+    '/cache/copilot/preloads/extension_bootstrap.mjs',
+    '--allow-all',
+    '--session-id',
+    'abc-123',
+  ]);
+});
+
+test('launchSessionCli uses copilot command when bootstrap is set without cli executable', async () => {
+  const spawnCalls = [];
+  const launched = await launchSessionCli({
+    targetSessionId: 'abc-123',
+    processCwd: '/relay',
+    workspaceRoot: '/repo',
+    env: {
+      PATH: process.env.PATH || '',
+      COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH: '/cache/copilot/preloads/extension_bootstrap.mjs',
+      EXTENSION_PATH: '/repo/server/relay-extension.mjs',
+    },
+    platform: 'linux',
+    execFileSyncImpl(command) {
+      if (command === 'tmux') throw new Error('missing tmux');
+      throw new Error(`unexpected command: ${command}`);
+    },
+    processInspector: {
+      findProcessForSession() {
+        return null;
+      },
+    },
+    spawnImpl(command, args, options) {
+      spawnCalls.push({ command, args, options });
+      return {
+        pid: 4242,
+        unref() {},
+      };
+    },
+  });
+
+  assert.equal(launched.launchMode, 'detached');
+  assert.equal(launched.pid, 4242);
+  assert.equal(spawnCalls[0]?.command, 'copilot');
+  assert.deepEqual(spawnCalls[0]?.args, [
+    '/cache/copilot/preloads/extension_bootstrap.mjs',
+    '--allow-all',
+    '--session-id',
+    'abc-123',
+  ]);
+});
+
+test('launchSessionCli keeps gh fallback when bootstrap is set without extension path', async () => {
+  const spawnCalls = [];
+  const launched = await launchSessionCli({
+    targetSessionId: 'abc-123',
+    processCwd: '/relay',
+    workspaceRoot: '/repo',
+    env: {
+      PATH: process.env.PATH || '',
+      COPILOT_WEB_RELAY_CLI_EXECUTABLE: '/usr/bin/copilot',
+      COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH: '/cache/copilot/preloads/extension_bootstrap.mjs',
+    },
+    platform: 'linux',
+    execFileSyncImpl(command) {
+      if (command === 'tmux') throw new Error('missing tmux');
+      throw new Error(`unexpected command: ${command}`);
+    },
+    processInspector: {
+      findProcessForSession() {
+        return null;
+      },
+    },
+    spawnImpl(command, args, options) {
+      spawnCalls.push({ command, args, options });
+      return {
+        pid: 4242,
+        unref() {},
+      };
+    },
+  });
+
+  assert.equal(launched.launchMode, 'detached');
+  assert.equal(launched.pid, 4242);
+  assert.equal(spawnCalls[0]?.command, 'gh');
+  assert.deepEqual(spawnCalls[0]?.args, [
+    'copilot',
+    '--',
+    '--allow-all',
+    '--session-id',
+    'abc-123',
+  ]);
 });
 
 test('launchSessionCli opens a visible detached console on windows', async () => {
@@ -281,6 +478,37 @@ test('launchSessionCli reuses a live existing process before launching', async (
   assert.equal(launched.reused, true);
   assert.equal(launched.pid, process.pid);
   assert.equal(launched.launchMode, 'existing');
+});
+
+test('launchSessionCli bypasses process reuse when disabled', async () => {
+  const spawnCalls = [];
+  const launched = await launchSessionCli({
+    targetSessionId: 'abc-123',
+    cwd: '/repo',
+    platform: 'linux',
+    allowProcessReuse: false,
+    processInspector: {
+      findProcessForSession() {
+        return { processId: process.pid, commandLine: 'gh copilot -- --session-id abc-123' };
+      },
+    },
+    execFileSyncImpl(command) {
+      if (command === 'tmux') throw new Error('missing tmux');
+      throw new Error(`unexpected command: ${command}`);
+    },
+    spawnImpl(command, args, options) {
+      spawnCalls.push({ command, args, options });
+      return {
+        pid: 4243,
+        unref() {},
+      };
+    },
+  });
+
+  assert.equal(launched.reused, false);
+  assert.equal(launched.launchMode, 'detached');
+  assert.equal(launched.pid, 4243);
+  assert.equal(spawnCalls[0]?.command, 'gh');
 });
 
 test('launchSessionCli ignores a dead discovered pid and continues to launch', async () => {

@@ -27,6 +27,10 @@ import {
   buildWindowsTerminalWindowName,
 } from './windows-terminal-launcher.mjs';
 import { isValidModelId, normalizeModelIdCandidate } from '../shared/model-id.mjs';
+import {
+  extractModelDescriptors,
+  normalizeContextLimitTokens,
+} from '../shared/model-descriptors.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -437,6 +441,7 @@ let client = null;
 let clientReady = false;
 let lastModelSnapshotMs = 0;
 const MODEL_SNAPSHOT_MIN_INTERVAL_MS = 30_000;
+const cachedModelMetadataById = new Map();
 
 const MODEL_ALIAS_CANDIDATES = {
   'sonnet-4.6': ['sonnet-4.6', 'claude-sonnet-4.6', 'claude-sonnet-4-6', 'anthropic/claude-sonnet-4.6'],
@@ -671,50 +676,88 @@ function canonicalModelId(id) {
   return String(id || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
 }
 
-function extractModelIds(value, out = []) {
-  const CONTAINER_KEYS = ['data', 'models', 'list', 'available', 'items', 'entries', 'result', 'response'];
-  if (!value) return out;
-  if (typeof value === 'string') {
-    const candidate = normalizeModelIdCandidate(value);
-    if (isValidModelId(candidate)) out.push(candidate);
-    return out;
+function appendDescriptorsWithPriority(raw, found, priority) {
+  const descriptors = [];
+  extractModelDescriptors(raw, descriptors);
+  for (const descriptor of descriptors) {
+    found.push({ ...descriptor, __priority: priority });
   }
-  if (Array.isArray(value)) {
-    for (const item of value) extractModelIds(item, out);
-    return out;
+}
+
+async function getAvailableModels(session) {
+  const modelApi = session?.rpc?.model;
+  const sendRequest = session?.connection?.sendRequest;
+  if (!modelApi && typeof sendRequest !== 'function' && !client?.listModels) {
+    if (!cachedModelMetadataById.size) return [];
+    return [...cachedModelMetadataById.values()];
   }
-  if (typeof value === 'object') {
-    for (const key of ['modelId', 'id', 'model']) {
-      const candidate = normalizeModelIdCandidate(value[key]);
-      if (isValidModelId(candidate)) out.push(candidate);
+
+  const found = [];
+  if (typeof client?.listModels === 'function') {
+    try {
+      const raw = await client.listModels();
+      appendDescriptorsWithPriority(raw, found, 4);
+    } catch (_) {
+      // Fall through to session-scoped model APIs.
     }
-    for (const key of CONTAINER_KEYS) {
-      const next = value[key];
-      if (next !== undefined && next !== null) {
-        extractModelIds(next, out);
+  }
+  if (typeof sendRequest === 'function') {
+    try {
+      const raw = await sendRequest.call(session.connection, 'models.list', {});
+      appendDescriptorsWithPriority(raw, found, 3);
+    } catch (_) {
+      // Ignore and try session-scoped listing.
+    }
+  }
+  if (typeof modelApi?.list === 'function') {
+    try {
+      const raw = await modelApi.list.call(modelApi, { skipCache: true });
+      appendDescriptorsWithPriority(raw, found, 2);
+    } catch (_) {
+      // Compatibility fallbacks below.
+    }
+  }
+  if (modelApi) {
+    for (const fnName of ['getAvailable', 'available', 'getAll', 'list']) {
+      const fn = modelApi[fnName];
+      if (typeof fn !== 'function') continue;
+      try {
+        const raw = await fn.call(modelApi);
+        appendDescriptorsWithPriority(raw, found, 1);
+      } catch (_) {
+        // Ignore; we'll still try alias-based switching below.
       }
     }
   }
-  return out;
+  found.sort((a, b) => Number(b?.__priority || 0) - Number(a?.__priority || 0));
+
+  const byModelId = new Map();
+  for (const entry of found) {
+    const modelId = normalizeModelIdCandidate(entry?.modelId);
+    if (!isValidModelId(modelId)) continue;
+    const existing = byModelId.get(modelId);
+    const cached = cachedModelMetadataById.get(modelId);
+    byModelId.set(modelId, {
+      modelId,
+      contextLimitTokens: existing?.contextLimitTokens
+        ?? normalizeContextLimitTokens(entry?.contextLimitTokens)
+        ?? cached?.contextLimitTokens
+        ?? null,
+      longContextLimitTokens: existing?.longContextLimitTokens
+        ?? normalizeContextLimitTokens(entry?.longContextLimitTokens)
+        ?? cached?.longContextLimitTokens
+        ?? null,
+      pricing: existing?.pricing || entry?.pricing || cached?.pricing || null,
+    });
+  }
+  const models = byModelId.size ? [...byModelId.values()] : [...cachedModelMetadataById.values()];
+  for (const entry of models) cachedModelMetadataById.set(entry.modelId, entry);
+  return models;
 }
 
 async function getAvailableModelIds(session) {
-  const modelApi = session?.rpc?.model;
-  if (!modelApi) return [];
-
-  const results = [];
-  for (const fnName of ['list', 'getAvailable', 'available', 'getAll']) {
-    const fn = modelApi[fnName];
-    if (typeof fn !== 'function') continue;
-    try {
-      const raw = await fn.call(modelApi);
-      extractModelIds(raw, results);
-    } catch (_) {
-      // Ignore; we'll still try alias-based switching below.
-    }
-  }
-
-  return [...new Set(results.filter(Boolean))];
+  const models = await getAvailableModels(session);
+  return models.map((entry) => entry.modelId);
 }
 
 function buildRequestedModelCandidates(requested) {
@@ -754,20 +797,36 @@ async function publishModelSnapshot(session, reason = 'standalone-relay', force 
   lastModelSnapshotMs = now;
   try {
     const currentModel = await getCurrentModelId(session);
-    const availableModels = await getAvailableModelIds(session);
+    const availableModels = await getAvailableModels(session);
+    const modelIds = availableModels.map((entry) => entry.modelId);
+    const contextLimitsByModel = Object.fromEntries(
+      availableModels
+        .filter((entry) => entry.contextLimitTokens !== null)
+        .map((entry) => [entry.modelId, entry.contextLimitTokens]),
+    );
+    const modelMetadataByModel = Object.fromEntries(
+      availableModels.map((entry) => [entry.modelId, {
+        defaultContextLimitTokens: entry.contextLimitTokens,
+        longContextLimitTokens: entry.longContextLimitTokens,
+        pricing: entry.pricing,
+      }]),
+    );
     await apiJson('POST', '/api/models/snapshot', {
       source: `standalone-relay:${reason}`,
-      models: availableModels,
+      models: modelIds,
+      contextLimitsByModel,
+      modelMetadataByModel,
       currentModel: currentModel || null,
-      defaultModel: currentModel || availableModels[0] || null,
+      defaultModel: currentModel || modelIds[0] || null,
       error: null,
     }, { auth: true });
-    vlog(`Published model snapshot (${reason}) models=${availableModels.length} current=${currentModel || 'unknown'}`);
+    vlog(`Published model snapshot (${reason}) models=${modelIds.length} contextLimits=${Object.keys(contextLimitsByModel).length} current=${currentModel || 'unknown'}`);
   } catch (e) {
     try {
       await apiJson('POST', '/api/models/snapshot', {
         source: `standalone-relay:${reason}`,
         models: [],
+        contextLimitsByModel: {},
         currentModel: null,
         defaultModel: null,
         error: e?.message || String(e),
@@ -777,12 +836,12 @@ async function publishModelSnapshot(session, reason = 'standalone-relay', force 
   }
 }
 
-async function setModelForMessage(session, model) {
+async function setModelForMessage(session, model, contextTier = 'default') {
   const requested = String(model || '').trim();
   if (!requested) return;
 
   const current = await getCurrentModelId(session);
-  if (canonicalModelId(current) === canonicalModelId(requested)) return;
+  if (canonicalModelId(current) === canonicalModelId(requested) && contextTier === 'default') return;
 
   const availableModels = await getAvailableModelIds(session);
   if (VERBOSE && availableModels.length) {
@@ -794,8 +853,9 @@ async function setModelForMessage(session, model) {
   vlog(`Model switch requested=${requested} resolved=${targetModel} current=${current || 'unknown'}`);
 
   const attempts = [
+    () => session.rpc.model.switchTo({ modelId: targetModel, contextTier }),
     () => session.rpc.model.setCurrent(targetModel),
-    () => session.rpc.model.setCurrent({ modelId: targetModel }),
+    () => session.rpc.model.setCurrent({ modelId: targetModel, contextTier }),
     () => session.rpc.model.setCurrent({ model: targetModel }),
     () => session.rpc.model.set(targetModel),
     () => session.rpc.model.set({ modelId: targetModel }),
