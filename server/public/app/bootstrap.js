@@ -1022,13 +1022,13 @@ function updateContextTierSelector(modelId) {
   const defaultOption = document.createElement('option');
   defaultOption.value = 'default';
   defaultOption.textContent = Number.isFinite(defaultLimit) && defaultLimit > 0
-    ? `Context: default (${Math.round(defaultLimit / 1000)}K)`
-    : 'Context: default';
+    ? `${Math.round(defaultLimit / 1000)}K`
+    : '—';
   select.appendChild(defaultOption);
   if (Number.isFinite(longLimit) && longLimit > 0) {
     const longOption = document.createElement('option');
     longOption.value = 'long_context';
-    longOption.textContent = `Context: long (${Math.round(longLimit / 1000)}K)`;
+    longOption.textContent = `${Math.round(longLimit / 1000)}K`;
     select.appendChild(longOption);
   }
   select.value = current === 'long_context' && select.querySelector('option[value="long_context"]')
