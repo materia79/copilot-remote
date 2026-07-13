@@ -34,8 +34,10 @@ import {
   toDriveWebPath as _toDriveWebPath,
   normalizeLinuxAbsolutePath as _normalizeLinuxAbsolutePath,
 } from './services/drives-path-helpers.mjs';
-import { createSessionDiscoveryService } from './services/session-discovery-service.mjs';
 import { createSessionTranscriptService } from './services/session-transcript-service.mjs';
+import { createSdkSessionImportService } from './services/sdk-session-import-service.mjs';
+import { createInstalledCopilotClient } from './copilot-sdk-runtime.mjs';
+import { createSessionHistoryRefreshService } from './services/session-history-refresh-service.mjs';
 import { createContextSnapshotService } from './services/context-snapshot-service.mjs';
 import { createRelaySingletonGuard } from './services/relay-singleton-guard.mjs';
 import { createRelayRestartOrchestrator } from './services/relay-restart-orchestrator-service.mjs';
@@ -1748,19 +1750,19 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_sdk_delete_requests_status
     ON sdk_delete_requests(status, requested_at, next_attempt_at);
 
-  CREATE TABLE IF NOT EXISTS sdk_history_fetch_requests (
+  CREATE TABLE IF NOT EXISTS sdk_session_imports (
     sdk_session_id TEXT PRIMARY KEY,
     conversation_id TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
-    requested_at TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    started_at TEXT,
+    completed_at TEXT,
     updated_at TEXT NOT NULL,
-    processing_at TEXT,
-    result_json TEXT,
     last_error TEXT
   );
 
-  CREATE INDEX IF NOT EXISTS idx_sdk_history_fetch_requests_status
-    ON sdk_history_fetch_requests(status, requested_at);
+  CREATE INDEX IF NOT EXISTS idx_sdk_session_imports_status
+    ON sdk_session_imports(status, updated_at);
 
   CREATE TABLE IF NOT EXISTS recent_workspace_roots (
     path         TEXT PRIMARY KEY,
@@ -2018,6 +2020,8 @@ db.exec(`
     VALUES (new.rowid, new.text);
   END;
 `);
+// The extension-backed history queue is superseded by the local SDK importer.
+db.exec(`DROP TABLE IF EXISTS sdk_history_fetch_requests`);
 // Only rebuild the FTS index if the virtual table is empty (first migration or new DB).
 // A full rebuild is O(N) in message count and blocks the sync event loop, so we skip it
 // when existing trigger-maintained rows are already present.
@@ -4496,12 +4500,6 @@ function buildScopedPwaManifest({ shared = false } = {}) {
   };
 }
 
-const sessionDiscoveryService = createSessionDiscoveryService({
-  fs,
-  path,
-  resolveSessionStateRoot,
-});
-const discoverSessionStateConversations = sessionDiscoveryService.discoverSessionStateConversations;
 const sessionTranscriptService = createSessionTranscriptService({
   fs,
   path,
@@ -4510,6 +4508,26 @@ const sessionTranscriptService = createSessionTranscriptService({
 const readSessionTranscriptMessages = sessionTranscriptService.readSessionTranscriptMessages;
 const parseSessionEventsToMessages = sessionTranscriptService.parseSessionEventsToMessages;
 const readSessionUsageSummary = sessionTranscriptService.readSessionUsageSummary;
+const sessionHistoryRefreshService = createSessionHistoryRefreshService({
+  db,
+  stmts,
+  parseSessionEventsToMessages,
+  inFlightStateForConversation,
+  isDeletedSdkSession: (sdkSessionId) => !!stmts.getDeletedSdkSession.get(String(sdkSessionId || '').trim()),
+});
+const sdkSessionImportService = createSdkSessionImportService({
+  db,
+  stmts,
+  createClient: () => createInstalledCopilotClient({
+    config,
+    cwd: currentWorkspaceRootPath(),
+    logLevel: 'error',
+  }),
+  parseSessionEventsToMessages,
+  replaceRetrievableHistory: sessionHistoryRefreshService.replaceRetrievableHistory,
+  ensureRuntimeSessionBinding,
+  logger: console,
+});
 const contextSnapshotService = createContextSnapshotService({
   fs,
   path,
@@ -5067,9 +5085,9 @@ const sharedRouteDeps = {
   sessionWorkerProcessInspector,
   buildContextResponseText,
   readContextFromSessionEvents,
-  discoverSessionStateConversations,
+  sessionHistoryRefreshService,
+  sdkSessionImportService,
   readSessionTranscriptMessages,
-  parseSessionEventsToMessages,
   readSessionUsageSummary,
   collectOrphanedUploadsFromConversation,
   deleteOrphanedUploads,
@@ -5270,68 +5288,10 @@ function ensureRuntimeSessionBinding(conversationId, model, nowIso = new Date().
 }
 
 function bootstrapRuntimeSessionBindings() {
-  const discoveredSessions = discoverSessionStateConversations(400);
-  const tombstonedSessions = new Set(
-    stmts.listDeletedSdkSessions.all().map((row) => String(row?.sdk_session_id || '').trim()).filter(Boolean),
-  );
   const missing = stmts.listConvIdsMissingRuntimeSession.all();
   const now = new Date().toISOString();
   let bootstrapped = 0;
   const tx = db.transaction(() => {
-    for (const item of discoveredSessions) {
-      const conversationId = String(item?.sdkSessionId || '').trim();
-      const discoveredUpdatedAt = String(item?.updatedAt || '').trim() || now;
-      if (!conversationId || tombstonedSessions.has(conversationId)) continue;
-
-      const existingConversation = stmts.getConvAnyStatus.get(conversationId) || null;
-      const discoveredTitle = String(item?.title || '').trim() || 'Session';
-      if (!existingConversation) {
-        stmts.insertConv.run(conversationId, discoveredTitle, discoveredUpdatedAt, discoveredUpdatedAt);
-      }
-      db.prepare(`
-        UPDATE conversations
-        SET sdk_session_id = ?,
-            updated_at = CASE
-              WHEN updated_at IS NULL OR updated_at = '' OR updated_at < ? THEN ?
-              ELSE updated_at
-            END
-        WHERE id = ?
-      `).run(conversationId, discoveredUpdatedAt, discoveredUpdatedAt, conversationId);
-
-      const existingRuntimeSession = stmts.getRuntimeSessionByConversation.get(conversationId) || null;
-      if (!existingRuntimeSession) {
-        const latestModel = stmts.getLatestConversationModel.get(conversationId)?.model || null;
-        const runtimeSession = ensureRuntimeSessionBinding(conversationId, latestModel, discoveredUpdatedAt, item?.sdkSessionId || null);
-        if (runtimeSession?.id) {
-          const updated = db.prepare(`
-            UPDATE runtime_sessions
-            SET sdk_session_id = ?, last_used_at = ?, status = 'active'
-            WHERE id = ?
-              AND NOT EXISTS (
-                SELECT 1
-                FROM runtime_sessions conflicts
-                WHERE conflicts.sdk_session_id = ?
-                  AND conflicts.id != runtime_sessions.id
-              )
-          `).run(conversationId, discoveredUpdatedAt, runtimeSession.id, conversationId);
-          if (updated.changes > 0) bootstrapped += 1;
-        }
-      } else if (String(existingRuntimeSession.sdk_session_id || '').trim() !== conversationId) {
-        const updated = db.prepare(`
-          UPDATE runtime_sessions
-          SET sdk_session_id = ?, last_used_at = ?, status = 'active'
-          WHERE id = ?
-            AND NOT EXISTS (
-              SELECT 1
-              FROM runtime_sessions conflicts
-              WHERE conflicts.sdk_session_id = ?
-                AND conflicts.id != runtime_sessions.id
-            )
-        `).run(conversationId, discoveredUpdatedAt, existingRuntimeSession.id, conversationId);
-        if (updated.changes > 0) bootstrapped += 1;
-      }
-    }
-
     for (const row of missing) {
       const conversationId = row?.id;
       if (!conversationId) continue;
@@ -5497,6 +5457,9 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
   runtimeShutdownStarted = true;
   console.log(`${runtimeLogPrefix()}Runtime shutdown started (${reason}, exitCode=${runtimeShutdownExitCode})`);
   clearRuntimeTimers();
+  void sdkSessionImportService.dispose().catch((error) => {
+    console.warn(`${runtimeLogPrefix()}SDK session importer shutdown failed: ${error?.message || error}`);
+  });
   sessionWorkerWebSocketService.stop();
   tmuxInspectorSocketService.stop();
   stopWorkspaceFileWatcher();
@@ -5613,4 +5576,7 @@ httpServer.listen(config.port, listenHost, () => {
 
   // Start SSH tunnel after server is listening
   sshTunnelManager.start();
+  void sdkSessionImportService.runStartupImport().catch((error) => {
+    console.warn(`${runtimeLogPrefix()}SDK session import startup failed: ${error?.message || error}`);
+  });
 });

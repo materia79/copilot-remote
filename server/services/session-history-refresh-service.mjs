@@ -50,7 +50,6 @@ export function createSessionHistoryRefreshService({
   db,
   stmts,
   parseSessionEventsToMessages = null,
-  discoverSessionStateConversations = null,
   inFlightStateForConversation = null,
   isDeletedSdkSession = null,
 } = {}) {
@@ -161,45 +160,6 @@ export function createSessionHistoryRefreshService({
     insertRebuiltMessages(conversationId, messages);
   });
 
-  function ensureConversationForRefresh(conversationId) {
-    const requestedId = normalizeId(conversationId);
-    if (!requestedId) {
-      return { ok: false, statusCode: 400, error: 'Missing conversation id' };
-    }
-    if (typeof isDeletedSdkSession === 'function' && isDeletedSdkSession(requestedId)) {
-      return { ok: false, statusCode: 404, error: 'Conversation not found' };
-    }
-    const existing = stmts.getConv.get(requestedId);
-    if (existing) return { ok: true, created: false, conversation: existing };
-
-    const discovered = typeof discoverSessionStateConversations === 'function'
-      ? discoverSessionStateConversations(400)
-      : [];
-    const discoveredMatch = ensureArray(discovered)
-      .find((item) => normalizeId(item?.sdkSessionId) === requestedId) || null;
-    if (!discoveredMatch) {
-      return { ok: false, statusCode: 404, error: 'Conversation not found' };
-    }
-
-    const nowIso = new Date().toISOString();
-    const discoveredTitle = String(discoveredMatch?.title || '').trim() || 'Session';
-    stmts.insertConv.run(requestedId, discoveredTitle, nowIso, nowIso);
-    if (typeof stmts.setConvSdkSessionIdIfMissing?.run === 'function') {
-      stmts.setConvSdkSessionIdIfMissing.run(requestedId, nowIso, requestedId);
-    }
-    const created = stmts.getConv.get(requestedId);
-    return {
-      ok: true,
-      created: true,
-      conversation: created || {
-        id: requestedId,
-        title: discoveredTitle,
-        sdk_session_id: requestedId,
-      },
-      discoveredMatch,
-    };
-  }
-
   function evaluateRefreshIdleState(conversationId) {
     const sid = normalizeId(conversationId);
     if (!sid) return { idle: false, reason: 'missing-conversation-id' };
@@ -248,7 +208,6 @@ export function createSessionHistoryRefreshService({
   }
 
   return {
-    ensureConversationForRefresh,
     evaluateRefreshIdleState,
     mapSdkEventsToMessages,
     countRetrievableMessages,

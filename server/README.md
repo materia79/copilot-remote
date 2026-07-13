@@ -459,6 +459,7 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | GET | `/api/status` | Overall status |
 | GET | `/api/models` | Live/cached model catalog used by the UI picker |
 | POST | `/api/models/snapshot` | (CLI/relay) Publish discovered model snapshot |
+| POST | `/api/conversation/:id/refresh-history` | Re-import an existing conversation's history through the local Copilot SDK |
 | GET | `/api/context/:conversationId` | Parse and return context metrics from session-state events for a conversation, falling back to a labeled lower-bound completion-token estimate when full legacy buckets are missing |
 | GET | `/api/context` | Parse context metrics only when `conversationId` query is provided; otherwise returns a missing-selection response |
 | GET | `/api/usage` | Live Copilot usage snapshot |

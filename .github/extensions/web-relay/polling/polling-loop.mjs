@@ -462,61 +462,6 @@ export function createPollingLoop({
     return true;
   }
 
-  async function processPendingSdkHistoryFetches() {
-    const status = await api("GET", "/api/status").catch(() => null);
-    if (status?.relayPaused) return false;
-    const pending = await api("GET", "/api/sdk-history-fetch/pending").catch(() => null);
-    const request = pending?.request || null;
-    const sdkSessionId = String(request?.sdkSessionId || "").trim();
-    if (!sdkSessionId) return false;
-
-    let ok = false;
-    let errorText = "";
-    let events = [];
-    try {
-      const conversationId = String(request?.conversationId || "").trim();
-      if (conversationId && typeof ensureSessionForConversation === "function") {
-        const ensured = await ensureSessionForConversation(conversationId, "sdk-history-fetch");
-        if (!ensured?.ok) {
-          throw new Error(ensured?.message || ensured?.reason || "session-ensure-failed");
-        }
-      }
-
-      if (!session || typeof session.getEvents !== "function") {
-        throw new Error("SDK getEvents() is unavailable in this CLI runtime");
-      }
-      const rawEvents = await session.getEvents();
-      const normalizedEvents = Array.isArray(rawEvents)
-        ? rawEvents
-        : (Array.isArray(rawEvents?.events) ? rawEvents.events : []);
-      events = normalizedEvents;
-      ok = true;
-      await session.log(
-        `🧾 Fetched ${normalizedEvents.length} SDK event(s) for ${sdkSessionId.slice(0, 8)}`,
-        { ephemeral: true },
-      );
-    } catch (error) {
-      ok = false;
-      errorText = String(error?.message || error || "unknown sdk history fetch failure").trim()
-        || "unknown sdk history fetch failure";
-      dbg("sdk history fetch failed", `session=${sdkSessionId}`, errorText);
-      await session?.log?.(
-        `⚠️ SDK history fetch failed (${sdkSessionId.slice(0, 8)}): ${errorText}`,
-        { level: "warn" },
-      );
-    }
-
-    await api("POST", "/api/sdk-history-fetch/result", {
-      sdk_session_id: sdkSessionId,
-      conversation_id: request?.conversationId || undefined,
-      ok,
-      events: ok ? events : undefined,
-      error: ok ? undefined : errorText,
-    }).catch(() => {});
-
-    return true;
-  }
-
   async function checkActiveAbortControl(message, { force = false } = {}) {
     const ownerSessionId = String(message?.ownerSessionId || "").trim();
     if (!ownerSessionId || !getWaitingForAI()) return false;
@@ -943,7 +888,6 @@ export function createPollingLoop({
         // Keep SDK-session-delete maintenance best-effort only; never starve
         // user turn dequeue when delete requests are backlogged/retrying.
         await processPendingSdkSessionDeletes();
-        await processPendingSdkHistoryFetches();
         if (!shouldFetchPending()) return;
 
         const pending = await api("GET", "/api/pending");

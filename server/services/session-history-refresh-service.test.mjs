@@ -142,40 +142,6 @@ test('clearRetrievableHistory removes only retrievable tables', () => {
   assert.equal(Number(db.prepare(`SELECT COUNT(*) AS cnt FROM queue WHERE conversation_id = 'conv-1'`).get()?.cnt || 0), 1);
 });
 
-test('ensureConversationForRefresh bootstraps discovered-only session', () => {
-  const db = makeDb();
-  const stmts = makeStmts(db);
-  const service = createSessionHistoryRefreshService({
-    db,
-    stmts,
-    discoverSessionStateConversations: () => ([
-      { sdkSessionId: 'conv-2', title: 'Discovered Session' },
-    ]),
-  });
-  const result = service.ensureConversationForRefresh('conv-2');
-  assert.equal(result.ok, true);
-  assert.equal(result.created, true);
-  assert.equal(result.conversation.id, 'conv-2');
-  assert.equal(result.conversation.sdk_session_id, 'conv-2');
-});
-
-test('ensureConversationForRefresh rejects discovered tombstoned session', () => {
-  const db = makeDb();
-  const stmts = makeStmts(db);
-  const service = createSessionHistoryRefreshService({
-    db,
-    stmts,
-    discoverSessionStateConversations: () => ([
-      { sdkSessionId: 'conv-deleted', title: 'Deleted Session' },
-    ]),
-    isDeletedSdkSession: (sdkSessionId) => String(sdkSessionId || '').trim() === 'conv-deleted',
-  });
-  const result = service.ensureConversationForRefresh('conv-deleted');
-  assert.equal(result.ok, false);
-  assert.equal(result.statusCode, 404);
-  assert.equal(result.error, 'Conversation not found');
-});
-
 test('evaluateRefreshIdleState rejects busy queue and in-flight processing', () => {
   const db = makeDb();
   const stmts = makeStmts(db);

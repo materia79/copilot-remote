@@ -157,63 +157,39 @@ export function createSessionRepository(db) {
         `),
         deleteSdkDeleteRequest: db.prepare(`DELETE FROM sdk_delete_requests WHERE sdk_session_id = ?`),
         deleteSdkDeleteRequests: db.prepare(`DELETE FROM sdk_delete_requests`),
-        // SDK session history fetch bridge queue (server <-> extension)
-        upsertSdkHistoryFetchRequest: db.prepare(`
-          INSERT INTO sdk_history_fetch_requests (
-            sdk_session_id, conversation_id, status, requested_at, updated_at, processing_at, result_json, last_error
-          ) VALUES (?, ?, 'pending', ?, ?, NULL, NULL, NULL)
-          ON CONFLICT(sdk_session_id) DO UPDATE SET
-            conversation_id = COALESCE(excluded.conversation_id, sdk_history_fetch_requests.conversation_id),
-            status = 'pending',
-            requested_at = excluded.requested_at,
-            updated_at = excluded.updated_at,
-            processing_at = NULL,
-            result_json = NULL,
-            last_error = NULL
+        // SDK session import ledger
+        getSdkSessionImport: db.prepare(`
+          SELECT sdk_session_id, conversation_id, status, attempt_count, started_at, completed_at, updated_at, last_error
+          FROM sdk_session_imports WHERE sdk_session_id = ? LIMIT 1
         `),
-        dequeueSdkHistoryFetchRequest: db.prepare(`
-          SELECT sdk_session_id, conversation_id, requested_at
-          FROM sdk_history_fetch_requests
-          WHERE status = 'pending'
-          ORDER BY requested_at ASC
-          LIMIT 1
+        upsertSdkSessionImport: db.prepare(`
+          INSERT INTO sdk_session_imports (sdk_session_id, conversation_id, status, attempt_count, started_at, completed_at, updated_at, last_error)
+          VALUES (?, ?, 'pending', 0, NULL, NULL, ?, NULL)
+          ON CONFLICT(sdk_session_id) DO NOTHING
         `),
-        setSdkHistoryFetchRequestProcessing: db.prepare(`
-          UPDATE sdk_history_fetch_requests
-          SET status = 'processing', processing_at = ?, updated_at = ?, last_error = NULL
-          WHERE sdk_session_id = ? AND status = 'pending'
-        `),
-        resetStaleSdkHistoryFetchProcessing: db.prepare(`
-          UPDATE sdk_history_fetch_requests
-          SET status = 'pending', processing_at = NULL, updated_at = ?
-          WHERE status = 'processing' AND processing_at < ?
-        `),
-        getSdkHistoryFetchRequestBySessionId: db.prepare(`
-          SELECT sdk_session_id, conversation_id, status, requested_at, updated_at, processing_at, result_json, last_error
-          FROM sdk_history_fetch_requests
+        claimSdkSessionImport: db.prepare(`
+          UPDATE sdk_session_imports
+          SET status = 'processing', attempt_count = attempt_count + 1, started_at = ?, updated_at = ?, last_error = NULL
           WHERE sdk_session_id = ?
-          LIMIT 1
+            AND (? = 1 OR status != 'completed')
+            AND status != 'processing'
         `),
-        setSdkHistoryFetchRequestCompleted: db.prepare(`
-          UPDATE sdk_history_fetch_requests
-          SET status = 'completed',
-              processing_at = NULL,
-              result_json = ?,
-              updated_at = ?,
-              last_error = NULL
+        completeSdkSessionImport: db.prepare(`
+          UPDATE sdk_session_imports
+          SET conversation_id = ?, status = 'completed', completed_at = ?, updated_at = ?, last_error = NULL
           WHERE sdk_session_id = ?
         `),
-        setSdkHistoryFetchRequestFailed: db.prepare(`
-          UPDATE sdk_history_fetch_requests
-          SET status = 'failed',
-              processing_at = NULL,
-              result_json = NULL,
-              updated_at = ?,
-              last_error = ?
+        failSdkSessionImport: db.prepare(`
+          UPDATE sdk_session_imports
+          SET status = 'failed', updated_at = ?, last_error = ?
           WHERE sdk_session_id = ?
         `),
-        deleteSdkHistoryFetchRequest: db.prepare(`DELETE FROM sdk_history_fetch_requests WHERE sdk_session_id = ?`),
-        deleteSdkHistoryFetchRequests: db.prepare(`DELETE FROM sdk_history_fetch_requests`),
+        resetInterruptedSdkSessionImports: db.prepare(`
+          UPDATE sdk_session_imports
+          SET status = 'failed', updated_at = ?, last_error = 'Interrupted before import completion'
+          WHERE status = 'processing'
+        `),
+        resetSdkSessionImports: db.prepare(`DELETE FROM sdk_session_imports`),
         listDeletedConversationsBySdkSessionId: db.prepare(`
           SELECT id, sdk_session_id
           FROM conversations
