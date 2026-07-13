@@ -65,25 +65,38 @@ export function resolveInstalledCopilotPaths({ config = {}, env = process.env, p
   throw new Error(`Copilot SDK runtime not found (${scope}). Install Copilot CLI or configure sdkPath and cliPath.`);
 }
 
-export function buildInstalledCopilotClientOptions({ cliPath, cwd, logLevel = 'debug' } = {}) {
+export function buildInstalledCopilotClientOptions({
+  cliPath,
+  cwd,
+  baseDirectory,
+  logLevel = 'debug',
+} = {}) {
   return {
     connection: {
       kind: 'stdio',
       path: cliPath,
     },
+    mode: 'empty',
+    baseDirectory,
     useLoggedInUser: true,
     logLevel,
     workingDirectory: cwd,
   };
 }
 
-export async function createInstalledCopilotClient({ config = {}, cwd, logLevel = 'debug' } = {}) {
+export async function createInstalledCopilotClient({
+  config = {},
+  cwd,
+  baseDirectory,
+  logLevel = 'debug',
+} = {}) {
   const paths = resolveInstalledCopilotPaths({ config });
   const sdk = await import(pathToFileURL(paths.sdkPath).href);
   if (typeof sdk.CopilotClient !== 'function') throw new Error('CopilotClient not found in installed Copilot SDK exports');
   const client = new sdk.CopilotClient(buildInstalledCopilotClientOptions({
     cliPath: paths.cliPath,
     cwd,
+    baseDirectory,
     logLevel,
   }));
   await client.start();

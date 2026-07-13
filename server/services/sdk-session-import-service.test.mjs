@@ -12,11 +12,15 @@ function makeHarness({ eventsBySession = {}, failSessions = new Set(), sessionMe
       sdk_session_id TEXT, configured_workspace_root_path TEXT, runtime_workspace_root_path TEXT,
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
+    CREATE TABLE messages (
+      id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, role TEXT NOT NULL,
+      text TEXT NOT NULL, timestamp TEXT NOT NULL
+    );
     CREATE TABLE deleted_sdk_sessions (sdk_session_id TEXT PRIMARY KEY);
     CREATE TABLE sdk_session_imports (
       sdk_session_id TEXT PRIMARY KEY, conversation_id TEXT, status TEXT NOT NULL,
       attempt_count INTEGER NOT NULL DEFAULT 0, started_at TEXT, completed_at TEXT,
-      updated_at TEXT NOT NULL, last_error TEXT
+      source_started_at TEXT, source_modified_at TEXT, updated_at TEXT NOT NULL, last_error TEXT
     );
   `);
   const stmts = {
@@ -24,7 +28,7 @@ function makeHarness({ eventsBySession = {}, failSessions = new Set(), sessionMe
     getSdkSessionImport: db.prepare(`SELECT * FROM sdk_session_imports WHERE sdk_session_id = ?`),
     upsertSdkSessionImport: db.prepare(`INSERT INTO sdk_session_imports (sdk_session_id, conversation_id, status, attempt_count, updated_at) VALUES (?, ?, 'pending', 0, ?) ON CONFLICT(sdk_session_id) DO NOTHING`),
     claimSdkSessionImport: db.prepare(`UPDATE sdk_session_imports SET status = 'processing', attempt_count = attempt_count + 1, started_at = ?, updated_at = ?, last_error = NULL WHERE sdk_session_id = ? AND (? = 1 OR status != 'completed') AND status != 'processing'`),
-    completeSdkSessionImport: db.prepare(`UPDATE sdk_session_imports SET conversation_id = ?, status = 'completed', completed_at = ?, updated_at = ?, last_error = NULL WHERE sdk_session_id = ?`),
+    completeSdkSessionImport: db.prepare(`UPDATE sdk_session_imports SET conversation_id = ?, status = 'completed', completed_at = ?, source_started_at = ?, source_modified_at = ?, updated_at = ?, last_error = NULL WHERE sdk_session_id = ?`),
     failSdkSessionImport: db.prepare(`UPDATE sdk_session_imports SET status = 'failed', updated_at = ?, last_error = ? WHERE sdk_session_id = ?`),
     resetInterruptedSdkSessionImports: db.prepare(`UPDATE sdk_session_imports SET status = 'failed', updated_at = ?, last_error = 'Interrupted before import completion' WHERE status = 'processing'`),
   };
@@ -57,10 +61,10 @@ function makeHarness({ eventsBySession = {}, failSessions = new Set(), sessionMe
     ensureRuntimeSessionBinding: () => null,
     logger: { info() {} },
   });
-  return { db, service, resumed, resumeConfigs, replaced };
+  return { db, service, resumed, resumeConfigs, replaced, eventsBySession, sessionMetadata };
 }
 
-test('imports all SDK sessions sequentially and skips completed ledger rows', async () => {
+test('imports all SDK sessions sequentially and skips unchanged ledger rows', async () => {
   const { db, service, resumed, resumeConfigs, replaced } = makeHarness({
     eventsBySession: {
       first: [{ id: 'm1', role: 'user', text: 'first' }],
@@ -68,16 +72,16 @@ test('imports all SDK sessions sequentially and skips completed ledger rows', as
     },
   });
   const first = await service.runStartupImport();
-  assert.deepEqual(first, { listed: 2, completed: 2, failed: 0, skipped: 0 });
+  assert.deepEqual(first, { listed: 2, new: 2, changed: 0, unchanged: 0, failed: 0, tombstoned: 0 });
   assert.deepEqual(resumed, ['first', 'second']);
   assert.deepEqual(resumeConfigs, [
-    { suppressResumeEvent: true },
-    { suppressResumeEvent: true },
+    { suppressResumeEvent: true, availableTools: [] },
+    { suppressResumeEvent: true, availableTools: [] },
   ]);
   assert.equal(replaced.length, 2);
 
   const second = await service.runStartupImport();
-  assert.deepEqual(second, { listed: 2, completed: 0, failed: 0, skipped: 2 });
+  assert.deepEqual(second, { listed: 2, new: 0, changed: 0, unchanged: 2, failed: 0, tombstoned: 0 });
   assert.deepEqual(resumed, ['first', 'second']);
   assert.equal(db.prepare(`SELECT COUNT(*) AS count FROM conversations`).get().count, 2);
 });
@@ -98,12 +102,66 @@ test('preserves SDK start and modified timestamps when importing', async () => {
   await service.runStartupImport();
 
   assert.deepEqual(
-    db.prepare(`SELECT created_at, updated_at FROM conversations WHERE id = 'dated'`).get(),
+    db.prepare(`
+      SELECT c.created_at, c.updated_at, i.source_started_at, i.source_modified_at
+      FROM conversations c
+      JOIN sdk_session_imports i ON i.sdk_session_id = c.id
+      WHERE c.id = 'dated'
+    `).get(),
     {
       created_at: '2026-07-10T09:00:00.000Z',
       updated_at: '2026-07-11T10:30:00.000Z',
+      source_started_at: '2026-07-10T09:00:00.000Z',
+      source_modified_at: '2026-07-11T10:30:00.000Z',
     },
   );
+});
+
+test('re-imports a newer SDK snapshot and preserves manual relay titles', async () => {
+  const { db, service, resumed, replaced, eventsBySession, sessionMetadata } = makeHarness({
+    eventsBySession: { changed: [{ id: 'm1', role: 'user', text: 'before' }] },
+    sessionMetadata: {
+      changed: {
+        title: 'SDK title',
+        startTime: new Date('2026-07-10T09:00:00.000Z'),
+        modifiedTime: new Date('2026-07-11T10:30:00.000Z'),
+      },
+    },
+  });
+  await service.runStartupImport();
+  db.prepare(`UPDATE conversations SET title = 'My title', title_source = 'manual' WHERE id = 'changed'`).run();
+  eventsBySession.changed = [{ id: 'm2', role: 'user', text: 'after' }];
+  sessionMetadata.changed.modifiedTime = '2026-07-12T10:30:00.000Z';
+
+  const summary = await service.runStartupImport();
+
+  assert.deepEqual(summary, { listed: 1, new: 0, changed: 1, unchanged: 0, failed: 0, tombstoned: 0 });
+  assert.deepEqual(resumed, ['changed', 'changed']);
+  assert.deepEqual(replaced.at(-1), {
+    conversationId: 'changed',
+    messages: [{ id: 'm2', role: 'user', text: 'after' }],
+  });
+  assert.deepEqual(
+    db.prepare(`SELECT title, title_source, updated_at FROM conversations WHERE id = 'changed'`).get(),
+    { title: 'My title', title_source: 'manual', updated_at: '2026-07-12T10:30:00.000Z' },
+  );
+});
+
+test('does not re-import older or malformed SDK modification timestamps', async () => {
+  const { service, resumed, sessionMetadata } = makeHarness({
+    eventsBySession: { stable: [{ id: 'm1', role: 'user', text: 'stable' }] },
+    sessionMetadata: {
+      stable: {
+        modifiedTime: '2026-07-11T10:30:00.000Z',
+      },
+    },
+  });
+  await service.runStartupImport();
+  sessionMetadata.stable.modifiedTime = '2026-07-10T10:30:00.000Z';
+  assert.equal((await service.runStartupImport()).unchanged, 1);
+  sessionMetadata.stable.modifiedTime = 'not-a-date';
+  assert.equal((await service.runStartupImport()).unchanged, 1);
+  assert.deepEqual(resumed, ['stable']);
 });
 
 test('records failures and retries them on a later startup pass', async () => {
@@ -118,8 +176,46 @@ test('records failures and retries them on a later startup pass', async () => {
 
   failSessions.delete('broken');
   const retried = await service.runStartupImport();
-  assert.equal(retried.completed, 1);
+  assert.equal(retried.new, 1);
   assert.deepEqual(resumed, ['broken', 'broken']);
   const row = db.prepare(`SELECT status, attempt_count FROM sdk_session_imports WHERE sdk_session_id = 'broken'`).get();
   assert.deepEqual(row, { status: 'completed', attempt_count: 2 });
+});
+
+test('an empty changed snapshot preserves existing history and retries later', async () => {
+  const { db, service, resumed, replaced, eventsBySession, sessionMetadata } = makeHarness({
+    eventsBySession: { protected: [{ id: 'm1', role: 'user', text: 'first' }] },
+    sessionMetadata: { protected: { modifiedTime: '2026-07-11T10:30:00.000Z' } },
+  });
+  await service.runStartupImport();
+  db.prepare(`
+    INSERT INTO messages (id, conversation_id, role, text, timestamp)
+    VALUES ('stored', 'protected', 'user', 'do not erase', '2026-07-11T10:30:00.000Z')
+  `).run();
+  eventsBySession.protected = [];
+  sessionMetadata.protected.modifiedTime = '2026-07-12T10:30:00.000Z';
+
+  const summary = await service.runStartupImport();
+
+  assert.equal(summary.failed, 1);
+  assert.equal(replaced.length, 1);
+  assert.equal(db.prepare(`SELECT text FROM messages WHERE id = 'stored'`).get().text, 'do not erase');
+  assert.equal(db.prepare(`SELECT status FROM sdk_session_imports WHERE sdk_session_id = 'protected'`).get().status, 'failed');
+  assert.deepEqual(resumed, ['protected', 'protected']);
+});
+
+test('forced refresh bypasses the timestamp skip decision', async () => {
+  const { service, resumed } = makeHarness({
+    eventsBySession: { refresh: [{ id: 'm1', role: 'user', text: 'refresh' }] },
+    sessionMetadata: { refresh: { modifiedTime: '2026-07-11T10:30:00.000Z' } },
+  });
+  await service.runStartupImport();
+
+  const result = await service.importSession({
+    sessionId: 'refresh',
+    metadata: { modifiedTime: '2026-07-11T10:30:00.000Z' },
+  }, { force: true });
+
+  assert.equal(result.status, 'completed');
+  assert.deepEqual(resumed, ['refresh', 'refresh']);
 });

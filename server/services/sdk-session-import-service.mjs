@@ -4,13 +4,39 @@ function text(value) {
   return String(value || '').trim();
 }
 
-function iso(value, fallback) {
-  const parsed = Date.parse(String(value || ''));
+function iso(value, fallback = null) {
+  const parsed = value instanceof Date ? value.getTime() : Date.parse(String(value || ''));
   return Number.isFinite(parsed) ? new Date(parsed).toISOString() : fallback;
 }
 
 function sessionIdOf(session) {
   return text(session?.sessionId || session?.id || session?.session_id);
+}
+
+function sessionMetadata(session) {
+  return session?.metadata || session || {};
+}
+
+function sourceTimestamps(session) {
+  const metadata = sessionMetadata(session);
+  return {
+    startedAt: iso(
+      metadata.startTime
+      || metadata.start_time
+      || metadata.createdAt
+      || metadata.created_at
+      || session?.startTime
+      || session?.createdAt,
+    ),
+    modifiedAt: iso(
+      metadata.modifiedTime
+      || metadata.modified_time
+      || metadata.updatedAt
+      || metadata.updated_at
+      || session?.modifiedTime
+      || session?.updatedAt,
+    ),
+  };
 }
 
 function sessionTitle(session, messages) {
@@ -50,6 +76,11 @@ export function createSdkSessionImportService({
   if (!db || !stmts || typeof createClient !== 'function') throw new Error('SDK session importer requires database, statements, and a client factory');
   let runtime = null;
   let activeRun = null;
+  const countConversationMessages = db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM messages
+    WHERE conversation_id = ?
+  `);
 
   const upsertConversation = db.prepare(`
     INSERT INTO conversations (id, title, sdk_session_id, configured_workspace_root_path, runtime_workspace_root_path, created_at, updated_at)
@@ -71,67 +102,80 @@ export function createSdkSessionImportService({
     return !!stmts.getDeletedSdkSession.get(sdkSessionId);
   }
 
-  function claim(sdkSessionId, { force = false } = {}) {
+  function claim(sdkSessionId, session, { force = false } = {}) {
     const now = new Date().toISOString();
     return db.transaction(() => {
       const existing = stmts.getSdkSessionImport.get(sdkSessionId);
-      if (!force && existing?.status === 'completed') return null;
+      const { modifiedAt } = sourceTimestamps(session);
+      const hasNewerSource = modifiedAt
+        && (!existing?.source_modified_at || modifiedAt > existing.source_modified_at);
+      if (!force && existing?.status === 'completed' && !hasNewerSource) {
+        return { claimed: null, category: 'unchanged' };
+      }
       stmts.upsertSdkSessionImport.run(sdkSessionId, existing?.conversation_id || sdkSessionId, now);
-      const claimed = stmts.claimSdkSessionImport.run(now, now, sdkSessionId, force ? 1 : 0);
-      return claimed.changes > 0 ? stmts.getSdkSessionImport.get(sdkSessionId) : null;
+      const claimed = stmts.claimSdkSessionImport.run(
+        now,
+        now,
+        sdkSessionId,
+        force || hasNewerSource ? 1 : 0,
+      );
+      if (claimed.changes === 0) return { claimed: null, category: 'unchanged' };
+      return {
+        claimed: stmts.getSdkSessionImport.get(sdkSessionId),
+        category: existing?.status === 'completed' ? 'changed' : 'new',
+      };
     })();
   }
 
   function persistCompletedImport({ sdkSessionId, session, messages }) {
     const now = new Date().toISOString();
-    const metadata = session?.metadata || session || {};
-    const updatedAt = iso(
-      metadata.modifiedTime
-      || metadata.modified_time
-      || metadata.updatedAt
-      || metadata.updated_at
-      || session?.modifiedTime
-      || session?.updatedAt,
-      now,
-    );
-    const createdAt = iso(
-      metadata.startTime
-      || metadata.start_time
-      || metadata.createdAt
-      || metadata.created_at
-      || session?.startTime
-      || session?.createdAt,
-      updatedAt,
-    );
+    const metadata = sessionMetadata(session);
+    const { startedAt: sourceStartedAt, modifiedAt: sourceModifiedAt } = sourceTimestamps(session);
+    const updatedAt = sourceModifiedAt || now;
+    const createdAt = sourceStartedAt || updatedAt;
     const workspaceRoot = text(metadata.workspaceRootPath || metadata.workspace_root_path || metadata.cwd) || null;
     const title = sessionTitle(session, messages);
     db.transaction(() => {
       upsertConversation.run(sdkSessionId, title, sdkSessionId, workspaceRoot, workspaceRoot, createdAt, updatedAt);
       ensureRuntimeSessionBinding(sdkSessionId, null, updatedAt, sdkSessionId);
       replaceRetrievableHistory(sdkSessionId, messages);
-      stmts.completeSdkSessionImport.run(sdkSessionId, now, now, sdkSessionId);
+      stmts.completeSdkSessionImport.run(
+        sdkSessionId,
+        now,
+        sourceStartedAt,
+        sourceModifiedAt,
+        now,
+        sdkSessionId,
+      );
     })();
   }
 
   async function importSession(session, { force = false } = {}) {
     const sdkSessionId = sessionIdOf(session);
-    if (!sdkSessionId) return { status: 'skipped', reason: 'missing-session-id' };
-    if (isTombstoned(sdkSessionId)) return { sdkSessionId, status: 'skipped', reason: 'tombstoned' };
-    if (!claim(sdkSessionId, { force })) return { sdkSessionId, status: 'skipped', reason: 'completed-or-active' };
+    if (!sdkSessionId) return { status: 'skipped', category: 'unchanged', reason: 'missing-session-id' };
+    if (isTombstoned(sdkSessionId)) return { sdkSessionId, status: 'skipped', category: 'tombstoned', reason: 'tombstoned' };
+    const claimed = claim(sdkSessionId, session, { force });
+    if (!claimed.claimed) return { sdkSessionId, status: 'skipped', category: claimed.category, reason: 'unchanged-or-active' };
 
     let resumed = null;
     try {
       const client = await getRuntime();
       resumed = await client.client.resumeSession(sdkSessionId, {
         suppressResumeEvent: true,
+        availableTools: [],
       });
       const events = await normalizeEvents(await resumed.getEvents());
-      const messages = Array.isArray(parseSessionEventsToMessages?.(events)) ? parseSessionEventsToMessages(events) : [];
+      const messages = parseSessionEventsToMessages?.(events);
+      if (!Array.isArray(messages)) throw new Error('SDK session import returned an invalid history snapshot');
+      const existingMessageCount = Number(countConversationMessages.get(sdkSessionId)?.count || 0);
+      if (messages.length === 0 && existingMessageCount > 0) {
+        throw new Error('SDK session import returned an empty history snapshot for an existing conversation');
+      }
       persistCompletedImport({ sdkSessionId, session, messages });
-      return { sdkSessionId, status: 'completed', messageCount: messages.length };
+      return { sdkSessionId, status: 'completed', category: claimed.category, messageCount: messages.length };
     } catch (error) {
       stmts.failSdkSessionImport.run(new Date().toISOString(), boundedError(error), sdkSessionId);
-      return { sdkSessionId, status: 'failed', error: boundedError(error) };
+      return { sdkSessionId, status: 'failed', category: 'failed', error: boundedError(error) };
     } finally {
       try { await resumed?.stop?.(); } catch {}
       try { await resumed?.dispose?.(); } catch {}
@@ -141,7 +185,14 @@ export function createSdkSessionImportService({
   async function runStartupImport() {
     if (activeRun) return activeRun;
     activeRun = (async () => {
-      const summary = { listed: 0, completed: 0, failed: 0, skipped: 0 };
+      const summary = {
+        listed: 0,
+        new: 0,
+        changed: 0,
+        unchanged: 0,
+        failed: 0,
+        tombstoned: 0,
+      };
       try {
         stmts.resetInterruptedSdkSessionImports.run(new Date().toISOString());
         const client = await getRuntime();
@@ -149,7 +200,7 @@ export function createSdkSessionImportService({
         summary.listed = sessions.length;
         for (const session of sessions) {
           const result = await importSession(session);
-          summary[result.status] = Number(summary[result.status] || 0) + 1;
+          summary[result.category] = Number(summary[result.category] || 0) + 1;
         }
       } catch (error) {
         summary.failed += 1;
@@ -157,7 +208,10 @@ export function createSdkSessionImportService({
       } finally {
         activeRun = null;
       }
-      logger.info?.(`[sdk-session-import] listed=${summary.listed} completed=${summary.completed} failed=${summary.failed} skipped=${summary.skipped}`);
+      logger.info?.(
+        `[sdk-session-import] listed=${summary.listed} new=${summary.new} changed=${summary.changed}`
+        + ` unchanged=${summary.unchanged} failed=${summary.failed} tombstoned=${summary.tombstoned}`,
+      );
       return summary;
     })();
     return activeRun;

@@ -2972,6 +2972,18 @@ export function registerMessagesRoutes(app, deps) {
     const modelResolution = resolveRequestedModel(model);
     if (!modelResolution.ok) return res.status(400).json({ error: modelResolution.error, supportedModels: modelResolution.available || [] });
     const requestedModel = String(modelResolution.model || '').trim();
+    const requestedAutoModel = requestedModel.toLowerCase() === AUTO_MODEL_SENTINEL;
+    if (requestedAutoModel && conversationId && !newConversation) {
+      const messageCount = Number(stmts.getConversationMessageCount?.get?.(conversationId)?.count || 0);
+      const activeQueueCount = Number(stmts.getConversationActiveQueueCount?.get?.(conversationId)?.count || 0);
+      if (messageCount > 0 || activeQueueCount > 0) {
+        return res.status(409).json({
+          error: 'Auto model selection is available only for a new conversation',
+          code: 'AUTO_MODEL_REQUIRES_NEW_CONVERSATION',
+          conversationId,
+        });
+      }
+    }
     const requestedModelVariantId = String(modelResolution.modelVariantId || model || requestedModel).trim();
     const explicitReasoningEffort = String(reasoningEffort || '').trim();
     let reasoningResolution = resolveRequestedReasoningEffort(

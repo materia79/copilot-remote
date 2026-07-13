@@ -1980,6 +1980,7 @@ export async function sendMessage() {
         preferredRelayMode: r.preferredRelayMode || selectedMode,
         preferredModelsByMode: r.preferredModelsByMode || { [selectedMode]: selectedModel },
       };
+      window.syncAutoModelAvailability?.();
       document.getElementById('chat-title').textContent = titleSeed.slice(0, 60);
       window.syncChatTitleControls?.();
       updateCompactButton();

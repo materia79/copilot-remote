@@ -1757,6 +1757,8 @@ db.exec(`
     attempt_count INTEGER NOT NULL DEFAULT 0,
     started_at TEXT,
     completed_at TEXT,
+    source_started_at TEXT,
+    source_modified_at TEXT,
     updated_at TEXT NOT NULL,
     last_error TEXT
   );
@@ -2048,6 +2050,14 @@ if (!messageColumns.includes('model_actual')) {
 }
 if (!messageColumns.includes('model_origin')) {
   db.exec(`ALTER TABLE messages ADD COLUMN model_origin TEXT`);
+}
+
+const sdkSessionImportColumns = db.prepare(`PRAGMA table_info(sdk_session_imports)`).all().map((c) => c.name);
+if (!sdkSessionImportColumns.includes('source_started_at')) {
+  db.exec(`ALTER TABLE sdk_session_imports ADD COLUMN source_started_at TEXT`);
+}
+if (!sdkSessionImportColumns.includes('source_modified_at')) {
+  db.exec(`ALTER TABLE sdk_session_imports ADD COLUMN source_modified_at TEXT`);
 }
 
 const queueColumns = db.prepare(`PRAGMA table_info(queue)`).all().map((c) => c.name);
@@ -4521,6 +4531,7 @@ const sdkSessionImportService = createSdkSessionImportService({
   createClient: () => createInstalledCopilotClient({
     config,
     cwd: currentWorkspaceRootPath(),
+    baseDirectory: path.dirname(resolveSessionStateRoot()),
     logLevel: 'error',
   }),
   parseSessionEventsToMessages,

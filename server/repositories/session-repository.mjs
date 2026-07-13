@@ -25,6 +25,8 @@ export function createSessionRepository(db) {
 
         // messages
         getMessages:    db.prepare(`SELECT * FROM messages WHERE conversation_id = ? ORDER BY timestamp ASC`),
+        getConversationMessageCount: db.prepare(`SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ?`),
+        getConversationActiveQueueCount: db.prepare(`SELECT COUNT(*) AS count FROM queue WHERE conversation_id = ? AND status IN ('pending', 'processing', 'parked')`),
         getLatestConversationModel: db.prepare(`SELECT model FROM messages WHERE conversation_id = ? AND model IS NOT NULL AND model != '' ORDER BY timestamp DESC LIMIT 1`),
         getRecentMessagesDesc: db.prepare(`SELECT role, text, timestamp FROM messages WHERE conversation_id = ? ORDER BY timestamp DESC LIMIT ?`),
         insertMsg:      db.prepare(`INSERT INTO messages (id, conversation_id, role, text, model, mode, attachments, timestamp, model_requested, model_actual, model_origin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
@@ -159,12 +161,16 @@ export function createSessionRepository(db) {
         deleteSdkDeleteRequests: db.prepare(`DELETE FROM sdk_delete_requests`),
         // SDK session import ledger
         getSdkSessionImport: db.prepare(`
-          SELECT sdk_session_id, conversation_id, status, attempt_count, started_at, completed_at, updated_at, last_error
+          SELECT sdk_session_id, conversation_id, status, attempt_count, started_at, completed_at,
+                 source_started_at, source_modified_at, updated_at, last_error
           FROM sdk_session_imports WHERE sdk_session_id = ? LIMIT 1
         `),
         upsertSdkSessionImport: db.prepare(`
-          INSERT INTO sdk_session_imports (sdk_session_id, conversation_id, status, attempt_count, started_at, completed_at, updated_at, last_error)
-          VALUES (?, ?, 'pending', 0, NULL, NULL, ?, NULL)
+          INSERT INTO sdk_session_imports (
+            sdk_session_id, conversation_id, status, attempt_count, started_at, completed_at,
+            source_started_at, source_modified_at, updated_at, last_error
+          )
+          VALUES (?, ?, 'pending', 0, NULL, NULL, NULL, NULL, ?, NULL)
           ON CONFLICT(sdk_session_id) DO NOTHING
         `),
         claimSdkSessionImport: db.prepare(`
@@ -176,7 +182,8 @@ export function createSessionRepository(db) {
         `),
         completeSdkSessionImport: db.prepare(`
           UPDATE sdk_session_imports
-          SET conversation_id = ?, status = 'completed', completed_at = ?, updated_at = ?, last_error = NULL
+          SET conversation_id = ?, status = 'completed', completed_at = ?, source_started_at = ?,
+              source_modified_at = ?, updated_at = ?, last_error = NULL
           WHERE sdk_session_id = ?
         `),
         failSdkSessionImport: db.prepare(`

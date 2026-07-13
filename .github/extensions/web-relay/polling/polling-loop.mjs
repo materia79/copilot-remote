@@ -380,10 +380,10 @@ export function createPollingLoop({
     return requested;
   };
   const resolveResponseModel = async (message, { finalEvent = null, unknownForAuto = false } = {}) => {
-    const currentModel = String(await getCurrentModelId() || "").trim();
-    if (currentModel) return currentModel;
     const eventModel = String(finalEvent?.data?.model || finalEvent?.data?.modelId || "").trim();
     if (eventModel) return eventModel;
+    const currentModel = String(await getCurrentModelId() || "").trim();
+    if (currentModel) return currentModel;
     const requestedManualModel = requestedManualModelOrNull(message);
     if (requestedManualModel) return requestedManualModel;
     if (unknownForAuto && isAutoRequestedModel(message?.model)) return "unknown";
@@ -669,7 +669,7 @@ export function createPollingLoop({
           messageId: message.id,
           conversationId: message.conversationId,
           mode: message.relayMode || "agent",
-          text: "Model selected: requested=auto active=auto via=sdk-auto",
+          text: "Model selection: Auto routing is active for this new SDK session",
         }).catch(() => {});
       }
 

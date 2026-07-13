@@ -2128,8 +2128,17 @@ export function registerSessionsRoutes(app, deps) {
     try {
       const result = await sdkSessionImportService.refreshConversation(existingConversation);
       if (result.status === 'failed') throw new Error(result.error || 'Failed to refresh conversation history');
+      if (result.status !== 'completed') {
+        const error = new Error(
+          result.reason === 'tombstoned'
+            ? 'Conversation not found'
+            : 'Conversation history refresh is already in progress',
+        );
+        error.statusCode = result.reason === 'tombstoned' ? 404 : 409;
+        throw error;
+      }
     } catch (error) {
-      return res.status(500).json({
+      return res.status(error?.statusCode || 500).json({
         error: error?.message || 'Failed to refresh conversation history',
       });
     }

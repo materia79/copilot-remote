@@ -778,6 +778,30 @@ function syncModelMetadataBlocker(message = '') {
   window.syncComposerControlState?.();
 }
 
+function currentConversationHasMessages() {
+  const conversation = currentConvId ? conversations[currentConvId] : null;
+  return Number(conversation?.messageCount || 0) > 0;
+}
+
+function syncAutoModelAvailability() {
+  const select = document.getElementById('model-select');
+  if (!select) return;
+  const autoOption = Array.from(select.options).find((option) => option.value.toLowerCase() === AUTO_MODEL_OPTION);
+  if (!autoOption) return;
+  const locked = currentConversationHasMessages();
+  autoOption.disabled = locked;
+  autoOption.title = locked ? 'Auto is available only for a new conversation' : '';
+  if (locked && select.value.toLowerCase() === AUTO_MODEL_OPTION) {
+    const fallback = [
+      modelCatalogState.currentModel,
+      modelCatalogState.defaultModel,
+      ...modelCatalogState.models,
+    ].find((modelId) => String(modelId || '').trim().toLowerCase() !== AUTO_MODEL_OPTION
+      && Array.from(select.options).some((option) => option.value === modelId));
+    if (fallback) select.value = fallback;
+  }
+}
+
 function applyModelMetadataHardFail(message = '') {
   modelMetadataBlocked = true;
   syncModelMetadataBlocker(message);
@@ -977,6 +1001,7 @@ function updateModelCatalogState(payload) {
   }
 
   syncModelMetadataBlocker();
+  syncAutoModelAvailability();
 }
 
 function selectedModelValue() {
@@ -1130,6 +1155,7 @@ function applyConversationPreferences({
   suppressConversationPreferenceSync = true;
   modeSelect.value = selection.mode;
   if (selection.model) modelSelect.value = selection.model;
+  syncAutoModelAvailability();
   const modeReasoning = String(activeConversationPreferredReasoningByMode?.[selection.mode] || '').trim().toLowerCase();
   updateReasoningSelectorForModel(selection.model || modelSelect.value, modeReasoning);
   suppressConversationPreferenceSync = false;
@@ -1171,6 +1197,11 @@ function initModelSelector() {
     select.dataset.bound = '1';
     select.addEventListener('change', () => {
       if (suppressConversationPreferenceSync) return;
+      if (currentConversationHasMessages() && select.value.toLowerCase() === AUTO_MODEL_OPTION) {
+        syncAutoModelAvailability();
+        setModelBanner('⚠️ Auto model selection is available only for a new conversation.');
+        return;
+      }
       const mode = String(document.getElementById('mode-select')?.value || '').trim();
       activeConversationPreferredModelsByMode = withUpdatedModelPreference({
         preferredModelsByMode: activeConversationPreferredModelsByMode,
@@ -2627,6 +2658,7 @@ window.confirmChangeCwdAndLaunch = confirmChangeCwdAndLaunch;
 window.showContext = showContext;
 window.promptInstallApp = promptInstallApp;
 window.toggleFullscreen = toggleFullscreen;
+window.syncAutoModelAvailability = syncAutoModelAvailability;
 window.openRepoBrowser = openRepoBrowser;
 window.closeRepoBrowser = closeRepoBrowser;
 window.loadRepoBrowserTree = loadRepoBrowserTree;

@@ -197,6 +197,15 @@ export function createModelSwitchingService({
   async function setModelForMessage(model, contextTier = 'default') {
     const requested = String(model || "").trim();
     if (!requested) return { requested, current: await getCurrentModelId(), switched: false };
+    if (requested.toLowerCase() === "auto") {
+      return {
+        requested,
+        current: await getCurrentModelId(),
+        switched: false,
+        requiresSessionBoundary: true,
+        error: "Auto model selection is only available when a new SDK session is created",
+      };
+    }
 
     const current = await getCurrentModelId();
     if (canonicalModelId(current) === canonicalModelId(requested) && contextTier === 'default') {
