@@ -49,16 +49,12 @@ The Copilot CLI extension that bridges local CLI sessions with the web relay ser
 ### Question Routing (`skills/question-routing-hooks.mjs`)
 
 - Intercepts `onElicitationRequest` and `onUserInputRequest` from the CLI session
-- Detects single-field (legacy `ask_user`) vs. multi-field (structured `ElicitationRequest`) flows
+- Uses structured elicitation (`requestedSchema`) as the canonical ask-user flow
 - For structured answers:
   - Extracts `requestSchema` (JSON schema)
   - Registers question in relay database
   - Waits for browser to render form and user to submit
   - Retrieves `structuredAnswer` and returns `ElicitationResponse`
-- For single-field text:
-  - Renders as web question card
-  - Waits for text response
-  - Returns `onUserInputRequest` response
 
 ### Tool Activity (`skills/tool-activity.mjs`)
 
@@ -69,12 +65,6 @@ The Copilot CLI extension that bridges local CLI sessions with the web relay ser
 - `store_memory` activity includes the available `subject`, `fact`, `citations`, `reason`, and `scope` metadata with preserved field content and line breaks
 - `vote_memory` activity includes the available `fact`, `direction`, `reason`, and `scope` metadata with preserved field content and line breaks
 - Activity is persisted by the relay and is therefore available to authorized shared viewers and replayed history
-
-### Tmux Input Bridge (`utils/tmux-input-bridge.mjs`)
-
-- On macOS/Linux: detects if session is running in a `tmux` window
-- Handles interactive CLI prompts (e.g., pagers, menu selections) by forwarding input from the browser
-- Allows browser-based interaction with interactive CLI tools
 
 ### Reasoning Stream (`skills/reasoning-stream.mjs`)
 
@@ -147,7 +137,6 @@ Key config keys read by the extension:
 ## Testing
 
 Test files located in:
-- `polling/polling-loop.test.mjs` — Polling logic tests
 - `runtime/worker-websocket-link.test.mjs` — WebSocket bridge tests
 - `skills/*.test.mjs` — Skill handler tests
 

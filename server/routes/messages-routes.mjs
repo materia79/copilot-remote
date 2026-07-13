@@ -511,16 +511,14 @@ export function extractRestartTerminalOutcome(orchestratorState = null) {
   };
 }
 
-export function maybeTriggerWorkerFallbackRestart({
-  enabled = false,
+export function buildFallbackRestartCompatibilityPayload({
   failureClass = null,
   requesterSessionId = null,
   relayRestartOrchestrator = null,
   inFlightProcessingCount = 0,
-  fallbackFailureReasons = [],
 } = {}) {
   const currentState = relayRestartOrchestrator?.getState?.() || null;
-  const fallback = {
+  return {
     enabled: false,
     considered: false,
     requested: false,
@@ -532,7 +530,6 @@ export function maybeTriggerWorkerFallbackRestart({
     orchestratorState: currentState,
     restartRequest: null,
   };
-  return fallback;
 }
 
 export function resolveInitialQueueOwnerSessionId({
@@ -729,8 +726,7 @@ export async function dequeuePendingMessageForWorkerLoop({
     const killBlocked = supervisor?.isKillBlocked?.(requesterSid) === true;
     if (killBlocked) {
       const lifecycle = supervisor?.getLifecycleState?.(requesterSid) || null;
-      const fallbackRestart = maybeTriggerWorkerFallbackRestart({
-        enabled: false,
+      const fallbackRestart = buildFallbackRestartCompatibilityPayload({
         failureClass: 'session-killed',
         requesterSessionId: requesterSid,
         relayRestartOrchestrator,
@@ -760,8 +756,7 @@ export async function dequeuePendingMessageForWorkerLoop({
     }
     const ensureResult = await supervisor.ensureWorker(requesterSid);
     if (!ensureResult?.ok) {
-      const fallbackRestart = maybeTriggerWorkerFallbackRestart({
-        enabled: false,
+      const fallbackRestart = buildFallbackRestartCompatibilityPayload({
         failureClass: ensureResult?.error || null,
         requesterSessionId: requesterSid,
         relayRestartOrchestrator,

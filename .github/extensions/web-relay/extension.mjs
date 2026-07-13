@@ -530,7 +530,6 @@ async function startPolling() {
       setPollingLoopStarted: (value) => { pollingLoopStarted = value; },
       getSessionReady: () => sessionReady,
       getWaitingForAI: () => waitingForAI,
-      getLastAskUserBridge: () => getScopedLastAskUserBridge(),
       setActiveMsg: (value) => { activeMsg = value; },
       setWaitingForAI: (value) => {
         waitingForAI = value;
@@ -557,7 +556,6 @@ async function startPolling() {
       },
       setLastActivityText: (value) => { setScopedLastActivityText(value); },
       setLastAskUserBridge: (value) => { setScopedLastAskUserBridge(value); },
-      getPendingAskUserRequest: () => getScopedPendingAskUserRequest(),
       setPendingAskUserRequest: (value) => { setScopedPendingAskUserRequest(value); },
       clearRelayScopeState: () => { clearScopedRelayState(); },
       // Worker-routed turns are delivered over the session-worker WebSocket.
@@ -566,9 +564,6 @@ async function startPolling() {
       shouldFetchPending: () => false,
       syncActiveSession,
       ensureSessionForConversation,
-      extractQuestionPrompt,
-      extractQuestionChoices,
-      getSessionId: () => session?.sessionId || null,
     });
   }
 
