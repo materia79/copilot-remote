@@ -59,7 +59,6 @@ export function createCacheRebuildService({
   fs,
   path,
   uploadsDir,
-  discoverSessionStateConversations,
   bootstrapRuntimeSessionBindings,
   collectOrphanedUploadsFromConversation,
   deleteOrphanedUploads,
@@ -145,6 +144,7 @@ export function createCacheRebuildService({
       }
       db.prepare(`DELETE FROM deleted_sdk_sessions`).run();
       db.prepare(`DELETE FROM sdk_delete_requests`).run();
+      db.prepare(`DELETE FROM sdk_session_imports`).run();
       db.prepare(`DELETE FROM upload_refs`).run();
       db.prepare(`DELETE FROM uploaded_files`).run();
     })();
@@ -172,18 +172,8 @@ export function createCacheRebuildService({
   }
 
   function reconcileCache() {
-    const discoveredSessionIds = new Set(
-      discoverSessionStateConversations(400)
-        .map((row) => normalizeId(row?.sdkSessionId))
-        .filter(Boolean),
-    );
-    const tombstonedSessionIds = new Set(
-      stmts.listDeletedSdkSessions.all().map((row) => normalizeId(row?.sdk_session_id)).filter(Boolean),
-    );
     const legacyRows = legacyConversationList.all();
     const summary = {
-      discoveredSessionCount: discoveredSessionIds.size,
-      backfilledConversationIds: [],
       purgedConversationIds: [],
       archivedConversationIds: [],
       retainedConversationIds: [],
@@ -194,20 +184,6 @@ export function createCacheRebuildService({
     for (const row of legacyRows) {
       const conversationId = normalizeId(row?.id);
       if (!conversationId) continue;
-
-      if (discoveredSessionIds.has(conversationId) && !tombstonedSessionIds.has(conversationId)) {
-        const now = new Date().toISOString();
-        const updateResult = db.prepare(`
-          UPDATE conversations
-          SET sdk_session_id = ?, updated_at = ?
-          WHERE id = ? AND (sdk_session_id IS NULL OR sdk_session_id = '')
-        `).run(conversationId, now, conversationId);
-        if (Number(updateResult?.changes || 0) > 0) {
-          summary.backfilledConversationIds.push(conversationId);
-          stmts.clearDeletedSdkSession.run(conversationId);
-        }
-        continue;
-      }
 
       if (isLegacyConversationActive(conversationId)) {
         if (archiveConversation(conversationId)) {

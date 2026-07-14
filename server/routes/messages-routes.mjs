@@ -511,16 +511,14 @@ export function extractRestartTerminalOutcome(orchestratorState = null) {
   };
 }
 
-export function maybeTriggerWorkerFallbackRestart({
-  enabled = false,
+export function buildFallbackRestartCompatibilityPayload({
   failureClass = null,
   requesterSessionId = null,
   relayRestartOrchestrator = null,
   inFlightProcessingCount = 0,
-  fallbackFailureReasons = [],
 } = {}) {
   const currentState = relayRestartOrchestrator?.getState?.() || null;
-  const fallback = {
+  return {
     enabled: false,
     considered: false,
     requested: false,
@@ -532,7 +530,6 @@ export function maybeTriggerWorkerFallbackRestart({
     orchestratorState: currentState,
     restartRequest: null,
   };
-  return fallback;
 }
 
 export function resolveInitialQueueOwnerSessionId({
@@ -729,8 +726,7 @@ export async function dequeuePendingMessageForWorkerLoop({
     const killBlocked = supervisor?.isKillBlocked?.(requesterSid) === true;
     if (killBlocked) {
       const lifecycle = supervisor?.getLifecycleState?.(requesterSid) || null;
-      const fallbackRestart = maybeTriggerWorkerFallbackRestart({
-        enabled: false,
+      const fallbackRestart = buildFallbackRestartCompatibilityPayload({
         failureClass: 'session-killed',
         requesterSessionId: requesterSid,
         relayRestartOrchestrator,
@@ -760,8 +756,7 @@ export async function dequeuePendingMessageForWorkerLoop({
     }
     const ensureResult = await supervisor.ensureWorker(requesterSid);
     if (!ensureResult?.ok) {
-      const fallbackRestart = maybeTriggerWorkerFallbackRestart({
-        enabled: false,
+      const fallbackRestart = buildFallbackRestartCompatibilityPayload({
         failureClass: ensureResult?.error || null,
         requesterSessionId: requesterSid,
         relayRestartOrchestrator,
@@ -1083,7 +1078,6 @@ export function registerMessagesRoutes(app, deps) {
   } = deps;
 
   const ttyConsoleActive = runtimeState?.ttyConsoleActive === true;
-  const conversationDraftPersistenceEnabled = featureFlags?.CONVERSATION_DRAFT_PERSISTENCE_ENABLED === true;
 
   function isAbnormalWorkerTelemetry(payload = {}, level = 'log') {
     const normalizedLevel = String(level || 'log').trim().toLowerCase();
@@ -2978,6 +2972,18 @@ export function registerMessagesRoutes(app, deps) {
     const modelResolution = resolveRequestedModel(model);
     if (!modelResolution.ok) return res.status(400).json({ error: modelResolution.error, supportedModels: modelResolution.available || [] });
     const requestedModel = String(modelResolution.model || '').trim();
+    const requestedAutoModel = requestedModel.toLowerCase() === AUTO_MODEL_SENTINEL;
+    if (requestedAutoModel && conversationId && !newConversation) {
+      const messageCount = Number(stmts.getConversationMessageCount?.get?.(conversationId)?.count || 0);
+      const activeQueueCount = Number(stmts.getConversationActiveQueueCount?.get?.(conversationId)?.count || 0);
+      if (messageCount > 0 || activeQueueCount > 0) {
+        return res.status(409).json({
+          error: 'Auto model selection is available only for a new conversation',
+          code: 'AUTO_MODEL_REQUIRES_NEW_CONVERSATION',
+          conversationId,
+        });
+      }
+    }
     const requestedModelVariantId = String(modelResolution.modelVariantId || model || requestedModel).trim();
     const explicitReasoningEffort = String(reasoningEffort || '').trim();
     let reasoningResolution = resolveRequestedReasoningEffort(
@@ -3133,24 +3139,22 @@ export function registerMessagesRoutes(app, deps) {
     );
     linkUploadReferences(convId, msgId, attachments);
     stmts.updateConvTime.run(now, convId);
-    if (conversationDraftPersistenceEnabled) {
-      if (typeof stmts.updateConvDraft?.run === 'function') {
-        stmts.updateConvDraft.run(null, now, sessionId || null, convId);
-      } else {
-        db.prepare(`
-          UPDATE conversations
-          SET draft_text = NULL, draft_updated_at = ?, draft_updated_by_client_id = ?
-          WHERE id = ?
-        `).run(now, sessionId || null, convId);
-      }
-      io.emit('conversation_draft_updated', {
-        conversationId: convId,
-        draftText: '',
-        draftUpdatedAt: now,
-        draftUpdatedByClientId: sessionId || null,
-        senderClientId: sessionId || null,
-      });
+    if (typeof stmts.updateConvDraft?.run === 'function') {
+      stmts.updateConvDraft.run(null, now, sessionId || null, convId);
+    } else {
+      db.prepare(`
+        UPDATE conversations
+        SET draft_text = NULL, draft_updated_at = ?, draft_updated_by_client_id = ?
+        WHERE id = ?
+      `).run(now, sessionId || null, convId);
     }
+    io.emit('conversation_draft_updated', {
+      conversationId: convId,
+      draftText: '',
+      draftUpdatedAt: now,
+      draftUpdatedByClientId: sessionId || null,
+      senderClientId: sessionId || null,
+    });
     const conversationPreferences = persistConversationModeModelPreference(
       convId,
       requestedRelayMode,

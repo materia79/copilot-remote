@@ -1,6 +1,5 @@
 import { extractToolName, parseMaybeJson, toolArgsSnapshot } from "./tool-activity.mjs";
 import {
-  containsRequestedSchema,
   extractRequestedSchema,
   schemaFields,
   validateStructuredAnswer,
@@ -30,10 +29,6 @@ function extractReportIntentText(request) {
     if (text) return text;
   }
   return "";
-}
-
-export function shouldStageTmuxFallback(request) {
-  return !containsRequestedSchema(request);
 }
 
 export function createQuestionRoutingHooks({
@@ -208,15 +203,8 @@ export function createQuestionRoutingHooks({
       dbg("onPreToolUse: detected ask_user tool", `msgId=${activeMsg.id}`, "waiting for onUserInputRequest callback...");
       dbg("onPreToolUse: ask_user request keys=", Object.keys(request || {}).join(","), "toolArgs=", JSON.stringify(request?.toolArgs)?.slice(0, 300), "choices=", JSON.stringify(extractedChoices));
       setLastAskUserBridge(null);
-      if (shouldStageTmuxFallback(request)) {
-        setPendingAskUserRequest?.(request);
-      } else {
-        // Structured requests are exclusively owned by onElicitationRequest.
-        // This also prevents invalid schemas from becoming text fallback cards
-        // before the CLI rejects and retries the tool call.
-        setPendingAskUserRequest?.(null);
-        dbg("onPreToolUse: structured ask_user skips tmux fallback", `msgId=${activeMsg.id}`);
-      }
+      setPendingAskUserRequest?.(null);
+      dbg("onPreToolUse: ask_user fallback staging disabled; waiting for SDK callbacks", `msgId=${activeMsg.id}`);
       await api("POST", "/api/activity", {
         messageId: activeMsg.id,
         conversationId: activeMsg.conversationId,

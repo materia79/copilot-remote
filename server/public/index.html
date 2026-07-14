@@ -1532,6 +1532,7 @@
     border-radius: 12px; height: 46px; padding: 0 12px; font-size: var(--fs-core-control);
     min-width: 140px; outline: none;
   }
+  #context-tier-select { min-width: 70px; width: 70px; }
   #model-select:focus,
   #reasoning-effort-select:focus,
   #context-tier-select:focus { border-color: var(--accent); }
@@ -1547,7 +1548,7 @@
   #mode-select {
     background: var(--bg3); border: 1px solid var(--border); color: var(--text);
     border-radius: 12px; height: 46px; padding: 0 12px; font-size: var(--fs-core-control);
-    min-width: 120px; outline: none;
+    min-width: 70px; width: 70px; outline: none;
   }
   #mode-select:focus { border-color: var(--accent); }
   #send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
@@ -2922,23 +2923,20 @@
     #pending-question-banner { font-size: var(--fs-ui-chip); padding: 3px 8px; }
     .header-icon-btn { width: 30px; height: 30px; border-radius: 8px; font-size: var(--fs-ui-icon); }
     #chat-actions-menu { min-width: 200px; }
-    #input-area { padding: 4px 10px calc(10px + env(safe-area-inset-bottom, 0px)); }
-    .input-row { flex-wrap: wrap; gap: 8px; align-items: stretch; }
+    #input-area { padding: 2px 10px calc(6px + env(safe-area-inset-bottom, 0px)); }
+    .input-row { flex-wrap: wrap; gap: 6px; align-items: stretch; }
     #repo-browser-input-btn,
     #attach-btn {
       display: inline-flex;
       align-items: center;
       justify-content: center;
       width: 40px;
-      height: 40px;
+      height: 36px;
       border-radius: 10px;
       font-size: var(--fs-ui-icon);
       padding: 0;
     }
-    #repo-browser-input-btn {
-      order: -4;
-      flex: 0 0 40px;
-    }
+    #repo-browser-input-btn { order: 3; flex: 0 0 40px; }
     #repo-browser-desktop-btn {
       display: none;
     }
@@ -2947,37 +2945,55 @@
       display: none !important;
     }
     #msg-input {
-      min-width: 0; min-height: 42px; max-height: 40vh; border-radius: 10px;
+      min-width: 0; min-height: 38px; max-height: 40vh; border-radius: 10px;
       padding: 10px 12px; font-size: clamp(1rem, 4.2vw, 1.12rem);
     }
     #send-btn {
-      height: 40px; border-radius: 10px; padding: 10px 14px; font-size: var(--fs-meta-md);
+      height: 36px; border-radius: 10px; padding: 8px 14px; font-size: var(--fs-meta-md);
     }
     #mode-select {
-      order: -3;
-      flex: 1 1 calc(100% - 48px);
-      width: calc(100% - 48px);
+      order: 1;
+      flex: 0 1 30%;
+      width: 30%;
       min-width: 0;
-      height: 40px;
+      height: 36px;
       border-radius: 10px;
       padding: 0 10px;
       font-size: var(--fs-meta-md);
     }
-    #attach-btn {
-      order: -2;
-      flex: 0 0 40px;
+    #model-select {
+      order: 2;
+      flex: 0 1 min(40%, calc(70% - 98px));
+      width: min(40%, calc(70% - 98px));
+      min-width: 0;
+      height: 36px;
+      border-radius: 10px;
+      padding: 0 10px;
+      font-size: var(--fs-meta-md);
     }
-    #model-select,
+    #attach-btn { order: 4; flex: 0 0 40px; }
+    #context-tier-select {
+      order: 5;
+      flex: 0 0 70px;
+      width: 70px;
+      min-width: 0;
+      height: 36px;
+      border-radius: 10px;
+      padding: 0 10px;
+      font-size: var(--fs-meta-md);
+    }
     #reasoning-effort-select {
-      order: -1;
-      flex: 1 1 calc(100% - 48px);
-      width: calc(100% - 48px);
+      order: 6;
+      flex: 1 1 120px;
+      width: auto;
       min-width: 0;
-      height: 40px;
+      height: 36px;
       border-radius: 10px;
       padding: 0 10px;
       font-size: var(--fs-meta-md);
     }
+    #send-btn { order: 7; }
+    #msg-input { order: 8; }
     .relay-question-card { border-radius: 12px; padding: 10px 11px; gap: 8px; }
     .relay-question-choice, .relay-question-submit { padding: 7px 10px; font-size: var(--fs-meta-md); }
     .relay-question-reply textarea { min-height: 60px; padding: 9px 10px; border-radius: 10px; }
@@ -3075,41 +3091,47 @@
     .input-row {
       flex-wrap: wrap;
       align-items: stretch;
-      gap: 8px;
+      gap: 6px;
     }
     #msg-input {
-      order: 7;
+      order: 8;
       flex: 1 1 100%;
       width: 100%;
     }
     #mode-select {
       order: 1;
-      flex: 0 0 calc(100% - 96px);
-      width: calc(100% - 96px);
+      flex: 0 1 30%;
+      width: 30%;
       min-width: 0;
     }
     #repo-browser-input-btn {
-      order: 2;
-      flex: 0 0 40px;
-    }
-    #attach-btn {
       order: 3;
       flex: 0 0 40px;
     }
-    #model-select {
+    #attach-btn {
       order: 4;
-      flex: 1 1 0;
-      width: auto;
+      flex: 0 0 40px;
+    }
+    #model-select {
+      order: 2;
+      flex: 0 1 min(40%, calc(70% - 98px));
+      width: min(40%, calc(70% - 98px));
+      min-width: 0;
+    }
+    #context-tier-select {
+      order: 5;
+      flex: 0 0 70px;
+      width: 70px;
       min-width: 0;
     }
     #reasoning-effort-select {
-      order: 5;
+      order: 6;
       flex: 1 1 0;
       width: auto;
       min-width: 0;
     }
     #send-btn {
-      order: 6;
+      order: 7;
       margin-left: auto;
       flex: 0 0 auto;
     }
@@ -3119,41 +3141,47 @@
     .input-row {
       flex-wrap: wrap;
       align-items: stretch;
-      gap: 8px;
+      gap: 6px;
     }
     #mode-select {
       order: 1;
-      flex: 0 0 104px;
-      width: 104px;
+      flex: 0 1 30%;
+      width: 30%;
       min-width: 0;
     }
     #repo-browser-input-btn {
-      order: 2;
-      flex: 0 0 40px;
-    }
-    #attach-btn {
       order: 3;
       flex: 0 0 40px;
     }
-    #model-select {
+    #attach-btn {
       order: 4;
-      flex: 1 1 0;
-      width: auto;
+      flex: 0 0 40px;
+    }
+    #model-select {
+      order: 2;
+      flex: 0 1 min(40%, calc(70% - 98px));
+      width: min(40%, calc(70% - 98px));
+      min-width: 0;
+    }
+    #context-tier-select {
+      order: 5;
+      flex: 0 0 70px;
+      width: 70px;
       min-width: 0;
     }
     #reasoning-effort-select {
-      order: 5;
+      order: 6;
       flex: 1 1 0;
       width: auto;
       min-width: 0;
     }
     #send-btn {
-      order: 6;
+      order: 7;
       margin-left: auto;
       flex: 0 0 auto;
     }
     #msg-input {
-      order: 7;
+      order: 8;
       flex: 1 1 100%;
       width: 100%;
     }
@@ -3253,11 +3281,8 @@
       <div id="emoji-popup" aria-hidden="true"></div>
       <div class="input-row">
         <input id="image-input" type="file" multiple hidden onchange="handleAttachmentInput(this.files); this.value='';">
-        <button id="attach-btn" onclick="document.getElementById('image-input').click()" title="Attach file">📎</button>
-        <button id="repo-browser-desktop-btn" onclick="openRepoBrowser()" title="Browse files" aria-label="Browse files">📁</button>
         <button id="emoji-btn" onclick="toggleEmojiPicker()" title="Emoji picker (Tip: Win + .)">🙂</button>
         <textarea id="msg-input" placeholder="Message Copilot…" rows="1" onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
-        <button id="repo-browser-input-btn" onclick="openRepoBrowser()" title="Open file explorer" aria-label="Open file explorer">🗂️</button>
         <select id="mode-select" title="Mode">
           <option value="agent" selected>Agent</option>
           <option value="ask">Ask</option>
@@ -3267,11 +3292,14 @@
         <select id="model-select" title="Model">
           <option value="">Loading models…</option>
         </select>
+        <button id="repo-browser-desktop-btn" onclick="openRepoBrowser()" title="Browse files" aria-label="Browse files">📁</button>
+        <button id="repo-browser-input-btn" onclick="openRepoBrowser()" title="Open file explorer" aria-label="Open file explorer">🗂️</button>
+        <button id="attach-btn" onclick="document.getElementById('image-input').click()" title="Attach file">📎</button>
+        <select id="context-tier-select" title="Context window" aria-label="Context window">
+          <option value="default">—</option>
+        </select>
         <select id="reasoning-effort-select" title="Reasoning effort" disabled>
           <option value="">Unavailable</option>
-        </select>
-        <select id="context-tier-select" title="Context window">
-          <option value="default">Context: default</option>
         </select>
         <button id="send-btn" onclick="sendMessage()">Send</button>
       </div>

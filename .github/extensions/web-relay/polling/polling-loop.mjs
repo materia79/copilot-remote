@@ -8,16 +8,6 @@ import { getActiveSession } from "../runtime/session-registry.mjs";
 import { DEFAULT_QUESTION_TIMEOUT_MS } from "../../../../shared/question-timeout.mjs";
 import { QUESTION_TIMEOUT_CONTINUATION_TEXT } from "../../../../shared/question-timeout.mjs";
 import { stripPromptContextPrefix } from "../skills/prompt-context.mjs";
-import {
-  parseQuestionFromText,
-  shouldForceFallbackQuestionBridge,
-} from "./question-text.mjs";
-import { answerCliPromptViaTmux, declineCliPromptViaTmux } from "../utils/tmux-input-bridge.mjs";
-import {
-  containsRequestedSchema,
-  extractRequestedSchema,
-  schemaFields,
-} from "../../../../shared/question-schema.mjs";
 
 function isImageAttachment(att) {
   const type = String(att?.type || "").toLowerCase();
@@ -54,13 +44,6 @@ export function evaluateSwitchRetry({
     shouldRetry: true,
     attempts: safeAttempts + 1,
   };
-}
-
-export function shouldUseTmuxAskUserFallback(request) {
-  // Structured requests are delivered through onElicitationRequest. A malformed
-  // schema must also stay on that path so a CLI validation retry cannot create
-  // an unstructured duplicate question card.
-  return !containsRequestedSchema(request);
 }
 
 function readImageBlobFromDataUrl(att) {
@@ -374,7 +357,6 @@ export function createPollingLoop({
   setPollingLoopStarted,
   getSessionReady,
   getWaitingForAI,
-  getLastAskUserBridge,
   syncActiveSession,
   ensureSessionForConversation,
   setActiveMsg,
@@ -382,14 +364,10 @@ export function createPollingLoop({
   setRelayTurnActive,
   setLastActivityText,
   setLastAskUserBridge,
-  getPendingAskUserRequest,
   setPendingAskUserRequest,
   clearRelayScopeState,
   shouldFetchPending = () => true,
-  extractQuestionPrompt,
-  extractQuestionChoices,
   handleControl,
-  getSessionId = () => null,
 }) {
   let stopRequested = false;
   let lastAbortControlCheckAt = 0;
@@ -402,10 +380,10 @@ export function createPollingLoop({
     return requested;
   };
   const resolveResponseModel = async (message, { finalEvent = null, unknownForAuto = false } = {}) => {
-    const currentModel = String(await getCurrentModelId() || "").trim();
-    if (currentModel) return currentModel;
     const eventModel = String(finalEvent?.data?.model || finalEvent?.data?.modelId || "").trim();
     if (eventModel) return eventModel;
+    const currentModel = String(await getCurrentModelId() || "").trim();
+    if (currentModel) return currentModel;
     const requestedManualModel = requestedManualModelOrNull(message);
     if (requestedManualModel) return requestedManualModel;
     if (unknownForAuto && isAutoRequestedModel(message?.model)) return "unknown";
@@ -445,110 +423,6 @@ export function createPollingLoop({
     }
   }
 
-  async function createFallbackRelayQuestion(message, parsed) {
-    if (!parsed.prompt) return null;
-
-    const created = await api("POST", "/api/relay-question", {
-      queueId: message.id,
-      messageId: message.id,
-      conversationId: message.conversationId,
-      mode: message.relayMode || "agent",
-      prompt: parsed.prompt,
-      choices: parsed.choices,
-      allowFreeform: parsed.choices.length === 0,
-      timeout_ms: sendTimeout,
-        context: {
-          source: "fallback-text-question",
-          rationale: "Auto-converted a plain-text follow-up question into a relay question card.",
-          queueMessageId: message.id,
-          conversationId: message.conversationId,
-          relayMode: message.relayMode || "agent",
-      },
-      request: {
-        source: "polling-loop-fallback",
-      },
-    });
-
-    const questionId = created?.question?.id;
-    if (!questionId) return null;
-    const answer = await waitForRelayQuestionAnswer(questionId, sendTimeout);
-    return {
-      questionId,
-      answer,
-      prompt: parsed.prompt,
-      choices: parsed.choices,
-    };
-  }
-
-  async function continueAfterQuestionAnswer(message, { questionPrompt, choices, answer, assistantText = "", timedOut = false } = {}) {
-    const normalizedChoices = Array.isArray(choices) ? choices : [];
-    const normalizedAnswer = String(answer || "").trim();
-    const lines = [
-      "You are resuming a paused relay turn after asking the user a follow-up question.",
-      `Original user request: ${String(message?.text || "").trim()}`,
-      assistantText ? `Your last assistant reply before the pause: ${String(assistantText || "").trim()}` : "",
-      `Question asked: ${String(questionPrompt || "").trim()}`,
-      normalizedChoices.length
-        ? `Choices shown to the user: ${normalizedChoices.map((choice, idx) => `${idx + 1}. ${String(choice || "").trim()}`).join(" | ")}`
-        : "Choices: (not available)",
-      timedOut
-        ? `No user answer was received before timeout. Treat this as if the user could not respond and continue according to the current relay mode.`
-        : `User's answer: ${normalizedAnswer}`,
-      "Continue the original task using that answer.",
-      "Do not repeat the question and do not turn the answer into a right-or-wrong grading step unless the original request explicitly asked for that.",
-      "Respond with the next assistant message only.",
-    ];
-    const finalEvent = await sendAndWaitWithHardTimeout({ prompt: lines.join("\n") }, sendTimeout);
-    return String(extractFinalText(finalEvent) || "").trim();
-  }
-
-  async function createRelayQuestionFromAskUserRequest(message, request) {
-    const prompt = extractQuestionPrompt(request);
-    const choices = extractQuestionChoices(request);
-    if (!prompt) return null;
-    const activeSession = getActiveSession();
-    const requestedSchema = extractRequestedSchema(request);
-
-    const created = await api("POST", "/api/relay-question", {
-      queueId: message.id,
-      messageId: message.id,
-      conversationId: message.conversationId,
-      mode: message.relayMode || "agent",
-      prompt,
-      choices,
-      allowFreeform: choices.length === 0,
-      requestedSchema: requestedSchema || undefined,
-      sdk_session_id: activeSession?.sdkSessionId || undefined,
-      timeout_ms: sendTimeout,
-      context: {
-        source: "ask-user-autopilot-bridge",
-        rationale: "ask_user called but onUserInputRequest was bypassed (autopilot mode); intercepted via onPreToolUse.",
-        queueMessageId: message.id,
-        conversationId: message.conversationId,
-        relayMode: message.relayMode || "agent",
-      },
-      request: { source: "polling-loop-ask-user-intercept" },
-    });
-
-    const questionId = created?.question?.id;
-    if (!questionId) return null;
-
-    dbg("ask_user autopilot bridge: relay question created", questionId, "for msgId", message.id, "prompt=", prompt, "choices=", String(choices.length));
-    const result = await waitForRelayQuestionAnswer(questionId, sendTimeout);
-    return { questionId, prompt, choices, answer: result.answer, structuredAnswer: result.structuredAnswer || null, timedOut: result.timedOut };
-  }
-
-  async function continueAfterAskUserAnswer(message, request, answer, timedOut = false) {
-    const prompt = extractQuestionPrompt(request);
-    const choices = extractQuestionChoices(request);
-    return continueAfterQuestionAnswer(message, {
-      questionPrompt: prompt,
-      choices,
-      answer,
-      timedOut,
-    });
-  }
-
   async function processPendingSdkSessionDeletes() {
     const status = await api("GET", "/api/status").catch(() => null);
     if (status?.relayPaused) return false;
@@ -582,61 +456,6 @@ export function createPollingLoop({
       sdk_session_id: sdkSessionId,
       conversation_id: request?.conversationId || undefined,
       ok,
-      error: ok ? undefined : errorText,
-    }).catch(() => {});
-
-    return true;
-  }
-
-  async function processPendingSdkHistoryFetches() {
-    const status = await api("GET", "/api/status").catch(() => null);
-    if (status?.relayPaused) return false;
-    const pending = await api("GET", "/api/sdk-history-fetch/pending").catch(() => null);
-    const request = pending?.request || null;
-    const sdkSessionId = String(request?.sdkSessionId || "").trim();
-    if (!sdkSessionId) return false;
-
-    let ok = false;
-    let errorText = "";
-    let events = [];
-    try {
-      const conversationId = String(request?.conversationId || "").trim();
-      if (conversationId && typeof ensureSessionForConversation === "function") {
-        const ensured = await ensureSessionForConversation(conversationId, "sdk-history-fetch");
-        if (!ensured?.ok) {
-          throw new Error(ensured?.message || ensured?.reason || "session-ensure-failed");
-        }
-      }
-
-      if (!session || typeof session.getEvents !== "function") {
-        throw new Error("SDK getEvents() is unavailable in this CLI runtime");
-      }
-      const rawEvents = await session.getEvents();
-      const normalizedEvents = Array.isArray(rawEvents)
-        ? rawEvents
-        : (Array.isArray(rawEvents?.events) ? rawEvents.events : []);
-      events = normalizedEvents;
-      ok = true;
-      await session.log(
-        `🧾 Fetched ${normalizedEvents.length} SDK event(s) for ${sdkSessionId.slice(0, 8)}`,
-        { ephemeral: true },
-      );
-    } catch (error) {
-      ok = false;
-      errorText = String(error?.message || error || "unknown sdk history fetch failure").trim()
-        || "unknown sdk history fetch failure";
-      dbg("sdk history fetch failed", `session=${sdkSessionId}`, errorText);
-      await session?.log?.(
-        `⚠️ SDK history fetch failed (${sdkSessionId.slice(0, 8)}): ${errorText}`,
-        { level: "warn" },
-      );
-    }
-
-    await api("POST", "/api/sdk-history-fetch/result", {
-      sdk_session_id: sdkSessionId,
-      conversation_id: request?.conversationId || undefined,
-      ok,
-      events: ok ? events : undefined,
       error: ok ? undefined : errorText,
     }).catch(() => {});
 
@@ -850,7 +669,7 @@ export function createPollingLoop({
           messageId: message.id,
           conversationId: message.conversationId,
           mode: message.relayMode || "agent",
-          text: "Model selected: requested=auto active=auto via=sdk-auto",
+          text: "Model selection: Auto routing is active for this new SDK session",
         }).catch(() => {});
       }
 
@@ -924,7 +743,6 @@ export function createPollingLoop({
       };
       const sendWithoutStreaming = async (sendPayload) => {
         const turnPromise = Promise.resolve().then(() => sendAndWaitWithHardTimeout(sendPayload, sendTimeout));
-        let tmuxBridgeAttempted = false;
         while (true) {
           const outcome = await Promise.race([
             turnPromise.then((value) => ({ done: true, value })),
@@ -932,92 +750,6 @@ export function createPollingLoop({
           ]);
           if (outcome.done) return outcome.value;
           await inspectActiveWorkerLiveness();
-
-          // Check for pending ask_user that wasn't handled by onUserInputRequest
-          // This happens on Linux where the CLI shows its terminal prompt instead
-          const pendingReq = !tmuxBridgeAttempted ? getPendingAskUserRequest?.() : null;
-          if (pendingReq && !getLastAskUserBridge?.()) {
-            if (!shouldUseTmuxAskUserFallback(pendingReq)) {
-              dbg("ask_user tmux bridge: structured request skipped; waiting for elicitation callback", `msgId=${message.id}`);
-              setPendingAskUserRequest?.(null);
-              continue;
-            }
-            const sessionId = getSessionId?.();
-            if (sessionId) {
-              tmuxBridgeAttempted = true;
-              dbg("ask_user tmux bridge: detected pending request while sendAndWait blocked", `sessionId=${sessionId}`, `msgId=${message.id}`);
-              dbg("ask_user tmux bridge: pendingReq keys=", Object.keys(pendingReq || {}).join(","), "toolArgs=", JSON.stringify(pendingReq?.toolArgs)?.slice(0, 300));
-              try {
-                // Create relay question for web UI
-                const prompt = extractQuestionPrompt?.(pendingReq) || "Clarification needed";
-                const choices = extractQuestionChoices?.(pendingReq) || [];
-                const requestedSchema = extractRequestedSchema(pendingReq);
-                const fields = requestedSchema ? schemaFields(requestedSchema) : [];
-                dbg("ask_user tmux bridge: extracted prompt=", prompt?.slice(0, 100), "choices=", JSON.stringify(choices), "fields=", String(fields.length));
-                const created = await api("POST", "/api/relay-question", {
-                  queueId: message.id,
-                  messageId: message.id,
-                  conversationId: message.conversationId,
-                  mode: message.relayMode || "agent",
-                  prompt,
-                  choices,
-                  allowFreeform: true,
-                  requestedSchema: requestedSchema || undefined,
-                  timeout_ms: sendTimeout,
-                  context: {
-                    source: "tmux-bridge",
-                    rationale: "CLI showed terminal prompt instead of using SDK callback; bridging via tmux.",
-                    queueMessageId: message.id,
-                  },
-                });
-                const questionId = created?.question?.id;
-                if (questionId) {
-                  dbg("ask_user tmux bridge: question created", `questionId=${questionId}`, `msgId=${message.id}`);
-                  await api("POST", "/api/activity", {
-                    messageId: message.id,
-                    conversationId: message.conversationId,
-                    mode: message.relayMode || "agent",
-                    text: "Tool (ask_user): question posted via tmux bridge; waiting for web answer",
-                  }).catch(() => {});
-
-                  // Wait for answer from web UI
-                  const { answer, structuredAnswer, timedOut } = await waitForRelayQuestionAnswer(questionId, sendTimeout);
-                  dbg("ask_user tmux bridge: got answer", `questionId=${questionId}`, `answer="${String(answer || "").slice(0, 50)}"`, `timedOut=${timedOut}`);
-
-                  if (!timedOut && (answer || structuredAnswer)) {
-                    // Send answer to CLI via tmux
-                    const wasFreeform = !choices.some((c) => String(c || "").trim().toLowerCase() === String(answer || "").trim().toLowerCase());
-                    const sent = await answerCliPromptViaTmux({
-                      sessionName: sessionId,
-                      answer,
-                      choices,
-                      wasFreeform,
-                      structuredAnswer: structuredAnswer || null,
-                      fields: fields.length ? fields : null,
-                      dbg,
-                    });
-                    if (sent) {
-                      dbg("ask_user tmux bridge: answer sent to terminal", `sessionId=${sessionId}`);
-                      setLastAskUserBridge?.({ source: "tmux-bridge", at: Date.now(), messageId: message.id });
-                      await api("POST", "/api/activity", {
-                        messageId: message.id,
-                        conversationId: message.conversationId,
-                        mode: message.relayMode || "agent",
-                        text: `Tool (ask_user): user answered "${String(answer || "").slice(0, 60)}" (via tmux bridge)`,
-                      }).catch(() => {});
-                    }
-                  } else if (timedOut) {
-                    // Send Ctrl+D to decline the prompt
-                    dbg("ask_user tmux bridge: timeout, sending Ctrl+D to decline");
-                    await declineCliPromptViaTmux(sessionId, dbg).catch(() => {});
-                  }
-                  setPendingAskUserRequest?.(null);
-                }
-              } catch (bridgeErr) {
-                dbg("ask_user tmux bridge failed", `msgId=${message.id}`, bridgeErr?.message || String(bridgeErr));
-              }
-            }
-          }
         }
       };
       try {
@@ -1039,8 +771,6 @@ export function createPollingLoop({
 
       const text = stripPromptContextPrefix(extractFinalText(finalEvent), message, "", prompt);
       const model = await resolveResponseModel(message, { finalEvent, unknownForAuto: true });
-      const bridgedViaAskUser = !!getLastAskUserBridge?.();
-      const pendingAskUserReq = !bridgedViaAskUser ? getPendingAskUserRequest?.() : null;
       const boardPayload = buildPlanReadyBoardPayload({
         finalEvent,
         message,
@@ -1051,88 +781,6 @@ export function createPollingLoop({
           await api("POST", "/api/relay-board", boardPayload);
         } catch (boardError) {
           dbg("plan board publish failed", `msgId=${message.id}`, boardError?.message || String(boardError));
-        }
-      }
-
-      if (!bridgedViaAskUser && pendingAskUserReq) {
-        dbg("ask_user safety-net bridge triggered — onUserInputRequest was not called for msgId", message.id, "(unexpected; should fire via SDK handler now)");
-        try {
-          const bridged = await createRelayQuestionFromAskUserRequest(message, pendingAskUserReq);
-          if (bridged?.questionId) {
-            let resumedText = "";
-            try {
-              resumedText = await continueAfterAskUserAnswer(message, pendingAskUserReq, bridged.answer, bridged.timedOut);
-            } catch (evaluateErr) {
-              dbg("ask_user autopilot resume failed", `msgId=${message.id}`, evaluateErr?.message || String(evaluateErr));
-            }
-            await api("POST", "/api/response", {
-              messageId: message.id,
-              conversationId: message.conversationId,
-              text: resumedText || (
-                bridged.timedOut
-                  ? "The user did not respond before timeout. I continued with the current relay mode."
-                  : `Thanks — I received your answer: "${bridged.answer}". I hit a problem while resuming the turn from it.`
-              ),
-              model,
-              modelOrigin: isAutoRequestedModel(message?.model) ? "auto" : "manual",
-            });
-            await session.log("✅ ask_user safety-net bridge: relay question card shown, answer received, turn resumed", { ephemeral: true });
-            return true;
-          }
-        } catch (bridgeErr) {
-          dbg("ask_user safety-net bridge failed", `msgId=${message.id}`, bridgeErr?.message || String(bridgeErr));
-          await api("POST", "/api/activity", {
-            messageId: message.id,
-            conversationId: message.conversationId,
-            mode: message.relayMode || "agent",
-            text: `ask_user safety-net bridge failed (${bridgeErr?.message || "unknown error"}). Falling through to normal response.`,
-          }).catch(() => {});
-        }
-      }
-
-      const fallbackBridgeCheck = !bridgedViaAskUser && !pendingAskUserReq && !!text
-        ? shouldForceFallbackQuestionBridge(text)
-        : { shouldForce: false, parsed: null };
-      const shouldForceQuestionBridge = fallbackBridgeCheck.shouldForce;
-
-      if (shouldForceQuestionBridge) {
-        try {
-          const bridged = await createFallbackRelayQuestion(message, fallbackBridgeCheck.parsed);
-          if (bridged?.questionId) {
-            let resumedText = "";
-            try {
-              resumedText = await continueAfterQuestionAnswer(message, {
-                questionPrompt: bridged.prompt,
-                choices: bridged.choices,
-                answer: bridged.answer,
-                timedOut: bridged.timedOut,
-                assistantText: text,
-              });
-            } catch (evaluateErr) {
-              dbg("fallback question resume failed", `msgId=${message.id}`, evaluateErr?.message || String(evaluateErr));
-            }
-            await api("POST", "/api/response", {
-              messageId: message.id,
-              conversationId: message.conversationId,
-              text: resumedText || (
-                bridged.timedOut
-                  ? "The user did not respond before timeout. I continued with the current relay mode."
-                  : `Thanks — I received your answer: "${bridged.answer}". I hit a problem while resuming the turn from it.`
-              ),
-              model,
-              modelOrigin: isAutoRequestedModel(message?.model) ? "auto" : "manual",
-            });
-            await session.log("✅ Converted plain-text question into relay bridge card and resumed the turn", { ephemeral: true });
-            return true;
-          }
-        } catch (bridgeErr) {
-          dbg("fallback question bridge failed", `msgId=${message.id}`, bridgeErr?.message || String(bridgeErr));
-          await api("POST", "/api/activity", {
-            messageId: message.id,
-            conversationId: message.conversationId,
-            mode: message.relayMode || "agent",
-            text: `Question bridge fallback failed (${bridgeErr?.message || "unknown error"}).`,
-          }).catch(() => {});
         }
       }
 
@@ -1240,7 +888,6 @@ export function createPollingLoop({
         // Keep SDK-session-delete maintenance best-effort only; never starve
         // user turn dequeue when delete requests are backlogged/retrying.
         await processPendingSdkSessionDeletes();
-        await processPendingSdkHistoryFetches();
         if (!shouldFetchPending()) return;
 
         const pending = await api("GET", "/api/pending");

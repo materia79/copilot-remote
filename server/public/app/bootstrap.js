@@ -88,7 +88,6 @@ import {
   getConversationLoadedMessageCount,
   loadOlderConversationMessages,
   syncComposerControlState,
-  setConversationDraftPersistenceEnabled,
   flushConversationDraft,
   initConversationHistoryLazyLoading,
   initBubbleActionHandlers,
@@ -779,6 +778,30 @@ function syncModelMetadataBlocker(message = '') {
   window.syncComposerControlState?.();
 }
 
+function currentConversationHasMessages() {
+  const conversation = currentConvId ? conversations[currentConvId] : null;
+  return Number(conversation?.messageCount || 0) > 0;
+}
+
+function syncAutoModelAvailability() {
+  const select = document.getElementById('model-select');
+  if (!select) return;
+  const autoOption = Array.from(select.options).find((option) => option.value.toLowerCase() === AUTO_MODEL_OPTION);
+  if (!autoOption) return;
+  const locked = currentConversationHasMessages();
+  autoOption.disabled = locked;
+  autoOption.title = locked ? 'Auto is available only for a new conversation' : '';
+  if (locked && select.value.toLowerCase() === AUTO_MODEL_OPTION) {
+    const fallback = [
+      modelCatalogState.currentModel,
+      modelCatalogState.defaultModel,
+      ...modelCatalogState.models,
+    ].find((modelId) => String(modelId || '').trim().toLowerCase() !== AUTO_MODEL_OPTION
+      && Array.from(select.options).some((option) => option.value === modelId));
+    if (fallback) select.value = fallback;
+  }
+}
+
 function applyModelMetadataHardFail(message = '') {
   modelMetadataBlocked = true;
   syncModelMetadataBlocker(message);
@@ -978,6 +1001,7 @@ function updateModelCatalogState(payload) {
   }
 
   syncModelMetadataBlocker();
+  syncAutoModelAvailability();
 }
 
 function selectedModelValue() {
@@ -998,13 +1022,13 @@ function updateContextTierSelector(modelId) {
   const defaultOption = document.createElement('option');
   defaultOption.value = 'default';
   defaultOption.textContent = Number.isFinite(defaultLimit) && defaultLimit > 0
-    ? `Context: default (${Math.round(defaultLimit / 1000)}K)`
-    : 'Context: default';
+    ? `${Math.round(defaultLimit / 1000)}K`
+    : '—';
   select.appendChild(defaultOption);
   if (Number.isFinite(longLimit) && longLimit > 0) {
     const longOption = document.createElement('option');
     longOption.value = 'long_context';
-    longOption.textContent = `Context: long (${Math.round(longLimit / 1000)}K)`;
+    longOption.textContent = `${Math.round(longLimit / 1000)}K`;
     select.appendChild(longOption);
   }
   select.value = current === 'long_context' && select.querySelector('option[value="long_context"]')
@@ -1131,6 +1155,7 @@ function applyConversationPreferences({
   suppressConversationPreferenceSync = true;
   modeSelect.value = selection.mode;
   if (selection.model) modelSelect.value = selection.model;
+  syncAutoModelAvailability();
   const modeReasoning = String(activeConversationPreferredReasoningByMode?.[selection.mode] || '').trim().toLowerCase();
   updateReasoningSelectorForModel(selection.model || modelSelect.value, modeReasoning);
   suppressConversationPreferenceSync = false;
@@ -1172,6 +1197,11 @@ function initModelSelector() {
     select.dataset.bound = '1';
     select.addEventListener('change', () => {
       if (suppressConversationPreferenceSync) return;
+      if (currentConversationHasMessages() && select.value.toLowerCase() === AUTO_MODEL_OPTION) {
+        syncAutoModelAvailability();
+        setModelBanner('⚠️ Auto model selection is available only for a new conversation.');
+        return;
+      }
       const mode = String(document.getElementById('mode-select')?.value || '').trim();
       activeConversationPreferredModelsByMode = withUpdatedModelPreference({
         preferredModelsByMode: activeConversationPreferredModelsByMode,
@@ -1747,7 +1777,6 @@ async function refreshSessionWorkerStatus() {
   const previousWorkerStatus = String(previousWorkerState?.status || '').trim().toLowerCase();
   const status = await refreshWorkspaceRootHints();
   if (!status) return;
-  setConversationDraftPersistenceEnabled(status?.features?.CONVERSATION_DRAFT_PERSISTENCE_ENABLED === true);
   syncQueueStatusMenuEntry(status);
   if (setSessionWorkerStatesFromStatusPayload(status.sessionWorker)) {
     renderConvList();
@@ -2629,6 +2658,7 @@ window.confirmChangeCwdAndLaunch = confirmChangeCwdAndLaunch;
 window.showContext = showContext;
 window.promptInstallApp = promptInstallApp;
 window.toggleFullscreen = toggleFullscreen;
+window.syncAutoModelAvailability = syncAutoModelAvailability;
 window.openRepoBrowser = openRepoBrowser;
 window.closeRepoBrowser = closeRepoBrowser;
 window.loadRepoBrowserTree = loadRepoBrowserTree;

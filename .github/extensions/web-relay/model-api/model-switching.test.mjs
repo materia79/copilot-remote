@@ -79,3 +79,24 @@ test('createModelSwitchingService prefers models.list metadata over fallback ses
     },
   ]);
 });
+
+test('createModelSwitchingService does not treat Auto as an SDK model switch target', async () => {
+  const service = createModelSwitchingService({
+    api: async () => ({}),
+    dbg: () => {},
+    getSession: () => ({
+      rpc: { model: { getCurrent: async () => ({ modelId: 'gpt-5.6-luna' }) } },
+    }),
+  });
+
+  assert.deepEqual(
+    await service.setModelForMessage('auto'),
+    {
+      requested: 'auto',
+      current: 'gpt-5.6-luna',
+      switched: false,
+      requiresSessionBoundary: true,
+      error: 'Auto model selection is only available when a new SDK session is created',
+    },
+  );
+});

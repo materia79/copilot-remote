@@ -142,40 +142,6 @@ test('clearRetrievableHistory removes only retrievable tables', () => {
   assert.equal(Number(db.prepare(`SELECT COUNT(*) AS cnt FROM queue WHERE conversation_id = 'conv-1'`).get()?.cnt || 0), 1);
 });
 
-test('ensureConversationForRefresh bootstraps discovered-only session', () => {
-  const db = makeDb();
-  const stmts = makeStmts(db);
-  const service = createSessionHistoryRefreshService({
-    db,
-    stmts,
-    discoverSessionStateConversations: () => ([
-      { sdkSessionId: 'conv-2', title: 'Discovered Session' },
-    ]),
-  });
-  const result = service.ensureConversationForRefresh('conv-2');
-  assert.equal(result.ok, true);
-  assert.equal(result.created, true);
-  assert.equal(result.conversation.id, 'conv-2');
-  assert.equal(result.conversation.sdk_session_id, 'conv-2');
-});
-
-test('ensureConversationForRefresh rejects discovered tombstoned session', () => {
-  const db = makeDb();
-  const stmts = makeStmts(db);
-  const service = createSessionHistoryRefreshService({
-    db,
-    stmts,
-    discoverSessionStateConversations: () => ([
-      { sdkSessionId: 'conv-deleted', title: 'Deleted Session' },
-    ]),
-    isDeletedSdkSession: (sdkSessionId) => String(sdkSessionId || '').trim() === 'conv-deleted',
-  });
-  const result = service.ensureConversationForRefresh('conv-deleted');
-  assert.equal(result.ok, false);
-  assert.equal(result.statusCode, 404);
-  assert.equal(result.error, 'Conversation not found');
-});
-
 test('evaluateRefreshIdleState rejects busy queue and in-flight processing', () => {
   const db = makeDb();
   const stmts = makeStmts(db);
@@ -306,6 +272,32 @@ test('replaceRetrievableHistory swaps messages atomically', () => {
     text: 'retained structure',
     response_message_id: 'new-a',
   });
+});
+
+test('replaceRetrievableHistory rolls back when inserting a malformed snapshot fails', () => {
+  const db = makeDb();
+  const stmts = makeStmts(db);
+  db.prepare(`INSERT INTO conversations (id, title, sdk_session_id, created_at, updated_at) VALUES ('conv-atomic', 'Atomic', 'conv-atomic', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`).run();
+  db.prepare(`INSERT INTO messages (id, conversation_id, role, text, timestamp) VALUES ('old-atomic', 'conv-atomic', 'user', 'old text', '2026-01-01T00:00:01Z')`).run();
+  db.prepare(`
+    INSERT INTO relay_activity (queue_message_id, response_message_id, conversation_id, relay_mode, text, created_at)
+    VALUES ('q-atomic', 'old-atomic', 'conv-atomic', 'agent', 'old activity', '2026-01-01T00:00:01Z')
+  `).run();
+  const service = createSessionHistoryRefreshService({ db, stmts });
+
+  assert.throws(() => service.replaceRetrievableHistory('conv-atomic', [
+    { id: 'duplicate', role: 'user', text: 'first', timestamp: '2026-01-01T00:00:02Z' },
+    { id: 'duplicate', role: 'assistant', text: 'second', timestamp: '2026-01-01T00:00:03Z' },
+  ]));
+
+  assert.deepEqual(
+    db.prepare(`SELECT id, text FROM messages WHERE conversation_id = 'conv-atomic'`).all(),
+    [{ id: 'old-atomic', text: 'old text' }],
+  );
+  assert.deepEqual(
+    db.prepare(`SELECT text FROM relay_activity WHERE conversation_id = 'conv-atomic'`).all(),
+    [{ text: 'old activity' }],
+  );
 });
 
 test('countRetrievableMessages reports stored message count', () => {

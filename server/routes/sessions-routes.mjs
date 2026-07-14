@@ -6,7 +6,6 @@ import { fileURLToPath } from 'url';
 import { randomUUID } from 'crypto';
 import { spawn } from 'child_process';
 import { createSdkSessionSyncService } from '../services/sdk-session-sync-service.mjs';
-import { createSessionHistoryRefreshService } from '../services/session-history-refresh-service.mjs';
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 import { persistConversationPreferences } from '../services/conversation-preferences-service.mjs';
 import { mapUsageSnapshotRow } from '../services/usage-snapshot-helpers.mjs';
@@ -1235,10 +1234,8 @@ export function registerSessionsRoutes(app, deps) {
     touchCli,
     markCliOffline,
     fetchUsageSummary,
-    discoverSessionStateConversations,
-    readSessionTranscriptMessages,
-    readSessionUsageSummary,
-    parseSessionEventsToMessages,
+    sessionHistoryRefreshService,
+    sdkSessionImportService,
     ensureRuntimeSessionBinding,
     bootstrapRuntimeSessionBindings,
     configuredConversationSessionMode,
@@ -1261,14 +1258,10 @@ export function registerSessionsRoutes(app, deps) {
     isSha256,
     uploadPathForSha,
   } = deps;
-  const conversationDraftPersistenceEnabled = featureFlags?.CONVERSATION_DRAFT_PERSISTENCE_ENABLED === true;
   const sdkSessionSyncService = createSdkSessionSyncService(db);
   const SDK_DELETE_WAIT_TIMEOUT_MS = 12_000;
   const SDK_DELETE_POLL_MS = 200;
   const SDK_DELETE_STALE_PROCESSING_MS = 60_000;
-  const SDK_HISTORY_FETCH_WAIT_TIMEOUT_MS = 12_000;
-  const SDK_HISTORY_FETCH_POLL_MS = 200;
-  const SDK_HISTORY_FETCH_STALE_PROCESSING_MS = 60_000;
   const markConversationDeleted = db.prepare(`UPDATE conversations SET status = 'deleted', updated_at = ? WHERE id = ?`);
   const listSessionWorkerQueueRows = db.prepare(`
     SELECT id, conversation_id, runtime_session_id, owner_sdk_session_id, status
@@ -1319,14 +1312,6 @@ export function registerSessionsRoutes(app, deps) {
     db.prepare(`DELETE FROM messages WHERE conversation_id = ?`).run(conversationId);
     db.prepare(`DELETE FROM runtime_sessions WHERE conversation_id = ?`).run(conversationId);
     db.prepare(`DELETE FROM conversations WHERE id = ?`).run(conversationId);
-  });
-  const sessionHistoryRefreshService = createSessionHistoryRefreshService({
-    db,
-    stmts,
-    parseSessionEventsToMessages,
-    discoverSessionStateConversations,
-    inFlightStateForConversation,
-    isDeletedSdkSession: (sdkSessionId) => !!stmts.getDeletedSdkSession.get(String(sdkSessionId || '').trim()),
   });
   const SHARED_PRESENCE_RATE_WINDOW_MS = 10_000;
   const SHARED_PRESENCE_RATE_LIMIT = 24;
@@ -1432,15 +1417,6 @@ export function registerSessionsRoutes(app, deps) {
     return true;
   }
 
-  function enqueueSdkHistoryFetchRequest(sdkSessionId, conversationId = null) {
-    const sid = String(sdkSessionId || '').trim();
-    if (!sid) return false;
-    const nowIso = new Date().toISOString();
-    const convId = String(conversationId || '').trim() || null;
-    stmts.upsertSdkHistoryFetchRequest.run(sid, convId, nowIso, nowIso);
-    return true;
-  }
-
   async function waitForSdkDeleteCompletion(sdkSessionId, timeoutMs = SDK_DELETE_WAIT_TIMEOUT_MS) {
     const sid = String(sdkSessionId || '').trim();
     if (!sid) return { completed: false };
@@ -1451,45 +1427,6 @@ export function registerSessionsRoutes(app, deps) {
       await sleep(SDK_DELETE_POLL_MS);
     }
     return { completed: false };
-  }
-
-  async function waitForSdkHistoryFetchCompletion(sdkSessionId, timeoutMs = SDK_HISTORY_FETCH_WAIT_TIMEOUT_MS) {
-    const sid = String(sdkSessionId || '').trim();
-    if (!sid) return { completed: false, events: null, error: 'missing-session-id' };
-    const startedAt = Date.now();
-    while ((Date.now() - startedAt) < timeoutMs) {
-      const row = stmts.getSdkHistoryFetchRequestBySessionId.get(sid);
-      if (!row) return { completed: false, events: null, error: 'request-missing' };
-      const status = String(row?.status || '').trim().toLowerCase();
-      if (status === 'completed') {
-        let events = null;
-        const raw = String(row?.result_json || '').trim();
-        if (raw) {
-          try {
-            const parsed = JSON.parse(raw);
-            events = Array.isArray(parsed)
-              ? parsed
-              : (Array.isArray(parsed?.events) ? parsed.events : null);
-          } catch (error) {
-            return {
-              completed: false,
-              events: null,
-              error: `invalid-result-json: ${error?.message || 'parse-failed'}`,
-            };
-          }
-        }
-        return { completed: true, events, error: null };
-      }
-      if (status === 'failed') {
-        return {
-          completed: false,
-          events: null,
-          error: String(row?.last_error || '').trim() || 'history-fetch-failed',
-        };
-      }
-      await sleep(SDK_HISTORY_FETCH_POLL_MS);
-    }
-    return { completed: false, events: null, error: 'timeout' };
   }
 
   function finalizeDeletedConversationsForSdkSession(sdkSessionId) {
@@ -1580,24 +1517,12 @@ export function registerSessionsRoutes(app, deps) {
   } = {}) {
     const resolvedConversationId = String(conv?.id || '').trim();
     if (!resolvedConversationId) return null;
-    const discoveredSessionState = (() => {
-      const sdkSessionId = String(conv.sdk_session_id || '').trim();
-      if (!sdkSessionId) return null;
-      const discovered = discoverSessionStateConversations(400);
-      return discovered.find((item) => String(item?.sdkSessionId || '').trim() === sdkSessionId) || null;
-    })();
-    const discoveredTitle = String(discoveredSessionState?.title || '').trim() || null;
     const resolvedTitle = resolveConversationTitle({
       title: conv.title,
       titleSource: conv.title_source,
-      discoveredTitle,
     });
     const inFlight = inFlightStateForConversation(resolvedConversationId);
     const sdkSessionId = String(conv.sdk_session_id || resolvedConversationId || '').trim();
-    const transcriptMessages = readSessionTranscriptMessages(
-      sdkSessionId,
-      { limit: Number.POSITIVE_INFINITY },
-    );
     const dbMessages = stmts.getMessages.all(resolvedConversationId);
     const queueRows = db.prepare(`
       SELECT id, response_message_id, text, timestamp, retry_count, reasoning_effort, model
@@ -1632,7 +1557,7 @@ export function registerSessionsRoutes(app, deps) {
           .filter(Boolean)
           .map((attachment) => rewriteSharedAttachmentContentUrl(attachment, shareToken)),
       })),
-      transcriptMessages,
+      transcriptMessages: [],
       relayActivitiesByMessageId,
       relayThoughtsByMessageId,
       responseMessageToSourceId,
@@ -1690,23 +1615,6 @@ export function registerSessionsRoutes(app, deps) {
   function resolveSessionUsageSummaryForSdkSession({ sdkSessionId, conversationId } = {}) {
     const sid = String(sdkSessionId || '').trim();
     const convId = String(conversationId || '').trim();
-    const summary = (sid && typeof readSessionUsageSummary === 'function')
-      ? readSessionUsageSummary(sid)
-      : null;
-    if (summary && typeof summary === 'object') {
-      const aicUsed = Number(summary.aicUsed);
-      const totalPremiumRequests = Number(summary.totalPremiumRequests);
-      return {
-        shutdownAt: summary.shutdownAt || null,
-        aicUsed: Number.isFinite(aicUsed) ? aicUsed : null,
-        totalPremiumRequests: Number.isFinite(totalPremiumRequests) ? totalPremiumRequests : null,
-        totalNanoAiu: Number.isFinite(Number(summary.totalNanoAiu)) ? Number(summary.totalNanoAiu) : null,
-        totalApiDurationMs: Number.isFinite(Number(summary.totalApiDurationMs)) ? Number(summary.totalApiDurationMs) : null,
-        requestCount: Number.isFinite(Number(summary.requestCount)) ? Number(summary.requestCount) : null,
-        source: 'session-shutdown',
-        estimated: false,
-      };
-    }
     if (!convId) return null;
     const aggregate = getConversationUsageSnapshotAggregate.get(convId) || null;
     const snapshotCount = Number(aggregate?.snapshot_count || 0);
@@ -1747,15 +1655,6 @@ export function registerSessionsRoutes(app, deps) {
 
   // GET /api/conversations — list all conversations
   app.get('/api/conversations', auth, (req, res) => {
-    const resolveMessageCount = (sdkSessionId, currentCount) => {
-      const numeric = Number(currentCount || 0);
-      if (numeric > 0) return numeric;
-      const sid = String(sdkSessionId || '').trim();
-      if (!sid) return 0;
-      const transcript = readSessionTranscriptMessages(sid, { limit: 2000 });
-      return Array.isArray(transcript) ? transcript.length : 0;
-    };
-
     const includeArchived = String(req.query.archived || '').trim().toLowerCase() === 'true';
     const limit = normalizeConversationListLimit(req.query.limit, DEFAULT_CONVERSATION_LIST_LIMIT);
     const beforeConversationId = String(req.query.beforeConversationId || '').trim();
@@ -1766,22 +1665,13 @@ export function registerSessionsRoutes(app, deps) {
       beforeConversationId,
       beforeUpdatedAt,
     });
-    const includeDiscoveryOverlay = !beforeConversationId && !beforeUpdatedAt;
-    const discovered = discoverSessionStateConversations(200);
-    const discoveredBySdkSessionId = new Map(
-      discovered
-        .map((item) => [String(item?.sdkSessionId || '').trim(), item])
-        .filter(([sid]) => !!sid),
-    );
     const conversations = page.rows.map((r) => {
       const sid = String(r.sdk_session_id || '').trim();
-      const discoveredItem = sid ? discoveredBySdkSessionId.get(sid) : null;
-      const discoveredTitle = String(discoveredItem?.title || '').trim();
       const workspaceState = typeof resolveConversationWorkspaceState === 'function'
         ? resolveConversationWorkspaceState({
           conversationId: r.id,
           sdkSessionId: sid,
-          discoveredWorkspaceRootPath: discoveredItem?.workspaceRootPath || '',
+          discoveredWorkspaceRootPath: '',
         })
         : null;
       const preferences = resolveConversationPreferences(r, {
@@ -1791,11 +1681,7 @@ export function registerSessionsRoutes(app, deps) {
       return {
         id:           r.id,
         sdkSessionId: sid || null,
-        title:        resolveConversationTitle({
-          title: r.title,
-          titleSource: r.title_source,
-          discoveredTitle,
-        }),
+        title:        resolveConversationTitle({ title: r.title, titleSource: r.title_source }),
         archived:     Number(r.archived || 0) === 1,
         compactedInto: r.compacted_into || null,
         compactedFrom: r.compacted_from || null,
@@ -1811,90 +1697,19 @@ export function registerSessionsRoutes(app, deps) {
         currentWorkspaceRootName: workspaceState?.currentWorkspaceRootName || null,
         createdAt:    normalizeConversationTimestampIso(r.created_at, r.created_at),
         updatedAt:    normalizeConversationTimestampIso(r.updated_at, r.updated_at),
-        messageCount: resolveMessageCount(r.sdk_session_id, r.message_count),
+        messageCount: Number(r.message_count || 0),
         preferredRelayMode: preferences.preferredRelayMode,
         preferredModelsByMode: preferences.preferredModelsByMode,
-        draftText: conversationDraftPersistenceEnabled ? String(r.draft_text || '') : '',
-        draftUpdatedAt: conversationDraftPersistenceEnabled ? (r.draft_updated_at || null) : null,
-        draftUpdatedByClientId: conversationDraftPersistenceEnabled ? (r.draft_updated_by_client_id || null) : null,
+        draftText: String(r.draft_text || ''),
+        draftUpdatedAt: r.draft_updated_at || null,
+        draftUpdatedByClientId: r.draft_updated_by_client_id || null,
       };
     });
 
-    const knownById = new Set(conversations.map((c) => String(c.id || '').trim()).filter(Boolean));
-    const knownBySdkSessionId = new Set(conversations.map((c) => String(c.sdkSessionId || '').trim()).filter(Boolean));
-    const deletedSdkSessions = new Set(
-      stmts.listDeletedSdkSessions
-        .all()
-        .map((row) => String(row?.sdk_session_id || '').trim())
-        .filter(Boolean),
-    );
-    const knownConversationIds = new Set(
-      rows
-        .map((row) => String(row?.id || '').trim())
-        .filter(Boolean),
-    );
-
-    if (includeDiscoveryOverlay) {
-      for (const item of discovered) {
-        const sdkSessionId = String(item?.sdkSessionId || '').trim();
-        if (!sdkSessionId) continue;
-        if (deletedSdkSessions.has(sdkSessionId)) continue;
-        if (knownBySdkSessionId.has(sdkSessionId) || knownById.has(sdkSessionId)) continue;
-
-        const runtimeSession = stmts.getRuntimeSessionBySdkSessionId.get(sdkSessionId) || null;
-        const updatedAt = normalizeConversationTimestampIso(item?.updatedAt, null) || new Date().toISOString();
-        const workspaceState = typeof resolveConversationWorkspaceState === 'function'
-          ? resolveConversationWorkspaceState({
-            conversationId: sdkSessionId,
-            sdkSessionId,
-            discoveredWorkspaceRootPath: item?.workspaceRootPath || '',
-          })
-          : null;
-        const syntheticConversation = {
-          id: sdkSessionId,
-          sdkSessionId,
-          title: String(item?.title || '').trim() || 'Session',
-          archived: false,
-          compactedInto: null,
-          compactedFrom: null,
-          runtimeSessionId: runtimeSession?.id || null,
-          runtimeSessionStrategy: runtimeSession?.strategy || null,
-          runtimeSessionStatus: runtimeSession?.status || null,
-          runtimeSessionLastUsedAt: runtimeSession?.last_used_at || updatedAt,
-          configuredWorkspaceRootPath: workspaceState?.configuredWorkspaceRootPath || null,
-          configuredWorkspaceRootName: workspaceState?.configuredWorkspaceRootName || null,
-          runtimeWorkspaceRootPath: workspaceState?.runtimeWorkspaceRootPath || null,
-          runtimeWorkspaceRootName: workspaceState?.runtimeWorkspaceRootName || null,
-          currentWorkspaceRootPath: workspaceState?.currentWorkspaceRootPath || null,
-          currentWorkspaceRootName: workspaceState?.currentWorkspaceRootName || null,
-          createdAt: updatedAt,
-          updatedAt,
-          messageCount: resolveMessageCount(sdkSessionId, 0),
-          preferredRelayMode: normalizeRelayModePreference(null, {
-            supportedRelayModes: SUPPORTED_RELAY_MODES,
-            fallbackMode: DEFAULT_RELAY_MODE,
-          }),
-          preferredModelsByMode: {},
-          draftText: '',
-          draftUpdatedAt: null,
-          draftUpdatedByClientId: null,
-        };
-        conversations.push(syntheticConversation);
-        knownConversationIds.add(sdkSessionId);
-        knownById.add(sdkSessionId);
-        knownBySdkSessionId.add(sdkSessionId);
-      }
-    }
-
-    conversations.sort(compareConversationListOrder);
-    const payload = {
+    return res.json({
       conversations,
       pageInfo: page.pageInfo,
-    };
-    if (includeDiscoveryOverlay) {
-      payload.knownConversationIds = Array.from(knownConversationIds);
-    }
-    res.json(payload);
+    });
   });
 
   app.get('/api/sessions', auth, (req, res) => {
@@ -1967,50 +1782,6 @@ export function registerSessionsRoutes(app, deps) {
       error: errorText,
     });
     return res.json({ ok: true, pending: true, retryCount: nextRetryCount, nextAttemptAt });
-  });
-
-  // GET /api/sdk-history-fetch/pending — relay extension fetches next pending SDK history request
-  app.get('/api/sdk-history-fetch/pending', auth, (_req, res) => {
-    touchCli();
-    const nowIso = new Date().toISOString();
-    const staleCutoff = new Date(Date.now() - SDK_HISTORY_FETCH_STALE_PROCESSING_MS).toISOString();
-    stmts.resetStaleSdkHistoryFetchProcessing.run(nowIso, staleCutoff);
-    const dequeue = db.transaction(() => {
-      const next = stmts.dequeueSdkHistoryFetchRequest.get();
-      if (!next?.sdk_session_id) return null;
-      const claimed = stmts.setSdkHistoryFetchRequestProcessing.run(nowIso, nowIso, next.sdk_session_id);
-      if (claimed.changes === 0) return null;
-      return {
-        sdkSessionId: next.sdk_session_id,
-        conversationId: next.conversation_id || null,
-        requestedAt: next.requested_at || nowIso,
-      };
-    });
-    const request = dequeue();
-    return res.json({ request });
-  });
-
-  // POST /api/sdk-history-fetch/result — relay extension reports SDK history fetch result
-  app.post('/api/sdk-history-fetch/result', auth, (req, res) => {
-    touchCli();
-    const sdkSessionId = String(req.body?.sdk_session_id || '').trim();
-    const ok = req.body?.ok === true;
-    if (!sdkSessionId) return res.status(400).json({ error: 'Missing sdk_session_id' });
-    const row = stmts.getSdkHistoryFetchRequestBySessionId.get(sdkSessionId);
-    if (!row) return res.json({ ok: true, ignored: 'request_missing' });
-    const nowIso = new Date().toISOString();
-    if (ok) {
-      const rawEvents = req.body?.events;
-      const normalizedEvents = Array.isArray(rawEvents)
-        ? rawEvents
-        : (Array.isArray(rawEvents?.events) ? rawEvents.events : []);
-      const encoded = JSON.stringify({ events: normalizedEvents });
-      stmts.setSdkHistoryFetchRequestCompleted.run(encoded, nowIso, sdkSessionId);
-      return res.json({ ok: true, eventCount: normalizedEvents.length });
-    }
-    const errorText = String(req.body?.error || '').trim() || 'Unknown SDK history fetch failure';
-    stmts.setSdkHistoryFetchRequestFailed.run(nowIso, errorText, sdkSessionId);
-    return res.json({ ok: true, error: errorText });
   });
 
   app.post('/api/session-sync', auth, (req, res) => {
@@ -2342,14 +2113,9 @@ export function registerSessionsRoutes(app, deps) {
     }
 
     const existingConversation = resolveConversationByIdOrSdkSessionId(requestedId);
-    const ensured = existingConversation
-      ? { ok: true, created: false, conversation: existingConversation }
-      : sessionHistoryRefreshService.ensureConversationForRefresh(requestedId);
-    if (!ensured?.ok) {
-      return res.status(Number(ensured?.statusCode || 404)).json({ error: ensured?.error || 'Conversation not found' });
-    }
-    const conversationId = String(ensured?.conversation?.id || requestedId).trim();
-    const sdkSessionId = String(ensured?.conversation?.sdk_session_id || requestedId).trim();
+    if (!existingConversation) return res.status(404).json({ error: 'Conversation not found' });
+    const conversationId = String(existingConversation.id).trim();
+    const sdkSessionId = String(existingConversation.sdk_session_id || requestedId).trim();
 
     const idleState = sessionHistoryRefreshService.evaluateRefreshIdleState(conversationId);
     if (!idleState?.idle) {
@@ -2359,32 +2125,22 @@ export function registerSessionsRoutes(app, deps) {
       });
     }
 
-    let rebuiltMessages = [];
-    const existingMessageCount = sessionHistoryRefreshService.countRetrievableMessages(conversationId);
     try {
-      enqueueSdkHistoryFetchRequest(sdkSessionId, conversationId);
-      const sdkFetchResult = await waitForSdkHistoryFetchCompletion(sdkSessionId);
-      if (sdkFetchResult?.completed && Array.isArray(sdkFetchResult?.events)) {
-        rebuiltMessages = sessionHistoryRefreshService.mapSdkEventsToMessages(sdkFetchResult.events);
+      const result = await sdkSessionImportService.refreshConversation(existingConversation);
+      if (result.status === 'failed') throw new Error(result.error || 'Failed to refresh conversation history');
+      if (result.status !== 'completed') {
+        const error = new Error(
+          result.reason === 'tombstoned'
+            ? 'Conversation not found'
+            : 'Conversation history refresh is already in progress',
+        );
+        error.statusCode = result.reason === 'tombstoned' ? 404 : 409;
+        throw error;
       }
-      if (!Array.isArray(rebuiltMessages) || rebuiltMessages.length === 0) {
-        rebuiltMessages = readSessionTranscriptMessages(sdkSessionId, { limit: Number.POSITIVE_INFINITY });
-      }
-      if ((!Array.isArray(rebuiltMessages) || rebuiltMessages.length === 0) && existingMessageCount > 0) {
-        return res.status(502).json({
-          error: 'Could not rebuild conversation history from SDK sources',
-          code: 'history-rebuild-empty',
-          preserved: true,
-        });
-      }
-      sessionHistoryRefreshService.replaceRetrievableHistory(conversationId, rebuiltMessages);
-      stmts.updateConvTime.run(new Date().toISOString(), conversationId);
     } catch (error) {
-      return res.status(500).json({
+      return res.status(error?.statusCode || 500).json({
         error: error?.message || 'Failed to refresh conversation history',
       });
-    } finally {
-      stmts.deleteSdkHistoryFetchRequest.run(sdkSessionId);
     }
 
     const conv = stmts.getConv.get(conversationId);
@@ -2392,24 +2148,15 @@ export function registerSessionsRoutes(app, deps) {
       return res.status(404).json({ error: 'Conversation not found' });
     }
     const runtimeSession = stmts.getRuntimeSessionByConversation.get(conversationId) || null;
-    const discoveredSessionState = (() => {
-      const sid = String(conv.sdk_session_id || '').trim();
-      if (!sid) return null;
-      const discovered = discoverSessionStateConversations(400);
-      return discovered.find((item) => String(item?.sdkSessionId || '').trim() === sid) || null;
-    })();
-    const discoveredTitle = String(discoveredSessionState?.title || '').trim() || null;
     const resolvedTitle = resolveConversationTitle({
       title: conv.title,
       titleSource: conv.title_source,
-      discoveredTitle,
     });
     const preferences = resolveConversationPreferences(conv, {
       supportedRelayModes: SUPPORTED_RELAY_MODES,
       defaultRelayMode: DEFAULT_RELAY_MODE,
     });
     const inFlight = inFlightStateForConversation(conversationId);
-    const transcriptMessages = readSessionTranscriptMessages(sdkSessionId, { limit: Number.POSITIVE_INFINITY });
     const sessionUsageSummary = resolveSessionUsageSummaryForSdkSession({
       sdkSessionId,
       conversationId,
@@ -2424,7 +2171,7 @@ export function registerSessionsRoutes(app, deps) {
       ? resolveConversationWorkspaceState({
         conversationId,
         sdkSessionId: conv.sdk_session_id || conversationId,
-        discoveredWorkspaceRootPath: discoveredSessionState?.workspaceRootPath || '',
+        discoveredWorkspaceRootPath: '',
       })
       : null;
     const dbMessages = stmts.getMessages.all(conversationId);
@@ -2458,7 +2205,7 @@ export function registerSessionsRoutes(app, deps) {
         ...message,
         attachments: parseAttachments(message.attachments).map(hydrateAttachment).filter(Boolean),
       })),
-      transcriptMessages,
+      transcriptMessages: [],
       relayActivitiesByMessageId,
       relayThoughtsByMessageId,
       responseMessageToSourceId,
@@ -2508,9 +2255,9 @@ export function registerSessionsRoutes(app, deps) {
       inFlight,
       preferredRelayMode: preferences.preferredRelayMode,
       preferredModelsByMode: preferences.preferredModelsByMode,
-      draftText: conversationDraftPersistenceEnabled ? String(conv.draft_text || '') : '',
-      draftUpdatedAt: conversationDraftPersistenceEnabled ? (conv.draft_updated_at || null) : null,
-      draftUpdatedByClientId: conversationDraftPersistenceEnabled ? (conv.draft_updated_by_client_id || null) : null,
+      draftText: String(conv.draft_text || ''),
+      draftUpdatedAt: conv.draft_updated_at || null,
+      draftUpdatedByClientId: conv.draft_updated_by_client_id || null,
       messages: history.messages,
       pageInfo: history.pageInfo,
       refreshed: true,
@@ -2698,90 +2445,12 @@ export function registerSessionsRoutes(app, deps) {
       return res.status(404).json({ error: 'Conversation not found' });
     }
     const conv = resolveConversationByIdOrSdkSessionId(requestedId);
-    if (!conv) {
-      const discovered = discoverSessionStateConversations(400);
-      const match = discovered.find((item) => String(item?.sdkSessionId || '').trim() === requestedId) || null;
-      if (!match) return res.status(404).json({ error: 'Conversation not found' });
-      const runtimeSession = stmts.getRuntimeSessionBySdkSessionId.get(requestedId) || null;
-      const updatedAt = String(match?.updatedAt || '').trim() || new Date().toISOString();
-      const discoveredTitle = String(match?.title || '').trim() || 'Session';
-      const transcriptMessages = readSessionTranscriptMessages(requestedId, { limit: Number.POSITIVE_INFINITY });
-      const sessionUsageSummary = resolveSessionUsageSummaryForSdkSession({
-        sdkSessionId: requestedId,
-      });
-      const history = selectConversationHistoryPage(
-        buildConversationMessages({
-          dbMessages: [],
-          transcriptMessages,
-        }),
-        { limit, beforeMessageId, beforeTimestamp, afterMessageId, afterTimestamp, aroundMessageId },
-      );
-      const sessionRoot = buildConversationSessionRootPayload({
-        conversationId: requestedId,
-        sdkSessionId: requestedId,
-        title: discoveredTitle,
-        resolveSessionStateRoot,
-      });
-      const workspaceState = typeof resolveConversationWorkspaceState === 'function'
-        ? resolveConversationWorkspaceState({
-          conversationId: requestedId,
-          sdkSessionId: requestedId,
-          discoveredWorkspaceRootPath: match?.workspaceRootPath || '',
-        })
-        : null;
-      return res.json({
-        id: requestedId,
-        sdkSessionId: requestedId,
-        title: discoveredTitle,
-        sessionRootPath: sessionRoot?.sessionRootPath || null,
-        sessionRootName: sessionRoot?.sessionRootName || discoveredTitle,
-        configuredWorkspaceRootPath: workspaceState?.configuredWorkspaceRootPath || null,
-        configuredWorkspaceRootName: workspaceState?.configuredWorkspaceRootName || null,
-        runtimeWorkspaceRootPath: workspaceState?.runtimeWorkspaceRootPath || null,
-        runtimeWorkspaceRootName: workspaceState?.runtimeWorkspaceRootName || null,
-        currentWorkspaceRootPath: workspaceState?.currentWorkspaceRootPath || null,
-        currentWorkspaceRootName: workspaceState?.currentWorkspaceRootName || null,
-        archived: false,
-        compactedInto: null,
-        compactedFrom: null,
-        runtimeSession: runtimeSession ? {
-          id: runtimeSession.id,
-          sdkSessionId: runtimeSession.sdk_session_id || requestedId,
-          strategy: runtimeSession.strategy || null,
-          status: runtimeSession.status || null,
-          model: runtimeSession.model || null,
-          createdAt: runtimeSession.created_at || null,
-          lastUsedAt: runtimeSession.last_used_at || null,
-        } : null,
-        createdAt: updatedAt,
-        updatedAt,
-        sessionUsageSummary,
-        inFlight: null,
-        preferredRelayMode: normalizeRelayModePreference(null, {
-          supportedRelayModes: SUPPORTED_RELAY_MODES,
-          fallbackMode: DEFAULT_RELAY_MODE,
-        }),
-        preferredModelsByMode: {},
-        draftText: '',
-        draftUpdatedAt: null,
-        draftUpdatedByClientId: null,
-        messages: history.messages,
-        pageInfo: history.pageInfo,
-      });
-    }
+    if (!conv) return res.status(404).json({ error: 'Conversation not found' });
     const resolvedConversationId = String(conv.id || '').trim() || requestedId;
     const runtimeSession = stmts.getRuntimeSessionByConversation.get(resolvedConversationId) || null;
-    const discoveredSessionState = (() => {
-      const sdkSessionId = String(conv.sdk_session_id || '').trim();
-      if (!sdkSessionId) return null;
-      const discovered = discoverSessionStateConversations(400);
-      return discovered.find((item) => String(item?.sdkSessionId || '').trim() === sdkSessionId) || null;
-    })();
-    const discoveredTitle = String(discoveredSessionState?.title || '').trim() || null;
     const resolvedTitle = resolveConversationTitle({
       title: conv.title,
       titleSource: conv.title_source,
-      discoveredTitle,
     });
     const preferences = resolveConversationPreferences(conv, {
       supportedRelayModes: SUPPORTED_RELAY_MODES,
@@ -2789,10 +2458,6 @@ export function registerSessionsRoutes(app, deps) {
     });
     const inFlight = inFlightStateForConversation(resolvedConversationId);
     const sdkSessionId = String(conv.sdk_session_id || resolvedConversationId || '').trim();
-    const transcriptMessages = readSessionTranscriptMessages(
-      sdkSessionId,
-      { limit: Number.POSITIVE_INFINITY },
-    );
     const sessionUsageSummary = resolveSessionUsageSummaryForSdkSession({
       sdkSessionId,
       conversationId: resolvedConversationId,
@@ -2807,7 +2472,7 @@ export function registerSessionsRoutes(app, deps) {
       ? resolveConversationWorkspaceState({
         conversationId: resolvedConversationId,
         sdkSessionId: conv.sdk_session_id || resolvedConversationId,
-        discoveredWorkspaceRootPath: discoveredSessionState?.workspaceRootPath || '',
+        discoveredWorkspaceRootPath: '',
       })
       : null;
     const dbMessages = stmts.getMessages.all(resolvedConversationId);
@@ -2841,7 +2506,7 @@ export function registerSessionsRoutes(app, deps) {
         ...message,
         attachments: parseAttachments(message.attachments).map(hydrateAttachment).filter(Boolean),
       })),
-      transcriptMessages,
+      transcriptMessages: [],
       relayActivitiesByMessageId,
       relayThoughtsByMessageId,
       responseMessageToSourceId,
@@ -2891,9 +2556,9 @@ export function registerSessionsRoutes(app, deps) {
       inFlight,
       preferredRelayMode: preferences.preferredRelayMode,
       preferredModelsByMode: preferences.preferredModelsByMode,
-      draftText: conversationDraftPersistenceEnabled ? String(conv.draft_text || '') : '',
-      draftUpdatedAt: conversationDraftPersistenceEnabled ? (conv.draft_updated_at || null) : null,
-      draftUpdatedByClientId: conversationDraftPersistenceEnabled ? (conv.draft_updated_by_client_id || null) : null,
+      draftText: String(conv.draft_text || ''),
+      draftUpdatedAt: conv.draft_updated_at || null,
+      draftUpdatedByClientId: conv.draft_updated_by_client_id || null,
       messages: history.messages,
       pageInfo: history.pageInfo,
     });
@@ -2970,19 +2635,11 @@ export function registerSessionsRoutes(app, deps) {
   });
 
   app.patch('/api/conversation/:id/draft', auth, (req, res) => {
-    if (!conversationDraftPersistenceEnabled) {
-      return res.status(404).json({ error: 'Conversation draft persistence is disabled' });
-    }
     const requestedId = String(req.params.id || '').trim();
     if (!requestedId) return res.status(400).json({ error: 'Missing conversation id' });
     const resolvedConversation = resolveConversationByIdOrSdkSessionId(requestedId);
-    const ensured = resolvedConversation
-      ? { ok: true, created: false, conversation: resolvedConversation }
-      : sessionHistoryRefreshService.ensureConversationForRefresh(requestedId);
-    if (!ensured?.ok) {
-      return res.status(Number(ensured?.statusCode || 404)).json({ error: ensured?.error || 'Conversation not found' });
-    }
-    const conversationId = String(ensured?.conversation?.id || requestedId).trim();
+    if (!resolvedConversation) return res.status(404).json({ error: 'Conversation not found' });
+    const conversationId = String(resolvedConversation.id).trim();
     const senderClientId = String(req.body?.clientId || '').trim() || null;
     const existing = stmts.getConvAnyStatus.get(conversationId);
     if (!existing || String(existing.status || '').trim() === 'deleted') {
@@ -3110,22 +2767,12 @@ export function registerSessionsRoutes(app, deps) {
 
     const existing = stmts.getConvAnyStatus.get(id);
     if (!existing) {
-      const discovered = discoverSessionStateConversations(400);
-      const isSdkSessionConversation = discovered.some((item) => String(item?.sdkSessionId || '').trim() === id);
-      if (!isSdkSessionConversation) return res.json({ ok: true, alreadyDeleted: true });
-      stmts.markDeletedSdkSession.run(id, new Date().toISOString());
-      enqueueSdkDeleteRequest(id, null);
-      const awaited = await waitForSdkDeleteCompletion(id);
-      if (awaited.completed) return res.json({ ok: true, deleted: true, sdkSessionOnly: true });
-      io.emit('conversation_delete_pending', { conversationId: id, sdkSessionOnly: true });
-      return res.json({ ok: true, pending: true, sdkSessionOnly: true });
+      return res.json({ ok: true, alreadyDeleted: true });
     }
 
     try {
       const sdkSessionId = String(existing.sdk_session_id || '').trim() || null;
       if (!sdkSessionId) {
-        // Tombstone the conversation id as a synthetic session id to prevent
-        // discoverSessionStateConversations() from resurrecting it via GET /api/conversation/:id.
         stmts.markDeletedSdkSession.run(id, new Date().toISOString());
         const orphanedUploads = collectOrphanedUploadsFromConversation(id);
         hardDeleteConversationRows(id);

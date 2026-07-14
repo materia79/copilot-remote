@@ -195,6 +195,8 @@ Roadmap for later launcher modes:
 
 ## Using the web UI
 
+On startup, the relay imports locally persisted Copilot sessions through the installed Copilot SDK into its database. Session lists, details, sharing, and history refreshes use that database; an unavailable SDK runtime is reported as an import failure and is not replaced with filesystem discovery.
+
 - Choose **mode** and **model** per message in the composer.
 - Use **Compact** to branch to a fresh conversation seeded with summary context.
 - Use **Browse files** to inspect workspace/drives and open previews.

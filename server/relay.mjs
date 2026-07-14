@@ -13,15 +13,14 @@
  *   node relay.mjs --token <newtoken>     # override auth token
  */
 
-import { createRequire } from 'module';
 import { fileURLToPath } from 'url';
 import { createConnection } from 'net';
 import { randomUUID } from 'crypto';
 import { spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs';
-import os from 'os';
 import { resolveStartupWorkspaceRoot } from './workspace-root.mjs';
+import { resolveInstalledCopilotPaths } from './copilot-sdk-runtime.mjs';
 import {
   buildWindowsTerminalForegroundArgs,
   buildWindowsTerminalWindowName,
@@ -33,7 +32,6 @@ import {
 } from '../shared/model-descriptors.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const require = createRequire(import.meta.url);
 
 // ─── Args ──────────────────────────────────────────────────────────────────────
 const args = process.argv.slice(2);
@@ -70,117 +68,14 @@ const RUNTIME_SESSION_POLICY = 'conversation-bound';
 const launchWorkspaceRoot = resolveStartupWorkspaceRoot(__dirname);
 
 // ─── Copilot path auto-detection ─────────────────────────────────────────────
-function dedupePaths(paths) {
-  const seen = new Set();
-  const out = [];
-  for (const value of paths) {
-    const candidate = String(value || '').trim();
-    if (!candidate) continue;
-    const normalized = path.normalize(candidate);
-    if (seen.has(normalized)) continue;
-    seen.add(normalized);
-    out.push(normalized);
-  }
-  return out;
-}
-
-function getCopilotBaseDirs() {
-  const explicitPkgDir = String(process.env.COPILOT_PKG_DIR || '').trim();
-  const configured = explicitPkgDir ? [explicitPkgDir] : [];
-
-  switch (process.platform) {
-    case 'win32':
-      return dedupePaths([
-        ...configured,
-        path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'copilot', 'pkg'),
-      ]);
-    case 'darwin':
-      return dedupePaths([
-        ...configured,
-        path.join(os.homedir(), 'Library', 'Application Support', 'copilot', 'pkg'),
-      ]);
-    default: // linux and others
-      return dedupePaths([
-        ...configured,
-        path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'copilot', 'pkg'),
-        path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'copilot', 'pkg'),
-      ]);
-  }
-}
-
-function getPlatformSubdirs() {
-  const specific = `${process.platform}-${process.arch}`;
-  return specific === 'universal' ? ['universal'] : [specific, 'universal'];
-}
-
-function detectCopilotPaths() {
-  // Config override takes priority when both keys are present
-  if (config.sdkPath && config.cliPath) {
-    console.log(`[relay] Using paths from config.json (sdkPath/cliPath)`);
-    return { sdkPath: config.sdkPath, cliPath: config.cliPath };
-  }
-
-  const baseDirs = getCopilotBaseDirs();
-  const subdirs = getPlatformSubdirs();
-  const requestedVersion = typeof config.sdkVersion === 'string' ? config.sdkVersion.trim() : '';
-
-  // Collect all valid candidates across all subdirs, then pick globally highest version.
-  // Base dir and subdir order are used as tiebreakers when the same version exists in multiple locations.
-  const candidates = [];
-  for (let baseDirIdx = 0; baseDirIdx < baseDirs.length; baseDirIdx++) {
-    const baseDir = baseDirs[baseDirIdx];
-    for (let subdirIdx = 0; subdirIdx < subdirs.length; subdirIdx++) {
-      const subdir = subdirs[subdirIdx];
-      const subdirPath = path.join(baseDir, subdir);
-      let entries;
-      try {
-        entries = fs.readdirSync(subdirPath);
-      } catch {
-        continue; // subdir doesn't exist on this machine
-      }
-
-      for (const entry of entries) {
-        if (!/^\d+\.\d+\.\d+$/.test(entry)) continue;
-        if (requestedVersion && entry !== requestedVersion) continue;
-        const versionDir = path.join(subdirPath, entry);
-        const sdkPath = path.join(versionDir, 'copilot-sdk', 'index.js');
-        const cliPath = path.join(versionDir, 'app.js');
-        if (fs.existsSync(sdkPath) && fs.existsSync(cliPath)) {
-          candidates.push({ version: entry, baseDir, baseDirIdx, subdir, subdirIdx, sdkPath, cliPath });
-        }
-      }
-    }
-  }
-
-  // Sort: highest semver first; then base dir priority; then subdir priority.
-  candidates.sort((a, b) => {
-    const [aMaj, aMin, aPat] = a.version.split('.').map(Number);
-    const [bMaj, bMin, bPat] = b.version.split('.').map(Number);
-    return bMaj - aMaj || bMin - aMin || bPat - aPat || a.baseDirIdx - b.baseDirIdx || a.subdirIdx - b.subdirIdx;
-  });
-
-  if (candidates.length) {
-    const best = candidates[0];
-    if (requestedVersion) {
-      console.log(`[relay] Using requested Copilot sdkVersion=${requestedVersion}`);
-    }
-    console.log(`[relay] Detected Copilot ${best.version} (${best.subdir}) in ${best.baseDir}`);
-    console.log(`[relay] Resolved SDK path: ${best.sdkPath}`);
-    console.log(`[relay] Resolved CLI path: ${best.cliPath}`);
-    return { sdkPath: best.sdkPath, cliPath: best.cliPath };
-  }
-
-  if (requestedVersion) {
-    console.error(`[relay] ERROR Requested sdkVersion=${requestedVersion} was not found`);
-  }
-  console.error(`[relay] ERROR Copilot installation not found in any base directory`);
-  console.error(`[relay] ERROR Searched base dirs: ${baseDirs.join(', ')}`);
-  console.error(`[relay] ERROR Searched subdirs: ${subdirs.join(', ')}`);
-  console.error(`[relay] ERROR Install Copilot CLI or set sdkPath/cliPath in config.json`);
+let installedCopilotPaths;
+try {
+  installedCopilotPaths = resolveInstalledCopilotPaths({ config });
+} catch (error) {
+  console.error(`[relay] ERROR ${error.message}`);
   process.exit(1);
 }
-
-const { sdkPath: SDK_PATH, cliPath: CLI_PATH } = detectCopilotPaths();
+const { sdkPath: SDK_PATH, cliPath: CLI_PATH } = installedCopilotPaths;
 const NODE_PATH = process.env.COPILOT_WEB_RELAY_NODE || process.execPath;
 const CLI_PORT  = config.cliPort || 4445;
 const foregroundWindowName = buildWindowsTerminalWindowName(launchWorkspaceRoot);
@@ -572,16 +467,22 @@ export function buildCopilotClientOptions({
 } = {}) {
   if (foreground && tcpInfo) {
     return {
-      cliUrl: `localhost:${tcpInfo.port}`,
-      tcpConnectionToken: tcpInfo.tcpConnectionToken,
+      connection: {
+        kind: 'uri',
+        url: `localhost:${tcpInfo.port}`,
+        connectionToken: tcpInfo.tcpConnectionToken,
+      },
     };
   }
 
   return {
-    cliPath,
+    connection: {
+      kind: 'stdio',
+      path: cliPath,
+    },
     useLoggedInUser: true,
     logLevel: 'debug',
-    cwd: launchRoot,
+    workingDirectory: launchRoot,
   };
 }
 
@@ -612,15 +513,15 @@ async function initClient(CopilotClient) {
   }
 
   vlog('Copilot client options:', {
-    mode: clientOptions.cliUrl ? 'foreground-tcp' : 'hidden-stdio',
+    mode: clientOptions.connection?.kind === 'uri' ? 'foreground-tcp' : 'hidden-stdio',
     logLevel: clientOptions.logLevel || 'n/a',
-    cwd: clientOptions.cwd || launchWorkspaceRoot,
+    cwd: clientOptions.workingDirectory || launchWorkspaceRoot,
   });
 
   client = new CopilotClient(clientOptions);
   await client.start();
   clientReady = true;
-  log(`Copilot SDK client ready ✓  (mode: ${FOREGROUND && clientOptions.cliUrl ? 'foreground TCP' : 'hidden stdio'})`);
+  log(`Copilot SDK client ready ✓  (mode: ${FOREGROUND && clientOptions.connection?.kind === 'uri' ? 'foreground TCP' : 'hidden stdio'})`);
 }
 
 function sessionKey(runtimeSessionId, convId) {
