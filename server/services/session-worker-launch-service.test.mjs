@@ -17,17 +17,19 @@ test('buildTmuxWorkerShellCommand injects only relay env needed for workers', ()
   const command = buildTmuxWorkerShellCommand('abc-123', {
     GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS: 'true',
     COPILOT_WEB_RELAY_SERVER_DIR: '/repo/server',
+    COPILOT_WEB_RELAY_CONFIG: '/repo/server/config.json',
     INIT_CWD: '/workspace',
     IGNORED_VAR: 'nope',
   });
 
-  assert.match(command, /GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS='true'/);
+  assert.doesNotMatch(command, /GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS/);
   assert.match(command, /COPILOT_WEB_RELAY_SERVER_DIR='\/repo\/server'/);
+  assert.match(command, /COPILOT_WEB_RELAY_CONFIG='\/repo\/server\/config\.json'/);
   assert.match(command, /INIT_CWD='\/workspace'/);
   assert.match(command, /SESSION_ID='abc-123'/);
   assert.doesNotMatch(command, /IGNORED_VAR/);
   assert.match(command, /exec script -q -c/);
-  assert.match(command, /gh copilot -- --allow-all --session-id/);
+  assert.match(command, /copilot.*--allow-all --session-id.*-i.*launch the server/);
   assert.match(command, /abc-123/);
   assert.match(command, /\/dev\/null/);
   assert.doesNotMatch(command, /GH_FORCE_TTY/);
@@ -45,7 +47,7 @@ test('buildTmuxWorkerShellCommand forwards extension bootstrap env vars', () => 
   assert.doesNotMatch(command, /SESSION_ID='stale-session'/);
 });
 
-test('buildTmuxWorkerShellCommand prefers bootstrap launch when configured', () => {
+test('buildTmuxWorkerShellCommand keeps the host CLI launch when extension bootstrap is configured', () => {
   const command = buildTmuxWorkerShellCommand('abc-123', {
     COPILOT_WEB_RELAY_CLI_EXECUTABLE: '/usr/bin/copilot',
     COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH: '/cache/copilot/preloads/extension_bootstrap.mjs',
@@ -55,11 +57,11 @@ test('buildTmuxWorkerShellCommand prefers bootstrap launch when configured', () 
   assert.match(command, /COPILOT_WEB_RELAY_CLI_EXECUTABLE='\/usr\/bin\/copilot'/);
   assert.match(command, /COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH='\/cache\/copilot\/preloads\/extension_bootstrap\.mjs'/);
   assert.match(command, /EXTENSION_PATH='\/repo\/server\/relay-extension\.mjs'/);
-  assert.match(command, /\/usr\/bin\/copilot/);
+  assert.match(command, /\/usr\/bin\/copilot.*--allow-all --session-id.*-i.*launch the server/);
   assert.match(command, /extension_bootstrap\.mjs/);
   assert.match(command, /--allow-all --session-id/);
   assert.match(command, /abc-123/);
-  assert.doesNotMatch(command, /gh copilot -- --allow-all --session-id/);
+  assert.doesNotMatch(command, /exec script -q -c .*extension_bootstrap\.mjs.*--allow-all/);
 });
 
 test('killTmuxSession returns false when tmux kill races after session exists', () => {
@@ -130,10 +132,10 @@ test('launchSessionCli uses tmux on posix and returns discovered worker pid', as
   const newSessionCall = calls.find((call) => call[1] === 'new-session');
   assert.equal(newSessionCall?.[6], '/relay');
   const shellCommand = newSessionCall?.slice(-1)?.[0] || '';
-  assert.match(shellCommand, /GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS='true'/);
+  assert.doesNotMatch(shellCommand, /GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS/);
   assert.match(shellCommand, /COPILOT_WORKSPACE_ROOT='\/repo'/);
   assert.match(shellCommand, /exec script -q -c/);
-  assert.match(shellCommand, /gh copilot -- --allow-all --session-id/);
+  assert.match(shellCommand, /copilot.*--allow-all --session-id.*-i.*launch the server/);
   assert.match(shellCommand, /abc-123/);
   assert.doesNotMatch(shellCommand, /GH_FORCE_TTY/);
 });
@@ -146,6 +148,7 @@ test('launchSessionCli falls back to detached spawn when tmux is unavailable', a
     workspaceRoot: '/repo',
     env: {
       PATH: process.env.PATH || '',
+      GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS: 'true',
       COPILOT_WORKSPACE_ROOT: '/stale',
     },
     platform: 'linux',
@@ -169,15 +172,16 @@ test('launchSessionCli falls back to detached spawn when tmux is unavailable', a
 
   assert.equal(launched.launchMode, 'detached');
   assert.equal(launched.pid, 4242);
-  assert.equal(spawnCalls[0]?.command, 'gh');
+  assert.equal(spawnCalls[0]?.command, 'copilot');
   assert.equal(spawnCalls[0]?.options?.cwd, '/relay');
   assert.equal(spawnCalls[0]?.options?.env?.COPILOT_WORKSPACE_ROOT, '/repo');
   assert.equal(spawnCalls[0]?.options?.env?.INIT_CWD, '/repo');
   assert.equal(spawnCalls[0]?.options?.env?.PWD, '/relay');
   assert.equal(spawnCalls[0]?.options?.env?.SESSION_ID, 'abc-123');
+  assert.equal(spawnCalls[0]?.options?.env?.GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS, undefined);
 });
 
-test('launchSessionCli keeps gh fallback when cli executable is set without bootstrap', async () => {
+test('launchSessionCli uses the configured host CLI executable', async () => {
   const spawnCalls = [];
   const launched = await launchSessionCli({
     targetSessionId: 'abc-123',
@@ -208,17 +212,11 @@ test('launchSessionCli keeps gh fallback when cli executable is set without boot
 
   assert.equal(launched.launchMode, 'detached');
   assert.equal(launched.pid, 4242);
-  assert.equal(spawnCalls[0]?.command, 'gh');
-  assert.deepEqual(spawnCalls[0]?.args, [
-    'copilot',
-    '--',
-    '--allow-all',
-    '--session-id',
-    'abc-123',
-  ]);
+  assert.equal(spawnCalls[0]?.command, '/usr/bin/copilot');
+  assert.deepEqual(spawnCalls[0]?.args, ['--allow-all', '--session-id', 'abc-123', '-i', 'launch the server']);
 });
 
-test('launchSessionCli uses bootstrap command on posix when configured', async () => {
+test('launchSessionCli uses the host CLI on posix when extension bootstrap is configured', async () => {
   const spawnCalls = [];
   const launched = await launchSessionCli({
     targetSessionId: 'abc-123',
@@ -252,12 +250,7 @@ test('launchSessionCli uses bootstrap command on posix when configured', async (
   assert.equal(launched.launchMode, 'detached');
   assert.equal(launched.pid, 4242);
   assert.equal(spawnCalls[0]?.command, '/usr/bin/copilot');
-  assert.deepEqual(spawnCalls[0]?.args, [
-    '/cache/copilot/preloads/extension_bootstrap.mjs',
-    '--allow-all',
-    '--session-id',
-    'abc-123',
-  ]);
+  assert.deepEqual(spawnCalls[0]?.args, ['--allow-all', '--session-id', 'abc-123', '-i', 'launch the server']);
 });
 
 test('launchSessionCli uses copilot command when bootstrap is set without cli executable', async () => {
@@ -293,15 +286,10 @@ test('launchSessionCli uses copilot command when bootstrap is set without cli ex
   assert.equal(launched.launchMode, 'detached');
   assert.equal(launched.pid, 4242);
   assert.equal(spawnCalls[0]?.command, 'copilot');
-  assert.deepEqual(spawnCalls[0]?.args, [
-    '/cache/copilot/preloads/extension_bootstrap.mjs',
-    '--allow-all',
-    '--session-id',
-    'abc-123',
-  ]);
+  assert.deepEqual(spawnCalls[0]?.args, ['--allow-all', '--session-id', 'abc-123', '-i', 'launch the server']);
 });
 
-test('launchSessionCli keeps gh fallback when bootstrap is set without extension path', async () => {
+test('launchSessionCli uses the configured host CLI when bootstrap is set without extension path', async () => {
   const spawnCalls = [];
   const launched = await launchSessionCli({
     targetSessionId: 'abc-123',
@@ -333,14 +321,8 @@ test('launchSessionCli keeps gh fallback when bootstrap is set without extension
 
   assert.equal(launched.launchMode, 'detached');
   assert.equal(launched.pid, 4242);
-  assert.equal(spawnCalls[0]?.command, 'gh');
-  assert.deepEqual(spawnCalls[0]?.args, [
-    'copilot',
-    '--',
-    '--allow-all',
-    '--session-id',
-    'abc-123',
-  ]);
+  assert.equal(spawnCalls[0]?.command, '/usr/bin/copilot');
+  assert.deepEqual(spawnCalls[0]?.args, ['--allow-all', '--session-id', 'abc-123', '-i', 'launch the server']);
 });
 
 test('launchSessionCli opens a visible detached console on windows', async () => {
@@ -508,7 +490,7 @@ test('launchSessionCli bypasses process reuse when disabled', async () => {
   assert.equal(launched.reused, false);
   assert.equal(launched.launchMode, 'detached');
   assert.equal(launched.pid, 4243);
-  assert.equal(spawnCalls[0]?.command, 'gh');
+  assert.equal(spawnCalls[0]?.command, 'copilot');
 });
 
 test('launchSessionCli ignores a dead discovered pid and continues to launch', async () => {
@@ -538,5 +520,5 @@ test('launchSessionCli ignores a dead discovered pid and continues to launch', a
   assert.equal(launched.reused, false);
   assert.equal(launched.launchMode, 'detached');
   assert.equal(launched.pid, 4243);
-  assert.equal(spawnCalls[0]?.command, 'gh');
+  assert.equal(spawnCalls[0]?.command, 'copilot');
 });

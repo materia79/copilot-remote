@@ -2629,13 +2629,25 @@ function buildSessionWorkerLaunchEnv() {
       const candidate = path.join(versionDir, 'preloads', 'extension_bootstrap.mjs');
       if (fs.existsSync(candidate)) return candidate;
     }
+    const platformName = process.platform === 'linux'
+      ? (process.arch === 'x64' ? 'linux-x64' : `linux-${process.arch}`)
+      : `${process.platform}-${process.arch}`;
+    const cacheRoot = path.join(os.homedir(), '.cache', 'copilot', 'pkg', platformName);
+    try {
+      const versions = fs.readdirSync(cacheRoot)
+        .filter((entry) => fs.existsSync(path.join(cacheRoot, entry, 'preloads', 'extension_bootstrap.mjs')))
+        .sort()
+        .reverse();
+      if (versions.length) {
+        return path.join(cacheRoot, versions[0], 'preloads', 'extension_bootstrap.mjs');
+      }
+    } catch {
+      // The CLI cache is optional; retain the normal fallback when unavailable.
+    }
     return null;
   };
 
   const next = { ...process.env };
-  if (!String(next.GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS || '').trim()) {
-    next.GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS = 'true';
-  }
   if (!String(next.COPILOT_WEB_RELAY_ROOT || '').trim()) {
     next.COPILOT_WEB_RELAY_ROOT = REPO_ROOT;
   }
@@ -2651,13 +2663,42 @@ function buildSessionWorkerLaunchEnv() {
   if (!String(next.COPILOT_WEB_RELAY_LOG_DIR || '').trim()) {
     next.COPILOT_WEB_RELAY_LOG_DIR = path.join(__dirname, 'logs');
   }
+  if (!String(next.EXTENSION_PATH || '').trim()) {
+    const projectExtensionPath = path.join(REPO_ROOT, '.github', 'extensions', 'web-relay', 'extension.mjs');
+    if (fs.existsSync(projectExtensionPath)) {
+      next.EXTENSION_PATH = projectExtensionPath;
+    }
+  }
   const cliExecutable = normalizePathValue(config.cliPath);
   if (cliExecutable && !String(next.COPILOT_WEB_RELAY_CLI_EXECUTABLE || '').trim()) {
     next.COPILOT_WEB_RELAY_CLI_EXECUTABLE = cliExecutable;
   }
+  if (!String(next.COPILOT_WEB_RELAY_CLI_EXECUTABLE || '').trim()) {
+    try {
+      const loaderPath = fs.realpathSync('/usr/bin/copilot');
+      const packageRoot = path.dirname(loaderPath);
+      const nativePath = path.join(
+        packageRoot,
+        'node_modules',
+        `@github/copilot-${process.platform}-${process.arch}`,
+        'copilot',
+      );
+      if (fs.existsSync(nativePath)) {
+        next.COPILOT_WEB_RELAY_CLI_EXECUTABLE = nativePath;
+      }
+    } catch {
+      // Fall back to the copilot executable resolved by PATH.
+    }
+  }
   const bootstrapPath = resolveBootstrapPath();
   if (bootstrapPath && !String(next.COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH || '').trim()) {
     next.COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH = bootstrapPath;
+  }
+  if (bootstrapPath && !String(next.COPILOT_SDK_PATH || '').trim()) {
+    const bundledSdkPath = path.join(path.dirname(path.dirname(bootstrapPath)), 'copilot-sdk');
+    if (fs.existsSync(path.join(bundledSdkPath, 'extension.js'))) {
+      next.COPILOT_SDK_PATH = bundledSdkPath;
+    }
   }
   return next;
 }
