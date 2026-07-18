@@ -1146,24 +1146,11 @@
   .msg.user .bubble-action-btn:hover:not(:disabled) {
     background: rgba(255, 255, 255, 0.18);
   }
-  .thinking-text {
-    display: none;
-    margin-bottom: 8px;
-    font-size: var(--fs-core-composer);
-    line-height: 1.5;
-    color: var(--text);
-    min-width: 0;
-    white-space: normal;
-    overflow-wrap: anywhere;
-    word-break: break-word;
-  }
-  .thinking-text.visible { display: block; }
-  .thinking-text p { margin: 0; }
   .thinking-thoughts-panel {
     margin-bottom: 8px;
     min-width: 0;
     color: var(--muted);
-    font-size: var(--fs-meta-sm);
+    font-size: var(--fs-meta-md);
   }
   .thinking-thoughts-panel > summary {
     cursor: pointer;
@@ -1293,6 +1280,7 @@
     font-style: italic;
     color: var(--muted);
     opacity: 0.92;
+    font-size: var(--fs-meta-md);
   }
   .thinking-thought > summary {
     cursor: pointer;
@@ -1302,6 +1290,7 @@
     word-break: break-word;
   }
   .thinking-thought > summary::-webkit-details-marker { display: none; }
+  .thinking-thought[open] > summary { display: none; }
   .thinking-thought-body {
     margin: 4px 0 6px 18px;
     font-style: normal;
@@ -1824,6 +1813,10 @@
     margin-top: 16px;
     flex-wrap: wrap;
   }
+  .summary-modal-actions .summary-close {
+    width: auto;
+    min-width: 72px;
+  }
   .summary-dialog {
     width: min(920px, 100%);
     max-height: min(88vh, 860px);
@@ -2061,23 +2054,30 @@
     display: none;
   }
   .change-cwd-menu-item {
+    box-sizing: border-box;
     border: 1px solid transparent;
     border-radius: 8px;
     background: transparent;
     color: var(--text);
     width: 100%;
-    min-height: 36px;
-    padding: 6px 8px;
+    min-height: 62px;
+    padding: 8px;
     font: inherit;
     text-align: left;
     cursor: pointer;
     display: flex;
     flex-direction: column;
     gap: 2px;
+    flex-shrink: 0;
   }
   .change-cwd-menu-item:hover {
     background: var(--bg2);
     border-color: var(--border);
+  }
+  .change-cwd-menu-item:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+    background: var(--bg2);
   }
   .change-cwd-menu-item.selected {
     border-color: var(--accent);
@@ -2086,6 +2086,7 @@
   .change-cwd-menu-item-primary {
     font-size: var(--fs-meta-sm);
     color: var(--muted);
+    line-height: 1.35;
   }
   .change-cwd-menu-item-secondary {
     font-size: var(--fs-meta-sm);
@@ -3059,6 +3060,10 @@
     }
     .summary-modal-actions > * {
       flex: 1 1 calc(50% - 5px);
+    }
+    .summary-modal-actions .summary-close {
+      width: auto;
+      min-width: 0;
     }
     .summary-header-actions {
       width: 100%;

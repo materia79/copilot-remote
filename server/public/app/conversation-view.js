@@ -58,7 +58,6 @@ const HISTORY_LOAD_MORE_ID = 'history-load-more';
 const OPAQUE_RELAY_TEXT_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 let thinkingMessageId = null;
-let thinkingText = '';
 const relayStreamStateByMessageId = new Map();
 const completedMessageIds = new Set();
 const bubbleCancelInFlight = new Set();
@@ -779,8 +778,6 @@ export function renderActivityMarkup(activities) {
 
 export function showThinking(messageId = null, autoScroll = true) {
   const nextMessageId = String(messageId || '').trim();
-  const shouldResetText = !nextMessageId || thinkingMessageId !== nextMessageId;
-  if (shouldResetText) thinkingText = '';
   if (nextMessageId) thinkingMessageId = nextMessageId;
   document.getElementById('thinking-indicator')?.remove();
   const el = document.getElementById('messages');
@@ -799,7 +796,6 @@ export function showThinking(messageId = null, autoScroll = true) {
         <summary>💭 Thoughts</summary>
         <div class="thinking-thoughts-list"></div>
       </details>
-      <div id="thinking-text" class="thinking-text"></div>
       <div class="dots"><span></span><span></span><span></span></div>
       <div id="thinking-activity" class="thinking-activity"></div>
       <div class="subagent-bubbles-container" data-subagent-bubbles-root="1"></div>
@@ -812,13 +808,11 @@ export function showThinking(messageId = null, autoScroll = true) {
   } else {
     el.appendChild(div);
   }
-  renderThinkingText(thinkingText);
   renderThinkingThoughts();
   if (autoScroll) scrollBottom();
 }
 
 export function removeThinking() {
-  thinkingText = '';
   thinkingMessageId = null;
   document.getElementById('thinking-indicator')?.remove();
 }
@@ -830,19 +824,6 @@ export function collapseThinkingThoughts() {
   panel.querySelectorAll('.thinking-thought').forEach((row) => {
     if (row instanceof HTMLDetailsElement) row.open = false;
   });
-}
-
-function renderThinkingText(text) {
-  const box = document.getElementById('thinking-text');
-  if (!box) return;
-  const value = String(text || '').trim();
-  if (!value) {
-    box.innerHTML = '';
-    box.classList.remove('visible');
-    return;
-  }
-  box.classList.add('visible');
-  box.innerHTML = `<p>${escHtml(value).replace(/\n/g, '<br>')}</p>`;
 }
 
 function clearRelayStreamState(messageId = null) {
@@ -926,7 +907,6 @@ export function restoreInFlightThinking(inFlight, autoScroll = true) {
       conversationId: currentConvId,
     });
   }
-  thinkingText = '';
   showThinking(messageId, autoScroll);
   renderThinkingActivities();
   renderThinkingThoughts();
@@ -934,9 +914,7 @@ export function restoreInFlightThinking(inFlight, autoScroll = true) {
   const streamState = deriveLatestInFlightStreamEvent(inFlight);
   if (streamState) {
     rememberRelayStreamState(messageId, streamState.seq, streamState.done || !!inFlight?.streamDone);
-    if (!isOpaqueRelayText(streamState.text)) {
-      updateThinkingText(streamState.text, messageId, streamState.done || !!inFlight?.streamDone, autoScroll);
-    }
+    updateThinkingStreamStatus(messageId, streamState.done || !!inFlight?.streamDone, autoScroll);
     return;
   }
   const fallbackSeq = normalizeStreamSeq(inFlight?.lastStreamSeq);
@@ -1178,6 +1156,14 @@ function thoughtSummaryText(text) {
   return value.length > 80 ? `${value.slice(0, 80)}…` : value;
 }
 
+export function setLiveThinkingThoughtState(row, done = false) {
+  if (!row) return;
+  row.dataset.done = done ? '1' : '0';
+  // The temporary panel represents an active turn, so every thought remains visible
+  // until the completed assistant message replaces it with collapsed history.
+  row.open = true;
+}
+
 export function appendThinkingThought(reasoningId, text, done = false, subagentRunId = null, autoScroll = true) {
   const key = String(reasoningId || 'reasoning');
   const value = String(text || '');
@@ -1211,8 +1197,7 @@ export function appendThinkingThought(reasoningId, text, done = false, subagentR
       const bodyEl = row.querySelector('.thinking-thought-body');
       if (summaryEl) summaryEl.textContent = `💭 ${thoughtSummaryText(value)}`;
       renderThoughtBody(bodyEl, value);
-      row.dataset.done = done ? '1' : '0';
-      row.open = !done;
+      setLiveThinkingThoughtState(row, done);
       if (autoScroll) scrollBottom();
       return;
     }
@@ -1238,8 +1223,7 @@ export function appendThinkingThought(reasoningId, text, done = false, subagentR
   const bodyEl = row.querySelector('.thinking-thought-body');
   if (summaryEl) summaryEl.textContent = `💭 ${thoughtSummaryText(value)}`;
   renderThoughtBody(bodyEl, value);
-  row.dataset.done = done ? '1' : '0';
-  row.open = !done;
+  setLiveThinkingThoughtState(row, done);
   if (autoScroll) scrollBottom();
 }
 
@@ -1253,7 +1237,7 @@ export function renderThinkingThoughts() {
   }
 }
 
-export function updateThinkingText(text, messageId = null, done = false, autoScroll = true) {
+export function updateThinkingStreamStatus(messageId = null, done = false, autoScroll = true) {
   if (messageId) {
     if (thinkingMessageId && thinkingMessageId !== messageId) return;
     thinkingMessageId = messageId;
@@ -1262,8 +1246,6 @@ export function updateThinkingText(text, messageId = null, done = false, autoScr
     if (done) return;
     showThinking(thinkingMessageId, autoScroll);
   }
-  thinkingText = String(text || '');
-  renderThinkingText(thinkingText);
   if (done) {
     const dots = document.querySelector('#thinking-indicator .dots');
     if (dots) dots.style.display = 'none';
@@ -1280,7 +1262,7 @@ export function applyRelayStreamEvent({ messageId, text, done = false, seq = nul
   if (!transition.accept) return false;
   rememberRelayStreamState(id, transition.state.seq, transition.state.done);
   if (isOpaqueRelayText(text)) return true;
-  updateThinkingText(String(text || ''), id, !!done, autoScroll);
+  updateThinkingStreamStatus(id, !!done, autoScroll);
   return true;
 }
 

@@ -127,8 +127,17 @@ const MAX_RECENT_WORKSPACE_ROOTS = 12;
 const WORKSPACE_RECURSIVE_WATCH_SUPPORTED = process.platform === 'win32' || process.platform === 'darwin';
 const WORKSPACE_CONTENT_TYPES = Object.freeze({
   '.md': 'text/markdown; charset=utf-8',
+  '.mdx': 'text/markdown; charset=utf-8',
+  '.markdown': 'text/markdown; charset=utf-8',
   '.txt': 'text/plain; charset=utf-8',
+  '.rst': 'text/plain; charset=utf-8',
+  '.adoc': 'text/plain; charset=utf-8',
+  '.asciidoc': 'text/plain; charset=utf-8',
+  '.tex': 'text/plain; charset=utf-8',
+  '.bib': 'text/plain; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
+  '.jsonl': 'text/plain; charset=utf-8',
+  '.ndjson': 'text/plain; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
   '.mjs': 'text/javascript; charset=utf-8',
   '.cjs': 'text/javascript; charset=utf-8',
@@ -136,17 +145,36 @@ const WORKSPACE_CONTENT_TYPES = Object.freeze({
   '.tsx': 'text/plain; charset=utf-8',
   '.jsx': 'text/plain; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
+  '.scss': 'text/plain; charset=utf-8',
+  '.sass': 'text/plain; charset=utf-8',
+  '.less': 'text/plain; charset=utf-8',
+  '.vue': 'text/plain; charset=utf-8',
+  '.svelte': 'text/plain; charset=utf-8',
   '.html': 'text/html; charset=utf-8',
   '.xml': 'application/xml; charset=utf-8',
   '.yml': 'text/yaml; charset=utf-8',
   '.yaml': 'text/yaml; charset=utf-8',
   '.toml': 'text/plain; charset=utf-8',
   '.ini': 'text/plain; charset=utf-8',
+  '.conf': 'text/plain; charset=utf-8',
+  '.cfg': 'text/plain; charset=utf-8',
+  '.properties': 'text/plain; charset=utf-8',
   '.csv': 'text/csv; charset=utf-8',
+  '.tsv': 'text/tab-separated-values; charset=utf-8',
   '.sql': 'text/plain; charset=utf-8',
+  '.graphql': 'text/plain; charset=utf-8',
+  '.gql': 'text/plain; charset=utf-8',
+  '.proto': 'text/plain; charset=utf-8',
+  '.thrift': 'text/plain; charset=utf-8',
+  '.sol': 'text/plain; charset=utf-8',
   '.ps1': 'text/plain; charset=utf-8',
+  '.psm1': 'text/plain; charset=utf-8',
   '.sh': 'text/plain; charset=utf-8',
+  '.bash': 'text/plain; charset=utf-8',
+  '.zsh': 'text/plain; charset=utf-8',
+  '.fish': 'text/plain; charset=utf-8',
   '.bat': 'text/plain; charset=utf-8',
+  '.cmd': 'text/plain; charset=utf-8',
   '.go': 'text/plain; charset=utf-8',
   '.py': 'text/plain; charset=utf-8',
   '.java': 'text/plain; charset=utf-8',
@@ -156,6 +184,36 @@ const WORKSPACE_CONTENT_TYPES = Object.freeze({
   '.h': 'text/plain; charset=utf-8',
   '.cpp': 'text/plain; charset=utf-8',
   '.hpp': 'text/plain; charset=utf-8',
+  '.cc': 'text/plain; charset=utf-8',
+  '.cxx': 'text/plain; charset=utf-8',
+  '.hh': 'text/plain; charset=utf-8',
+  '.hxx': 'text/plain; charset=utf-8',
+  '.cs': 'text/plain; charset=utf-8',
+  '.kt': 'text/plain; charset=utf-8',
+  '.kts': 'text/plain; charset=utf-8',
+  '.swift': 'text/plain; charset=utf-8',
+  '.m': 'text/plain; charset=utf-8',
+  '.mm': 'text/plain; charset=utf-8',
+  '.scala': 'text/plain; charset=utf-8',
+  '.groovy': 'text/plain; charset=utf-8',
+  '.dart': 'text/plain; charset=utf-8',
+  '.zig': 'text/plain; charset=utf-8',
+  '.ex': 'text/plain; charset=utf-8',
+  '.exs': 'text/plain; charset=utf-8',
+  '.erl': 'text/plain; charset=utf-8',
+  '.hrl': 'text/plain; charset=utf-8',
+  '.fs': 'text/plain; charset=utf-8',
+  '.fsx': 'text/plain; charset=utf-8',
+  '.vb': 'text/plain; charset=utf-8',
+  '.pl': 'text/plain; charset=utf-8',
+  '.pm': 'text/plain; charset=utf-8',
+  '.lua': 'text/plain; charset=utf-8',
+  '.r': 'text/plain; charset=utf-8',
+  '.clj': 'text/plain; charset=utf-8',
+  '.cljs': 'text/plain; charset=utf-8',
+  '.hs': 'text/plain; charset=utf-8',
+  '.ml': 'text/plain; charset=utf-8',
+  '.mli': 'text/plain; charset=utf-8',
   '.rs': 'text/plain; charset=utf-8',
   '.lock': 'text/plain; charset=utf-8',
   '.log': 'text/plain; charset=utf-8',
@@ -176,13 +234,36 @@ const WORKSPACE_CONTENT_TYPES = Object.freeze({
   '.wmv': 'video/x-ms-wmv',
   '.pdf': 'application/pdf',
 });
+const WORKSPACE_CONTENT_TYPES_BY_FILENAME = Object.freeze({
+  '.dockerignore': 'text/plain; charset=utf-8',
+  '.editorconfig': 'text/plain; charset=utf-8',
+  '.env': 'text/plain; charset=utf-8',
+  '.gitignore': 'text/plain; charset=utf-8',
+  '.npmrc': 'text/plain; charset=utf-8',
+  'authors': 'text/plain; charset=utf-8',
+  'changelog': 'text/plain; charset=utf-8',
+  'cmakelists.txt': 'text/plain; charset=utf-8',
+  'containerfile': 'text/plain; charset=utf-8',
+  'dockerfile': 'text/plain; charset=utf-8',
+  'gnumakefile': 'text/plain; charset=utf-8',
+  'license': 'text/plain; charset=utf-8',
+  'makefile': 'text/plain; charset=utf-8',
+  'readme': 'text/plain; charset=utf-8',
+});
 const WORKSPACE_MARKDOWN_EXTENSIONS = new Set(['.md', '.mdx', '.markdown']);
 const WORKSPACE_PREVIEW_LANGUAGE_BY_EXTENSION = Object.freeze({
   '.md': 'markdown',
   '.mdx': 'markdown',
   '.markdown': 'markdown',
   '.txt': 'plaintext',
+  '.rst': 'plaintext',
+  '.adoc': 'plaintext',
+  '.asciidoc': 'plaintext',
+  '.tex': 'plaintext',
+  '.bib': 'plaintext',
   '.json': 'json',
+  '.jsonl': 'plaintext',
+  '.ndjson': 'plaintext',
   '.js': 'javascript',
   '.mjs': 'javascript',
   '.cjs': 'javascript',
@@ -190,17 +271,36 @@ const WORKSPACE_PREVIEW_LANGUAGE_BY_EXTENSION = Object.freeze({
   '.tsx': 'typescript',
   '.jsx': 'javascript',
   '.css': 'css',
+  '.scss': 'scss',
+  '.sass': 'scss',
+  '.less': 'less',
+  '.vue': 'xml',
+  '.svelte': 'xml',
   '.html': 'xml',
   '.xml': 'xml',
   '.yml': 'yaml',
   '.yaml': 'yaml',
   '.toml': 'toml',
   '.ini': 'ini',
+  '.conf': 'plaintext',
+  '.cfg': 'plaintext',
+  '.properties': 'plaintext',
   '.csv': 'plaintext',
+  '.tsv': 'plaintext',
   '.sql': 'sql',
+  '.graphql': 'graphql',
+  '.gql': 'graphql',
+  '.proto': 'plaintext',
+  '.thrift': 'plaintext',
+  '.sol': 'plaintext',
   '.ps1': 'powershell',
+  '.psm1': 'powershell',
   '.sh': 'bash',
+  '.bash': 'bash',
+  '.zsh': 'bash',
+  '.fish': 'bash',
   '.bat': 'dos',
+  '.cmd': 'dos',
   '.go': 'go',
   '.py': 'python',
   '.java': 'java',
@@ -210,9 +310,55 @@ const WORKSPACE_PREVIEW_LANGUAGE_BY_EXTENSION = Object.freeze({
   '.h': 'c',
   '.cpp': 'cpp',
   '.hpp': 'cpp',
+  '.cc': 'cpp',
+  '.cxx': 'cpp',
+  '.hh': 'cpp',
+  '.hxx': 'cpp',
+  '.cs': 'csharp',
+  '.kt': 'kotlin',
+  '.kts': 'kotlin',
+  '.swift': 'swift',
+  '.m': 'objectivec',
+  '.mm': 'objectivec',
+  '.scala': 'plaintext',
+  '.groovy': 'plaintext',
+  '.dart': 'plaintext',
+  '.zig': 'plaintext',
+  '.ex': 'plaintext',
+  '.exs': 'plaintext',
+  '.erl': 'plaintext',
+  '.hrl': 'plaintext',
+  '.fs': 'plaintext',
+  '.fsx': 'plaintext',
+  '.vb': 'plaintext',
+  '.pl': 'plaintext',
+  '.pm': 'plaintext',
+  '.lua': 'lua',
+  '.r': 'r',
+  '.clj': 'plaintext',
+  '.cljs': 'plaintext',
+  '.hs': 'plaintext',
+  '.ml': 'plaintext',
+  '.mli': 'plaintext',
   '.rs': 'rust',
   '.lock': 'plaintext',
   '.log': 'plaintext',
+});
+const WORKSPACE_PREVIEW_LANGUAGE_BY_FILENAME = Object.freeze({
+  '.dockerignore': 'plaintext',
+  '.editorconfig': 'ini',
+  '.env': 'plaintext',
+  '.gitignore': 'plaintext',
+  '.npmrc': 'ini',
+  'authors': 'plaintext',
+  'changelog': 'plaintext',
+  'cmakelists.txt': 'plaintext',
+  'containerfile': 'plaintext',
+  'dockerfile': 'plaintext',
+  'gnumakefile': 'plaintext',
+  'license': 'plaintext',
+  'makefile': 'plaintext',
+  'readme': 'plaintext',
 });
 const WORKSPACE_CODE_EXTENSIONS = new Set(Object.keys(WORKSPACE_PREVIEW_LANGUAGE_BY_EXTENSION)
   .filter((ext) => !WORKSPACE_MARKDOWN_EXTENSIONS.has(ext)));
@@ -3387,7 +3533,10 @@ function uploadContentUrlForSha(sha256) {
 
 function workspaceContentType(filePath) {
   const ext = path.extname(String(filePath || '')).toLowerCase();
-  return WORKSPACE_CONTENT_TYPES[ext] || 'application/octet-stream';
+  const filename = path.basename(String(filePath || '')).toLowerCase();
+  return WORKSPACE_CONTENT_TYPES[ext]
+    || WORKSPACE_CONTENT_TYPES_BY_FILENAME[filename]
+    || 'application/octet-stream';
 }
 
 function normalizeWorkspaceRelativePath(rawPath) {
@@ -3457,7 +3606,10 @@ function readWorkspaceFileMeta(filePath) {
 
 function previewLanguageForWorkspaceFile(filePath) {
   const ext = path.extname(String(filePath || '')).toLowerCase();
-  return WORKSPACE_PREVIEW_LANGUAGE_BY_EXTENSION[ext] || null;
+  const filename = path.basename(String(filePath || '')).toLowerCase();
+  return WORKSPACE_PREVIEW_LANGUAGE_BY_EXTENSION[ext]
+    || WORKSPACE_PREVIEW_LANGUAGE_BY_FILENAME[filename]
+    || null;
 }
 
 function readWorkspaceFilePreviewBuffer(filePath, size) {
@@ -3506,13 +3658,15 @@ function parseBooleanQueryFlag(value, fallback = false) {
   return fallback;
 }
 
-function workspacePreviewKindForMeta(ext, contentType) {
-  const normalizedExt = String(ext || '').toLowerCase();
+function workspacePreviewKindForMeta(filePath, contentType) {
+  const normalizedPath = String(filePath || '');
+  const normalizedExt = path.extname(normalizedPath).toLowerCase();
+  const filename = path.basename(normalizedPath).toLowerCase();
   const normalizedType = String(contentType || '').toLowerCase();
   if (WORKSPACE_MARKDOWN_EXTENSIONS.has(normalizedExt)) return 'markdown';
   if (WORKSPACE_IMAGE_EXTENSIONS.has(normalizedExt) || normalizedType.startsWith('image/')) return 'image';
   if (WORKSPACE_VIDEO_EXTENSIONS.has(normalizedExt) || normalizedType.startsWith('video/')) return 'video';
-  if (WORKSPACE_CODE_EXTENSIONS.has(normalizedExt)) return 'code';
+  if (WORKSPACE_CODE_EXTENSIONS.has(normalizedExt) || WORKSPACE_PREVIEW_LANGUAGE_BY_FILENAME[filename]) return 'code';
   if (isLikelyTextContentType(normalizedType)) return 'text';
   return 'binary';
 }
@@ -3572,7 +3726,7 @@ function mapDriveDirectoryEntry(entry) {
   node.ext = ext || null;
   node.size = Number(entry.size || 0);
   node.contentType = contentType;
-  node.previewKind = workspacePreviewKindForMeta(ext, contentType);
+  node.previewKind = workspacePreviewKindForMeta(absolutePath, contentType);
   return node;
 }
 
@@ -3713,7 +3867,7 @@ function mapLinuxDirectoryEntry(entry) {
   node.ext = ext || null;
   node.size = Number(entry.size || 0);
   node.contentType = contentType;
-  node.previewKind = workspacePreviewKindForMeta(ext, contentType);
+  node.previewKind = workspacePreviewKindForMeta(absolutePath, contentType);
   return node;
 }
 
@@ -3826,7 +3980,7 @@ function fetchWorkspaceDirectoryEntries(requestedPath, {
     childNode.ext = ext || null;
     childNode.size = Number(childStat.size || 0);
     childNode.contentType = contentType;
-    childNode.previewKind = workspacePreviewKindForMeta(ext, contentType);
+    childNode.previewKind = workspacePreviewKindForMeta(childAbsolutePath, contentType);
     children.push(childNode);
   }
 
@@ -3895,7 +4049,7 @@ function buildRepositoryTreeSnapshot({
       node.ext = ext || null;
       node.size = Number(stat.size || 0);
       node.contentType = contentType;
-      node.previewKind = workspacePreviewKindForMeta(ext, contentType);
+      node.previewKind = workspacePreviewKindForMeta(absolutePath, contentType);
       return node;
     }
 

@@ -2502,7 +2502,7 @@ export function registerMessagesRoutes(app, deps) {
     const likelyBinaryBytes = isLikelyBinaryPreviewBuffer(contentBuffer);
     const likelyTextType = isLikelyTextContentType(contentType);
 
-    let kind = workspacePreviewKindForMeta(ext, contentType);
+    let kind = workspacePreviewKindForMeta(filePath, contentType);
     if ((kind === 'markdown' || kind === 'code' || kind === 'text') && likelyBinaryType) {
       kind = 'binary';
     } else if ((kind === 'markdown' || kind === 'code' || kind === 'text') && (!likelyTextType && likelyBinaryBytes)) {
@@ -2821,7 +2821,7 @@ export function registerMessagesRoutes(app, deps) {
       const likelyBinaryBytes = isLikelyBinaryPreviewBuffer(contentBuffer);
       const likelyTextType = isLikelyTextContentType(contentType);
 
-      let kind = workspacePreviewKindForMeta(ext, contentType);
+      let kind = workspacePreviewKindForMeta(filePath, contentType);
       if ((kind === 'markdown' || kind === 'code' || kind === 'text') && likelyBinaryType) {
         kind = 'binary';
       } else if ((kind === 'markdown' || kind === 'code' || kind === 'text') && (!likelyTextType && likelyBinaryBytes)) {
@@ -2894,7 +2894,7 @@ export function registerMessagesRoutes(app, deps) {
       const likelyBinaryBytes = isLikelyBinaryPreviewBuffer(contentBuffer);
       const likelyTextType = isLikelyTextContentType(contentType);
 
-      let kind = workspacePreviewKindForMeta(ext, contentType);
+      let kind = workspacePreviewKindForMeta(filePath, contentType);
       if ((kind === 'markdown' || kind === 'code' || kind === 'text') && likelyBinaryType) {
         kind = 'binary';
       } else if ((kind === 'markdown' || kind === 'code' || kind === 'text') && (!likelyTextType && likelyBinaryBytes)) {

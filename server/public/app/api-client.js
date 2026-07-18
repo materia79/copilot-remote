@@ -197,6 +197,16 @@ export async function launchSessionWorker(sdkSessionId) {
   });
 }
 
+export async function relaunchSessionWorkerWithWorkspaceRoot(conversationId, rootPath) {
+  const convId = String(conversationId || '').trim();
+  const pathValue = String(rootPath || '').trim();
+  if (!convId || !pathValue) return null;
+  return apiFetch(`/api/conversation/${encodeURIComponent(convId)}/relaunch-with-workspace-root`, {
+    method: 'POST',
+    body: JSON.stringify({ rootPath: pathValue }),
+  });
+}
+
 export async function loadUsageSummary() {
   return apiFetch('/api/usage');
 }

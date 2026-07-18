@@ -1,4 +1,5 @@
 'use strict';
+import { killTmuxSession } from '../services/session-worker-launch-service.mjs';
 
 import fs from 'fs';
 import path from 'path';
@@ -220,6 +221,67 @@ export async function launchWorkspaceRootSession(runtimeState = {}, sessionWorke
     };
   }
   return { ok: true, statusCode: 200, ...result };
+}
+
+export function evaluateWorkspaceRootRelaunch({
+  workerStatus = '',
+  activeQueueCount = 0,
+} = {}) {
+  const normalizedStatus = String(workerStatus || '').trim().toLowerCase();
+  if (Number(activeQueueCount) > 0 || normalizedStatus === 'processing' || normalizedStatus === 'starting') {
+    return {
+      ok: false,
+      statusCode: 409,
+      error: 'Wait for the active turn to finish before changing CWD.',
+    };
+  }
+  return { ok: true, stopWorker: normalizedStatus === 'ready' };
+}
+
+async function stopIdleWorkspaceRootSession({
+  sdkSessionId,
+  worker,
+  sessionWorkerSupervisor,
+  sessionWorkerRegistry,
+  sessionWorkerProcessInspector,
+} = {}) {
+  const sid = String(sdkSessionId || '').trim();
+  if (!sid) return { ok: false, error: 'Missing session id' };
+  sessionWorkerSupervisor?.markKilled?.(sid);
+  await sessionWorkerSupervisor?.cancelPendingStart?.(sid, { wait: true });
+
+  const processRows = process.platform === 'win32'
+    ? (sessionWorkerProcessInspector?.findWindowsProcessTreeForSession?.(sid)
+      || sessionWorkerProcessInspector?.findWindowsProcessesForSession?.(sid)
+      || [])
+    : (sessionWorkerProcessInspector?.findProcessesForSession?.(sid) || []);
+  const pids = [...new Set([
+    ...processRows.map((row) => Number(row?.processId)).filter(Number.isInteger),
+    Number(worker?.pid),
+  ].filter((pid) => Number.isInteger(pid) && pid > 0))];
+
+  try {
+    if (process.platform === 'win32') {
+      sessionWorkerProcessInspector?.stopWindowsPids?.(pids);
+    } else {
+      for (const pid of pids) {
+        try {
+          process.kill(pid, 'SIGTERM');
+        } catch (error) {
+          if (error?.code !== 'ESRCH') throw error;
+        }
+      }
+      // The tmux session can retain the shell after its child has received SIGTERM.
+      killTmuxSession(sid);
+    }
+  } catch (error) {
+    return { ok: false, error: error?.message || 'Failed to stop the idle CLI' };
+  }
+
+  sessionWorkerRegistry?.removeWorker?.(sid);
+  sessionWorkerSupervisor?.clearRestartSchedule?.(sid);
+  sessionWorkerSupervisor?.resetHealth?.(sid, { clearFailureCount: false });
+  return { ok: true, stoppedPids: pids };
 }
 
 export function learnWorkspaceRootFromSessionSync({
@@ -1251,6 +1313,7 @@ export function registerSessionsRoutes(app, deps) {
     featureFlags,
     sessionWorkerSupervisor,
     sessionWorkerRegistry,
+    sessionWorkerProcessInspector,
     resolveSessionStateRoot,
     markSharedViewerPresence,
     getSharedWatcherCount,
@@ -1275,6 +1338,12 @@ export function registerSessionsRoutes(app, deps) {
     WHERE status = 'pending'
       AND sdk_session_id IS NOT NULL
       AND TRIM(sdk_session_id) <> ''
+  `);
+  const countActiveConversationQueueRows = db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM queue
+    WHERE conversation_id = ?
+      AND status IN ('pending', 'processing', 'parked')
   `);
   const getConversationUsageSnapshotAggregate = db.prepare(`
     SELECT
@@ -2715,6 +2784,7 @@ export function registerSessionsRoutes(app, deps) {
       conversationId,
       rootPath: nextRootPath,
     });
+
     if (!result?.ok) {
       return res.status(400).json({ error: result?.error || 'Failed to update conversation workspace root' });
     }
@@ -2742,6 +2812,79 @@ export function registerSessionsRoutes(app, deps) {
       currentWorkspaceRootPath: state?.currentWorkspaceRootPath || null,
       currentWorkspaceRootName: state?.currentWorkspaceRootName || null,
       recentWorkspaceRoots: Array.isArray(workspaceHints?.recentWorkspaceRoots) ? workspaceHints.recentWorkspaceRoots : [],
+    });
+  });
+
+  app.post('/api/conversation/:id/relaunch-with-workspace-root', auth, async (req, res) => {
+    const conversationId = String(req.params.id || '').trim();
+    const rootPath = String(req.body?.rootPath || req.body?.workspaceRootPath || '').trim();
+    if (!conversationId) return res.status(400).json({ error: 'Missing conversation id' });
+    if (!rootPath) return res.status(400).json({ error: 'Missing rootPath' });
+    if (typeof updateConversationConfiguredWorkspaceRoot !== 'function') {
+      return res.status(500).json({ error: 'Conversation workspace updates are unavailable' });
+    }
+
+    const workspaceState = resolveConversationWorkspaceState?.({ conversationId }) || null;
+    const sdkSessionId = String(workspaceState?.sdkSessionId || '').trim();
+    if (!sdkSessionId) {
+      return res.status(409).json({ error: 'Open a conversation with a bound session before relaunching.' });
+    }
+    const worker = sessionWorkerSupervisor?.getWorkerState?.(sdkSessionId)
+      || sessionWorkerRegistry?.getWorker?.(sdkSessionId)
+      || null;
+    const activeQueueCount = Number(countActiveConversationQueueRows.get(conversationId)?.count || 0);
+    const eligibility = evaluateWorkspaceRootRelaunch({
+      workerStatus: worker?.status,
+      activeQueueCount,
+    });
+    if (!eligibility.ok) return res.status(eligibility.statusCode).json({ ok: false, error: eligibility.error });
+
+    const updateResult = updateConversationConfiguredWorkspaceRoot({ conversationId, rootPath });
+    if (!updateResult?.ok) {
+      return res.status(400).json({ error: updateResult?.error || 'Failed to update conversation workspace root' });
+    }
+    if (eligibility.stopWorker) {
+      const stopped = await stopIdleWorkspaceRootSession({
+        sdkSessionId,
+        worker,
+        sessionWorkerSupervisor,
+        sessionWorkerRegistry,
+        sessionWorkerProcessInspector,
+      });
+      if (!stopped.ok) return res.status(500).json({ ok: false, error: stopped.error });
+    }
+    const launched = await launchWorkspaceRootSession(
+      runtimeState,
+      sessionWorkerSupervisor,
+      sdkSessionId,
+      sessionWorkerRegistry,
+    );
+    if (!launched?.ok) {
+      return res.status(launched?.statusCode || 409).json({
+        ok: false,
+        error: launched?.error || 'Failed to relaunch the CLI',
+      });
+    }
+    const state = updateResult.state || null;
+    const workspaceHints = workspaceRootPayload();
+    io.emit('conversation_workspace_root_updated', {
+      conversationId,
+      sdkSessionId,
+      configuredWorkspaceRootPath: state?.configuredWorkspaceRootPath || null,
+      configuredWorkspaceRootName: state?.configuredWorkspaceRootName || null,
+      runtimeWorkspaceRootPath: state?.runtimeWorkspaceRootPath || null,
+      runtimeWorkspaceRootName: state?.runtimeWorkspaceRootName || null,
+      currentWorkspaceRootPath: state?.currentWorkspaceRootPath || null,
+      currentWorkspaceRootName: state?.currentWorkspaceRootName || null,
+      recentWorkspaceRoots: Array.isArray(workspaceHints?.recentWorkspaceRoots) ? workspaceHints.recentWorkspaceRoots : [],
+    });
+    return res.json({
+      ok: true,
+      conversationId,
+      sdkSessionId,
+      ...state,
+      worker: launched.worker || null,
+      lifecycle: launched.lifecycle || null,
     });
   });
 
