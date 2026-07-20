@@ -33,7 +33,8 @@ test('buildTmuxWorkerShellCommand injects only relay env needed for workers', ()
   assert.match(command, /SESSION_ID='abc-123'/);
   assert.doesNotMatch(command, /IGNORED_VAR/);
   assert.match(command, /exec script -q -c/);
-  assert.match(command, /copilot.*--allow-all --session-id.*-i.*launch the server/);
+  assert.match(command, /copilot.*--allow-all --session-id/);
+  assert.doesNotMatch(command, /(?:^|\s)-i(?:\s|$)|launch the server/);
   assert.match(command, /abc-123/);
   assert.match(command, /\/dev\/null/);
   assert.doesNotMatch(command, /GH_FORCE_TTY/);
@@ -61,7 +62,8 @@ test('buildTmuxWorkerShellCommand keeps the host CLI launch when extension boots
   assert.match(command, /COPILOT_WEB_RELAY_CLI_EXECUTABLE='\/usr\/bin\/copilot'/);
   assert.match(command, /COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH='\/cache\/copilot\/preloads\/extension_bootstrap\.mjs'/);
   assert.match(command, /EXTENSION_PATH='\/repo\/server\/relay-extension\.mjs'/);
-  assert.match(command, /\/usr\/bin\/copilot.*--allow-all --session-id.*-i.*launch the server/);
+  assert.match(command, /\/usr\/bin\/copilot.*--allow-all --session-id/);
+  assert.doesNotMatch(command, /(?:^|\s)-i(?:\s|$)|launch the server/);
   assert.match(command, /extension_bootstrap\.mjs/);
   assert.match(command, /--allow-all --session-id/);
   assert.match(command, /abc-123/);
@@ -145,7 +147,8 @@ test('launchSessionCli uses tmux on posix and returns discovered worker pid', as
   assert.match(shellCommand, /COPILOT_WEB_RELAY_CONFIG='\/relay\/server\/config\.json'/);
   assert.match(shellCommand, /COPILOT_WORKSPACE_ROOT='\/repo'/);
   assert.match(shellCommand, /exec script -q -c/);
-  assert.match(shellCommand, /copilot.*--allow-all --session-id.*-i.*launch the server/);
+  assert.match(shellCommand, /copilot.*--allow-all --session-id/);
+  assert.doesNotMatch(shellCommand, /(?:^|\s)-i(?:\s|$)|launch the server/);
   assert.match(shellCommand, /abc-123/);
   assert.doesNotMatch(shellCommand, /GH_FORCE_TTY/);
 });
@@ -229,7 +232,7 @@ test('launchSessionCli uses the configured host CLI executable', async () => {
   assert.equal(launched.launchMode, 'detached');
   assert.equal(launched.pid, 4242);
   assert.equal(spawnCalls[0]?.command, '/usr/bin/copilot');
-  assert.deepEqual(spawnCalls[0]?.args, ['--allow-all', '--session-id', 'abc-123', '-i', 'launch the server']);
+  assert.deepEqual(spawnCalls[0]?.args, ['--allow-all', '--session-id', 'abc-123']);
 });
 
 test('launchSessionCli uses the host CLI on posix when extension bootstrap is configured', async () => {
@@ -266,7 +269,7 @@ test('launchSessionCli uses the host CLI on posix when extension bootstrap is co
   assert.equal(launched.launchMode, 'detached');
   assert.equal(launched.pid, 4242);
   assert.equal(spawnCalls[0]?.command, '/usr/bin/copilot');
-  assert.deepEqual(spawnCalls[0]?.args, ['--allow-all', '--session-id', 'abc-123', '-i', 'launch the server']);
+  assert.deepEqual(spawnCalls[0]?.args, ['--allow-all', '--session-id', 'abc-123']);
 });
 
 test('launchSessionCli uses copilot command when bootstrap is set without cli executable', async () => {
@@ -302,7 +305,7 @@ test('launchSessionCli uses copilot command when bootstrap is set without cli ex
   assert.equal(launched.launchMode, 'detached');
   assert.equal(launched.pid, 4242);
   assert.equal(spawnCalls[0]?.command, 'copilot');
-  assert.deepEqual(spawnCalls[0]?.args, ['--allow-all', '--session-id', 'abc-123', '-i', 'launch the server']);
+  assert.deepEqual(spawnCalls[0]?.args, ['--allow-all', '--session-id', 'abc-123']);
 });
 
 test('launchSessionCli uses the configured host CLI when bootstrap is set without extension path', async () => {
@@ -338,7 +341,7 @@ test('launchSessionCli uses the configured host CLI when bootstrap is set withou
   assert.equal(launched.launchMode, 'detached');
   assert.equal(launched.pid, 4242);
   assert.equal(spawnCalls[0]?.command, '/usr/bin/copilot');
-  assert.deepEqual(spawnCalls[0]?.args, ['--allow-all', '--session-id', 'abc-123', '-i', 'launch the server']);
+  assert.deepEqual(spawnCalls[0]?.args, ['--allow-all', '--session-id', 'abc-123']);
 });
 
 test('launchSessionCli opens a visible detached console on windows', async () => {

@@ -34,15 +34,13 @@ is actively watching that session.
 > **Single-owner rule:** Use either extension-managed relay transport **or** standalone `relay.mjs`, never both at the same time.
 > Agent/runtime restart policy is defined in `.github/copilot-instructions.md`.
 
-Tell the Copilot CLI agent: **"launch the server"**
-
-Or start Copilot with no manual prompt typing:
+Launch Copilot CLI from the repository root with extensions enabled and no initial user prompt:
 
 ```bash
 npm run copilot:relay
 ```
 
-That runs `gh copilot -- --allow-all -i "launch the server"` from the repo root, so the
+That runs `gh copilot -- --allow-all` from the repo root, so the
 extension is discovered and the relay starts immediately. If you installed the extension
 globally, plain `gh copilot` from any repository is enough.
 

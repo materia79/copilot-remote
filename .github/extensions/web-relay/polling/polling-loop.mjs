@@ -653,7 +653,9 @@ export function createPollingLoop({
       if (message.model && !isAutoRequestedModel(message.model)) {
         const modelSwitch = await setModelForMessage(message.model, message.contextTier);
         const activeModel = modelSwitch.after || modelSwitch.current || "unknown";
-        const switchText = modelSwitch.switched
+        const switchText = modelSwitch.confirmationPending
+          ? `Model switch requested: requested=${message.model} active=pending target=${activeModel} via=${modelSwitch.via || "switchTo"}`
+          : modelSwitch.switched
           ? `Model selected: requested=${message.model} active=${activeModel} via=${modelSwitch.via || "switchTo"}`
           : `Model switch failed: requested=${message.model} active=${activeModel}${modelSwitch.error ? ` error=${modelSwitch.error}` : ""}`;
         await publishModelSnapshot("model-switch", true);

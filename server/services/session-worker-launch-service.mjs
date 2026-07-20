@@ -33,7 +33,7 @@ function buildPosixWorkerLaunchCommand(targetSessionId, env = {}) {
     || normalizeText(env?.COPILOT_CLI_EXECUTABLE)
     || normalizeText(env?.COPILOT_CLI_PATH)
     || 'copilot';
-  return `${shellQuote(cliExecutable)} --allow-all --session-id ${shellQuote(targetSessionId)} -i ${shellQuote('launch the server')}`;
+  return `${shellQuote(cliExecutable)} --allow-all --session-id ${shellQuote(targetSessionId)}`;
 }
 
 export function normalizeTmuxSessionName(targetSessionId) {
@@ -286,7 +286,7 @@ export async function launchSessionCli({
       '--session-id',
       target,
     ]
-    : ['--allow-all', '--session-id', target, '-i', 'launch the server'];
+    : ['--allow-all', '--session-id', target];
   const child = spawnImpl(spawnCommand, spawnArgs, {
     cwd: launchProcessCwd,
     env: launchSessionEnv,
