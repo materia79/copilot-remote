@@ -108,6 +108,8 @@ export function buildTmuxWorkerShellCommand(targetSessionId, env = {}) {
   };
   const exports = [];
   for (const key of [
+    'COPILOT_ALLOW_ALL',
+    'GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS',
     'COPILOT_WEB_RELAY_ROOT',
     'COPILOT_WEB_RELAY_SERVER_DIR',
     'COPILOT_WEB_RELAY_CONFIG',
@@ -115,7 +117,6 @@ export function buildTmuxWorkerShellCommand(targetSessionId, env = {}) {
     'COPILOT_WEB_RELAY_LOG_DIR',
     'COPILOT_WEB_RELAY_CLI_EXECUTABLE',
     'COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH',
-    'COPILOT_WEB_RELAY_FORCE_GLOBAL_EXTENSION',
     'COPILOT_SDK_PATH',
     'EXTENSION_PATH',
     'SESSION_ID',
@@ -144,15 +145,19 @@ function buildWorkerLaunchEnv({ processCwd, workspaceRoot, env = process.env } =
   if (!launchProcessCwd && !launchWorkspaceRoot) return env;
   const launchEnv = {
     ...env,
+    COPILOT_ALLOW_ALL: 'true',
+    GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS: 'true',
     ...(launchWorkspaceRoot ? {
       COPILOT_WORKSPACE_ROOT: launchWorkspaceRoot,
       INIT_CWD: launchWorkspaceRoot,
     } : {}),
     ...(launchProcessCwd ? { PWD: launchProcessCwd } : {}),
   };
-  // Prompt mode adds project extensions only when this is true. Relay workers
-  // use the installed user-global extension as their single bridge instance.
-  delete launchEnv.GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS;
+  // COPILOT_ALLOW_ALL matches the --allow-all launch flag and lets headless
+  // workers pass folder trust before extension activation. The global wrapper
+  // handles outside-package workers and defers to the project extension inside
+  // this package, so workers must not force both.
+  delete launchEnv.COPILOT_WEB_RELAY_FORCE_GLOBAL_EXTENSION;
   return launchEnv;
 }
 

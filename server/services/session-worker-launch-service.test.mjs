@@ -15,14 +15,18 @@ test('normalizeTmuxSessionName rejects unsafe session ids', () => {
 
 test('buildTmuxWorkerShellCommand injects only relay env needed for workers', () => {
   const command = buildTmuxWorkerShellCommand('abc-123', {
-    GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS: 'true',
+    COPILOT_ALLOW_ALL: 'true',
+    GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS: 'false',
+    COPILOT_WEB_RELAY_FORCE_GLOBAL_EXTENSION: 'true',
     COPILOT_WEB_RELAY_SERVER_DIR: '/repo/server',
     COPILOT_WEB_RELAY_CONFIG: '/repo/server/config.json',
     INIT_CWD: '/workspace',
     IGNORED_VAR: 'nope',
   });
 
-  assert.doesNotMatch(command, /GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS/);
+  assert.match(command, /COPILOT_ALLOW_ALL='true'/);
+  assert.match(command, /GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS='false'/);
+  assert.doesNotMatch(command, /COPILOT_WEB_RELAY_FORCE_GLOBAL_EXTENSION/);
   assert.match(command, /COPILOT_WEB_RELAY_SERVER_DIR='\/repo\/server'/);
   assert.match(command, /COPILOT_WEB_RELAY_CONFIG='\/repo\/server\/config\.json'/);
   assert.match(command, /INIT_CWD='\/workspace'/);
@@ -115,7 +119,10 @@ test('launchSessionCli uses tmux on posix and returns discovered worker pid', as
     processCwd: '/relay',
     workspaceRoot: '/repo',
     env: {
-      GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS: 'true',
+      COPILOT_ALLOW_ALL: 'false',
+      GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS: 'false',
+      COPILOT_WEB_RELAY_FORCE_GLOBAL_EXTENSION: 'true',
+      COPILOT_WEB_RELAY_CONFIG: '/relay/server/config.json',
       COPILOT_WORKSPACE_ROOT: '/stale',
     },
     platform: 'linux',
@@ -132,7 +139,10 @@ test('launchSessionCli uses tmux on posix and returns discovered worker pid', as
   const newSessionCall = calls.find((call) => call[1] === 'new-session');
   assert.equal(newSessionCall?.[6], '/relay');
   const shellCommand = newSessionCall?.slice(-1)?.[0] || '';
-  assert.doesNotMatch(shellCommand, /GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS/);
+  assert.match(shellCommand, /COPILOT_ALLOW_ALL='true'/);
+  assert.match(shellCommand, /GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS='true'/);
+  assert.doesNotMatch(shellCommand, /COPILOT_WEB_RELAY_FORCE_GLOBAL_EXTENSION/);
+  assert.match(shellCommand, /COPILOT_WEB_RELAY_CONFIG='\/relay\/server\/config\.json'/);
   assert.match(shellCommand, /COPILOT_WORKSPACE_ROOT='\/repo'/);
   assert.match(shellCommand, /exec script -q -c/);
   assert.match(shellCommand, /copilot.*--allow-all --session-id.*-i.*launch the server/);
@@ -148,7 +158,10 @@ test('launchSessionCli falls back to detached spawn when tmux is unavailable', a
     workspaceRoot: '/repo',
     env: {
       PATH: process.env.PATH || '',
-      GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS: 'true',
+      COPILOT_ALLOW_ALL: 'false',
+      GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS: 'false',
+      COPILOT_WEB_RELAY_FORCE_GLOBAL_EXTENSION: 'true',
+      COPILOT_WEB_RELAY_CONFIG: '/relay/server/config.json',
       COPILOT_WORKSPACE_ROOT: '/stale',
     },
     platform: 'linux',
@@ -178,7 +191,10 @@ test('launchSessionCli falls back to detached spawn when tmux is unavailable', a
   assert.equal(spawnCalls[0]?.options?.env?.INIT_CWD, '/repo');
   assert.equal(spawnCalls[0]?.options?.env?.PWD, '/relay');
   assert.equal(spawnCalls[0]?.options?.env?.SESSION_ID, 'abc-123');
-  assert.equal(spawnCalls[0]?.options?.env?.GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS, undefined);
+  assert.equal(spawnCalls[0]?.options?.env?.COPILOT_ALLOW_ALL, 'true');
+  assert.equal(spawnCalls[0]?.options?.env?.GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS, 'true');
+  assert.equal(spawnCalls[0]?.options?.env?.COPILOT_WEB_RELAY_FORCE_GLOBAL_EXTENSION, undefined);
+  assert.equal(spawnCalls[0]?.options?.env?.COPILOT_WEB_RELAY_CONFIG, '/relay/server/config.json');
 });
 
 test('launchSessionCli uses the configured host CLI executable', async () => {
@@ -335,6 +351,9 @@ test('launchSessionCli opens a visible detached console on windows', async () =>
     env: {
       PATH: process.env.PATH || '',
       ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+      COPILOT_ALLOW_ALL: 'false',
+      GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS: 'false',
+      COPILOT_WEB_RELAY_FORCE_GLOBAL_EXTENSION: 'true',
     },
     platform: 'win32',
     processInspector: {
@@ -375,6 +394,9 @@ test('launchSessionCli opens a visible detached console on windows', async () =>
   assert.equal(spawnCalls[0]?.options?.detached, true);
   assert.equal(spawnCalls[0]?.options?.stdio, 'ignore');
   assert.equal(spawnCalls[0]?.options?.windowsHide, false);
+  assert.equal(spawnCalls[0]?.options?.env?.COPILOT_ALLOW_ALL, 'true');
+  assert.equal(spawnCalls[0]?.options?.env?.GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS, 'true');
+  assert.equal(spawnCalls[0]?.options?.env?.COPILOT_WEB_RELAY_FORCE_GLOBAL_EXTENSION, undefined);
   assert.equal(unrefCalled, true);
 });
 
@@ -467,6 +489,9 @@ test('launchSessionCli bypasses process reuse when disabled', async () => {
   const launched = await launchSessionCli({
     targetSessionId: 'abc-123',
     cwd: '/repo',
+    env: {
+      PATH: process.env.PATH || '',
+    },
     platform: 'linux',
     allowProcessReuse: false,
     processInspector: {
@@ -498,6 +523,9 @@ test('launchSessionCli ignores a dead discovered pid and continues to launch', a
   const launched = await launchSessionCli({
     targetSessionId: 'abc-123',
     cwd: '/repo',
+    env: {
+      PATH: process.env.PATH || '',
+    },
     platform: 'linux',
     processInspector: {
       findProcessForSession() {
