@@ -1491,6 +1491,7 @@ export function registerSessionsRoutes(app, deps) {
     markSharedViewerPresence,
     getSharedWatcherCount,
     statusEventService,
+    windowsAutostartService,
     isSha256,
     uploadPathForSha,
   } = deps;
@@ -3475,6 +3476,39 @@ export function registerSessionsRoutes(app, deps) {
         ? `${reconciliationFailures.length} unstarted conversation(s) could not switch provider.`
         : (discovery?.ok ? null : (discovery?.error || 'OpenAI model discovery failed')),
     });
+  });
+
+  app.get('/api/settings/windows-autostart', auth, (_req, res) => {
+    if (!windowsAutostartService) {
+      return res.status(500).json({ error: 'Windows autostart settings are unavailable' });
+    }
+    try {
+      return res.json(windowsAutostartService.getState());
+    } catch {
+      return res.status(500).json({
+        error: 'Unable to read Windows autostart. Check access to your user Startup folder.',
+      });
+    }
+  });
+
+  app.post('/api/settings/windows-autostart', auth, (req, res) => {
+    if (typeof req.body?.enabled !== 'boolean') {
+      return res.status(400).json({ error: 'enabled must be a boolean' });
+    }
+    if (!windowsAutostartService) {
+      return res.status(500).json({ error: 'Windows autostart settings are unavailable' });
+    }
+    try {
+      const currentState = windowsAutostartService.getState();
+      if (!currentState.supported) {
+        return res.status(400).json({ error: 'Windows autostart is only available on Windows' });
+      }
+      return res.json(windowsAutostartService.setEnabled(req.body.enabled));
+    } catch {
+      return res.status(500).json({
+        error: 'Unable to update Windows autostart. Check access to your user Startup folder.',
+      });
+    }
   });
 
   app.post('/api/workspace-root', auth, (req, res) => {

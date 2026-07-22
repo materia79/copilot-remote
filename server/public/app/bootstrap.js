@@ -155,6 +155,7 @@ import {
   toggleOpenAIProvider,
   applyOpenAISettingsState,
   refreshOpenAISettingsState,
+  updateWindowsAutostartSettingFromToggle,
 } from './settings-modal.js';
 import {
   initActionConfirmations,
@@ -2955,6 +2956,7 @@ window.saveOpenAISettings = saveOpenAISettings;
 window.removeOpenAISettings = removeOpenAISettings;
 window.toggleOpenAIProvider = toggleOpenAIProvider;
 window.updateShowSuspendHostSetting = updateShowSuspendHostSetting;
+window.updateWindowsAutostartSettingFromToggle = updateWindowsAutostartSettingFromToggle;
 window.openSettingsModal = openSettingsModal;
 window.closeSettingsModal = closeSettingsModal;
 window.doAuth = doAuth;

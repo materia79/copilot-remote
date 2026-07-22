@@ -1,12 +1,15 @@
 import {
   defaultSessionWorkspaceRootPath,
   defaultSessionWorkspaceRootWarning,
+  serverPlatform,
   showTransientRelayNotice,
 } from './store.js';
 import {
   loadOpenAISettings,
   updateDefaultSessionWorkspaceRoot,
   updateOpenAISettings,
+  loadWindowsAutostartSetting,
+  updateWindowsAutostartSetting,
 } from './api-client.js';
 import { syncFontScaleSelect } from './font-scaling.js';
 import { syncPwaAppNameInput } from './pwa-install.js';
@@ -35,6 +38,8 @@ function ensureOpenAISettingsInputTracking() {
     });
   }
 }
+let windowsAutostartUpdateInFlight = false;
+let windowsAutostartEnabled = false;
 
 function readLocalStorage(key) {
   try {
@@ -253,6 +258,64 @@ export async function removeOpenAISettings() {
   }
 }
 
+function syncWindowsAutostartSetting() {
+  const container = document.getElementById('windows-autostart-setting');
+  const checkbox = document.getElementById('windows-autostart-toggle');
+  const supported = serverPlatform === 'win32';
+  if (container) container.hidden = !supported;
+  if (checkbox instanceof HTMLInputElement) {
+    checkbox.checked = windowsAutostartEnabled;
+    checkbox.disabled = !supported || windowsAutostartUpdateInFlight;
+  }
+}
+
+export async function refreshWindowsAutostartSetting() {
+  syncWindowsAutostartSetting();
+  if (serverPlatform !== 'win32' || windowsAutostartUpdateInFlight) return;
+  windowsAutostartUpdateInFlight = true;
+  syncWindowsAutostartSetting();
+  try {
+    const result = await loadWindowsAutostartSetting();
+    if (!result?.supported) {
+      alert('Failed to read the Windows autostart setting.');
+      return;
+    }
+    windowsAutostartEnabled = !!result.enabled;
+  } catch (error) {
+    alert(error?.message || 'Failed to read the Windows autostart setting.');
+  } finally {
+    windowsAutostartUpdateInFlight = false;
+    syncWindowsAutostartSetting();
+  }
+}
+
+export async function updateWindowsAutostartSettingFromToggle(enabled) {
+  if (serverPlatform !== 'win32' || windowsAutostartUpdateInFlight) {
+    syncWindowsAutostartSetting();
+    return;
+  }
+  windowsAutostartUpdateInFlight = true;
+  syncWindowsAutostartSetting();
+  try {
+    const result = await updateWindowsAutostartSetting(!!enabled);
+    if (!result?.supported) {
+      alert('Failed to update the Windows autostart setting.');
+      return;
+    }
+    windowsAutostartEnabled = !!result.enabled;
+    showTransientRelayNotice(
+      windowsAutostartEnabled
+        ? 'Windows autostart enabled.'
+        : 'Windows autostart disabled.',
+    );
+  } catch (error) {
+    alert(error?.message || 'Failed to update the Windows autostart setting.');
+  } finally {
+    windowsAutostartUpdateInFlight = false;
+    syncWindowsAutostartSetting();
+  }
+}
+
 function readShowSuspendHostSetting() {
   const stored = String(readLocalStorage(SHOW_SUSPEND_HOST_STORAGE_KEY) || '').trim().toLowerCase();
   if (!stored) return true;
@@ -356,6 +419,8 @@ export function openSettingsModal() {
   openAISettingsInputsDirty = false;
   ensureOpenAISettingsInputTracking();
   void syncOpenAISettingsInputs();
+  syncWindowsAutostartSetting();
+  void refreshWindowsAutostartSetting();
   modal?.classList.add('visible');
   modal?.setAttribute('aria-hidden', 'false');
 }

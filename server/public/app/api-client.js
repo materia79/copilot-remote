@@ -233,6 +233,17 @@ export async function updateOpenAISettings({
   }
 }
 
+export async function loadWindowsAutostartSetting() {
+  return apiFetch('/api/settings/windows-autostart');
+}
+
+export async function updateWindowsAutostartSetting(enabled) {
+  return apiFetch('/api/settings/windows-autostart', {
+    method: 'POST',
+    body: JSON.stringify({ enabled: !!enabled }),
+  });
+}
+
 export async function launchSessionWorker(sdkSessionId) {
   const sessionId = String(sdkSessionId || '').trim();
   if (!sessionId) return null;

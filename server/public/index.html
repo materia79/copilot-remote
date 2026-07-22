@@ -3538,6 +3538,18 @@
         >
       </div>
       <div class="settings-help" style="margin-top: 6px;">Hide the menu action when host suspend is unsupported or not needed on this device.</div>
+      <div id="windows-autostart-setting" hidden>
+        <div class="settings-row" style="margin-top: 12px; margin-bottom: 0;">
+          <label for="windows-autostart-toggle">Autostart (Windows)</label>
+          <input
+            id="windows-autostart-toggle"
+            type="checkbox"
+            onchange="updateWindowsAutostartSettingFromToggle(this.checked)"
+            aria-label="Autostart on Windows sign-in"
+          >
+        </div>
+        <div class="settings-help" style="margin-top: 6px;">Open a visible terminal and start only the web relay server when you sign in. A Copilot CLI host must attach separately to process turns.</div>
+      </div>
       <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
         <label for="pwa-app-name-input">Install app name</label>
         <input

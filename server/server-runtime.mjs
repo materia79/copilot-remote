@@ -52,6 +52,7 @@ import {
 } from '../shared/model-catalog-freshness.mjs';
 import { applyOpenAIProviderEnvironment, killTmuxSession, launchSessionCli } from './services/session-worker-launch-service.mjs';
 import { createSshTunnelManager } from './services/ssh-tunnel-manager-service.mjs';
+import { createWindowsAutostartService } from './services/windows-autostart-service.mjs';
 import { createSessionWorkerWebSocketService } from './services/session-worker-websocket-service.mjs';
 import { createTmuxInspectorAccessPolicy } from './services/tmux-inspector-access-policy.mjs';
 import { createTmuxInspectorStreamService } from './services/tmux-inspector-stream-service.mjs';
@@ -5587,6 +5588,10 @@ const runtimeState = {
   get featureFlags() { return featureFlags; },
   get sessionWorkerSupervisor() { return sessionWorkerSupervisor; },
 };
+const windowsAutostartService = createWindowsAutostartService({
+  packageRoot: REPO_ROOT,
+  configPath: CONFIG_PATH,
+});
 
 const sharedRouteDeps = {
   auth,
@@ -5727,6 +5732,7 @@ const sharedRouteDeps = {
   markSharedViewerPresence,
   getSharedWatcherCount,
   statusEventService,
+  windowsAutostartService,
 };
 registerMessagesRoutes(app, sharedRouteDeps);
 registerSessionsRoutes(app, sharedRouteDeps);
