@@ -18,6 +18,7 @@ import {
   usageSnapshotFromRow,
   usageSnapshotFromSummary,
 } from '../services/usage-snapshot-helpers.mjs';
+import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mjs';
 
 export const SESSION_WORKER_OWNER_LEASE_MS = 120_000;
 export const SESSION_WORKER_TRANSIENT_DEQUEUE_RETRIES = 2;
@@ -35,6 +36,41 @@ const STRANDED_SESSION_HEARTBEAT_FRESH_MS = 15_000;
 const RELAY_QUESTION_FINALIZATION_HOLD_MS = 5_000;
 const AUTO_MODEL_SENTINEL = 'auto';
 const USAGE_FETCH_RETRY_DELAY_MS = 250;
+
+export function resolveOpenAIReasoningEffort(explicitReasoningEffort = '', model = '') {
+  const explicit = String(explicitReasoningEffort || '').trim().toLowerCase();
+  const supported = openAIReasoningEffortsForModel(model);
+  if (explicit && !supported.includes(explicit)) {
+    return {
+      ok: false,
+      effort: null,
+      supported,
+      error: `OpenAI model "${String(model || 'configured model').trim()}" does not support reasoning effort "${explicit}"`,
+    };
+  }
+  return { ok: true, effort: explicit || 'none', supported };
+}
+
+export function shouldRequireNewOpenAIConversation({
+  shouldCreateConversation = false,
+  runtimeUsesOpenAI = false,
+  requestedConfiguredOpenAIModel = false,
+  githubModelAvailable = false,
+} = {}) {
+  return (
+    !shouldCreateConversation
+    && !runtimeUsesOpenAI
+    && requestedConfiguredOpenAIModel
+    && !githubModelAvailable
+  );
+}
+
+function normalizeRequestedProviderType(value = '') {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'openai' || normalized === 'openai-byok') return 'openai';
+  if (normalized === 'github' || normalized === 'github-copilot') return 'github';
+  return '';
+}
 
 function deriveModelOrigin(model) {
   const requested = String(model || '').trim().toLowerCase();
@@ -1050,6 +1086,8 @@ export function registerMessagesRoutes(app, deps) {
     computeRetryDelayMs,
     resolveRequestedModel,
     resolveRequestedReasoningEffort = () => ({ ok: false, error: 'Reasoning metadata unavailable', supported: [] }),
+    getOpenAIProviderSettings = () => ({ enabled: false, model: '' }),
+    rebindUnstartedOpenAIConversationModel = null,
     normalizeRelayMode,
     DEFAULT_RELAY_MODE,
     DEFAULT_MODEL,
@@ -1190,14 +1228,16 @@ export function registerMessagesRoutes(app, deps) {
     return text || null;
   }
 
-  function persistConversationModeModelPreference(conversationId, relayMode, model, nowIso = new Date().toISOString()) {
+  function persistConversationModeModelPreference(conversationId, relayMode, model, reasoningEffort = '', nowIso = new Date().toISOString()) {
     const convId = String(conversationId || '').trim();
     const mode = normalizeRelayMode(relayMode) || DEFAULT_RELAY_MODE;
     const modelId = String(model || '').trim();
+    const normalizedReasoningEffort = String(reasoningEffort || '').trim().toLowerCase();
     if (!convId || !mode || !modelId) {
       return {
         preferredRelayMode: mode || DEFAULT_RELAY_MODE,
         preferredModelsByMode: {},
+        preferredReasoningByMode: {},
       };
     }
     const persisted = persistConversationModeModelPreferenceTx({
@@ -1206,6 +1246,9 @@ export function registerMessagesRoutes(app, deps) {
       conversationId: convId,
       relayMode: mode,
       model: modelId,
+      preferredReasoningByMode: normalizedReasoningEffort
+        ? { [mode]: normalizedReasoningEffort }
+        : {},
       normalizeMode: (value) => normalizeRelayMode(value) || null,
       fallbackRelayMode: DEFAULT_RELAY_MODE,
       updatedAt: nowIso,
@@ -1214,6 +1257,7 @@ export function registerMessagesRoutes(app, deps) {
     return {
       preferredRelayMode: persisted.preferredRelayMode || mode,
       preferredModelsByMode: persisted.preferredModelsByMode || {},
+      preferredReasoningByMode: persisted.preferredReasoningByMode || {},
     };
   }
 
@@ -2925,7 +2969,7 @@ export function registerMessagesRoutes(app, deps) {
   });
 
   // POST /api/message — browser sends a message
-  app.post('/api/message', auth, (req, res) => {
+  app.post('/api/message', auth, async (req, res) => {
     const {
       messageId: clientMessageId,
       clientId,
@@ -2937,6 +2981,8 @@ export function registerMessagesRoutes(app, deps) {
       contextTier,
       relayMode,
       mode,
+      providerType,
+      provider,
       attachments: rawAttachments,
     } = req.body;
     const sessionId = clientId || ensureSessionId(req, res);
@@ -2969,7 +3015,121 @@ export function registerMessagesRoutes(app, deps) {
     }
 
     if (!trimmedText && attachments.length === 0) return res.status(400).json({ error: 'Empty message' });
-    const modelResolution = resolveRequestedModel(model);
+    const shouldCreateConversation = !!newConversation || !conversationId;
+    const existingRuntimeSession = shouldCreateConversation
+      ? null
+      : (stmts.getRuntimeSessionByConversation.get(conversationId) || null);
+    const configuredOpenAI = getOpenAIProviderSettings();
+    const requestedProviderType = normalizeRequestedProviderType(providerType || provider);
+    const runtimeUsesOpenAI = String(existingRuntimeSession?.provider_type || '').trim().toLowerCase() === 'openai';
+    const configuredOpenAIModel = String(configuredOpenAI?.model || '').trim();
+    const availableOpenAIModels = new Set(
+      (Array.isArray(configuredOpenAI?.models) ? configuredOpenAI.models : [])
+        .map((value) => String(value || '').trim())
+        .filter(Boolean),
+    );
+    const requestedOpenAIModel = String(model || '').trim();
+    const requestedModelLooksOpenAI = !!requestedOpenAIModel && (
+      requestedOpenAIModel === configuredOpenAIModel || availableOpenAIModels.has(requestedOpenAIModel)
+    );
+    const requestedGitHubModelResolution = requestedOpenAIModel
+      ? resolveRequestedModel(model)
+      : null;
+    const requestedModelAvailableInGitHub = requestedGitHubModelResolution?.ok === true;
+    const useOpenAIProvider = runtimeUsesOpenAI
+      || (shouldCreateConversation && (
+        requestedProviderType === 'openai'
+        || (requestedProviderType === '' && (
+          configuredOpenAI?.enabled === true
+          && requestedModelLooksOpenAI
+        ))
+      ));
+    if (
+      !shouldCreateConversation
+      && !runtimeUsesOpenAI
+      && requestedModelLooksOpenAI
+      && (
+        requestedProviderType === 'openai'
+        || !requestedModelAvailableInGitHub
+      )
+    ) {
+      return res.status(409).json({
+        error: 'OpenAI model selection requires creating a new OpenAI conversation',
+        code: 'OPENAI_MODEL_REQUIRES_NEW_CONVERSATION',
+      });
+    }
+    if (shouldCreateConversation && requestedProviderType === 'openai' && configuredOpenAI?.configured !== true) {
+      return res.status(400).json({
+        error: 'OpenAI API key is not configured',
+        code: 'OPENAI_NOT_CONFIGURED',
+      });
+    }
+    const requestedConfiguredOpenAIModel = configuredOpenAI?.enabled
+      && String(model || '').trim() === String(configuredOpenAI.model || '').trim();
+    if (shouldRequireNewOpenAIConversation({
+      shouldCreateConversation,
+      runtimeUsesOpenAI,
+      requestedConfiguredOpenAIModel,
+      githubModelAvailable: requestedConfiguredOpenAIModel && requestedModelAvailableInGitHub,
+    })) {
+      return res.status(409).json({
+        error: 'The configured OpenAI model is available only when creating a new conversation',
+        code: 'OPENAI_MODEL_REQUIRES_NEW_CONVERSATION',
+      });
+    }
+    if (
+      useOpenAIProvider
+      && requestedOpenAIModel
+      && requestedOpenAIModel !== String(existingRuntimeSession?.provider_model || '').trim()
+      && requestedOpenAIModel !== configuredOpenAIModel
+      && !availableOpenAIModels.has(requestedOpenAIModel)
+    ) {
+      return res.status(400).json({
+        error: `OpenAI model "${requestedOpenAIModel}" is not available`,
+        code: 'OPENAI_MODEL_UNAVAILABLE',
+      });
+    }
+    if (
+      runtimeUsesOpenAI
+      && requestedOpenAIModel
+      && requestedOpenAIModel !== String(existingRuntimeSession?.provider_model || '').trim()
+    ) {
+      if (typeof rebindUnstartedOpenAIConversationModel !== 'function') {
+        return res.status(409).json({
+          error: 'OpenAI session model cannot be changed after the session starts',
+          code: 'OPENAI_SESSION_MODEL_LOCKED',
+        });
+      }
+      try {
+        const reboundRuntime = await rebindUnstartedOpenAIConversationModel({
+          conversationId,
+          model: requestedOpenAIModel,
+        });
+        existingRuntimeSession.provider_model = reboundRuntime?.provider_model || requestedOpenAIModel;
+        existingRuntimeSession.model = reboundRuntime?.model || requestedOpenAIModel;
+      } catch (error) {
+        return res.status(409).json({
+          error: String(error?.message || error || 'Failed to change OpenAI session model'),
+          code: 'OPENAI_SESSION_MODEL_REBIND_FAILED',
+        });
+      }
+    }
+    const openAIModel = runtimeUsesOpenAI
+      ? String(existingRuntimeSession?.provider_model || existingRuntimeSession?.model || '').trim()
+      : (
+          requestedOpenAIModel === configuredOpenAIModel || availableOpenAIModels.has(requestedOpenAIModel)
+            ? requestedOpenAIModel
+            : configuredOpenAIModel
+        );
+    const modelResolution = useOpenAIProvider
+      ? {
+          ok: !!openAIModel,
+          model: openAIModel,
+          modelVariantId: openAIModel,
+          reasoningEffort: null,
+          error: openAIModel ? null : 'OpenAI model is not configured',
+        }
+      : resolveRequestedModel(model);
     if (!modelResolution.ok) return res.status(400).json({ error: modelResolution.error, supportedModels: modelResolution.available || [] });
     const requestedModel = String(modelResolution.model || '').trim();
     const requestedAutoModel = requestedModel.toLowerCase() === AUTO_MODEL_SENTINEL;
@@ -2986,10 +3146,12 @@ export function registerMessagesRoutes(app, deps) {
     }
     const requestedModelVariantId = String(modelResolution.modelVariantId || model || requestedModel).trim();
     const explicitReasoningEffort = String(reasoningEffort || '').trim();
-    let reasoningResolution = resolveRequestedReasoningEffort(
-      requestedModel,
-      explicitReasoningEffort || modelResolution.reasoningEffort || null,
-    );
+    let reasoningResolution = useOpenAIProvider
+      ? resolveOpenAIReasoningEffort(explicitReasoningEffort, openAIModel)
+      : resolveRequestedReasoningEffort(
+          requestedModel,
+          explicitReasoningEffort || modelResolution.reasoningEffort || null,
+        );
     if (!reasoningResolution?.ok && !explicitReasoningEffort) {
       const supportedEfforts = Array.isArray(reasoningResolution?.supported)
         ? reasoningResolution.supported.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean)
@@ -3013,7 +3175,6 @@ export function registerMessagesRoutes(app, deps) {
       return res.status(400).json({ error: 'Unsupported context tier' });
     }
     if (!requestedRelayMode) return res.status(400).json({ error: 'Unsupported relay mode' });
-    const shouldCreateConversation = !!newConversation || !conversationId;
     const conversationWorkspaceState = (!shouldCreateConversation && typeof resolveConversationWorkspaceState === 'function')
       ? resolveConversationWorkspaceState({ conversationId })
       : null;
@@ -3103,7 +3264,21 @@ export function registerMessagesRoutes(app, deps) {
     const shouldApplySeed = Number(convSeed?.seed_pending || 0) > 0 && String(convSeed?.summary_seed || '').trim().length > 0;
 
     const now   = new Date().toISOString();
-    const runtimeSession = ensureRuntimeSessionBinding(convId, requestedModel, now);
+    const runtimeSession = ensureRuntimeSessionBinding(
+      convId,
+      requestedModel,
+      now,
+      null,
+      {
+        assignConfiguredProvider: shouldCreateConversation,
+        providerType: shouldCreateConversation
+          ? (useOpenAIProvider ? 'openai' : 'github')
+          : '',
+        providerModel: shouldCreateConversation && useOpenAIProvider
+          ? requestedModel
+          : null,
+      },
+    );
     const ownerSessionId = resolveInitialQueueOwnerSessionId({
       routingEnabled: sessionWorkerRoutingEnabled,
       requesterSessionId,
@@ -3159,6 +3334,7 @@ export function registerMessagesRoutes(app, deps) {
       convId,
       requestedRelayMode,
       requestedModel,
+      requestedReasoningEffort,
       now,
     );
     stmts.insertQ.run(
@@ -3279,9 +3455,12 @@ export function registerMessagesRoutes(app, deps) {
       messageId: msgId,
       conversationId: convId,
       runtimeSessionId: runtimeSession?.id || null,
+      runtimeProviderType: String(runtimeSession?.provider_type || (useOpenAIProvider ? 'openai' : 'github')).trim().toLowerCase(),
+      runtimeProviderModel: runtimeSession?.provider_model || (useOpenAIProvider ? openAIModel : null),
       ownerSessionId: ownerSessionId || null,
       preferredRelayMode: conversationPreferences.preferredRelayMode,
       preferredModelsByMode: conversationPreferences.preferredModelsByMode,
+      preferredReasoningByMode: conversationPreferences.preferredReasoningByMode,
       warning: modelResolution.warning || null,
       selectedModelVariantId: requestedModelVariantId,
       selectedBaseModel: requestedModel,

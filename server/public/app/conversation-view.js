@@ -601,16 +601,7 @@ function createMessageNode(msg, msgId = null, force = false) {
   const usageStaleTag = usage?.stale
     ? ' <span class="msg-usage msg-usage-stale">stale</span>'
     : '';
-  const renderAssistantMarkdown = (text) => {
-    const markdown = globalThis.marked;
-    if (!markdown || typeof markdown.parse !== 'function') {
-      return `<p>${escHtml(String(text || '')).replace(/\n/g, '<br>')}</p>`;
-    }
-    return markdown.parse(String(text || ''));
-  };
-  const content = msg.role === 'assistant'
-    ? renderAssistantMarkdown(msg.text || '')
-    : renderMarkdownPreview(msg.text || '', false);
+  const content = renderMarkdownPreview(msg.text || '', false);
   const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
   const activities = Array.isArray(msg.activities) ? msg.activities.filter(Boolean).slice(0, 48) : [];
   if (activities.length) div.classList.add('msg-with-activity');
@@ -1959,8 +1950,11 @@ export async function sendMessage() {
         updatedAt: new Date().toISOString(),
         messageCount: 1,
         runtimeSessionId: r.runtimeSessionId || null,
+        runtimeProviderType: r.runtimeProviderType || 'github',
+        runtimeProviderModel: r.runtimeProviderModel || null,
         preferredRelayMode: r.preferredRelayMode || selectedMode,
         preferredModelsByMode: r.preferredModelsByMode || { [selectedMode]: selectedModel },
+        preferredReasoningByMode: r.preferredReasoningByMode || { [selectedMode]: selectedReasoningEffort || 'none' },
       };
       window.syncAutoModelAvailability?.();
       document.getElementById('chat-title').textContent = titleSeed.slice(0, 60);
@@ -1969,6 +1963,16 @@ export async function sendMessage() {
       window.renderConvList?.();
       applyContextUsageBar(null);
       scheduleContextUsageRefresh(r.conversationId, 0);
+    }
+    if (conversations[r.conversationId]) {
+      conversations[r.conversationId] = {
+        ...conversations[r.conversationId],
+        messageCount: Math.max(1, Number(conversations[r.conversationId].messageCount || 0)),
+        runtimeSessionId: r.runtimeSessionId || conversations[r.conversationId].runtimeSessionId || null,
+        runtimeProviderType: r.runtimeProviderType || conversations[r.conversationId].runtimeProviderType || 'github',
+        runtimeProviderModel: r.runtimeProviderModel ?? conversations[r.conversationId].runtimeProviderModel ?? null,
+      };
+      window.syncAutoModelAvailability?.();
     }
     const persistedConversationId = String(r.conversationId || targetConversationId || '').trim();
     if (persistedConversationId) {

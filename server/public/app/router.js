@@ -231,8 +231,221 @@ export function sanitizePreviewHtml(html) {
   return template.innerHTML;
 }
 
+const COMPATIBILITY_DISPLAY_MATH_COMMAND = /\\(?:frac|sqrt|sum|prod|int|iint|iiint|lim|log|ln|sin|cos|tan|theta|alpha|beta|gamma|delta|lambda|mu|pi|sigma|phi|omega|vec|hat|bar|overline|underline|left|right|begin|end|text|mathrm|mathbf|mathbb|mathcal|ce)\b/i;
+const INLINE_MATH_COMMAND = /\\(?:frac|sqrt|sum|prod|int|iint|iiint|lim|log|ln|sin|cos|tan|cot|sec|csc|arcsin|arccos|theta|alpha|beta|gamma|delta|lambda|mu|pi|rho|sigma|phi|omega|Omega|Gamma|Delta|Lambda|Pi|Sigma|Phi|Psi|Omega|vec|hat|bar|overline|underline|left|right|text|mathrm|mathbf|mathbb|mathcal|operatorname|circ|degree|times|cdot|pm|mp|leq|geq|neq|approx|equiv|infty|partial|nabla|forall|exists|rightarrow|longmapsto|to|mapsto|ce)\b/;
+const STRICT_INLINE_SCRIPT = /(?:\^[{]|\^[-+]?\d|_[{]|_[-+]?\d)/;
+const URL_LIKE_TEXT = /\b(?:https?|ftp):\/\/|www\./i;
+const MARKDOWN_ESCAPABLE_TEX_CHARACTERS = new Set(Array.from('!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~'));
+
+function isStrictInlineMathCandidate(value) {
+  const text = String(value || '').trim();
+  if (!text || text.length > 240 || URL_LIKE_TEXT.test(text)) return false;
+  return INLINE_MATH_COMMAND.test(text) || STRICT_INLINE_SCRIPT.test(text);
+}
+
+function findClosingParenthesis(source, openingIndex) {
+  let depth = 0;
+  for (let index = openingIndex; index < source.length; index += 1) {
+    if (source[index] === '\\') {
+      index += 1;
+      continue;
+    }
+    if (source[index] === '(') depth += 1;
+    if (source[index] === ')') {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
+function normalizeInlineMathDelimiters(line) {
+  let output = '';
+  let index = 0;
+  let inCode = false;
+  let inDollarMath = false;
+
+  while (index < line.length) {
+    const char = line[index];
+    if (char === '`') {
+      inCode = !inCode;
+      output += char;
+      index += 1;
+      continue;
+    }
+    if (inCode) {
+      output += char;
+      index += 1;
+      continue;
+    }
+    if (char === '$' && line[index - 1] !== '\\') {
+      inDollarMath = !inDollarMath;
+      output += char;
+      index += 1;
+      continue;
+    }
+    if (inDollarMath) {
+      output += char;
+      index += 1;
+      continue;
+    }
+    if (char === '\\' && line[index + 1] === '(') {
+      const closeIndex = line.indexOf('\\)', index + 2);
+      if (closeIndex >= 0) {
+        output += `$${line.slice(index + 2, closeIndex).trim()}$`;
+        index = closeIndex + 2;
+        continue;
+      }
+    }
+    if (char !== '(' || line[index - 1] === '\\') {
+      output += char;
+      index += 1;
+      continue;
+    }
+    const closeIndex = findClosingParenthesis(line, index);
+    if (closeIndex < 0) {
+      output += char;
+      index += 1;
+      continue;
+    }
+    const candidate = line.slice(index + 1, closeIndex);
+    if (!isStrictInlineMathCandidate(candidate)) {
+      output += char;
+      index += 1;
+      continue;
+    }
+    output += `$${candidate.trim()}$`;
+    index = closeIndex + 1;
+  }
+
+  return output;
+}
+
+function protectMarkdownEscapesInMath(source) {
+  const lines = String(source ?? '').split('\n');
+  let inFence = false;
+
+  return lines.map((line) => {
+    if (/^\s*(?:`{3,}|~{3,})/.test(line)) {
+      inFence = !inFence;
+      return line;
+    }
+    if (inFence) return line;
+
+    let output = '';
+    let index = 0;
+    let inCode = false;
+    while (index < line.length) {
+      if (line[index] === '`') {
+        inCode = !inCode;
+        output += line[index];
+        index += 1;
+        continue;
+      }
+      if (inCode || line[index] !== '$' || line[index - 1] === '\\') {
+        output += line[index];
+        index += 1;
+        continue;
+      }
+      const delimiter = line[index + 1] === '$' ? '$$' : '$';
+      const closeIndex = line.indexOf(delimiter, index + delimiter.length);
+      if (closeIndex < 0) {
+        output += line[index];
+        index += 1;
+        continue;
+      }
+      const formula = line.slice(index + delimiter.length, closeIndex);
+      const protectedFormula = formula.replace(/\\(.)/g, (match, character) => (
+        MARKDOWN_ESCAPABLE_TEX_CHARACTERS.has(character) ? `\\\\${character}` : match
+      ));
+      output += `${delimiter}${protectedFormula}${delimiter}`;
+      index = closeIndex + delimiter.length;
+    }
+    return output;
+  }).join('\n');
+}
+
+export function normalizeMathDelimiters(source) {
+  const lines = String(source ?? '').split('\n');
+  const normalized = [];
+  let inFence = false;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    let line = lines[index];
+    if (/^\s*(?:`{3,}|~{3,})/.test(line)) {
+      inFence = !inFence;
+      normalized.push(line);
+      continue;
+    }
+    if (inFence || /^(?: {4}|\t)/.test(line)) {
+      normalized.push(line);
+      continue;
+    }
+
+    line = normalizeInlineMathDelimiters(line)
+      .replace(/\\\[([^\n]+?)\\\]/g, (_match, formula) => `$$${formula.trim()}$$`);
+    const delimiter = line.trim();
+    const closingDelimiter = delimiter === '$$'
+      ? '$$'
+      : delimiter === '\\['
+        ? '\\]'
+        : delimiter === '['
+          ? ']'
+          : '';
+    if (!closingDelimiter) {
+      normalized.push(line);
+      continue;
+    }
+
+    let closingIndex = index + 1;
+    while (closingIndex < lines.length && lines[closingIndex].trim() !== closingDelimiter) closingIndex += 1;
+    if (closingIndex >= lines.length) {
+      normalized.push(line);
+      continue;
+    }
+
+    const formula = lines.slice(index + 1, closingIndex).join('\n');
+    if (delimiter === '[' && !COMPATIBILITY_DISPLAY_MATH_COMMAND.test(formula)) {
+      normalized.push(line);
+      continue;
+    }
+    normalized.push(`$$${formula.trim().replace(/[ \t]*\n[ \t]*/g, ' ')}$$`);
+    index = closingIndex;
+  }
+
+  return protectMarkdownEscapesInMath(normalized.join('\n'));
+}
+
+function renderMathInHtml(html) {
+  const renderMathInElement = globalThis.renderMathInElement;
+  if (typeof renderMathInElement !== 'function' || !globalThis.document?.createElement) return html;
+
+  const container = document.createElement('div');
+  container.innerHTML = html;
+  try {
+    renderMathInElement(container, {
+      delimiters: [
+        { left: '$$', right: '$$', display: true },
+        { left: '\\[', right: '\\]', display: true },
+        { left: '\\(', right: '\\)', display: false },
+        { left: '$', right: '$', display: false },
+      ],
+      ignoredTags: ['pre', 'code', 'script', 'style', 'textarea', 'option', 'a'],
+      throwOnError: false,
+      strict: 'ignore',
+      trust: false,
+    });
+  } catch (error) {
+    console.warn('[markdown] could not render mathematical notation', error);
+    return html;
+  }
+  // The original Markdown was sanitized before this pass. KaTeX generates its own
+  // layout styles, which are necessary for fractions, scripts, and matrices.
+  return container.innerHTML;
+}
+
 export function renderMarkdownPreview(source, allowEmbeddedHtml) {
-  const sourceText = String(source ?? '');
+  const sourceText = normalizeMathDelimiters(source);
   const fallbackEscaped = `<p>${escHtml(sourceText).replace(/\n/g, '<br>')}</p>`;
   const markdown = globalThis.marked;
   if (!markdown || typeof markdown.parse !== 'function' || typeof markdown.Renderer !== 'function') {
@@ -241,7 +454,7 @@ export function renderMarkdownPreview(source, allowEmbeddedHtml) {
   if (allowEmbeddedHtml) {
     const parsed = markdown.parse(sourceText);
     if (typeof parsed !== 'string') return fallbackEscaped;
-    return sanitizePreviewHtml(parsed);
+    return renderMathInHtml(sanitizePreviewHtml(parsed));
   }
   const renderer = new markdown.Renderer();
   renderer.html = (htmlToken) => {
@@ -253,7 +466,7 @@ export function renderMarkdownPreview(source, allowEmbeddedHtml) {
   };
   const parsed = markdown.parse(sourceText, { renderer });
   if (typeof parsed !== 'string') return fallbackEscaped;
-  return sanitizePreviewHtml(parsed);
+  return renderMathInHtml(sanitizePreviewHtml(parsed));
 }
 
 export function eventTargetElement(event) {

@@ -50,7 +50,7 @@ import {
   isModelCatalogRefreshStale,
   latestModelCatalogRefresh,
 } from '../shared/model-catalog-freshness.mjs';
-import { launchSessionCli } from './services/session-worker-launch-service.mjs';
+import { applyOpenAIProviderEnvironment, killTmuxSession, launchSessionCli } from './services/session-worker-launch-service.mjs';
 import { createSshTunnelManager } from './services/ssh-tunnel-manager-service.mjs';
 import { createSessionWorkerWebSocketService } from './services/session-worker-websocket-service.mjs';
 import { createTmuxInspectorAccessPolicy } from './services/tmux-inspector-access-policy.mjs';
@@ -65,7 +65,13 @@ import { FEATURES, normalizeFeatureFlags } from './features.mjs';
 import { RELAY_RESTART_EXIT_CODE } from './relay-exit-codes.mjs';
 import { DEFAULT_QUESTION_TIMEOUT_MS } from '../shared/question-timeout.mjs';
 import { normalizeRelayThoughtList } from './public/app/relay-thoughts.mjs';
-import { filterValidModelIds, isValidModelId, canonicalizeModelId } from '../shared/model-id.mjs';
+import {
+  canonicalizeModelId,
+  filterValidModelIds,
+  isOpenAIModelId,
+  isSafeProviderModelId,
+  isValidModelId,
+} from '../shared/model-id.mjs';
 import { selectModelIdsForVariantRefresh } from '../shared/model-refresh.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -97,15 +103,165 @@ const SESSION_COOKIE = 'copilot_session';
 const AUTH_COOKIE = 'copilot_auth';
 
 if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+}
+if (process.platform !== 'win32') {
+  fs.chmodSync(DATA_DIR, 0o700);
 }
 if (!fs.existsSync(UPLOAD_DIR)) {
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 }
 
+async function refreshOpenAIProviderModels() {
+  const settings = getOpenAIProviderSettings();
+  if (!settings.enabled) return { ok: false, models: [], error: 'OpenAI API key is not configured' };
+  let response;
+  try {
+    response = await fetch(`${settings.baseUrl}/models`, {
+      headers: {
+        Authorization: `Bearer ${settings.apiKey}`,
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+  } catch (error) {
+    return { ok: false, models: settings.models, error: error?.message || 'OpenAI model discovery failed' };
+  }
+  if (!response.ok) {
+    const detail = String(await response.text().catch(() => '')).trim().slice(0, 240);
+    return {
+      ok: false,
+      models: settings.models,
+      error: `OpenAI model discovery failed (${response.status})${detail ? `: ${detail}` : ''}`,
+    };
+  }
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    return { ok: false, models: settings.models, error: 'OpenAI model discovery returned invalid JSON' };
+  }
+  const models = Array.from(new Set([
+    settings.model,
+    ...(Array.isArray(payload?.data) ? payload.data : [])
+      .map((entry) => String(entry?.id || '').trim())
+      .filter((modelId) => isOpenAIModelId(modelId)),
+  ])).filter(Boolean);
+  stmts.upsertAppSetting.run(OPENAI_MODELS_SETTING_KEY, JSON.stringify(models), new Date().toISOString());
+  return { ok: true, models, error: null };
+}
+
+function getOpenAIProviderSettings() {
+  const apiKey = readAppSettingValue(OPENAI_API_KEY_SETTING_KEY);
+  const enabledSetting = readAppSettingValue(OPENAI_ENABLED_SETTING_KEY);
+  const enabled = !!apiKey && (enabledSetting === '' || enabledSetting === 'true');
+  const model = readAppSettingValue(OPENAI_MODEL_SETTING_KEY) || DEFAULT_OPENAI_MODEL;
+  let models = [];
+  try {
+    const parsed = JSON.parse(readAppSettingValue(OPENAI_MODELS_SETTING_KEY) || '[]');
+    if (Array.isArray(parsed)) {
+      models = parsed.map((value) => String(value || '').trim()).filter(Boolean);
+    }
+  } catch {
+    models = [];
+  }
+  return {
+    configured: !!apiKey,
+    enabled,
+    apiKey,
+    model,
+    models: Array.from(new Set([model, ...models])),
+    baseUrl: readAppSettingValue(OPENAI_BASE_URL_SETTING_KEY) || DEFAULT_OPENAI_BASE_URL,
+    providerType: 'openai',
+  };
+}
+
+function setOpenAIProviderSettings(update = {}) {
+  const payload = update && typeof update === 'object' ? update : {};
+  const apiKey = payload.apiKey;
+  const model = payload.model;
+  const enabled = payload.enabled;
+  const remove = payload.remove === true;
+  const hasBaseUrl = Object.prototype.hasOwnProperty.call(payload, 'baseUrl');
+  const baseUrl = hasBaseUrl ? payload.baseUrl : '';
+  if (typeof stmts?.upsertAppSetting?.run !== 'function' || typeof stmts?.deleteAppSetting?.run !== 'function') {
+    return { ok: false, error: 'OpenAI settings are unavailable' };
+  }
+  const existing = getOpenAIProviderSettings();
+  const normalizedModel = String(model || existing.model || '').trim() || DEFAULT_OPENAI_MODEL;
+  if (!isSafeProviderModelId(normalizedModel)) {
+    return { ok: false, error: 'Invalid OpenAI model ID' };
+  }
+  const nowIso = new Date().toISOString();
+  if (remove) {
+    const providerCandidates = Array.isArray(stmts?.listRuntimeSessionProviderCandidates?.all?.())
+      ? stmts.listRuntimeSessionProviderCandidates.all()
+      : [];
+    const startedConversationCount = providerCandidates.filter((row) => (
+      String(row?.provider_type || 'github').trim().toLowerCase() === 'openai'
+      && Number(row?.message_count || 0) > 0
+    )).length;
+    const activeQueueConversationCount = providerCandidates.filter((row) => (
+      String(row?.provider_type || 'github').trim().toLowerCase() === 'openai'
+      && Number(row?.active_queue_count || 0) > 0
+    )).length;
+    const activeConversationCount = providerCandidates.filter((row) => (
+      String(row?.provider_type || 'github').trim().toLowerCase() === 'openai'
+      && (Number(row?.message_count || 0) > 0 || Number(row?.active_queue_count || 0) > 0)
+    )).length;
+    if (activeConversationCount > 0) {
+      return {
+        ok: false,
+        code: 'openai-key-removal-blocked',
+        error: `Cannot remove OpenAI API key while ${activeConversationCount} active OpenAI conversation(s) still exist. Disable OpenAI for new conversations instead.`,
+        activeConversationCount,
+        startedConversationCount,
+        activeQueueConversationCount,
+      };
+    }
+    stmts.deleteAppSetting.run(OPENAI_API_KEY_SETTING_KEY);
+    stmts.deleteAppSetting.run(OPENAI_MODELS_SETTING_KEY);
+    stmts.upsertAppSetting.run(OPENAI_ENABLED_SETTING_KEY, 'false', nowIso);
+    stmts.upsertAppSetting.run(OPENAI_MODEL_SETTING_KEY, normalizedModel, nowIso);
+  } else {
+    const normalizedApiKey = String(apiKey || '').trim();
+    if (normalizedApiKey) {
+      stmts.deleteAppSetting.run(OPENAI_MODELS_SETTING_KEY);
+      stmts.upsertAppSetting.run(OPENAI_API_KEY_SETTING_KEY, normalizedApiKey, nowIso);
+    }
+    const hasApiKey = !!(normalizedApiKey || existing.apiKey);
+    const nextEnabled = typeof enabled === 'boolean' ? enabled : (normalizedApiKey ? true : existing.enabled);
+    if (nextEnabled && !hasApiKey) return { ok: false, error: 'OpenAI API key is not configured' };
+    stmts.upsertAppSetting.run(OPENAI_ENABLED_SETTING_KEY, nextEnabled ? 'true' : 'false', nowIso);
+    stmts.upsertAppSetting.run(OPENAI_MODEL_SETTING_KEY, normalizedModel, nowIso);
+    if (hasBaseUrl) {
+      const normalizedBaseUrl = String(baseUrl || '').trim();
+      if (normalizedBaseUrl && normalizedBaseUrl !== DEFAULT_OPENAI_BASE_URL) {
+        stmts.upsertAppSetting.run(OPENAI_BASE_URL_SETTING_KEY, normalizedBaseUrl, nowIso);
+      } else {
+        stmts.deleteAppSetting.run(OPENAI_BASE_URL_SETTING_KEY);
+      }
+    }
+  }
+  const current = getOpenAIProviderSettings();
+  return {
+    ok: true,
+    configured: current.configured,
+    enabled: current.enabled,
+    model: current.model,
+    baseUrl: current.baseUrl,
+  };
+}
+
 const DEFAULT_CONFIG = { authToken: '', port: 3333, pollIntervalMs: 3000, conversationSessionMode: 'isolated', localhostOnly: true };
 const DEFAULT_PROCESSING_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_MODEL = 'gpt-5.4-mini';
+const DEFAULT_OPENAI_MODEL = 'gpt-4o';
+const OPENAI_API_KEY_SETTING_KEY = 'openai_api_key';
+const OPENAI_ENABLED_SETTING_KEY = 'openai_enabled';
+const OPENAI_MODEL_SETTING_KEY = 'openai_model';
+const OPENAI_MODELS_SETTING_KEY = 'openai_models';
+const OPENAI_BASE_URL_SETTING_KEY = 'openai_base_url';
+const DEFAULT_OPENAI_BASE_URL = 'https://api.openai.com/v1';
 const MODEL_CATALOG_STALE_MS = 2 * 60 * 1000;
 const MODEL_CATALOG_WARNING_MS = 10 * 60 * 1000;
 const SUPPORTED_RELAY_MODES = ['plan', 'ask', 'agent', 'autopilot'];
@@ -942,7 +1098,13 @@ function isReasoningVariantEligibleModel(modelId) {
 function modelProviderForId(modelId) {
   const text = String(modelId || '').trim().toLowerCase();
   if (!text) return 'other';
-  if (text.startsWith('gpt-')) return 'openai';
+  if (
+    text.startsWith('gpt-')
+    || text.startsWith('o1-')
+    || text.startsWith('o3-')
+    || text.startsWith('codex-')
+    || text.startsWith('openai/')
+  ) return 'openai';
   if (text.startsWith('claude-')) return 'anthropic';
   if (text.startsWith('gemini-')) return 'google';
   if (text.startsWith('mai-')) return 'microsoft';
@@ -1761,8 +1923,16 @@ updateModelCatalog({ models: [DEFAULT_MODEL], currentModel: DEFAULT_MODEL, defau
 
 // ─── SQLite Setup ─────────────────────────────────────────────────────────────
 const db = new Database(DB_PATH);
+if (process.platform !== 'win32') {
+  fs.chmodSync(DB_PATH, 0o600);
+}
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
+if (process.platform !== 'win32') {
+  for (const sqlitePath of [`${DB_PATH}-wal`, `${DB_PATH}-shm`]) {
+    if (fs.existsSync(sqlitePath)) fs.chmodSync(sqlitePath, 0o600);
+  }
+}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS conversations (
@@ -1772,6 +1942,7 @@ db.exec(`
     sdk_session_id TEXT,
     preferred_relay_mode TEXT,
     preferred_models_by_mode TEXT,
+    preferred_reasoning_by_mode TEXT,
     configured_workspace_root_path TEXT,
     runtime_workspace_root_path TEXT,
     archived   INTEGER NOT NULL DEFAULT 0,
@@ -1868,6 +2039,8 @@ db.exec(`
     strategy        TEXT NOT NULL DEFAULT 'isolated',
     runtime_key     TEXT NOT NULL,
     model           TEXT,
+    provider_type   TEXT NOT NULL DEFAULT 'github',
+    provider_model  TEXT,
     status          TEXT NOT NULL DEFAULT 'active',
     created_at      TEXT NOT NULL,
     last_used_at    TEXT NOT NULL,
@@ -2281,6 +2454,12 @@ if (runtimeSessionColumns.length) {
   if (!runtimeSessionColumns.includes('model')) {
     db.exec(`ALTER TABLE runtime_sessions ADD COLUMN model TEXT`);
   }
+  if (!runtimeSessionColumns.includes('provider_type')) {
+    db.exec(`ALTER TABLE runtime_sessions ADD COLUMN provider_type TEXT NOT NULL DEFAULT 'github'`);
+  }
+  if (!runtimeSessionColumns.includes('provider_model')) {
+    db.exec(`ALTER TABLE runtime_sessions ADD COLUMN provider_model TEXT`);
+  }
   if (!runtimeSessionColumns.includes('status')) {
     db.exec(`ALTER TABLE runtime_sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`);
   }
@@ -2304,6 +2483,9 @@ if (!conversationColumns.includes('preferred_relay_mode')) {
 }
 if (!conversationColumns.includes('preferred_models_by_mode')) {
   db.exec(`ALTER TABLE conversations ADD COLUMN preferred_models_by_mode TEXT`);
+}
+if (!conversationColumns.includes('preferred_reasoning_by_mode')) {
+  db.exec(`ALTER TABLE conversations ADD COLUMN preferred_reasoning_by_mode TEXT`);
 }
 if (!conversationColumns.includes('configured_workspace_root_path')) {
   db.exec(`ALTER TABLE conversations ADD COLUMN configured_workspace_root_path TEXT`);
@@ -2703,6 +2885,23 @@ function buildSessionWorkerLaunchEnv() {
   return next;
 }
 const sessionWorkerLaunchEnv = buildSessionWorkerLaunchEnv();
+function buildSessionWorkerLaunchEnvForSession(targetSessionId) {
+  const normalizedTargetSessionId = String(targetSessionId || '').trim();
+  const runtimeSession = stmts.getRuntimeSessionBySdkSessionId.get(normalizedTargetSessionId)
+    || stmts.getRuntimeSessionByConversation.get(normalizedTargetSessionId)
+    || null;
+  if (String(runtimeSession?.provider_type || 'github').trim().toLowerCase() !== 'openai') {
+    return applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv);
+  }
+  const settings = getOpenAIProviderSettings();
+  const model = String(runtimeSession?.provider_model || runtimeSession?.model || settings.model).trim();
+  return applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv, {
+    enabled: true,
+    apiKey: settings.apiKey,
+    model,
+    baseUrl: settings.baseUrl,
+  });
+}
 const relayCliLauncherService = createRelayCliLauncherService({
   cwd: (targetSessionId) => resolveLaunchWorkspaceRootForSession(targetSessionId),
   env: sessionWorkerLaunchEnv,
@@ -2722,10 +2921,11 @@ async function spawnSessionWorkerCli(targetSessionId, { allowProcessReuse = true
     }
   }
   const resolvedWorkspaceRoot = resolveLaunchWorkspaceRootForSession(normalizedTargetSessionId);
+  const workerLaunchEnv = buildSessionWorkerLaunchEnvForSession(normalizedTargetSessionId);
   const launched = await launchSessionCli({
     targetSessionId: normalizedTargetSessionId,
     cwd: resolvedWorkspaceRoot,
-    env: sessionWorkerLaunchEnv,
+    env: workerLaunchEnv,
     platform: process.platform,
     spawnImpl: spawn,
     execFileSyncImpl: execFileSync,
@@ -2746,6 +2946,207 @@ const sessionWorkerSupervisor = createSessionWorkerSupervisor({
   log: (message) => console.warn(`${runtimeLogPrefix()}${message}`),
 });
 const featureFlags = normalizeFeatureFlags(FEATURES);
+
+async function stopSessionWorkerForProviderRebind(sdkSessionId) {
+  const sessionId = String(sdkSessionId || '').trim();
+  if (!sessionId) return;
+  const currentWorker = sessionWorkerRegistry?.getWorker?.(sessionId) || null;
+  sessionWorkerSupervisor?.markKilled?.(sessionId);
+  await sessionWorkerSupervisor?.cancelPendingStart?.(sessionId);
+
+  const discoveredProcesses = process.platform === 'win32'
+    ? (
+        sessionWorkerProcessInspector?.findWindowsProcessTreeForSession?.(sessionId)
+        || sessionWorkerProcessInspector?.findWindowsProcessesForSession?.(sessionId)
+        || sessionWorkerProcessInspector?.findProcessesForSession?.(sessionId)
+        || []
+      )
+    : (sessionWorkerProcessInspector?.findProcessesForSession?.(sessionId) || []);
+  const pids = [...new Set([
+    ...discoveredProcesses.map((entry) => Number(entry?.processId)).filter((pid) => Number.isInteger(pid) && pid > 0),
+    Number(currentWorker?.pid),
+  ].filter((pid) => Number.isInteger(pid) && pid > 0))];
+
+  if (process.platform === 'win32') {
+    if (pids.length) sessionWorkerProcessInspector.stopWindowsPids(pids);
+  } else {
+    killTmuxSession(sessionId);
+    for (const pid of pids) {
+      try {
+        process.kill(pid, 'SIGTERM');
+      } catch (error) {
+        if (String(error?.code || '') !== 'ESRCH') throw error;
+      }
+    }
+  }
+  const stopDeadline = Date.now() + 3_000;
+  while (pids.some((pid) => isProcessAlive(pid)) && Date.now() < stopDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const remainingPids = pids.filter((pid) => isProcessAlive(pid));
+  if (remainingPids.length) {
+    throw new Error(`worker-stop-timeout:${remainingPids.join(',')}`);
+  }
+
+  sessionWorkerRegistry?.removeWorker?.(sessionId);
+  sessionWorkerSupervisor?.clearRestartSchedule?.(sessionId);
+  sessionWorkerSupervisor?.resetHealth?.(sessionId, { clearFailureCount: false });
+}
+
+async function reconcileUnstartedConversationProviders({ enabled, model } = {}) {
+  const providerType = enabled === true ? 'openai' : 'github';
+  const providerModel = enabled === true
+    ? (String(model || '').trim() || DEFAULT_OPENAI_MODEL)
+    : null;
+  const runtimeModel = providerModel || DEFAULT_MODEL;
+  const candidates = stmts.listRuntimeSessionProviderCandidates.all();
+  const result = {
+    updatedUnstartedConversations: 0,
+    skippedStartedConversations: 0,
+    skippedActiveQueueConversations: 0,
+    failedConversations: [],
+  };
+  if (!stmts.runtimeSessionsSupportProviders || !stmts.updateRuntimeSessionProvider) {
+    return result;
+  }
+
+  for (const row of candidates) {
+    const currentProvider = String(row?.provider_type || 'github').trim().toLowerCase() || 'github';
+    const currentProviderModel = String(row?.provider_model || '').trim();
+    if (currentProvider === providerType && (providerType !== 'openai' || currentProviderModel === providerModel)) {
+      continue;
+    }
+    if (Number(row?.message_count || 0) > 0) {
+      result.skippedStartedConversations += 1;
+      continue;
+    }
+    if (Number(row?.active_queue_count || 0) > 0) {
+      result.skippedActiveQueueConversations += 1;
+      continue;
+    }
+
+    const conversationId = String(row?.conversation_id || '').trim();
+    const ownerSessionId = String(
+      row?.sdk_session_id
+      || row?.conversation_sdk_session_id
+      || conversationId,
+    ).trim();
+    let workerWasStopped = false;
+    let providerWasUpdated = false;
+    try {
+      if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true && ownerSessionId) {
+        workerWasStopped = true;
+        await stopSessionWorkerForProviderRebind(ownerSessionId);
+      }
+      stmts.updateRuntimeSessionProvider.run(
+        providerType,
+        providerModel,
+        runtimeModel,
+        new Date().toISOString(),
+        row.id,
+      );
+      providerWasUpdated = true;
+      if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true && ownerSessionId) {
+        sessionWorkerSupervisor?.clearRestartSchedule?.(ownerSessionId, { resetKilledMarker: true });
+        const ensured = await sessionWorkerSupervisor?.ensureWorker?.(ownerSessionId, {
+          allowProcessReuse: false,
+        });
+        if (!ensured?.ok) throw new Error(ensured?.error || 'worker-relaunch-failed');
+      }
+      result.updatedUnstartedConversations += 1;
+    } catch (error) {
+      let rollbackError = null;
+      const canRestorePreviousProvider = currentProvider !== 'openai'
+        || getOpenAIProviderSettings().configured === true;
+      if (providerWasUpdated && canRestorePreviousProvider) {
+        stmts.updateRuntimeSessionProvider.run(
+          currentProvider,
+          currentProviderModel || null,
+          String(row?.model || '').trim() || DEFAULT_MODEL,
+          new Date().toISOString(),
+          row.id,
+        );
+      }
+      if (workerWasStopped && ownerSessionId) {
+        sessionWorkerSupervisor?.clearRestartSchedule?.(ownerSessionId, { resetKilledMarker: true });
+        const restored = await sessionWorkerSupervisor?.ensureWorker?.(ownerSessionId, {
+          allowProcessReuse: false,
+        });
+        if (!restored?.ok) rollbackError = String(restored?.error || 'worker-rollback-relaunch-failed');
+      }
+      result.failedConversations.push({
+        conversationId,
+        error: [
+          String(error?.message || error || 'provider-rebind-failed'),
+          rollbackError ? `rollback: ${rollbackError}` : '',
+        ].filter(Boolean).join('; '),
+      });
+    }
+  }
+  return result;
+}
+
+async function rebindUnstartedOpenAIConversationModel({ conversationId, model } = {}) {
+  const normalizedConversationId = String(conversationId || '').trim();
+  const nextModel = String(model || '').trim();
+  const runtimeSession = normalizedConversationId
+    ? stmts.getRuntimeSessionByConversation.get(normalizedConversationId)
+    : null;
+  if (!runtimeSession || String(runtimeSession.provider_type || '').trim().toLowerCase() !== 'openai') {
+    throw new Error('openai-runtime-session-not-found');
+  }
+  const previousModel = String(runtimeSession.provider_model || runtimeSession.model || '').trim();
+  if (!nextModel || nextModel === previousModel) return runtimeSession;
+  const messageCount = Number(stmts.getConversationMessageCount.get(normalizedConversationId)?.count || 0);
+  const activeQueueCount = Number(stmts.getConversationActiveQueueCount.get(normalizedConversationId)?.count || 0);
+  if (messageCount > 0 || activeQueueCount > 0) {
+    throw new Error('openai-session-model-locked');
+  }
+  const ownerSessionId = String(
+    runtimeSession.sdk_session_id
+    || stmts.getConv.get(normalizedConversationId)?.sdk_session_id
+    || normalizedConversationId,
+  ).trim();
+  let providerWasUpdated = false;
+  try {
+    if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true && ownerSessionId) {
+      await stopSessionWorkerForProviderRebind(ownerSessionId);
+    }
+    stmts.updateRuntimeSessionProvider.run(
+      'openai',
+      nextModel,
+      nextModel,
+      new Date().toISOString(),
+      runtimeSession.id,
+    );
+    providerWasUpdated = true;
+    if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true && ownerSessionId) {
+      sessionWorkerSupervisor?.clearRestartSchedule?.(ownerSessionId, { resetKilledMarker: true });
+      const ensured = await sessionWorkerSupervisor?.ensureWorker?.(ownerSessionId, {
+        allowProcessReuse: false,
+      });
+      if (!ensured?.ok) throw new Error(ensured?.error || 'worker-relaunch-failed');
+    }
+    return stmts.getRuntimeSessionByConversation.get(normalizedConversationId);
+  } catch (error) {
+    if (providerWasUpdated) {
+      stmts.updateRuntimeSessionProvider.run(
+        'openai',
+        previousModel,
+        previousModel,
+        new Date().toISOString(),
+        runtimeSession.id,
+      );
+    }
+    if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true && ownerSessionId) {
+      sessionWorkerSupervisor?.clearRestartSchedule?.(ownerSessionId, { resetKilledMarker: true });
+      await sessionWorkerSupervisor?.ensureWorker?.(ownerSessionId, {
+        allowProcessReuse: false,
+      });
+    }
+    throw error;
+  }
+}
 
 function queueCounts() {
   const rows = stmts.countStatus.all();
@@ -5236,6 +5637,11 @@ const sharedRouteDeps = {
   updateConversationConfiguredWorkspaceRoot,
   setWorkspaceRoot: applyWorkspaceRoot,
   setDefaultSessionWorkspaceRootPath,
+  getOpenAIProviderSettings,
+  setOpenAIProviderSettings,
+  refreshOpenAIProviderModels,
+  reconcileUnstartedConversationProviders,
+  rebindUnstartedOpenAIConversationModel,
   getOrCreateConversation,
   ensureRuntimeSessionBinding,
   linkUploadReferences,
@@ -5432,7 +5838,13 @@ function getOrCreateConversation(id, firstLine) {
   return stmts.getConv.get(id);
 }
 
-function ensureRuntimeSessionBinding(conversationId, model, nowIso = new Date().toISOString(), sdkSessionId = null) {
+function ensureRuntimeSessionBinding(
+  conversationId,
+  model,
+  nowIso = new Date().toISOString(),
+  sdkSessionId = null,
+  { assignConfiguredProvider = false, providerType = '', providerModel = null } = {},
+) {
   const normalizedConversationId = String(conversationId || '').trim();
   if (!normalizedConversationId) return null;
   const normalizedModel = String(model || '').trim() || null;
@@ -5460,8 +5872,18 @@ function ensureRuntimeSessionBinding(conversationId, model, nowIso = new Date().
   const runtimeSessionId = uuidv4();
   const strategy = configuredConversationSessionMode;
   const runtimeKey = runtimeSessionId;
+  const openAISettings = assignConfiguredProvider ? getOpenAIProviderSettings() : null;
+  const normalizedRequestedProviderType = String(providerType || '').trim().toLowerCase();
+  const resolvedProviderType = normalizedRequestedProviderType === 'openai'
+    ? 'openai'
+    : (normalizedRequestedProviderType === 'github'
+      ? 'github'
+      : (openAISettings?.enabled ? 'openai' : 'github'));
+  const resolvedProviderModel = resolvedProviderType === 'openai'
+    ? (String(providerModel || normalizedModel || '').trim() || null)
+    : null;
   try {
-    stmts.insertRuntimeSession.run(
+    const insertArgs = [
       runtimeSessionId,
       normalizedConversationId,
       strategy,
@@ -5470,7 +5892,9 @@ function ensureRuntimeSessionBinding(conversationId, model, nowIso = new Date().
       nowIso,
       nowIso,
       normalizedSdkSessionId,
-    );
+    ];
+    if (stmts.runtimeSessionsSupportProviders) insertArgs.push(resolvedProviderType, resolvedProviderModel);
+    stmts.insertRuntimeSession.run(...insertArgs);
   } catch (error) {
     if (String(error?.code || '') !== 'SQLITE_CONSTRAINT_UNIQUE') throw error;
     const byConversation = stmts.getRuntimeSessionByConversation.get(normalizedConversationId);

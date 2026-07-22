@@ -51,6 +51,7 @@ export const pendingUserMessageEntries = new Map();
 export let cliOnline = false;
 export let relayOnline = false;
 export let activeRuntimeSessionCount = 0;
+export let runtimeSessionBindingCount = 0;
 export let conversations = {};
 export let selectedAttachments = [];
 export const RELAY_QUESTION_POLL_MS = 3000;
@@ -460,6 +461,12 @@ export function getConversationCurrentWorkspaceRootPath(conversationId = current
 export function setActiveRuntimeSessionCount(value) {
   const numeric = Number(value);
   activeRuntimeSessionCount = Number.isFinite(numeric) && numeric > 0 ? Math.trunc(numeric) : 0;
+  updateCliStatus();
+}
+
+export function setRuntimeSessionBindingCount(value) {
+  const numeric = Number(value);
+  runtimeSessionBindingCount = Number.isFinite(numeric) && numeric > 0 ? Math.trunc(numeric) : 0;
   updateCliStatus();
 }
 

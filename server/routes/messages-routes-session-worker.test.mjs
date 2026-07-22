@@ -1,7 +1,56 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { dequeuePendingMessageForWorkerLoop, validateSubagentRunBinding } from './messages-routes.mjs';
+import {
+  dequeuePendingMessageForWorkerLoop,
+  resolveOpenAIReasoningEffort,
+  shouldRequireNewOpenAIConversation,
+  validateSubagentRunBinding,
+} from './messages-routes.mjs';
+
+test('OpenAI reasoning uses model capabilities instead of always forcing none', () => {
+  assert.deepEqual(resolveOpenAIReasoningEffort(''), {
+    ok: true,
+    effort: 'none',
+    supported: ['none'],
+  });
+  assert.deepEqual(resolveOpenAIReasoningEffort('none'), {
+    ok: true,
+    effort: 'none',
+    supported: ['none'],
+  });
+  assert.deepEqual(resolveOpenAIReasoningEffort('high', 'gpt-5.6-luna'), {
+    ok: true,
+    effort: 'high',
+    supported: ['none', 'low', 'medium', 'high', 'xhigh'],
+  });
+  assert.deepEqual(resolveOpenAIReasoningEffort('high', 'codex-5.3'), {
+    ok: true,
+    effort: 'high',
+    supported: ['none', 'low', 'medium', 'high', 'xhigh'],
+  });
+  assert.deepEqual(resolveOpenAIReasoningEffort('xhigh', 'gpt-4o'), {
+    ok: false,
+    effort: null,
+    supported: ['none'],
+    error: 'OpenAI model "gpt-4o" does not support reasoning effort "xhigh"',
+  });
+});
+
+test('overlapping GitHub models do not require a new OpenAI conversation', () => {
+  assert.equal(shouldRequireNewOpenAIConversation({
+    shouldCreateConversation: false,
+    runtimeUsesOpenAI: false,
+    requestedConfiguredOpenAIModel: true,
+    githubModelAvailable: true,
+  }), false);
+  assert.equal(shouldRequireNewOpenAIConversation({
+    shouldCreateConversation: false,
+    runtimeUsesOpenAI: false,
+    requestedConfiguredOpenAIModel: true,
+    githubModelAvailable: false,
+  }), true);
+});
 
 test('dequeuePendingMessageForWorkerLoop returns session-killed without calling ensureWorker', async () => {
   let ensureCalled = 0;

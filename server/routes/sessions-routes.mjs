@@ -10,6 +10,8 @@ import { createSdkSessionSyncService } from '../services/sdk-session-sync-servic
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 import { persistConversationPreferences } from '../services/conversation-preferences-service.mjs';
 import { mapUsageSnapshotRow } from '../services/usage-snapshot-helpers.mjs';
+import { isSafeProviderModelId } from '../../shared/model-id.mjs';
+import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mjs';
 
 export { mapUsageSnapshotRow };
 
@@ -143,6 +145,117 @@ export function parseDefaultSessionWorkspaceRootUpdateRequest(body = {}) {
     clearRequested,
     rootPath,
   };
+}
+
+export function parseOpenAISettingsUpdateRequest(body = {}) {
+  const payload = body && typeof body === 'object' ? body : {};
+  const remove = payload.remove === true;
+  const hasModel = Object.prototype.hasOwnProperty.call(payload, 'model');
+  const model = hasModel ? (String(payload.model || '').trim() || 'gpt-4o') : undefined;
+  const apiKey = String(payload.apiKey || '').trim();
+  const hasEnabled = typeof payload.enabled === 'boolean';
+  const hasBaseUrl = Object.prototype.hasOwnProperty.call(payload, 'baseUrl');
+  const baseUrl = hasBaseUrl ? String(payload.baseUrl || '').trim() : undefined;
+  if (!remove && !hasModel && !apiKey && !hasEnabled && !hasBaseUrl) {
+    return { ok: false, error: 'No OpenAI settings update provided' };
+  }
+  if (hasModel && !isSafeProviderModelId(model)) {
+    return { ok: false, error: 'Invalid OpenAI model ID' };
+  }
+  if (remove) {
+    return {
+      ok: true,
+      remove: true,
+      apiKey: '',
+      ...(hasModel ? { model } : {}),
+      enabled: false,
+    };
+  }
+  return {
+    ok: true,
+    remove: false,
+    apiKey,
+    ...(hasModel ? { model } : {}),
+    ...(hasBaseUrl ? { baseUrl } : {}),
+    enabled: hasEnabled ? payload.enabled : (apiKey ? true : undefined),
+  };
+}
+
+export function buildModelCatalogWithOpenAIProvider(modelState = {}, openAISettings = {}) {
+  const configured = openAISettings?.enabled === true;
+  const model = String(openAISettings?.model || '').trim();
+  if (!configured || !model) return { ...modelState };
+  const baseModels = new Set(
+    (Array.isArray(modelState?.models) ? modelState.models : [])
+      .map((value) => String(value || '').trim().toLowerCase())
+      .filter((value) => value && value.toLowerCase() !== 'auto'),
+  );
+  const openAIModels = Array.isArray(openAISettings?.models)
+    ? openAISettings.models.map((value) => String(value || '').trim()).filter(Boolean)
+    : [];
+  const models = Array.from(new Set([model, ...openAIModels, ...(Array.isArray(modelState?.models) ? modelState.models : [])]));
+  const reasoningByModel = { ...(modelState?.reasoningByModel || {}) };
+  const openAIReasoningByModel = {};
+  const modelMetadataByModel = { ...(modelState?.modelMetadataByModel || {}) };
+  const providersByModel = { ...(modelState?.providersByModel || {}) };
+  for (const openAIModel of [model, ...openAIModels]) {
+    const providersKey = String(openAIModel || '').trim();
+    const lowerKey = providersKey.toLowerCase();
+    const reasoningKey = openAIModel.toLowerCase();
+    openAIReasoningByModel[reasoningKey] = openAIReasoningEffortsForModel(openAIModel);
+    if (!Array.isArray(reasoningByModel[reasoningKey]) || reasoningByModel[reasoningKey].length === 0) {
+      reasoningByModel[reasoningKey] = ['none'];
+    }
+    const existingProviders = Array.isArray(providersByModel[providersKey])
+      ? providersByModel[providersKey]
+      : (Array.isArray(providersByModel[lowerKey])
+          ? providersByModel[lowerKey]
+          : (modelMetadataByModel[providersKey]?.provider ? [modelMetadataByModel[providersKey].provider] : []));
+    providersByModel[providersKey] = Array.from(new Set([
+      ...existingProviders,
+      ...(baseModels.has(lowerKey) ? ['github-copilot'] : []),
+      'openai-byok',
+    ]));
+    modelMetadataByModel[providersKey] = {
+      ...(modelMetadataByModel[providersKey] || {}),
+      provider: modelMetadataByModel[providersKey]?.provider || (baseModels.has(lowerKey) ? 'github-copilot' : 'openai-byok'),
+    };
+  }
+  return {
+    ...modelState,
+    models,
+    reasoningByModel,
+    reasoningByProvider: {
+      ...(modelState?.reasoningByProvider || {}),
+      github: { ...(modelState?.reasoningByModel || {}) },
+      openai: openAIReasoningByModel,
+    },
+    modelMetadataByModel,
+    providersByModel,
+  };
+}
+
+function normalizeRequestedProviderType(value = '') {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'openai' || normalized === 'openai-byok') return 'openai';
+  if (normalized === 'github' || normalized === 'github-copilot') return 'github';
+  return '';
+}
+
+export function resolveOpenAISessionModel({
+  requestedModel = '',
+  configuredModel = 'gpt-4o',
+  availableModels = [],
+} = {}) {
+  const requested = String(requestedModel || '').trim();
+  const fallback = String(configuredModel || '').trim() || 'gpt-4o';
+  const available = new Set(
+    (Array.isArray(availableModels) ? availableModels : [])
+      .map((value) => String(value || '').trim())
+      .filter(Boolean),
+  );
+  if (requested === fallback || available.has(requested)) return requested;
+  return fallback;
 }
 
 function runHostSuspendToRam() {
@@ -430,6 +543,32 @@ export function normalizePreferredModelsByMode(value, {
   return normalized;
 }
 
+export function normalizePreferredReasoningByMode(value, {
+  supportedRelayModes = [],
+} = {}) {
+  const allowedModes = Array.isArray(supportedRelayModes)
+    ? supportedRelayModes.map((mode) => String(mode || '').trim()).filter(Boolean)
+    : [];
+  let parsed = value;
+  if (typeof parsed === 'string') {
+    const trimmed = parsed.trim();
+    if (!trimmed) return {};
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      return {};
+    }
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+  const normalized = {};
+  for (const mode of allowedModes) {
+    const effort = String(parsed[mode] || '').trim().toLowerCase();
+    if (!effort) continue;
+    normalized[mode] = effort;
+  }
+  return normalized;
+}
+
 const MAX_CONVERSATION_DRAFT_LENGTH = 20_000;
 
 function normalizeConversationDraftText(value, { maxLength = MAX_CONVERSATION_DRAFT_LENGTH } = {}) {
@@ -466,6 +605,9 @@ function resolveConversationPreferences(row, {
       fallbackMode: defaultRelayMode,
     }),
     preferredModelsByMode: normalizePreferredModelsByMode(row?.preferred_models_by_mode, {
+      supportedRelayModes,
+    }),
+    preferredReasoningByMode: normalizePreferredReasoningByMode(row?.preferred_reasoning_by_mode, {
       supportedRelayModes,
     }),
   };
@@ -607,6 +749,24 @@ export function buildSessionWorkerStatusPayload({
     ? supervisorSnapshot
     : {};
   const workers = Array.isArray(snapshot.workers) ? snapshot.workers : [];
+  const onlineWorkerStatuses = new Set(['starting', 'ready', 'processing']);
+  const onlineCount = workers.reduce((count, worker) => {
+    const status = normalizeWorkerStatusText(worker?.status, 'new');
+    return count + (onlineWorkerStatuses.has(status) ? 1 : 0);
+  }, 0);
+  const onlineProcessCount = workers.reduce((count, worker) => {
+    const status = normalizeWorkerStatusText(worker?.status, 'new');
+    if (!onlineWorkerStatuses.has(status)) return count;
+    return count + (isPidAlive(worker?.pid) ? 1 : 0);
+  }, 0);
+  const onlineBoundProcessCount = workers.reduce((count, worker) => {
+    const status = normalizeWorkerStatusText(worker?.status, 'new');
+    if (!onlineWorkerStatuses.has(status)) return count;
+    if (!isPidAlive(worker?.pid)) return count;
+    const conversationId = normalizeWorkerStatusText(worker?.conversationId);
+    return count + (conversationId ? 1 : 0);
+  }, 0);
+  const onlineUnassignedProcessCount = Math.max(0, onlineProcessCount - onlineBoundProcessCount);
   const normalizedRows = Array.isArray(queueRows) ? queueRows : [];
   const workerBySession = new Map();
   for (const worker of workers) {
@@ -686,6 +846,10 @@ export function buildSessionWorkerStatusPayload({
     degradedReason: normalizeWorkerStatusText(snapshot?.health?.degradedReason, null),
     health: snapshot?.health && typeof snapshot.health === 'object' ? snapshot.health : null,
     workerCount: toSafeNonNegativeInt(snapshot.workerCount, workers.length),
+    onlineCount,
+    onlineProcessCount,
+    onlineBoundProcessCount,
+    onlineUnassignedProcessCount,
     counts: snapshot.counts && typeof snapshot.counts === 'object' ? snapshot.counts : {},
     workers,
     pendingStarts: toSafeNonNegativeInt(snapshot.pendingStarts, 0),
@@ -1284,6 +1448,15 @@ export function registerSessionsRoutes(app, deps) {
     workspaceRootPayload,
     setWorkspaceRoot,
     setDefaultSessionWorkspaceRootPath,
+    getOpenAIProviderSettings = () => ({ configured: false, enabled: false, model: 'gpt-4o' }),
+    setOpenAIProviderSettings = () => ({ ok: false, error: 'OpenAI settings are unavailable' }),
+    refreshOpenAIProviderModels = async () => ({ ok: false, models: [], error: 'OpenAI model discovery is unavailable' }),
+    reconcileUnstartedConversationProviders = async () => ({
+      updatedUnstartedConversations: 0,
+      skippedStartedConversations: 0,
+      skippedActiveQueueConversations: 0,
+      failedConversations: [],
+    }),
     resolveConversationWorkspaceState,
     updateConversationConfiguredWorkspaceRoot,
     learnConversationWorkspaceRoot,
@@ -1758,6 +1931,9 @@ export function registerSessionsRoutes(app, deps) {
         runtimeSessionStrategy: r.runtime_strategy || null,
         runtimeSessionStatus: r.runtime_status || null,
         runtimeSessionLastUsedAt: r.runtime_last_used_at || null,
+        runtimeModel: r.runtime_model || null,
+        runtimeProviderType: String(r.runtime_provider_type || 'github').trim().toLowerCase() || 'github',
+        runtimeProviderModel: r.runtime_provider_model || null,
         configuredWorkspaceRootPath: workspaceState?.configuredWorkspaceRootPath || null,
         configuredWorkspaceRootName: workspaceState?.configuredWorkspaceRootName || null,
         runtimeWorkspaceRootPath: workspaceState?.runtimeWorkspaceRootPath || null,
@@ -1769,6 +1945,7 @@ export function registerSessionsRoutes(app, deps) {
         messageCount: Number(r.message_count || 0),
         preferredRelayMode: preferences.preferredRelayMode,
         preferredModelsByMode: preferences.preferredModelsByMode,
+        preferredReasoningByMode: preferences.preferredReasoningByMode,
         draftText: String(r.draft_text || ''),
         draftUpdatedAt: r.draft_updated_at || null,
         draftUpdatedByClientId: r.draft_updated_by_client_id || null,
@@ -2315,6 +2492,8 @@ export function registerSessionsRoutes(app, deps) {
         strategy: runtimeSession.strategy || null,
         status: runtimeSession.status || null,
         model: runtimeSession.model || null,
+        providerType: String(runtimeSession.provider_type || 'github').trim().toLowerCase() || 'github',
+        providerModel: runtimeSession.provider_model || null,
         createdAt: runtimeSession.created_at || null,
         lastUsedAt: runtimeSession.last_used_at || null,
       } : null,
@@ -2324,6 +2503,7 @@ export function registerSessionsRoutes(app, deps) {
       inFlight,
       preferredRelayMode: preferences.preferredRelayMode,
       preferredModelsByMode: preferences.preferredModelsByMode,
+      preferredReasoningByMode: preferences.preferredReasoningByMode,
       draftText: String(conv.draft_text || ''),
       draftUpdatedAt: conv.draft_updated_at || null,
       draftUpdatedByClientId: conv.draft_updated_by_client_id || null,
@@ -2616,6 +2796,8 @@ export function registerSessionsRoutes(app, deps) {
         strategy: runtimeSession.strategy || null,
         status: runtimeSession.status || null,
         model: runtimeSession.model || null,
+        providerType: String(runtimeSession.provider_type || 'github').trim().toLowerCase() || 'github',
+        providerModel: runtimeSession.provider_model || null,
         createdAt: runtimeSession.created_at || null,
         lastUsedAt: runtimeSession.last_used_at || null,
       } : null,
@@ -2625,6 +2807,7 @@ export function registerSessionsRoutes(app, deps) {
       inFlight,
       preferredRelayMode: preferences.preferredRelayMode,
       preferredModelsByMode: preferences.preferredModelsByMode,
+      preferredReasoningByMode: preferences.preferredReasoningByMode,
       draftText: String(conv.draft_text || ''),
       draftUpdatedAt: conv.draft_updated_at || null,
       draftUpdatedByClientId: conv.draft_updated_by_client_id || null,
@@ -2673,12 +2856,16 @@ export function registerSessionsRoutes(app, deps) {
     const preferredModelsByMode = normalizePreferredModelsByMode(req.body?.preferredModelsByMode, {
       supportedRelayModes: SUPPORTED_RELAY_MODES,
     });
+    const preferredReasoningByMode = normalizePreferredReasoningByMode(req.body?.preferredReasoningByMode, {
+      supportedRelayModes: SUPPORTED_RELAY_MODES,
+    });
     const persisted = persistConversationPreferences({
       db,
       stmts,
       conversationId,
       preferredRelayMode,
       preferredModelsByMode,
+      preferredReasoningByMode,
       updatedAt: now,
       createIfMissing: !existing,
       createTitle: 'Session',
@@ -2688,6 +2875,7 @@ export function registerSessionsRoutes(app, deps) {
       conversationId,
       preferredRelayMode: persisted.preferredRelayMode,
       preferredModelsByMode: persisted.preferredModelsByMode,
+      preferredReasoningByMode: persisted.preferredReasoningByMode,
       updatedAt: persisted.updatedAt,
       senderClientId,
     });
@@ -2697,6 +2885,7 @@ export function registerSessionsRoutes(app, deps) {
       conversationId,
       preferredRelayMode: persisted.preferredRelayMode,
       preferredModelsByMode: persisted.preferredModelsByMode,
+      preferredReasoningByMode: persisted.preferredReasoningByMode,
       updatedAt: persisted.updatedAt,
       created: persisted.created,
       senderClientId,
@@ -2977,16 +3166,84 @@ export function registerSessionsRoutes(app, deps) {
 
     const requestedTitle = String(req.body?.title || '').trim();
     const title = (requestedTitle || 'New Conversation').slice(0, 80);
-    const modelState = getModelCatalogState();
-    const selectedModel = resolveBootstrapModelSelection({
+    const openAISettings = getOpenAIProviderSettings();
+    const requestedProviderType = normalizeRequestedProviderType(req.body?.providerType || req.body?.provider);
+    const modelState = buildModelCatalogWithOpenAIProvider(
+      getModelCatalogState(),
+      openAISettings,
+    );
+    const catalogSelectedModel = resolveBootstrapModelSelection({
       requestedModel: req.body?.model,
       modelState,
       defaultModel: DEFAULT_MODEL,
     });
+    const requestedBootstrapModel = String(req.body?.model || '').trim();
+    const availableOpenAIModels = new Set([
+      String(openAISettings?.model || '').trim(),
+      ...(Array.isArray(openAISettings?.models) ? openAISettings.models : []),
+    ].map((value) => String(value || '').trim()).filter(Boolean));
+    if (
+      requestedProviderType === 'openai'
+      && requestedBootstrapModel
+      && requestedBootstrapModel.toLowerCase() !== 'auto'
+      && !availableOpenAIModels.has(requestedBootstrapModel)
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: `OpenAI model "${requestedBootstrapModel}" is not available`,
+        code: 'OPENAI_MODEL_UNAVAILABLE',
+      });
+    }
+    const useOpenAIProvider = requestedProviderType === 'openai'
+      || (
+        requestedProviderType === ''
+        && requestedBootstrapModel
+        && requestedBootstrapModel.toLowerCase() !== 'auto'
+        && availableOpenAIModels.has(requestedBootstrapModel)
+      );
+    if (useOpenAIProvider && openAISettings?.configured !== true) {
+      return res.status(400).json({
+        ok: false,
+        error: 'OpenAI API key is not configured',
+        code: 'OPENAI_NOT_CONFIGURED',
+      });
+    }
+
+    const selectedModel = useOpenAIProvider
+      ? resolveOpenAISessionModel({
+          requestedModel: catalogSelectedModel,
+          configuredModel: openAISettings.model,
+          availableModels: openAISettings.models,
+        })
+      : catalogSelectedModel;
+    if (!useOpenAIProvider) {
+      const selectedProviders = Array.isArray(modelState?.providersByModel?.[String(selectedModel || '').trim().toLowerCase()])
+        ? modelState.providersByModel[String(selectedModel || '').trim().toLowerCase()]
+        : [];
+      const openAIOnlySelection = selectedProviders.length > 0
+        && selectedProviders.every((provider) => String(provider || '').trim().toLowerCase() === 'openai-byok');
+      if (openAIOnlySelection) {
+        return res.status(400).json({
+          ok: false,
+          error: `Model "${selectedModel}" requires the OpenAI provider`,
+          code: 'OPENAI_PROVIDER_REQUIRED',
+        });
+      }
+    }
 
     try {
       stmts.insertConv.run(conversationId, title, now, now);
-      const runtimeSession = ensureRuntimeSessionBinding(conversationId, selectedModel, now, conversationId);
+      const runtimeSession = ensureRuntimeSessionBinding(
+        conversationId,
+        selectedModel,
+        now,
+        conversationId,
+        {
+          assignConfiguredProvider: true,
+          providerType: useOpenAIProvider ? 'openai' : 'github',
+          providerModel: useOpenAIProvider ? selectedModel : null,
+        },
+      );
       const routingEnabled = featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true;
       const ownerSessionId = routingEnabled ? conversationId : null;
       if (ownerSessionId && typeof sessionWorkerSupervisor?.ensureWorker === 'function') {
@@ -3038,6 +3295,7 @@ export function registerSessionsRoutes(app, deps) {
         worker: ownerWorker,
         lifecycle: ownerSessionId ? (sessionWorkerSupervisor?.getLifecycleState?.(ownerSessionId) || null) : null,
         selectedModel,
+        selectedProviderType: useOpenAIProvider ? 'openai' : 'github',
         warning: routingEnabled ? null : 'Session worker routing is disabled; worker prestart skipped.',
         ...workspaceRootPayload(),
       });
@@ -3055,13 +3313,21 @@ export function registerSessionsRoutes(app, deps) {
     ensureSessionId(req, res);
     const { pendingCount, processingCount, parkedCount } = queueCounts();
     const modelState = getModelCatalogState();
-    const activeRuntimeSessionCount = Number(stmts.countRuntimeSessions.get()?.cnt || 0);
+    const runtimeSessionBindingCount = Number(stmts.countRuntimeSessions.get()?.cnt || 0);
     const configuredContextIndicatorMode = String(config?.contextIndicatorMode || '').trim().toLowerCase();
     const contextIndicatorMode = configuredContextIndicatorMode === 'bar' ? 'bar' : 'default';
     const readyBanner = buildRelayReadyBannerData();
     const pendingQuestionSessionIds = listPendingQuestionSessionRows.all()
       .map((row) => normalizeWorkerStatusText(row?.sdk_session_id))
       .filter(Boolean);
+    const sessionWorkerStatus = buildSessionWorkerStatusPayload({
+      featureFlags,
+      supervisorSnapshot: sessionWorkerSupervisor?.snapshot?.({ pendingQuestionSessionIds }) || null,
+      queueRows: listSessionWorkerQueueRows.all(...SESSION_WORKER_STATUS_QUEUE_STATES),
+    });
+    const activeRuntimeSessionCount = featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true
+      ? Number(sessionWorkerStatus?.onlineBoundProcessCount || 0)
+      : runtimeSessionBindingCount;
     res.json({
       cliOnline: runtimeState.cliOnline,
       relayPaused: runtimeState.relayPaused,
@@ -3069,6 +3335,7 @@ export function registerSessionsRoutes(app, deps) {
       processingCount,
       parkedCount,
       activeRuntimeSessionCount,
+      runtimeSessionBindingCount,
       supportedModels: modelState.models,
       defaultModel: modelState.defaultModel,
       currentModel: modelState.currentModel,
@@ -3107,11 +3374,7 @@ export function registerSessionsRoutes(app, deps) {
       relayShutdown: runtimeState.relayShutdown || null,
       platform: process.platform,
       features: featureFlags || {},
-      sessionWorker: buildSessionWorkerStatusPayload({
-        featureFlags,
-        supervisorSnapshot: sessionWorkerSupervisor?.snapshot?.({ pendingQuestionSessionIds }) || null,
-        queueRows: listSessionWorkerQueueRows.all(...SESSION_WORKER_STATUS_QUEUE_STATES),
-      }),
+      sessionWorker: sessionWorkerStatus,
     });
   });
 
@@ -3136,6 +3399,81 @@ export function registerSessionsRoutes(app, deps) {
       defaultSessionWorkspaceRootPath: payload.defaultSessionWorkspaceRootPath || null,
       defaultSessionWorkspaceRootWarning: payload.defaultSessionWorkspaceRootWarning || null,
       recentWorkspaceRoots: Array.isArray(payload.recentWorkspaceRoots) ? payload.recentWorkspaceRoots : [],
+    });
+  });
+
+  app.get('/api/settings/openai', auth, (_req, res) => {
+    const settings = getOpenAIProviderSettings();
+    return res.json({
+      configured: settings?.configured === true,
+      enabled: settings?.enabled === true,
+      model: String(settings?.model || 'gpt-4o').trim() || 'gpt-4o',
+      baseUrl: String(settings?.baseUrl || 'https://api.openai.com/v1').trim() || 'https://api.openai.com/v1',
+    });
+  });
+
+  app.post('/api/settings/openai', auth, async (req, res) => {
+    const parsed = parseOpenAISettingsUpdateRequest(req.body);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    const previous = getOpenAIProviderSettings();
+    const result = setOpenAIProviderSettings(parsed);
+    if (!result?.ok) {
+      const statusCode = result?.code === 'openai-key-removal-blocked' ? 409 : 400;
+      return res.status(statusCode).json({
+        error: result?.error || 'Failed to update OpenAI settings',
+        code: result?.code || null,
+        activeConversationCount: Number(result?.activeConversationCount || 0),
+        startedConversationCount: Number(result?.startedConversationCount || 0),
+        activeQueueConversationCount: Number(result?.activeQueueConversationCount || 0),
+      });
+    }
+    const shouldDiscover = result.enabled === true && (
+      !!parsed.apiKey
+      || previous?.enabled !== true
+      || previous?.model !== result.model
+      || (
+        Object.prototype.hasOwnProperty.call(parsed, 'baseUrl')
+        && String(previous?.baseUrl || '').trim() !== String(result?.baseUrl || '').trim()
+      )
+    );
+    const discovery = !shouldDiscover
+      ? { ok: true, models: [], error: null }
+      : await refreshOpenAIProviderModels();
+    const reconciliationResult = await reconcileUnstartedConversationProviders({
+      enabled: result.enabled === true,
+      model: result.model,
+    });
+    const reconciliation = {
+      updatedUnstartedConversations: Number(reconciliationResult?.updatedUnstartedConversations || 0),
+      skippedStartedConversations: Number(reconciliationResult?.skippedStartedConversations || 0),
+      skippedActiveQueueConversations: Number(reconciliationResult?.skippedActiveQueueConversations || 0),
+      failedConversations: Array.isArray(reconciliationResult?.failedConversations)
+        ? reconciliationResult.failedConversations
+        : [],
+    };
+    const currentSettings = getOpenAIProviderSettings();
+    const settingsPayload = {
+      configured: currentSettings?.configured === true,
+      enabled: currentSettings?.enabled === true,
+      model: String(currentSettings?.model || result.model || 'gpt-4o').trim() || 'gpt-4o',
+      baseUrl: String(currentSettings?.baseUrl || 'https://api.openai.com/v1').trim() || 'https://api.openai.com/v1',
+      reconciliation,
+    };
+    io.emit('models_updated', buildModelCatalogWithOpenAIProvider(
+      getModelCatalogState(),
+      currentSettings,
+    ));
+    io.emit('openai_settings_updated', settingsPayload);
+    const reconciliationFailures = Array.isArray(reconciliation?.failedConversations)
+      ? reconciliation.failedConversations
+      : [];
+    return res.json({
+      ok: true,
+      ...settingsPayload,
+      models: Array.isArray(discovery?.models) ? discovery.models : [],
+      warning: reconciliationFailures.length
+        ? `${reconciliationFailures.length} unstarted conversation(s) could not switch provider.`
+        : (discovery?.ok ? null : (discovery?.error || 'OpenAI model discovery failed')),
     });
   });
 
@@ -3333,11 +3671,30 @@ export function registerSessionsRoutes(app, deps) {
       return res.status(501).json({ error: 'Model refresh is unavailable' });
     }
     try {
-      await refreshModelVariantCatalogFromCli();
-      io.emit('models_updated', getModelCatalogState());
+      const openAISettings = getOpenAIProviderSettings();
+      const refreshTasks = [
+        refreshModelVariantCatalogFromCli(),
+        openAISettings?.enabled === true
+          ? refreshOpenAIProviderModels()
+          : Promise.resolve({ ok: true, skipped: true, models: [], error: null }),
+      ];
+      const [cliRefresh, openAIRefresh] = await Promise.allSettled(refreshTasks);
+      if (cliRefresh.status === 'rejected') throw cliRefresh.reason;
+      const openAIModelDiscovery = openAIRefresh.status === 'fulfilled'
+        ? openAIRefresh.value
+        : {
+            ok: false,
+            models: Array.isArray(openAISettings?.models) ? openAISettings.models : [],
+            error: openAIRefresh.reason?.message || 'OpenAI model discovery failed',
+          };
+      io.emit('models_updated', buildModelCatalogWithOpenAIProvider(
+        getModelCatalogState(),
+        getOpenAIProviderSettings(),
+      ));
       return res.json({
         ok: true,
         ...buildModelVariantCatalogPayloadForRoute(),
+        openAIModelDiscovery,
       });
     } catch (error) {
       return res.status(500).json({
@@ -3356,7 +3713,10 @@ export function registerSessionsRoutes(app, deps) {
       ? req.body.enabledVariantIds.map((value) => String(value || '').trim()).filter(Boolean)
       : [];
     setEnabledModelVariants(enabledVariantIds);
-    io.emit('models_updated', getModelCatalogState());
+    io.emit('models_updated', buildModelCatalogWithOpenAIProvider(
+      getModelCatalogState(),
+      getOpenAIProviderSettings(),
+    ));
     return res.json({
       ok: true,
       ...buildModelVariantCatalogPayloadForRoute(),
@@ -3365,15 +3725,20 @@ export function registerSessionsRoutes(app, deps) {
 
   app.get('/api/models', auth, (req, res) => {
     ensureSessionId(req, res);
-    const modelState = getModelCatalogState();
+    const modelState = buildModelCatalogWithOpenAIProvider(
+      getModelCatalogState(),
+      getOpenAIProviderSettings(),
+    );
     res.json({
       models: modelState.models,
       currentModel: modelState.currentModel,
       defaultModel: modelState.defaultModel,
       reasoningByModel: modelState.reasoningByModel || {},
+      reasoningByProvider: modelState.reasoningByProvider || {},
       reasoningEfforts: modelState.reasoningEfforts || [],
       contextLimitsByModel: modelState.contextLimitsByModel || {},
       modelMetadataByModel: modelState.modelMetadataByModel || {},
+      providersByModel: modelState.providersByModel || {},
       stale: modelState.stale,
       metadataValid: modelState.metadataValid === true,
       reasoningMetadataValid: modelState.reasoningMetadataValid === true,
@@ -3396,7 +3761,10 @@ export function registerSessionsRoutes(app, deps) {
       source: source || 'relay-extension',
       error,
     });
-    io.emit('models_updated', getModelCatalogState());
+    io.emit('models_updated', buildModelCatalogWithOpenAIProvider(
+      getModelCatalogState(),
+      getOpenAIProviderSettings(),
+    ));
     res.json({
       ok: true,
       ...getModelCatalogState(),

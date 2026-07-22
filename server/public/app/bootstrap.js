@@ -71,7 +71,12 @@ import {
   setNetworkRequestsEnabled,
 } from './api-client.js';
 import { loadConversations, refreshConversations, openConversation, renderConvList, applyLoadedConversationState, initConversationListLazyLoading } from './journal-view.js';
-import { newConversation, deleteConv } from './journal-view.js';
+import {
+  newConversation,
+  confirmNewConversationModel,
+  closeNewConversationModelModal,
+  deleteConv,
+} from './journal-view.js';
 import {
   loadRelayQuestions,
   getPendingQuestionCountsByConversation,
@@ -101,6 +106,10 @@ import {
   withUpdatedModelPreference,
   normalizePreferredModelsByMode,
 } from './conversation-preferences.mjs';
+import {
+  modelSelectorOptionsEqual,
+  normalizeModelSelectorOptions,
+} from './model-selector-options.mjs';
 import {
   initMessageSearchView,
   openMessageSearchModal,
@@ -141,6 +150,11 @@ import {
   updateShowSuspendHostSetting,
   syncDefaultSessionWorkspaceRootInput,
   updateDefaultSessionWorkspaceRootSetting,
+  saveOpenAISettings,
+  removeOpenAISettings,
+  toggleOpenAIProvider,
+  applyOpenAISettingsState,
+  refreshOpenAISettingsState,
 } from './settings-modal.js';
 import {
   initActionConfirmations,
@@ -165,6 +179,8 @@ const FALLBACK_REASONING_EFFORT = 'none';
 const FALLBACK_MODE = 'agent';
 const PROVIDER_LABELS = {
   openai: 'OpenAI',
+  'openai-byok': 'OpenAI (BYOK)',
+  'github-copilot': 'GitHub Copilot',
   anthropic: 'Anthropic',
   google: 'Google',
   microsoft: 'Microsoft',
@@ -198,6 +214,8 @@ let modelCatalogState = {
   currentModel: FALLBACK_MODEL,
   defaultModel: FALLBACK_MODEL,
   reasoningByModel: {},
+  reasoningByProvider: {},
+  providersByModel: {},
   reasoningEfforts: [],
   modelMetadataByModel: {},
   stale: true,
@@ -208,6 +226,7 @@ let modelCatalogState = {
   refreshedAt: null,
 };
 let lastHealthyModelCatalogState = null;
+let deferredModelCatalogPayload = null;
 let modelMetadataBlocked = true;
 let modelMetadataRetryInFlight = false;
 let modelVariantCatalogState = {
@@ -220,6 +239,7 @@ let modelVariantCatalogState = {
   error: null,
   reasoningEfforts: [],
 };
+let modelVariantCatalogProviderTab = 'copilot';
 let activeConversationPreferredModelsByMode = {};
 let activeConversationPreferredReasoningByMode = {};
 let suppressConversationPreferenceSync = false;
@@ -783,15 +803,46 @@ function currentConversationHasMessages() {
   return Number(conversation?.messageCount || 0) > 0;
 }
 
+function currentOpenAIModelLock() {
+  const conversation = currentConvId ? conversations[currentConvId] : null;
+  const providerType = String(
+    conversation?.runtimeProviderType
+    || conversation?.runtime_provider_type
+    || document.getElementById('provider-status-pill')?.dataset?.provider
+    || '',
+  ).trim().toLowerCase();
+  const providerIsOpenAI = providerType === 'openai' || providerType === 'openai-byok';
+  if (!providerIsOpenAI || !currentConversationHasMessages()) return null;
+  return {
+    model: String(
+      conversation?.runtimeProviderModel
+      || conversation?.runtime_provider_model
+      || '',
+    ).trim(),
+  };
+}
+
 function syncAutoModelAvailability() {
   const select = document.getElementById('model-select');
   if (!select) return;
+  const currentProviderScope = normalizeModelSelectorProviderType(activeComposerProviderType());
+  if (select.dataset.providerScope !== currentProviderScope) {
+    updateModelCatalogState(modelCatalogState);
+    return;
+  }
   const autoOption = Array.from(select.options).find((option) => option.value.toLowerCase() === AUTO_MODEL_OPTION);
-  if (!autoOption) return;
-  const locked = currentConversationHasMessages();
-  autoOption.disabled = locked;
-  autoOption.title = locked ? 'Auto is available only for a new conversation' : '';
-  if (locked && select.value.toLowerCase() === AUTO_MODEL_OPTION) {
+  const hasMessages = currentConversationHasMessages();
+  const openAILock = currentOpenAIModelLock();
+  for (const option of Array.from(select.options)) {
+    if (option.dataset.runtimeModelLock === '1' && option.value !== openAILock?.model) {
+      option.remove();
+    }
+  }
+  if (autoOption) {
+    autoOption.disabled = hasMessages;
+    autoOption.title = hasMessages ? 'Auto is available only for a new conversation' : '';
+  }
+  if (hasMessages && select.value.toLowerCase() === AUTO_MODEL_OPTION) {
     const fallback = [
       modelCatalogState.currentModel,
       modelCatalogState.defaultModel,
@@ -799,6 +850,29 @@ function syncAutoModelAvailability() {
     ].find((modelId) => String(modelId || '').trim().toLowerCase() !== AUTO_MODEL_OPTION
       && Array.from(select.options).some((option) => option.value === modelId));
     if (fallback) select.value = fallback;
+  }
+  if (openAILock?.model && !Array.from(select.options).some((option) => option.value === openAILock.model)) {
+    const option = document.createElement('option');
+    option.value = openAILock.model;
+    option.textContent = `🔒 ${modelOptionLabel(openAILock.model)}`;
+    option.dataset.runtimeModelLock = '1';
+    select.appendChild(option);
+  }
+  if (openAILock?.model) {
+    select.value = openAILock.model;
+  }
+  select.dataset.runtimeModelLocked = openAILock ? '1' : '0';
+  const metadataBlocked = modelMetadataBlocked || !isModelMetadataHealthy();
+  select.disabled = metadataBlocked || !!openAILock;
+  select.title = openAILock
+    ? `Model locked to ${openAILock.model || 'the configured OpenAI model'} for this active OpenAI session`
+    : (metadataBlocked ? 'Model metadata unavailable' : 'Model');
+  const note = document.getElementById('model-lock-note');
+  if (note) {
+    note.hidden = !openAILock;
+    note.textContent = openAILock
+      ? `🔒 OpenAI session model locked${openAILock.model ? ` to ${openAILock.model}` : ''}.`
+      : '';
   }
 }
 
@@ -814,6 +888,20 @@ function clearModelMetadataHardFail() {
   if (!modelCatalogState.warning && !modelCatalogState.stale) {
     setModelBanner('');
   }
+}
+
+function normalizePreferredReasoningByMode(value, { supportedModes = [] } = {}) {
+  const allowedModes = Array.isArray(supportedModes)
+    ? supportedModes.map((mode) => String(mode || '').trim()).filter(Boolean)
+    : [];
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const normalized = {};
+  for (const mode of allowedModes) {
+    const effort = String(value[mode] || '').trim().toLowerCase();
+    if (!effort) continue;
+    normalized[mode] = effort;
+  }
+  return normalized;
 }
 
 function readStoredReasoningByMode() {
@@ -852,9 +940,79 @@ async function startAppWithErrorHandling() {
   }
 }
 
+function activeComposerProviderType() {
+  const conversation = conversations[currentConvId] || null;
+  return String(
+    conversation?.runtimeProviderType
+    || conversation?.runtime_provider_type
+    || document.getElementById('provider-status-pill')?.dataset?.provider
+    || 'github',
+  ).trim().toLowerCase();
+}
+
+function normalizeModelSelectorProviderType(providerType = '') {
+  const normalized = String(providerType || '').trim().toLowerCase();
+  if (normalized === 'openai' || normalized === 'openai-byok') return 'openai';
+  return 'github';
+}
+
+function modelProvidersForId(modelId, providersByModel = {}) {
+  const key = String(modelId || '').trim().toLowerCase();
+  if (!key) return [];
+  const providers = providersByModel?.[key];
+  if (!Array.isArray(providers)) return [];
+  return providers.map((provider) => String(provider || '').trim().toLowerCase()).filter(Boolean);
+}
+
+function modelVisibleForActiveProvider(modelId, activeProviderType, providersByModel = {}) {
+  const normalizedModelId = String(modelId || '').trim().toLowerCase();
+  if (!normalizedModelId) return false;
+  if (normalizedModelId === AUTO_MODEL_OPTION) return true;
+  const providers = modelProvidersForId(normalizedModelId, providersByModel);
+  const hasOpenAIByok = providers.includes('openai-byok');
+  const hasNonByokProvider = providers.some((provider) => provider !== 'openai-byok');
+  const activeProvider = normalizeModelSelectorProviderType(activeProviderType);
+  if (activeProvider === 'openai') return hasOpenAIByok;
+  return !(hasOpenAIByok && !hasNonByokProvider);
+}
+
+function buildModelSelectorOptions(models = [], providersByModel = {}, activeProviderType = '') {
+  const normalizedOptions = normalizeModelSelectorOptions(models.length ? models : [FALLBACK_MODEL], {
+    autoValue: AUTO_MODEL_OPTION,
+    labelFor: modelOptionLabel,
+  });
+  return normalizedOptions.filter((option) => modelVisibleForActiveProvider(
+    option.value,
+    activeProviderType,
+    providersByModel,
+  ));
+}
+
 function reasoningOptionsForModel(modelId = '') {
   if (!isModelMetadataHealthy()) return [];
   const key = String(modelId || '').trim().toLowerCase();
+  const provider = activeComposerProviderType();
+  const providerOptions = modelCatalogState.reasoningByProvider?.[provider]?.[key];
+  if (Array.isArray(providerOptions)) return normalizeReasoningEffortList(providerOptions);
+  return normalizeReasoningEffortList(modelCatalogState.reasoningByModel?.[key] || []);
+}
+
+function reasoningProviderKey(providerType = '') {
+  const key = String(providerType || '').trim().toLowerCase();
+  if (key === 'openai-byok') return 'openai';
+  if (key === 'github-copilot') return 'github';
+  return key;
+}
+
+function reasoningOptionsForProviderModel(providerType = '', modelId = '') {
+  if (!isModelMetadataHealthy()) return [];
+  const key = String(modelId || '').trim().toLowerCase();
+  if (!key) return [];
+  const provider = reasoningProviderKey(providerType);
+  const providerOptions = modelCatalogState.reasoningByProvider?.[provider]?.[key];
+  if (Array.isArray(providerOptions) && providerOptions.length) {
+    return normalizeReasoningEffortList(providerOptions);
+  }
   return normalizeReasoningEffortList(modelCatalogState.reasoningByModel?.[key] || []);
 }
 
@@ -870,6 +1028,11 @@ function updateReasoningSelectorForModel(modelId, preferredEffort = '') {
   if (!select) return;
   const options = reasoningOptionsForModel(modelId);
   const selectedBefore = String(select.value || '').trim().toLowerCase();
+  const mode = String(document.getElementById('mode-select')?.value || '').trim() || FALLBACK_MODE;
+  const storedByMode = readStoredReasoningByMode();
+  const modeStored = String(storedByMode?.[mode] || '').trim().toLowerCase();
+  const modeInMemory = String(activeConversationPreferredReasoningByMode?.[mode] || '').trim().toLowerCase();
+  const genericStored = String(localStorage.getItem(REASONING_STORAGE_KEY) || '').trim().toLowerCase();
   select.innerHTML = '';
   if (!options.length) {
     const opt = document.createElement('option');
@@ -886,12 +1049,18 @@ function updateReasoningSelectorForModel(modelId, preferredEffort = '') {
     select.appendChild(opt);
   }
   const preferred = String(preferredEffort || '').trim().toLowerCase();
-  const resolved = [preferred, selectedBefore, localStorage.getItem(REASONING_STORAGE_KEY)]
-    .map((value) => String(value || '').trim().toLowerCase())
-    .find((value) => value && options.includes(value))
+  const resolvedPreferred = [preferred, modeInMemory, modeStored, selectedBefore, genericStored]
+    .find((value) => value && options.includes(value));
+  const resolved = resolvedPreferred
+    || options.find((value) => value !== 'none')
     || options[0];
   select.value = resolved;
   localStorage.setItem(REASONING_STORAGE_KEY, resolved);
+  activeConversationPreferredReasoningByMode = {
+    ...activeConversationPreferredReasoningByMode,
+    [mode]: resolved,
+  };
+  localStorage.setItem(REASONING_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredReasoningByMode));
 }
 
 function updateModelCatalogState(payload) {
@@ -902,18 +1071,39 @@ function updateModelCatalogState(payload) {
     : [];
   const currentModel = String(payload?.currentModel || models[0] || '').trim();
   const defaultModel = String(payload?.defaultModel || models[0] || '').trim();
-  const nextModels = Array.from(new Set(models.filter(Boolean)));
-  if (!nextModels.includes(AUTO_MODEL_OPTION)) nextModels.unshift(AUTO_MODEL_OPTION);
-  if (!nextModels.length) nextModels.push(FALLBACK_MODEL);
+  const normalizedModelOptions = normalizeModelSelectorOptions(models.length ? models : [FALLBACK_MODEL], {
+    autoValue: AUTO_MODEL_OPTION,
+    labelFor: modelOptionLabel,
+  });
+  const normalizedModels = normalizedModelOptions.map((option) => option.value);
 
   const nextState = {
-    models: nextModels,
-    currentModel: currentModel || nextModels[0] || FALLBACK_MODEL,
-    defaultModel: defaultModel || nextModels[0] || FALLBACK_MODEL,
+    models: normalizedModels,
+    currentModel: currentModel || normalizedModels[0] || FALLBACK_MODEL,
+    defaultModel: defaultModel || normalizedModels[0] || FALLBACK_MODEL,
     reasoningByModel: payload?.reasoningByModel && typeof payload.reasoningByModel === 'object'
       ? Object.fromEntries(Object.entries(payload.reasoningByModel).map(([modelId, efforts]) => [
         String(modelId || '').trim().toLowerCase(),
         normalizeReasoningEffortList(efforts),
+      ]))
+      : {},
+    reasoningByProvider: payload?.reasoningByProvider && typeof payload.reasoningByProvider === 'object'
+      ? Object.fromEntries(Object.entries(payload.reasoningByProvider).map(([provider, entries]) => [
+        String(provider || '').trim().toLowerCase(),
+        entries && typeof entries === 'object'
+          ? Object.fromEntries(Object.entries(entries).map(([modelId, efforts]) => [
+              String(modelId || '').trim().toLowerCase(),
+              normalizeReasoningEffortList(efforts),
+            ]))
+          : {},
+      ]))
+      : {},
+    providersByModel: payload?.providersByModel && typeof payload.providersByModel === 'object'
+      ? Object.fromEntries(Object.entries(payload.providersByModel).map(([modelId, providers]) => [
+        String(modelId || '').trim().toLowerCase(),
+        Array.isArray(providers)
+          ? providers.map((provider) => String(provider || '').trim().toLowerCase()).filter(Boolean)
+          : [],
       ]))
       : {},
     reasoningEfforts: normalizeReasoningEffortList(payload?.reasoningEfforts || []),
@@ -928,6 +1118,25 @@ function updateModelCatalogState(payload) {
     error: payload?.error ? String(payload.error) : null,
     refreshedAt: payload?.refreshedAt || null,
   };
+  const activeProviderType = activeComposerProviderType();
+  const nextOptions = buildModelSelectorOptions(
+    normalizedModels,
+    nextState.providersByModel,
+    activeProviderType,
+  );
+  const nextModels = nextOptions.map((option) => option.value);
+  const currentOptions = Array.from(select.options)
+    .filter((option) => option.dataset.runtimeModelLock !== '1')
+    .map((option) => ({
+      value: option.value,
+      label: option.textContent,
+    }));
+  const optionsChanged = !modelSelectorOptionsEqual(currentOptions, nextOptions);
+  if (optionsChanged && document.activeElement === select) {
+    deferredModelCatalogPayload = payload;
+    return;
+  }
+  deferredModelCatalogPayload = null;
 
   const nextHealthy = isModelMetadataHealthy(nextState);
   const currentlyHealthy = isModelMetadataHealthy(modelCatalogState);
@@ -960,13 +1169,16 @@ function updateModelCatalogState(payload) {
   const selectedBefore = select.value;
   const selectedMode = String(document.getElementById('mode-select')?.value || '').trim();
   const preferredForMode = String(activeConversationPreferredModelsByMode?.[selectedMode] || '').trim();
-  select.innerHTML = '';
-  for (const modelId of nextModels) {
-    const opt = document.createElement('option');
-    opt.value = modelId;
-    opt.textContent = modelOptionLabel(modelId);
-    select.appendChild(opt);
+  if (optionsChanged) {
+    select.innerHTML = '';
+    for (const option of nextOptions) {
+      const opt = document.createElement('option');
+      opt.value = option.value;
+      opt.textContent = option.label;
+      select.appendChild(opt);
+    }
   }
+  select.dataset.providerScope = normalizeModelSelectorProviderType(activeProviderType);
 
   const preferred = [preferredForMode, selectedBefore, localStorage.getItem(MODEL_STORAGE_KEY), modelCatalogState.currentModel, modelCatalogState.defaultModel, nextModels[0]]
     .find((value) => value && nextModels.includes(value)) || nextModels[0];
@@ -1121,6 +1333,7 @@ async function persistCurrentConversationPreferences() {
     clientId: CLIENT_ID,
     preferredRelayMode: mode,
     preferredModelsByMode: activeConversationPreferredModelsByMode,
+    preferredReasoningByMode: activeConversationPreferredReasoningByMode,
   });
   if (!response || writeVersion !== conversationPreferenceWriteVersion) return;
   if (conversations[convId]) {
@@ -1128,6 +1341,7 @@ async function persistCurrentConversationPreferences() {
       ...conversations[convId],
       preferredRelayMode: response.preferredRelayMode,
       preferredModelsByMode: response.preferredModelsByMode,
+      preferredReasoningByMode: response.preferredReasoningByMode || conversations[convId].preferredReasoningByMode || {},
     };
   }
 }
@@ -1135,6 +1349,7 @@ async function persistCurrentConversationPreferences() {
 function applyConversationPreferences({
   preferredRelayMode = '',
   preferredModelsByMode = {},
+  preferredReasoningByMode = {},
 } = {}) {
   const modeSelect = document.getElementById('mode-select');
   const modelSelect = document.getElementById('model-select');
@@ -1156,7 +1371,12 @@ function applyConversationPreferences({
   modeSelect.value = selection.mode;
   if (selection.model) modelSelect.value = selection.model;
   syncAutoModelAvailability();
-  const modeReasoning = String(activeConversationPreferredReasoningByMode?.[selection.mode] || '').trim().toLowerCase();
+  const normalizedPreferredReasoningByMode = normalizePreferredReasoningByMode(preferredReasoningByMode, { supportedModes });
+  const modeReasoning = String(
+    normalizedPreferredReasoningByMode?.[selection.mode]
+    || activeConversationPreferredReasoningByMode?.[selection.mode]
+    || '',
+  ).trim().toLowerCase();
   updateReasoningSelectorForModel(selection.model || modelSelect.value, modeReasoning);
   suppressConversationPreferenceSync = false;
 
@@ -1167,6 +1387,7 @@ function applyConversationPreferences({
   activeConversationPreferredReasoningByMode = {
     ...readStoredReasoningByMode(),
     ...activeConversationPreferredReasoningByMode,
+    ...normalizedPreferredReasoningByMode,
   };
   localStorage.setItem(MODELS_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredModelsByMode));
   localStorage.setItem(REASONING_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredReasoningByMode));
@@ -1184,9 +1405,22 @@ function applyConversationPreferencesForConversation(conversationId, payload = {
   const preferredModelsByMode = payload?.preferredModelsByMode
     ?? conversation?.preferredModelsByMode
     ?? readStoredModelsByMode();
+  const preferredReasoningByMode = payload?.preferredReasoningByMode
+    ?? conversation?.preferredReasoningByMode
+    ?? {};
+  const runtimeModel = String(
+    payload?.runtimeModel
+    ?? conversation?.runtimeModel
+    ?? conversation?.runtime_model
+    ?? '',
+  ).trim();
+  const effectivePreferredModelsByMode = Number(conversation?.messageCount || 0) === 0 && runtimeModel
+    ? { ...preferredModelsByMode, [preferredRelayMode]: runtimeModel }
+    : preferredModelsByMode;
   applyConversationPreferences({
     preferredRelayMode,
-    preferredModelsByMode,
+    preferredModelsByMode: effectivePreferredModelsByMode,
+    preferredReasoningByMode,
   });
 }
 
@@ -1213,6 +1447,12 @@ function initModelSelector() {
       updateReasoningSelectorForModel(select.value, preferredReasoning);
       updateContextTierSelector(select.value);
       void persistCurrentConversationPreferences().catch(() => {});
+    });
+    select.addEventListener('blur', () => {
+      if (!deferredModelCatalogPayload) return;
+      const payload = deferredModelCatalogPayload;
+      deferredModelCatalogPayload = null;
+      updateModelCatalogState(payload);
     });
   }
 
@@ -1258,11 +1498,16 @@ function initModeSelector() {
     const modelSelect = document.getElementById('model-select');
     if (modelSelect) {
       const mode = String(select.value || '').trim();
-      const modeModel = String(activeConversationPreferredModelsByMode?.[mode] || '').trim();
-      if (modeModel && modelOptions().includes(modeModel)) {
-        suppressConversationPreferenceSync = true;
-        modelSelect.value = modeModel;
-        suppressConversationPreferenceSync = false;
+      const openAIModelLocked = modelSelect.dataset.runtimeModelLocked === '1';
+      if (!openAIModelLocked) {
+        const modeModel = String(activeConversationPreferredModelsByMode?.[mode] || '').trim();
+        if (modeModel && modelOptions().includes(modeModel)) {
+          suppressConversationPreferenceSync = true;
+          modelSelect.value = modeModel;
+          suppressConversationPreferenceSync = false;
+        }
+      } else {
+        syncAutoModelAvailability();
       }
       const modeReasoning = String(activeConversationPreferredReasoningByMode?.[mode] || '').trim().toLowerCase();
       updateReasoningSelectorForModel(modelSelect.value, modeReasoning);
@@ -1289,6 +1534,15 @@ function refreshModelCatalog(force = false) {
   });
 }
 
+function reportOpenAIModelDiscoveryFailure(payload) {
+  const discovery = payload?.openAIModelDiscovery;
+  if (!discovery || discovery.ok !== false) return;
+  showTransientRelayNotice(
+    `GitHub models refreshed, but OpenAI model discovery failed. Cached OpenAI models were kept: ${discovery.error || 'unknown error'}`,
+    8000,
+  );
+}
+
 async function retryModelMetadataRefresh() {
   if (modelMetadataRetryInFlight) return;
   modelMetadataRetryInFlight = true;
@@ -1298,6 +1552,7 @@ async function retryModelMetadataRefresh() {
     try {
       const refreshed = await refreshModelVariantCatalog();
       if (!refreshed) variantError = new Error('Model variant refresh returned empty');
+      reportOpenAIModelDiscoveryFailure(refreshed);
     } catch (e) {
       variantError = e;
     }
@@ -1325,6 +1580,7 @@ function applyModelVariantCatalogState(payload) {
       label: String(entry?.label || '').trim(),
       releaseStatus: String(entry?.releaseStatus || '').trim().toLowerCase() || null,
       reasoningEffort: String(entry?.reasoningEffort || '').trim().toLowerCase() || null,
+      selectable: entry?.selectable !== false,
       enabled: !!entry?.enabled,
       sortOrder: Number.isFinite(Number(entry?.sortOrder)) ? Math.max(0, Math.trunc(Number(entry.sortOrder))) : 0,
     })).filter((entry) => entry.variantId && entry.baseModelId)
@@ -1430,6 +1686,32 @@ function renderModelVariantCatalogBody() {
     if (!grouped.has(providerKey)) grouped.set(providerKey, []);
     grouped.get(providerKey).push(entry);
   }
+  const openAIBaseModelsAlreadyListed = new Set(
+    (grouped.get('openai-byok') || [])
+      .map((entry) => String(entry.baseModelId || '').trim().toLowerCase())
+      .filter(Boolean),
+  );
+  for (const [modelId, providers] of Object.entries(modelCatalogState.providersByModel || {})) {
+    const baseModelId = String(modelId || '').trim().toLowerCase();
+    if (!baseModelId) continue;
+    const providerList = Array.isArray(providers) ? providers : [];
+    if (!providerList.includes('openai-byok')) continue;
+    if (openAIBaseModelsAlreadyListed.has(baseModelId)) continue;
+    const providerRows = grouped.get('openai-byok') || [];
+    providerRows.push({
+      variantId: `${baseModelId}--provider-openai-byok`,
+      baseModelId,
+      provider: 'openai-byok',
+      label: humanizeModelLabel(baseModelId),
+      releaseStatus: null,
+      reasoningEffort: null,
+      selectable: false,
+      enabled: false,
+      sortOrder: Number.MAX_SAFE_INTEGER,
+    });
+    grouped.set('openai-byok', providerRows);
+    openAIBaseModelsAlreadyListed.add(baseModelId);
+  }
   const selected = new Set(modelVariantCatalogState.enabledVariantIds);
   const selectedOrder = new Map(
     modelVariantCatalogState.enabledVariantIds.map((variantId, index) => [variantId, index]),
@@ -1456,6 +1738,23 @@ function renderModelVariantCatalogBody() {
   const refreshedLabel = modelVariantCatalogState.refreshedAt
     ? new Date(modelVariantCatalogState.refreshedAt).toLocaleString()
     : 'Never';
+  const providerBelongsToTab = (providerKey, tab) => {
+    const key = String(providerKey || '').trim().toLowerCase();
+    return tab === 'openai'
+      ? key === 'openai-byok'
+      : key !== 'openai-byok';
+  };
+  const hasOpenAITab = providerOrder.some((providerKey) => providerBelongsToTab(providerKey, 'openai'));
+  const hasCopilotTab = providerOrder.some((providerKey) => providerBelongsToTab(providerKey, 'copilot'));
+  if (modelVariantCatalogProviderTab === 'openai' && !hasOpenAITab) modelVariantCatalogProviderTab = 'copilot';
+  if (modelVariantCatalogProviderTab === 'copilot' && !hasCopilotTab && hasOpenAITab) modelVariantCatalogProviderTab = 'openai';
+  const visibleProviderOrder = providerOrder.filter((providerKey) => providerBelongsToTab(providerKey, modelVariantCatalogProviderTab));
+  const providerTabButtons = `
+    <div class="summary-tab-strip" style="display:flex;gap:8px;align-items:center;">
+      <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'copilot' ? ' active' : ''}" data-model-provider-tab="copilot">Copilot</button>
+      <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'openai' ? ' active' : ''}" data-model-provider-tab="openai" ${hasOpenAITab ? '' : 'disabled'}>OpenAI</button>
+    </div>
+  `;
   const warnings = [
     modelVariantCatalogState.warning ? `⚠️ ${escHtml(modelVariantCatalogState.warning)}` : '',
     modelVariantCatalogState.error ? `⚠️ ${escHtml(modelVariantCatalogState.error)}` : '',
@@ -1464,7 +1763,7 @@ function renderModelVariantCatalogBody() {
     modelVariantCatalogState.variants,
     modelVariantCatalogState.reasoningByModel,
   );
-  const groupsHtml = providerOrder.map((providerKey) => {
+  const groupsHtml = visibleProviderOrder.map((providerKey) => {
     const providerLabel = PROVIDER_LABELS[providerKey] || providerKey;
     const rows = grouped.get(providerKey) || [];
     rows.sort((a, b) => {
@@ -1490,10 +1789,15 @@ function renderModelVariantCatalogBody() {
       byBaseModel.get(baseModelId).push(row);
     }
     const baseModelBlocks = Array.from(byBaseModel.entries()).map(([baseModelId, variantRows]) => {
-      const meta = reasoningByBaseModel.get(baseModelId) || { label: humanizeModelLabel(baseModelId), efforts: new Set() };
+      const providerEfforts = reasoningOptionsForProviderModel(providerKey, baseModelId);
+      const fallbackMeta = reasoningByBaseModel.get(baseModelId) || { label: humanizeModelLabel(baseModelId), efforts: new Set() };
+      const meta = providerEfforts.length
+        ? { ...fallbackMeta, efforts: new Set(providerEfforts) }
+        : fallbackMeta;
       const label = meta.label || humanizeModelLabel(baseModelId) || baseModelId;
       const variantRowsHtml = variantRows.map((row) => {
-        const checked = selected.has(row.variantId);
+        const selectable = row.selectable !== false;
+        const checked = selectable && selected.has(row.variantId);
         const effortChip = row.reasoningEffort
           ? ` <span class="model-reasoning-chip">${escHtml(row.reasoningEffort)}</span>`
           : '';
@@ -1501,11 +1805,14 @@ function renderModelVariantCatalogBody() {
         const statusChip = unavailable
           ? ' <span class="model-reasoning-chip model-reasoning-chip-warn">unavailable</span>'
           : '';
+        const fixedChip = !selectable
+          ? ' <span class="model-reasoning-chip">managed in settings</span>'
+          : '';
         return `
           <label class="model-variant-row">
-            <input class="model-variant-checkbox" type="checkbox" data-variant-id="${escHtml(row.variantId)}" ${checked ? 'checked' : ''}>
+            <input class="model-variant-checkbox" type="checkbox" data-selectable="${selectable ? '1' : '0'}" data-variant-id="${escHtml(row.variantId)}" ${checked ? 'checked' : ''} ${selectable ? '' : 'disabled'}>
             <span class="model-variant-row-copy">
-              <span class="model-variant-row-title">${escHtml(row.variantId)}${effortChip}${statusChip}</span>
+              <span class="model-variant-row-title">${escHtml(row.variantId)}${effortChip}${statusChip}${fixedChip}</span>
             </span>
           </label>
         `;
@@ -1533,6 +1840,7 @@ function renderModelVariantCatalogBody() {
   }).join('');
   const bodyHtml = `
     <div style="display:flex;flex-direction:column;gap:10px">
+      ${providerTabButtons}
       <div style="font-size:0.8rem;color:var(--muted)">
         Saved globally for this relay. Refreshed: <strong>${escHtml(refreshedLabel)}</strong>
       </div>
@@ -1553,6 +1861,7 @@ function renderModelVariantCatalogBody() {
     refresh: async () => {
       const refreshed = await refreshModelVariantCatalog();
       if (!refreshed) throw new Error('Failed to refresh model variants');
+      reportOpenAIModelDiscoveryFailure(refreshed);
       applyModelVariantCatalogState(refreshed);
       renderModelVariantCatalogBody();
       await refreshModelCatalog(true);
@@ -1570,9 +1879,18 @@ function renderModelVariantCatalogBody() {
     saveBtn.onclick = () => saveSelectedModelsFromModal();
     headerActions.insertBefore(saveBtn, refreshBtn);
   }
+  for (const button of Array.from(document.querySelectorAll('[data-model-provider-tab]'))) {
+    button.onclick = () => {
+      const nextTab = String(button.dataset.modelProviderTab || '').trim().toLowerCase();
+      if (!nextTab || nextTab === modelVariantCatalogProviderTab) return;
+      modelVariantCatalogProviderTab = nextTab;
+      renderModelVariantCatalogBody();
+    };
+  }
 }
 
 async function openSelectModelsModal() {
+  modelVariantCatalogProviderTab = 'copilot';
   openSummaryModal({
     title: '🤗 Select Models',
     subtitle: 'Loading…',
@@ -1600,7 +1918,7 @@ async function openSelectModelsModal() {
 async function saveSelectedModelsFromModal() {
   const body = document.getElementById('summary-modal-body');
   if (!body) return;
-  const selectedVariantIds = Array.from(body.querySelectorAll('.model-variant-checkbox:checked'))
+  const selectedVariantIds = Array.from(body.querySelectorAll('.model-variant-checkbox:checked[data-selectable="1"]'))
     .map((input) => String(input.getAttribute('data-variant-id') || '').trim())
     .filter(Boolean);
   if (!selectedVariantIds.length) {
@@ -2301,6 +2619,7 @@ initSocketHandlers({
   applyConversationTitleUpdate,
   syncChatTitleControls,
   applyConversationPreferencesForConversation,
+  applyOpenAISettingsState,
 });
 
 initCwdPicker({
@@ -2546,6 +2865,7 @@ async function initApp() {
   const status = await refreshWorkspaceRootHints();
   syncQueueStatusMenuEntry(status);
   setSessionWorkerStatesFromStatusPayload(status?.sessionWorker || null);
+  await refreshOpenAISettingsState();
   await refreshModelCatalog(true);
   initFullscreenButton();
   initInstallButton();
@@ -2642,6 +2962,9 @@ window.updateTheme = updateTheme;
 window.updateFontScaleFromSelect = updateFontScaleFromSelect;
 window.updatePwaAppName = updatePwaAppName;
 window.updateDefaultSessionWorkspaceRootSetting = updateDefaultSessionWorkspaceRootSetting;
+window.saveOpenAISettings = saveOpenAISettings;
+window.removeOpenAISettings = removeOpenAISettings;
+window.toggleOpenAIProvider = toggleOpenAIProvider;
 window.updateShowSuspendHostSetting = updateShowSuspendHostSetting;
 window.openSettingsModal = openSettingsModal;
 window.closeSettingsModal = closeSettingsModal;
@@ -2678,6 +3001,8 @@ window.updateCliStatus = updateCliStatus;
 window.showAuthError = showAuthError;
 window.registerPwaShell = registerPwaShell;
 window.newConversation = newConversation;
+window.confirmNewConversationModel = confirmNewConversationModel;
+window.closeNewConversationModelModal = closeNewConversationModelModal;
 window.deleteConv = deleteConv;
 window.openConversation = openConversation;
 window.toggleStatusView = toggleStatusView;

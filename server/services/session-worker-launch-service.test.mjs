@@ -2,11 +2,65 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  applyOpenAIProviderEnvironment,
   buildTmuxWorkerShellCommand,
+  createWorkerSecretEnvFile,
   killTmuxSession,
   launchSessionCli,
   normalizeTmuxSessionName,
+  resolveOpenAIWireApi,
 } from './session-worker-launch-service.mjs';
+
+test('resolveOpenAIWireApi uses responses for reasoning model families', () => {
+  assert.equal(resolveOpenAIWireApi('gpt-5.6-sol'), 'responses');
+  assert.equal(resolveOpenAIWireApi('openai/gpt-5.6-sol'), 'responses');
+  assert.equal(resolveOpenAIWireApi('codex-mini-latest'), 'responses');
+  assert.equal(resolveOpenAIWireApi('o3-pro'), 'responses');
+  assert.equal(resolveOpenAIWireApi('gpt-4o'), 'completions');
+});
+
+test('applyOpenAIProviderEnvironment injects and removes BYOK variables', () => {
+  const configured = applyOpenAIProviderEnvironment({
+    PATH: '/usr/bin',
+    COPILOT_PROVIDER_API_KEY: 'stale',
+  }, {
+    enabled: true,
+    apiKey: 'sk-test',
+    model: 'gpt-4o',
+  });
+  assert.equal(configured.COPILOT_PROVIDER_TYPE, 'openai');
+  assert.equal(configured.COPILOT_PROVIDER_BASE_URL, 'https://api.openai.com/v1');
+  assert.equal(configured.COPILOT_PROVIDER_API_KEY, 'sk-test');
+  assert.equal(configured.COPILOT_PROVIDER_WIRE_API, 'completions');
+  assert.equal(configured.COPILOT_MODEL, 'gpt-4o');
+
+  const cleared = applyOpenAIProviderEnvironment(configured);
+  assert.equal(cleared.PATH, '/usr/bin');
+  assert.equal(cleared.COPILOT_PROVIDER_TYPE, undefined);
+  assert.equal(cleared.COPILOT_PROVIDER_API_KEY, undefined);
+  assert.equal(cleared.COPILOT_PROVIDER_WIRE_API, undefined);
+  assert.equal(cleared.COPILOT_MODEL, undefined);
+});
+
+test('applyOpenAIProviderEnvironment selects responses for GPT-5', () => {
+  const configured = applyOpenAIProviderEnvironment({}, {
+    enabled: true,
+    apiKey: 'sk-test',
+    model: 'gpt-5.6-sol',
+  });
+  assert.equal(configured.COPILOT_PROVIDER_WIRE_API, 'responses');
+});
+
+test('applyOpenAIProviderEnvironment requires a key and model when enabled', () => {
+  assert.throws(
+    () => applyOpenAIProviderEnvironment({}, { enabled: true, model: 'gpt-4o' }),
+    /openai-api-key-not-configured/,
+  );
+  assert.throws(
+    () => applyOpenAIProviderEnvironment({}, { enabled: true, apiKey: 'sk-test' }),
+    /openai-model-not-configured/,
+  );
+});
 
 test('normalizeTmuxSessionName rejects unsafe session ids', () => {
   assert.throws(() => normalizeTmuxSessionName('abc:def'), /invalid-tmux-session-name/);
@@ -22,6 +76,57 @@ test('buildTmuxWorkerShellCommand injects only relay env needed for workers', ()
     COPILOT_WEB_RELAY_CONFIG: '/repo/server/config.json',
     INIT_CWD: '/workspace',
     IGNORED_VAR: 'nope',
+  });
+
+  test('tmux worker command never embeds the provider API key', () => {
+    const env = {
+      COPILOT_PROVIDER_TYPE: 'openai',
+      COPILOT_PROVIDER_API_KEY: "sk-secret-'value",
+    };
+    assert.throws(
+      () => buildTmuxWorkerShellCommand('abc-123', env),
+      /worker-secret-env-file-required/,
+    );
+    const command = buildTmuxWorkerShellCommand('abc-123', env, {
+      secretEnvFilePath: '/tmp/copilot-relay-worker-test/provider.env',
+    });
+    assert.doesNotMatch(command, /sk-secret|COPILOT_PROVIDER_API_KEY/);
+    assert.match(command, /\. '\/tmp\/copilot-relay-worker-test\/provider\.env'/);
+  });
+
+  test('createWorkerSecretEnvFile uses owner-only permissions and cleans up', () => {
+    const calls = [];
+    const fsImpl = {
+      mkdtempSync(prefix) {
+        calls.push(['mkdtemp', prefix]);
+        return '/tmp/copilot-relay-worker-test';
+      },
+      chmodSync(target, mode) {
+        calls.push(['chmod', target, mode]);
+      },
+      writeFileSync(target, contents, options) {
+        calls.push(['write', target, contents, options]);
+      },
+      rmSync(target, options) {
+        calls.push(['rm', target, options]);
+      },
+      rmdirSync(target) {
+        calls.push(['rmdir', target]);
+      },
+    };
+    const secret = createWorkerSecretEnvFile({
+      COPILOT_PROVIDER_API_KEY: "sk-secret-'value",
+    }, {
+      fsImpl,
+      tempRoot: '/tmp',
+    });
+    assert.equal(secret.filePath, '/tmp/copilot-relay-worker-test/provider.env');
+    assert.deepEqual(calls[1], ['chmod', '/tmp/copilot-relay-worker-test', 0o700]);
+    assert.deepEqual(calls[2][3], { encoding: 'utf8', mode: 0o600 });
+    assert.match(calls[2][2], /^export COPILOT_PROVIDER_API_KEY='sk-secret-'/);
+    secret.cleanup();
+    assert.deepEqual(calls.at(-2), ['rm', secret.filePath, { force: true }]);
+    assert.deepEqual(calls.at(-1), ['rmdir', '/tmp/copilot-relay-worker-test']);
   });
 
   assert.match(command, /COPILOT_ALLOW_ALL='true'/);

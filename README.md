@@ -57,6 +57,7 @@ Copilot Remote is still under active development, so expect occasional rough edg
 - Per-message **mode** picker: `plan`, `ask`, `agent`, `autopilot`
 - Per-message **model** picker (live model discovery + fallback catalog)
 - Streaming tool/activity updates while a turn runs
+- Mathematical and scientific notation rendering for TeX/LaTeX equations and chemical formulas
 - Web question cards for `ask_user` clarification flows (single-field text and multi-field structured forms)
 - Structured answer support: multi-field elicitation with JSON schema validation and UI-rendered forms
 - Conversation history stored in local SQLite
