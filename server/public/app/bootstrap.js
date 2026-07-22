@@ -2640,9 +2640,12 @@ initTmuxInspectorView({
   closeChatActionsMenu,
 });
 
-function showAuthGate() {
+function showAuthGate(error = '') {
+  document.getElementById('startup-loading')?.remove();
   document.getElementById('auth-gate').style.display = 'flex';
   document.getElementById('app').classList.remove('visible');
+  showAuthError(error);
+  document.getElementById('token-input')?.focus();
 }
 
 async function initApp() {
@@ -2671,6 +2674,7 @@ async function initApp() {
     void flushConversationDraft(currentConvId);
     closeTmuxInspectorView();
   });
+  document.getElementById('startup-loading')?.remove();
   document.getElementById('auth-gate').style.display = 'none';
   document.getElementById('app').classList.add('visible');
   initSidebarLayout();
@@ -2934,27 +2938,12 @@ async function bootstrap() {
     await startAppWithErrorHandling();
     return;
   }
-  if (urlToken) {
-    const tokenResult = await verifyToken(urlToken);
-    if (tokenResult?.ok) {
-      setToken('');
-      await startAppWithErrorHandling();
-      return;
-    }
-  }
-  if (!urlToken && persistedToken) {
-    const persistedResult = await verifyToken(persistedToken);
-    if (persistedResult?.ok) {
-      setToken('');
-      await startAppWithErrorHandling();
-      return;
-    }
-  }
-  if (existingSession?.status === 401 && persistedToken) {
+  if (bootstrapToken) {
     setToken('');
+    document.getElementById('token-input').value = '';
+    showAuthGate(resolveAuthErrorMessage(existingSession));
+    return;
   }
-  if (urlToken) document.getElementById('token-input').value = urlToken;
-  else if (persistedToken) document.getElementById('token-input').value = persistedToken;
   showAuthGate();
 }
 
