@@ -2765,7 +2765,7 @@ modelSelectorSql = {
   normalizeLegacyVariantIdsTx();
 }
 
-const deleteArchiveService = createDeleteArchiveService(db, null);
+const deleteArchiveService = createDeleteArchiveService(db, null, { resolveSessionStateRoot });
 void deleteArchiveService.retryPendingDeletesOnStartup()
   .then((result) => {
     if (result?.pendingCount > 0) {

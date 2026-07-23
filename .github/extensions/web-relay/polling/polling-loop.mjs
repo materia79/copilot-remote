@@ -182,10 +182,13 @@ export function shouldEmitRelayStreamUpdate(nextText, previousText) {
   return false;
 }
 
-export function resolveEmptyFinalTextHandling({ lastStreamedSent = "", lastActivityText = "" } = {}) {
+export function resolveEmptyFinalTextHandling({ lastStreamedSent = "", lastActivityText = "", hasGeneratedImages = false } = {}) {
   const streamed = String(lastStreamedSent || "").trim();
   if (streamed) {
     return { action: "use_stream_text", text: streamed };
+  }
+  if (hasGeneratedImages) {
+    return { action: "publish_generated_images_only", reason: "empty-final-text:generated-images" };
   }
   const activity = String(lastActivityText || "").trim();
   return {
@@ -194,6 +197,28 @@ export function resolveEmptyFinalTextHandling({ lastStreamedSent = "", lastActiv
       ? `empty-final-text:last-activity:${activity.slice(0, 120)}`
       : "empty-final-text:no-stream-or-text",
   };
+}
+
+export function shouldUseDirectOpenAIImageApi(message = {}) {
+  const providerType = String(message?.providerType || "").trim().toLowerCase();
+  if (providerType !== "openai") return false;
+  const model = String(message?.providerModel || message?.model || "").trim().toLowerCase();
+  return model.startsWith("gpt-image-") || model.startsWith("dall-e-");
+}
+
+function isDirectOpenAIImageTerminalStatus(status) {
+  const numeric = Number(status);
+  if (!Number.isFinite(numeric)) return false;
+  return (
+    numeric === 400
+    || numeric === 401
+    || numeric === 403
+    || numeric === 404
+    || numeric === 409
+    || numeric === 422
+    || numeric === 429
+    || numeric === 503
+  );
 }
 
 export async function publishRelayStreamEvent({
@@ -347,6 +372,7 @@ export function createPollingLoop({
   sendAndWaitWithHardTimeout,
   sendWithBestEffortStreaming,
   extractFinalText,
+  extractGeneratedImages = () => [],
   getLastActivityText,
   getCurrentModelId,
   getPreferredConversationSessionMode,
@@ -648,8 +674,60 @@ export function createPollingLoop({
       if (!done && publish.ok) lastStreamedSent = value;
     };
     let sendAndWaitStartedAtMs = 0;
+    const processDirectOpenAIImageRequest = async () => {
+      if (!shouldUseDirectOpenAIImageApi(message)) return false;
+      const directModel = String(message?.providerModel || requestedManualModelOrNull(message) || message?.model || "").trim();
+      const prompt = String(message?.text || "").trim();
+      if (!directModel) throw new Error("OpenAI image request is missing model");
+      if (!prompt) throw new Error("OpenAI image request is missing prompt");
+      await api("POST", "/api/activity", {
+        messageId: message.id,
+        conversationId: message.conversationId,
+        mode: message.relayMode || "agent",
+        text: `Calling OpenAI image API directly (${directModel})`,
+      }).catch(() => {});
+      let directResult;
+      try {
+        directResult = await api("POST", "/api/openai/images/generate", {
+          messageId: message.id,
+          conversationId: message.conversationId,
+          model: directModel,
+          prompt,
+          n: message?.n,
+          size: message?.size || message?.contextTier,
+          quality: message?.quality || message?.reasoningEffort,
+          attachments: Array.isArray(message?.attachments) ? message.attachments : [],
+        });
+      } catch (error) {
+        if (isDirectOpenAIImageTerminalStatus(error?.status)) {
+          const terminalError = new Error(
+            `OpenAI image request failed: ${error?.detail || `HTTP ${error?.status || "error"}`}`,
+          );
+          terminalError.code = "RELAY_OPENAI_IMAGE_TERMINAL";
+          throw terminalError;
+        }
+        throw error;
+      }
+      const generatedImages = Array.isArray(directResult?.generatedImages) ? directResult.generatedImages : [];
+      if (!generatedImages.length) {
+        throw new Error("OpenAI image API returned no images");
+      }
+      await api("POST", "/api/response", {
+        messageId: message.id,
+        conversationId: message.conversationId,
+        text: "",
+        generatedImages,
+        model: String(directResult?.model || directModel).trim() || directModel,
+        modelOrigin: isAutoRequestedModel(message?.model) ? "auto" : "manual",
+      });
+      await session.log(`✅ Sent generated image response (${generatedImages.length} image${generatedImages.length === 1 ? "" : "s"})`, { ephemeral: true });
+      return true;
+    };
 
     try {
+      const handledWithDirectImageApi = await processDirectOpenAIImageRequest();
+      if (handledWithDirectImageApi) return true;
+
       if (message.model && !isAutoRequestedModel(message.model)) {
         const modelSwitch = await setModelForMessage(message.model, message.contextTier);
         const activeModel = modelSwitch.after || modelSwitch.current || "unknown";
@@ -772,6 +850,8 @@ export function createPollingLoop({
       dbg("session.sendAndWait: completed for msgId", message.id, sendAndWaitDurationMs ? `durationMs=${sendAndWaitDurationMs}` : "");
 
       const text = stripPromptContextPrefix(extractFinalText(finalEvent), message, "", prompt);
+      const generatedImagePayload = extractGeneratedImages(finalEvent);
+      const generatedImages = Array.isArray(generatedImagePayload) ? generatedImagePayload : [];
       const model = await resolveResponseModel(message, { finalEvent, unknownForAuto: true });
       const boardPayload = buildPlanReadyBoardPayload({
         finalEvent,
@@ -790,6 +870,7 @@ export function createPollingLoop({
         const emptyHandling = resolveEmptyFinalTextHandling({
           lastStreamedSent,
           lastActivityText: String(getLastActivityText?.() || ""),
+          hasGeneratedImages: generatedImages.length > 0,
         });
         if (emptyHandling.action === "use_stream_text") {
           const streamedText = String(emptyHandling.text || "");
@@ -800,6 +881,17 @@ export function createPollingLoop({
             messageId: message.id,
             conversationId: message.conversationId,
             text: streamedText,
+            generatedImages,
+            model,
+            modelOrigin: isAutoRequestedModel(message?.model) ? "auto" : "manual",
+          });
+        } else if (emptyHandling.action === "publish_generated_images_only") {
+          dbg("sendAndWait returned empty text but generated images were captured; finalizing msgId", message.id, `images=${generatedImages.length}`);
+          await api("POST", "/api/response", {
+            messageId: message.id,
+            conversationId: message.conversationId,
+            text: "",
+            generatedImages,
             model,
             modelOrigin: isAutoRequestedModel(message?.model) ? "auto" : "manual",
           });
@@ -814,6 +906,7 @@ export function createPollingLoop({
           messageId: message.id,
           conversationId: message.conversationId,
           text,
+          generatedImages,
           model,
           modelOrigin: isAutoRequestedModel(message?.model) ? "auto" : "manual",
         });
@@ -856,6 +949,16 @@ export function createPollingLoop({
           messageId: message.id,
           conversationId: message.conversationId,
           terminalError: e.terminalFailure,
+          model: await resolveResponseModel(message, { unknownForAuto: true }),
+        }).catch(async () => {
+          await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
+        });
+      } else if (String(e?.code || "").trim() === "RELAY_OPENAI_IMAGE_TERMINAL") {
+        await pushRelayStream(lastStreamedSent, true);
+        await api("POST", "/api/response", {
+          messageId: message.id,
+          conversationId: message.conversationId,
+          text: String(e?.message || "OpenAI image request failed").trim(),
           model: await resolveResponseModel(message, { unknownForAuto: true }),
         }).catch(async () => {
           await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});

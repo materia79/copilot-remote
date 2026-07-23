@@ -10,6 +10,7 @@ import { createSdkSessionSyncService } from '../services/sdk-session-sync-servic
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 import { persistConversationPreferences } from '../services/conversation-preferences-service.mjs';
 import { mapUsageSnapshotRow } from '../services/usage-snapshot-helpers.mjs';
+import { cleanupGeneratedImagesForConversation as cleanupGeneratedImagesForConversationDefault } from '../services/generated-image-cleanup-service.mjs';
 import { isSafeProviderModelId } from '../../shared/model-id.mjs';
 import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mjs';
 
@@ -238,8 +239,14 @@ export function buildModelCatalogWithOpenAIProvider(modelState = {}, openAISetti
 function normalizeRequestedProviderType(value = '') {
   const normalized = String(value || '').trim().toLowerCase();
   if (normalized === 'openai' || normalized === 'openai-byok') return 'openai';
+  if (normalized === 'openai-image' || normalized === 'openai-image-byok') return 'openai-image';
   if (normalized === 'github' || normalized === 'github-copilot') return 'github';
   return '';
+}
+
+function isOpenAIImageModelId(model = '') {
+  const normalized = String(model || '').trim().toLowerCase().replace(/^openai\//, '');
+  return normalized.startsWith('gpt-image-') || normalized.startsWith('dall-e-');
 }
 
 export function resolveOpenAISessionModel({
@@ -1437,6 +1444,7 @@ export function registerSessionsRoutes(app, deps) {
     createCompactedConversation,
     collectOrphanedUploadsFromConversation,
     deleteOrphanedUploads,
+    cleanupGeneratedImagesForConversation = cleanupGeneratedImagesForConversationDefault,
     queueCounts,
     getModelCatalogState,
     updateModelCatalog,
@@ -1680,6 +1688,14 @@ export function registerSessionsRoutes(app, deps) {
     for (const row of rows) {
       const conversationId = String(row?.id || '').trim();
       if (!conversationId) continue;
+      cleanupGeneratedImagesForConversation({
+        conversationId,
+        sdkSessionId: sid,
+        messageRows: stmts.getMessages?.all?.(conversationId) || [],
+        parseAttachments,
+        hydrateAttachment,
+        resolveSessionStateRoot,
+      });
       const orphanedUploads = collectOrphanedUploadsFromConversation(conversationId);
       hardDeleteConversationRows(conversationId);
       deleteOrphanedUploads(orphanedUploads);
@@ -1720,6 +1736,14 @@ export function registerSessionsRoutes(app, deps) {
     return `${String(remotePath || '').replace(/\/+$/, '')}/api/shared/${shareToken}/upload/${normalizedSha}/content`.replace(/\/{2,}/g, '/');
   }
 
+  function buildSharedGeneratedImageContentUrl(token, messageId, imageId) {
+    const shareToken = normalizeShareToken(token);
+    const normalizedMessageId = String(messageId || '').trim();
+    const normalizedImageId = String(imageId || '').trim();
+    if (!shareToken || !normalizedMessageId || !normalizedImageId) return '';
+    return `${String(remotePath || '').replace(/\/+$/, '')}/api/shared/${shareToken}/generated-image/${encodeURIComponent(normalizedMessageId)}/${encodeURIComponent(normalizedImageId)}/content`.replace(/\/{2,}/g, '/');
+  }
+
   function conversationReferencesUploadSha(conversationId, sha256) {
     const convId = String(conversationId || '').trim();
     const normalizedSha = String(sha256 || '').trim().toLowerCase();
@@ -1741,6 +1765,22 @@ export function registerSessionsRoutes(app, deps) {
     const normalizedSha = String(attachment.sha256 || '').trim().toLowerCase();
     if (!isSha256(normalizedSha)) return attachment;
     const contentUrl = buildSharedUploadContentUrl(shareToken, normalizedSha);
+    if (!contentUrl) return attachment;
+    return {
+      ...attachment,
+      contentUrl,
+    };
+  }
+
+  function rewriteSharedGeneratedImageAttachmentContentUrl(attachment, shareToken) {
+    if (!attachment || typeof attachment !== 'object') return attachment;
+    const generatedImage = attachment.generatedImage && typeof attachment.generatedImage === 'object'
+      ? attachment.generatedImage
+      : null;
+    const messageId = String(generatedImage?.messageId || generatedImage?.responseMessageId || generatedImage?.parentMessageId || '').trim();
+    const imageId = String(generatedImage?.imageId || '').trim();
+    if (!messageId || !imageId) return attachment;
+    const contentUrl = buildSharedGeneratedImageContentUrl(shareToken, messageId, imageId);
     if (!contentUrl) return attachment;
     return {
       ...attachment,
@@ -1798,7 +1838,7 @@ export function registerSessionsRoutes(app, deps) {
         attachments: parseAttachments(message.attachments)
           .map(hydrateAttachment)
           .filter(Boolean)
-          .map((attachment) => rewriteSharedAttachmentContentUrl(attachment, shareToken)),
+          .map((attachment) => rewriteSharedGeneratedImageAttachmentContentUrl(rewriteSharedAttachmentContentUrl(attachment, shareToken), shareToken)),
       })),
       transcriptMessages: [],
       relayActivitiesByMessageId,
@@ -1811,7 +1851,7 @@ export function registerSessionsRoutes(app, deps) {
       const sourceMessageId = responseMessageToSourceId.get(String(message.id || '').trim()) || message.sourceMessageId || undefined;
       const nextMessage = sourceMessageId ? { ...message, sourceMessageId } : message;
       const attachments = Array.isArray(nextMessage?.attachments)
-        ? nextMessage.attachments.map((attachment) => rewriteSharedAttachmentContentUrl(attachment, shareToken))
+        ? nextMessage.attachments.map((attachment) => rewriteSharedGeneratedImageAttachmentContentUrl(rewriteSharedAttachmentContentUrl(attachment, shareToken), shareToken))
         : nextMessage?.attachments;
       return attachments === nextMessage?.attachments
         ? nextMessage
@@ -2682,6 +2722,57 @@ export function registerSessionsRoutes(app, deps) {
     stream.pipe(res);
   });
 
+  app.get('/api/shared/:token/generated-image/:messageId/:imageId/content', (req, res) => {
+    const token = normalizeShareToken(req.params.token);
+    const messageId = String(req.params.messageId || '').trim();
+    const imageId = String(req.params.imageId || '').trim();
+    if (!token || !messageId || !imageId) {
+      return res.status(404).json({ error: 'Shared attachment not found' });
+    }
+    const share = stmts.getConversationShareByToken?.get(token) || null;
+    if (!share || String(share.revoked_at || '').trim()) {
+      return res.status(404).json({ error: 'Shared attachment not found' });
+    }
+    const conversationId = String(share.conversation_id || '').trim();
+    if (!conversationId) return res.status(404).json({ error: 'Shared attachment not found' });
+    const rows = stmts.getMessages.all(conversationId);
+    const messageRow = rows.find((row) => String(row?.id || '').trim() === messageId);
+    if (!messageRow) return res.status(404).json({ error: 'Shared attachment not found' });
+    const attachments = parseAttachments(messageRow?.attachments).map(hydrateAttachment).filter(Boolean);
+    const attachment = attachments.find((entry) => String(entry?.generatedImage?.imageId || '').trim() === imageId);
+    if (!attachment) return res.status(404).json({ error: 'Shared attachment not found' });
+
+    const sessionId = String(attachment?.generatedImage?.sessionId || '').trim();
+    const relativePath = String(attachment?.generatedImage?.relativePath || '').replace(/\\/g, '/').trim();
+    const root = typeof resolveSessionStateRoot === 'function'
+      ? String(resolveSessionStateRoot() || '').trim()
+      : '';
+    if (!root || !sessionId || !relativePath) return res.status(404).json({ error: 'Shared attachment not found' });
+    const safeSession = sessionId.replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+    const normalizedRelative = path.posix.normalize(relativePath).replace(/^\/+/, '');
+    if (!safeSession || !normalizedRelative || normalizedRelative.startsWith('..') || normalizedRelative.includes('/../')) {
+      return res.status(404).json({ error: 'Shared attachment not found' });
+    }
+    const baseDir = path.resolve(path.join(root, safeSession, 'generated-images'));
+    const filePath = path.resolve(path.join(baseDir, normalizedRelative));
+    if (!(filePath === baseDir || filePath.startsWith(`${baseDir}${path.sep}`))) {
+      return res.status(404).json({ error: 'Shared attachment not found' });
+    }
+    if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Shared attachment not found' });
+    res.setHeader('Content-Type', attachment.type || 'application/octet-stream');
+    res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
+    res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
+    const stream = fs.createReadStream(filePath);
+    stream.on('error', () => {
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Failed to stream shared attachment' });
+        return;
+      }
+      res.destroy();
+    });
+    stream.pipe(res);
+  });
+
   // GET /api/conversation/:id — get paginated conversation history
   app.get('/api/conversation/:id', auth, (req, res) => {
     const requestedId = String(req.params.id || '').trim();
@@ -3107,6 +3198,14 @@ export function registerSessionsRoutes(app, deps) {
       const sdkSessionId = String(existing.sdk_session_id || '').trim() || null;
       if (!sdkSessionId) {
         stmts.markDeletedSdkSession.run(id, new Date().toISOString());
+        cleanupGeneratedImagesForConversation({
+          conversationId: id,
+          sdkSessionId: null,
+          messageRows: stmts.getMessages?.all?.(id) || [],
+          parseAttachments,
+          hydrateAttachment,
+          resolveSessionStateRoot,
+        });
         const orphanedUploads = collectOrphanedUploadsFromConversation(id);
         hardDeleteConversationRows(id);
         deleteOrphanedUploads(orphanedUploads);
@@ -3184,7 +3283,7 @@ export function registerSessionsRoutes(app, deps) {
       ...(Array.isArray(openAISettings?.models) ? openAISettings.models : []),
     ].map((value) => String(value || '').trim()).filter(Boolean));
     if (
-      requestedProviderType === 'openai'
+      (requestedProviderType === 'openai' || requestedProviderType === 'openai-image')
       && requestedBootstrapModel
       && requestedBootstrapModel.toLowerCase() !== 'auto'
       && !availableOpenAIModels.has(requestedBootstrapModel)
@@ -3196,6 +3295,7 @@ export function registerSessionsRoutes(app, deps) {
       });
     }
     const useOpenAIProvider = requestedProviderType === 'openai'
+      || requestedProviderType === 'openai-image'
       || (
         requestedProviderType === ''
         && requestedBootstrapModel
@@ -3217,6 +3317,13 @@ export function registerSessionsRoutes(app, deps) {
           availableModels: openAISettings.models,
         })
       : catalogSelectedModel;
+    if (requestedProviderType === 'openai-image' && !isOpenAIImageModelId(selectedModel)) {
+      return res.status(400).json({
+        ok: false,
+        error: `OpenAI image provider requires an image model (received "${selectedModel}")`,
+        code: 'OPENAI_IMAGE_MODEL_REQUIRED',
+      });
+    }
     if (!useOpenAIProvider) {
       const selectedProviders = Array.isArray(modelState?.providersByModel?.[String(selectedModel || '').trim().toLowerCase()])
         ? modelState.providersByModel[String(selectedModel || '').trim().toLowerCase()]

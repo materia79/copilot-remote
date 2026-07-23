@@ -11,6 +11,7 @@ import {
 test('prompts for a new model while OpenAI is enabled', () => {
   assert.equal(shouldPromptForNewConversationModel({ provider: 'openai' }), true);
   assert.equal(shouldPromptForNewConversationModel({ provider: 'openai-byok' }), true);
+  assert.equal(shouldPromptForNewConversationModel({ provider: 'openai-image' }), true);
   assert.equal(shouldPromptForNewConversationModel({ provider: 'github' }), false);
   assert.equal(shouldPromptForNewConversationModel({ provider: '' }), false);
 });

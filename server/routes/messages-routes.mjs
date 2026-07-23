@@ -48,7 +48,8 @@ export function resolveOpenAIReasoningEffort(explicitReasoningEffort = '', model
       error: `OpenAI model "${String(model || 'configured model').trim()}" does not support reasoning effort "${explicit}"`,
     };
   }
-  return { ok: true, effort: explicit || 'none', supported };
+  const fallback = supported.includes('none') ? 'none' : (supported[0] || null);
+  return { ok: true, effort: explicit || fallback, supported };
 }
 
 export function shouldRequireNewOpenAIConversation({
@@ -67,7 +68,7 @@ export function shouldRequireNewOpenAIConversation({
 
 function normalizeRequestedProviderType(value = '') {
   const normalized = String(value || '').trim().toLowerCase();
-  if (normalized === 'openai' || normalized === 'openai-byok') return 'openai';
+  if (normalized === 'openai' || normalized === 'openai-byok' || normalized === 'openai-image') return 'openai';
   if (normalized === 'github' || normalized === 'github-copilot') return 'github';
   return '';
 }
@@ -80,6 +81,35 @@ function deriveModelOrigin(model) {
 
 function isAutoModel(model) {
   return String(model || '').trim().toLowerCase() === AUTO_MODEL_SENTINEL;
+}
+
+function isOpenAIImageModelId(model = '') {
+  const normalized = String(model || '').trim().toLowerCase().replace(/^openai\//, '');
+  return normalized.startsWith('gpt-image-') || normalized.startsWith('dall-e-');
+}
+
+const OPENAI_IMAGE_QUALITY_VALUES = new Set(['auto', 'low', 'medium', 'high']);
+const OPENAI_IMAGE_SIZE_VALUES = new Set([
+  'auto',
+  '256x256',
+  '512x512',
+  '1024x1024',
+  '1536x1024',
+  '1024x1536',
+  '1792x1024',
+  '1024x1792',
+]);
+
+function normalizeOpenAIImageQuality(value = '') {
+  const normalized = String(value || '').trim().toLowerCase();
+  return OPENAI_IMAGE_QUALITY_VALUES.has(normalized) ? normalized : '';
+}
+
+function normalizeOpenAIImageSize(value = '') {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (OPENAI_IMAGE_SIZE_VALUES.has(normalized)) return normalized;
+  if (normalized === 'default' || normalized === 'long_context') return 'auto';
+  return '';
 }
 
 function normalizeSessionWorkerId(value) {
@@ -930,8 +960,12 @@ export function buildDequeuedRelayMessage({
     isNewConversation: msg.is_new_conversation === 1,
     model: String(msg.model || '').trim() || defaultModel,
     modelVariantId: String(msg.model_variant_id || '').trim() || String(msg.model || '').trim() || null,
+    providerType: String(runtimeSession?.provider_type || '').trim().toLowerCase() || null,
+    providerModel: String(runtimeSession?.provider_model || '').trim() || null,
     reasoningEffort: String(msg.reasoning_effort || '').trim() || null,
     contextTier: String(msg.context_tier || '').trim() || 'default',
+    quality: normalizeOpenAIImageQuality(msg.reasoning_effort),
+    size: normalizeOpenAIImageSize(msg.context_tier),
     relayMode: normalizeRelayMode(msg.relay_mode) || defaultRelayMode,
     text: msg.text,
     attachments,
@@ -969,6 +1003,369 @@ function buildAttachmentPromptContext(attachments) {
   }
   lines.push('</system_reminder>');
   return lines.join('\n');
+}
+
+const GENERATED_IMAGE_EXTENSIONS = Object.freeze({
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/jpg': 'jpg',
+  'image/webp': 'webp',
+  'image/gif': 'gif',
+  'image/bmp': 'bmp',
+});
+
+function normalizeStorageSegment(value, fallback = 'item') {
+  const text = String(value || '').trim();
+  const compact = text.replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+  return compact.slice(0, 96) || fallback;
+}
+
+function resolveGeneratedImageExtension(mimeType) {
+  const normalized = String(mimeType || '').trim().toLowerCase();
+  return GENERATED_IMAGE_EXTENSIONS[normalized] || 'png';
+}
+
+function parseGeneratedImageData(raw) {
+  const dataUrl = String(raw?.dataUrl || raw?.data_url || '').trim();
+  if (dataUrl.startsWith('data:')) {
+    const match = dataUrl.match(/^data:([^;,]+);base64,(.+)$/i);
+    if (!match) throw new Error('Invalid generated image data URL');
+    return {
+      mimeType: String(raw?.mimeType || raw?.mime_type || match[1] || '').trim().toLowerCase(),
+      dataBase64: String(match[2] || '').trim(),
+    };
+  }
+  return {
+    mimeType: String(raw?.mimeType || raw?.mime_type || '').trim().toLowerCase(),
+    dataBase64: String(raw?.data || raw?.base64 || raw?.b64_json || raw?.image_base64 || '').trim(),
+  };
+}
+
+export function normalizeGeneratedImageResponses(rawGeneratedImages, { maxImages = 8, maxImageBytes = 20 * 1024 * 1024 } = {}) {
+  if (!rawGeneratedImages) return [];
+  const input = Array.isArray(rawGeneratedImages) ? rawGeneratedImages : [rawGeneratedImages];
+  const output = [];
+  for (const raw of input.slice(0, Math.max(1, Math.trunc(Number(maxImages) || 8)))) {
+    if (!raw || typeof raw !== 'object') continue;
+    const parsed = parseGeneratedImageData(raw);
+    const mimeType = parsed.mimeType || 'image/png';
+    if (!mimeType.startsWith('image/')) throw new Error('Generated image type must be image/*');
+    if (!parsed.dataBase64) throw new Error('Generated image payload is missing base64 data');
+    if (!/^[a-z0-9+/=\s]+$/i.test(parsed.dataBase64)) {
+      throw new Error('Generated image payload is not valid base64');
+    }
+    const buffer = Buffer.from(parsed.dataBase64, 'base64');
+    if (!buffer.length) throw new Error('Generated image payload is empty');
+    if (buffer.length > maxImageBytes) throw new Error('Generated image payload is too large');
+    output.push({
+      mimeType,
+      dataBase64: buffer.toString('base64'),
+      size: buffer.length,
+      name: String(raw?.name || raw?.filename || raw?.fileName || 'generated-image').trim().slice(0, 120) || 'generated-image',
+    });
+  }
+  return output;
+}
+
+export function shouldAcceptAssistantResponsePayload({ text = '', terminalFailure = null, generatedImages = [] } = {}) {
+  if (terminalFailure) return true;
+  const trimmedText = String(text || '').trim();
+  if (trimmedText) return true;
+  return Array.isArray(generatedImages) && generatedImages.length > 0;
+}
+
+function parseOpenAIImageBase64Value(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  if (!/^[a-z0-9+/=\s]+$/i.test(raw)) {
+    throw new Error('OpenAI image payload contains invalid base64 data');
+  }
+  return Buffer.from(raw, 'base64').toString('base64');
+}
+
+function normalizeOpenAIImageOptionString(value, fieldName) {
+  if (value === undefined || value === null) return undefined;
+  const normalized = String(value).trim();
+  if (!normalized) return undefined;
+  if (!/^[a-z0-9._-]{2,32}$/i.test(normalized)) {
+    throw new Error(`Invalid OpenAI image option "${fieldName}"`);
+  }
+  return normalized;
+}
+
+export function normalizeOpenAIImageGenerateRequestBody(rawBody, { maxImages = 10 } = {}) {
+  const body = rawBody && typeof rawBody === 'object' ? rawBody : {};
+  const messageId = String(body.messageId || '').trim();
+  const conversationId = String(body.conversationId || '').trim();
+  const model = String(body.model || '').trim();
+  const prompt = String(body.prompt || '').trim();
+  if (!messageId) throw new Error('Missing messageId');
+  if (!conversationId) throw new Error('Missing conversationId');
+  if (!model) throw new Error('Missing model');
+  if (!prompt) throw new Error('Missing prompt');
+
+  const hasN = Object.prototype.hasOwnProperty.call(body, 'n');
+  let n = undefined;
+  if (hasN) {
+    const parsed = Number(body.n);
+    const maxN = Math.max(1, Math.trunc(Number(maxImages) || 10));
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > maxN) {
+      throw new Error(`Invalid n value (must be an integer between 1 and ${maxN})`);
+    }
+    n = parsed;
+  }
+
+  const sizeRaw = body.size;
+  let size = undefined;
+  if (sizeRaw !== undefined && sizeRaw !== null && String(sizeRaw).trim()) {
+    const normalizedSize = String(sizeRaw).trim().toLowerCase();
+    if (normalizedSize !== 'auto' && !/^\d{2,5}x\d{2,5}$/i.test(normalizedSize)) {
+      throw new Error('Invalid size value (expected "<width>x<height>" or "auto")');
+    }
+    size = normalizedSize;
+  }
+
+  const quality = normalizeOpenAIImageOptionString(body.quality, 'quality');
+  const attachments = body.attachments;
+  if (attachments !== undefined && !Array.isArray(attachments)) {
+    throw new Error('attachments must be an array when provided');
+  }
+
+  return {
+    messageId,
+    conversationId,
+    model,
+    prompt,
+    n,
+    size,
+    quality,
+    attachments: Array.isArray(attachments) ? attachments : [],
+  };
+}
+
+function isOpenAIImageAttachment(raw) {
+  if (!raw || typeof raw !== 'object') return false;
+  const type = String(raw.type || '').trim().toLowerCase();
+  if (type.startsWith('image/')) return true;
+  const dataUrl = String(raw.dataUrl || '').trim().toLowerCase();
+  return dataUrl.startsWith('data:image/');
+}
+
+export function resolveOpenAIImageEditAttachment(rawAttachments, {
+  maxImageBytes = 20 * 1024 * 1024,
+  allowedRootPath = '',
+} = {}) {
+  const attachments = Array.isArray(rawAttachments) ? rawAttachments : [];
+  const firstImage = attachments.find((entry) => isOpenAIImageAttachment(entry));
+  if (!firstImage) return null;
+
+  const dataUrl = String(firstImage.dataUrl || '').trim();
+  let mimeType = String(firstImage.type || '').trim().toLowerCase();
+  let bytes = null;
+
+  if (dataUrl.startsWith('data:')) {
+    const match = dataUrl.match(/^data:([^;,]+);base64,(.+)$/i);
+    if (!match) throw new Error('Invalid image attachment data URL');
+    mimeType = mimeType || String(match[1] || '').trim().toLowerCase();
+    const payload = parseOpenAIImageBase64Value(match[2]);
+    bytes = Buffer.from(payload, 'base64');
+  } else {
+    const filePath = String(firstImage.path || '').trim();
+    if (!filePath) throw new Error('Image attachment is missing file path or data URL');
+    const allowedRoot = String(allowedRootPath || '').trim();
+    if (allowedRoot) {
+      const resolvedRoot = path.resolve(allowedRoot);
+      const resolvedPath = path.resolve(filePath);
+      const rootPrefix = resolvedRoot.endsWith(path.sep) ? resolvedRoot : `${resolvedRoot}${path.sep}`;
+      if (resolvedPath !== resolvedRoot && !resolvedPath.startsWith(rootPrefix)) {
+        throw new Error('Image attachment path is outside the upload directory');
+      }
+    }
+    if (!fs.existsSync(filePath)) throw new Error(`Image attachment file not found: ${filePath}`);
+    bytes = fs.readFileSync(filePath);
+  }
+
+  if (!mimeType.startsWith('image/')) {
+    throw new Error('Image attachment must use image/* MIME type');
+  }
+  if (!Buffer.isBuffer(bytes) || !bytes.length) {
+    throw new Error('Image attachment payload is empty');
+  }
+  if (bytes.length > maxImageBytes) {
+    throw new Error('Image attachment is too large');
+  }
+
+  return {
+    bytes,
+    mimeType,
+    name: String(firstImage.name || 'image').trim().slice(0, 120) || 'image',
+  };
+}
+
+export function normalizeOpenAIImageApiGeneratedImages(payload, { maxImages = 8 } = {}) {
+  const rows = Array.isArray(payload?.data) ? payload.data : [];
+  const maxCount = Math.max(1, Math.trunc(Number(maxImages) || 8));
+  const generatedImages = [];
+  for (const [index, row] of rows.entries()) {
+    if (index >= maxCount) break;
+    if (!row || typeof row !== 'object') continue;
+    const data = parseOpenAIImageBase64Value(row.b64_json || row.data || row.base64);
+    if (!data) throw new Error('OpenAI image response is missing b64_json');
+    const revisedPrompt = String(row.revised_prompt || row.revisedPrompt || '').trim();
+    generatedImages.push({
+      data,
+      mimeType: 'image/png',
+      name: `generated-image-${index + 1}`,
+      ...(revisedPrompt ? { revisedPrompt } : {}),
+    });
+  }
+  if (!generatedImages.length) {
+    throw new Error('OpenAI image response did not contain generated images');
+  }
+  return generatedImages;
+}
+
+function resolveGeneratedImageStoragePath({
+  resolveSessionStateRoot,
+  sdkSessionId,
+  conversationId,
+  responseMessageId,
+  imageId,
+  extension,
+} = {}) {
+  if (typeof resolveSessionStateRoot !== 'function') throw new Error('Session-state root is unavailable');
+  const root = String(resolveSessionStateRoot() || '').trim();
+  if (!root) throw new Error('Session-state root is unavailable');
+  const safeSession = normalizeStorageSegment(sdkSessionId || conversationId || 'session', 'session');
+  const safeConversation = normalizeStorageSegment(conversationId || 'conversation', 'conversation');
+  const safeMessage = normalizeStorageSegment(responseMessageId || 'message', 'message');
+  const safeImageId = normalizeStorageSegment(imageId || 'image', 'image');
+  const fileName = `${safeImageId}.${extension}`;
+  const relativePath = `${safeConversation}/${safeMessage}/${fileName}`;
+  const absoluteDir = path.join(root, safeSession, 'generated-images', safeConversation, safeMessage);
+  return {
+    root,
+    safeSession,
+    relativePath,
+    fileName,
+    absoluteDir,
+    absolutePath: path.join(absoluteDir, fileName),
+  };
+}
+
+function resolveGeneratedImageReadPath({
+  resolveSessionStateRoot,
+  sessionId,
+  relativePath,
+} = {}) {
+  if (typeof resolveSessionStateRoot !== 'function') return null;
+  const root = String(resolveSessionStateRoot() || '').trim();
+  if (!root) return null;
+  const safeSession = normalizeStorageSegment(sessionId || '', '');
+  if (!safeSession) return null;
+  const rawRelative = String(relativePath || '').replace(/\\/g, '/').trim();
+  if (!rawRelative) return null;
+  const normalizedRelative = path.posix.normalize(rawRelative).replace(/^\/+/, '');
+  if (!normalizedRelative || normalizedRelative.startsWith('..') || normalizedRelative.includes('/../')) return null;
+  const baseDir = path.resolve(path.join(root, safeSession, 'generated-images'));
+  const candidate = path.resolve(path.join(baseDir, normalizedRelative));
+  if (!(candidate === baseDir || candidate.startsWith(`${baseDir}${path.sep}`))) return null;
+  return candidate;
+}
+
+function createGeneratedImageAttachment({
+  image,
+  messageId,
+  conversationId,
+  sdkSessionId,
+  imageIndex,
+  resolveSessionStateRoot,
+}) {
+  const imageId = `img-${String(imageIndex + 1).padStart(2, '0')}`;
+  const extension = resolveGeneratedImageExtension(image.mimeType);
+  const location = resolveGeneratedImageStoragePath({
+    resolveSessionStateRoot,
+    sdkSessionId,
+    conversationId,
+    responseMessageId: messageId,
+    imageId,
+    extension,
+  });
+  fs.mkdirSync(location.absoluteDir, { recursive: true });
+  const tmpPath = path.join(location.absoluteDir, `${location.fileName}.${process.pid}.${Date.now()}.tmp`);
+  const bytes = Buffer.from(String(image.dataBase64 || ''), 'base64');
+  fs.writeFileSync(tmpPath, bytes);
+  try {
+    fs.renameSync(tmpPath, location.absolutePath);
+  } catch (error) {
+    try {
+      fs.rmSync(tmpPath, { force: true });
+    } catch {}
+    throw error;
+  }
+  return {
+    name: `${String(image.name || 'generated-image').replace(/\.[a-z0-9]+$/i, '') || 'generated-image'}-${imageIndex + 1}.${extension}`,
+    type: image.mimeType,
+    size: bytes.length,
+    contentUrl: `/api/generated-image/${encodeURIComponent(conversationId)}/${encodeURIComponent(messageId)}/${encodeURIComponent(imageId)}/content`,
+    generatedImage: {
+      imageId,
+      messageId,
+      conversationId,
+      sessionId: location.safeSession,
+      relativePath: location.relativePath,
+    },
+  };
+}
+
+export function persistGeneratedImagesForAssistantResponse({
+  images = [],
+  messageId,
+  conversationId,
+  sdkSessionId,
+  resolveSessionStateRoot,
+} = {}) {
+  if (!Array.isArray(images) || images.length === 0) return [];
+  const persistedAttachments = [];
+  try {
+    for (const [index, image] of images.entries()) {
+      const attachment = createGeneratedImageAttachment({
+        image,
+        messageId,
+        conversationId,
+        sdkSessionId,
+        imageIndex: index,
+        resolveSessionStateRoot,
+      });
+      persistedAttachments.push(attachment);
+    }
+    return persistedAttachments;
+  } catch (error) {
+    cleanupPersistedGeneratedImagesForAssistantResponse({
+      attachments: persistedAttachments,
+      resolveSessionStateRoot,
+    });
+    throw error;
+  }
+}
+
+export function cleanupPersistedGeneratedImagesForAssistantResponse({
+  attachments = [],
+  resolveSessionStateRoot,
+} = {}) {
+  if (!Array.isArray(attachments) || attachments.length === 0) return;
+  for (const attachment of attachments) {
+    const generatedImage = attachment?.generatedImage;
+    const filePath = resolveGeneratedImageReadPath({
+      resolveSessionStateRoot,
+      sessionId: generatedImage?.sessionId,
+      relativePath: generatedImage?.relativePath,
+    });
+    if (!filePath) continue;
+    try {
+      fs.rmSync(filePath, { force: true });
+    } catch {}
+  }
 }
 
 function serveFileWithRangeSupport(req, res, filePath, meta, { safeName, cacheDelete = null } = {}) {
@@ -1033,6 +1430,7 @@ export function registerMessagesRoutes(app, deps) {
     ts,
     MAX_UPLOAD_BYTES,
     MAX_UPLOAD_ATTACHMENTS,
+    uploadsDir,
     MAX_REPO_TREE_NODES,
     MAX_REQUEUE_RETRIES,
     MAX_IMAGE_DATA_URL_LENGTH,
@@ -1109,6 +1507,7 @@ export function registerMessagesRoutes(app, deps) {
     sessionWorkerRegistry,
     sessionWorkerSupervisor,
     sessionWorkerProcessInspector,
+    resolveSessionStateRoot,
     fetchUsageSummary = null,
     opaqueResponseRecoveryWaitMs = OPAQUE_RESPONSE_RECOVERY_WAIT_MS,
     opaqueResponseRecoveryPollMs = OPAQUE_RESPONSE_RECOVERY_POLL_MS,
@@ -1116,6 +1515,12 @@ export function registerMessagesRoutes(app, deps) {
   } = deps;
 
   const ttyConsoleActive = runtimeState?.ttyConsoleActive === true;
+  const getMessageAttachmentsByConversation = db.prepare(`
+    SELECT attachments
+    FROM messages
+    WHERE id = ? AND conversation_id = ?
+    LIMIT 1
+  `);
 
   function isAbnormalWorkerTelemetry(payload = {}, level = 'log') {
     const normalizedLevel = String(level || 'log').trim().toLowerCase();
@@ -2481,6 +2886,47 @@ export function registerMessagesRoutes(app, deps) {
     fs.createReadStream(filePath).pipe(res);
   });
 
+  app.get('/api/generated-image/:conversationId/:messageId/:imageId/content', auth, (req, res) => {
+    const conversationId = String(req.params.conversationId || '').trim();
+    const messageId = String(req.params.messageId || '').trim();
+    const imageId = String(req.params.imageId || '').trim();
+    if (!conversationId || !messageId || !imageId) {
+      return res.status(400).json({ error: 'Invalid generated image reference' });
+    }
+    const messageRow = getMessageAttachmentsByConversation.get(messageId, conversationId);
+    if (!messageRow) return res.status(404).json({ error: 'Generated image not found' });
+    const attachments = parseAttachments(messageRow.attachments).map(hydrateAttachment).filter(Boolean);
+    const attachment = attachments.find((entry) => {
+      const generatedImage = entry?.generatedImage && typeof entry.generatedImage === 'object'
+        ? entry.generatedImage
+        : null;
+      return String(generatedImage?.imageId || '').trim() === imageId;
+    });
+    if (!attachment) return res.status(404).json({ error: 'Generated image not found' });
+    const generatedImage = attachment.generatedImage;
+    const filePath = resolveGeneratedImageReadPath({
+      resolveSessionStateRoot,
+      sessionId: generatedImage?.sessionId,
+      relativePath: generatedImage?.relativePath,
+    });
+    if (!filePath || !fs.existsSync(filePath)) {
+      return res.status(404).json({ error: 'Generated image file missing' });
+    }
+    let stat = null;
+    try {
+      stat = fs.statSync(filePath);
+    } catch {
+      return res.status(404).json({ error: 'Generated image file missing' });
+    }
+    if (!stat.isFile()) return res.status(404).json({ error: 'Generated image file missing' });
+    return serveFileWithRangeSupport(req, res, filePath, {
+      size: stat.size,
+      contentType: String(attachment.type || 'application/octet-stream').trim() || 'application/octet-stream',
+    }, {
+      safeName: path.basename(filePath).replace(/"/g, ''),
+    });
+  });
+
   app.get('/api/files/*', auth, (req, res) => {
     const requestedPath = String(req.params?.[0] || '').trim();
     const rootOverride = resolveScopedWorkspaceRootPath(req);
@@ -3146,6 +3592,8 @@ export function registerMessagesRoutes(app, deps) {
     }
     const requestedModelVariantId = String(modelResolution.modelVariantId || model || requestedModel).trim();
     const explicitReasoningEffort = String(reasoningEffort || '').trim();
+    const requestedContextTier = String(contextTier || 'default').trim().toLowerCase();
+    const openAIImageModel = useOpenAIProvider && isOpenAIImageModelId(requestedModel);
     let reasoningResolution = useOpenAIProvider
       ? resolveOpenAIReasoningEffort(explicitReasoningEffort, openAIModel)
       : resolveRequestedReasoningEffort(
@@ -3170,8 +3618,13 @@ export function registerMessagesRoutes(app, deps) {
       });
     }
     const requestedReasoningEffort = reasoningResolution.effort || null;
-    const requestedContextTier = String(contextTier || 'default').trim().toLowerCase();
-    if (!['default', 'long_context'].includes(requestedContextTier)) {
+    let normalizedContextTier = requestedContextTier;
+    if (openAIImageModel) {
+      normalizedContextTier = normalizeOpenAIImageSize(requestedContextTier) || 'auto';
+      if (!normalizedContextTier) {
+        return res.status(400).json({ error: 'Unsupported image size option' });
+      }
+    } else if (!['default', 'long_context'].includes(requestedContextTier)) {
       return res.status(400).json({ error: 'Unsupported context tier' });
     }
     if (!requestedRelayMode) return res.status(400).json({ error: 'Unsupported relay mode' });
@@ -3345,7 +3798,7 @@ export function registerMessagesRoutes(app, deps) {
       requestedModel,
       requestedModelVariantId,
       requestedReasoningEffort,
-      requestedContextTier,
+      normalizedContextTier,
       requestedRelayMode,
       queueText,
       attachments.length ? JSON.stringify(attachments) : null,
@@ -4064,14 +4517,146 @@ export function registerMessagesRoutes(app, deps) {
     return res.json({ ok: true, ...result });
   });
 
+  app.post('/api/openai/images/generate', auth, async (req, res) => {
+    touchCli();
+    const settings = getOpenAIProviderSettings();
+    if (settings?.configured !== true || !String(settings?.apiKey || '').trim()) {
+      return res.status(503).json({ error: 'OpenAI BYOK is not configured' });
+    }
+
+    let requestBody;
+    try {
+      requestBody = normalizeOpenAIImageGenerateRequestBody(req.body, {
+        maxImages: MAX_UPLOAD_ATTACHMENTS,
+      });
+    } catch (error) {
+      return res.status(400).json({ error: error?.message || 'Invalid OpenAI image request' });
+    }
+
+    const baseUrl = String(settings.baseUrl || '').trim().replace(/\/+$/, '');
+    if (!baseUrl) return res.status(503).json({ error: 'OpenAI base URL is not configured' });
+
+    let editAttachment = null;
+    if (Array.isArray(requestBody.attachments) && requestBody.attachments.length > 0) {
+      try {
+        editAttachment = resolveOpenAIImageEditAttachment(requestBody.attachments, {
+          maxImageBytes: MAX_UPLOAD_BYTES,
+          allowedRootPath: uploadsDir,
+        });
+      } catch (error) {
+        return res.status(400).json({ error: error?.message || 'Invalid image attachment' });
+      }
+    }
+
+    const options = {
+      model: requestBody.model,
+      prompt: requestBody.prompt,
+    };
+    const supportsResponseFormat = String(requestBody.model || '')
+      .trim()
+      .toLowerCase()
+      .replace(/^openai\//, '')
+      .startsWith('dall-e-');
+    if (supportsResponseFormat) options.response_format = 'b64_json';
+    if (requestBody.n !== undefined) options.n = requestBody.n;
+    if (requestBody.size) options.size = requestBody.size;
+    if (requestBody.quality) options.quality = requestBody.quality;
+
+    const endpoint = editAttachment ? '/images/edits' : '/images/generations';
+    let response;
+    try {
+      if (editAttachment) {
+        const form = new FormData();
+        form.set('model', options.model);
+        form.set('prompt', options.prompt);
+        if (options.response_format) form.set('response_format', String(options.response_format));
+        if (options.n !== undefined) form.set('n', String(options.n));
+        if (options.size) form.set('size', String(options.size));
+        if (options.quality) form.set('quality', String(options.quality));
+        form.set(
+          'image',
+          new Blob([editAttachment.bytes], { type: editAttachment.mimeType }),
+          editAttachment.name,
+        );
+        response = await fetch(`${baseUrl}${endpoint}`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${settings.apiKey}`,
+          },
+          body: form,
+        });
+      } else {
+        response = await fetch(`${baseUrl}${endpoint}`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${settings.apiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(options),
+        });
+      }
+    } catch (error) {
+      return res.status(502).json({ error: `OpenAI image API request failed: ${error?.message || 'request error'}` });
+    }
+
+    const rawText = String(await response.text().catch(() => '')).trim();
+    let payload = {};
+    if (rawText) {
+      try {
+        payload = JSON.parse(rawText);
+      } catch {
+        return res.status(502).json({ error: 'OpenAI image API returned invalid JSON' });
+      }
+    }
+
+    if (!response.ok) {
+      const detail = String(payload?.error?.message || payload?.message || rawText).trim().slice(0, 240);
+      const upstreamStatus = Number(response.status);
+      const relayStatus = Number.isFinite(upstreamStatus) && upstreamStatus >= 400 && upstreamStatus < 500
+        ? upstreamStatus
+        : 502;
+      return res.status(relayStatus).json({
+        error: `OpenAI image API failed (${response.status})${detail ? `: ${detail}` : ''}`,
+        upstreamStatus: Number.isFinite(upstreamStatus) ? upstreamStatus : null,
+      });
+    }
+
+    let generatedImages = [];
+    try {
+      generatedImages = normalizeOpenAIImageApiGeneratedImages(payload, {
+        maxImages: MAX_UPLOAD_ATTACHMENTS,
+      });
+    } catch (error) {
+      return res.status(502).json({ error: error?.message || 'OpenAI image API returned no images' });
+    }
+
+    return res.json({
+      ok: true,
+      generatedImages,
+      model: requestBody.model,
+      endpoint,
+    });
+  });
+
   // POST /api/response — CLI submits response
   app.post('/api/response', auth, async (req, res) => {
     touchCli();
-    const { messageId, conversationId, text, model, mode } = req.body;
+    const { messageId, conversationId, text, model, mode, generatedImages: rawGeneratedImages } = req.body;
     const trimmedText = String(text || '').trim();
     const terminalFailure = resolveTerminalFailurePayload(req.body, { fallbackText: trimmedText });
+    let generatedImages = [];
+    try {
+      generatedImages = normalizeGeneratedImageResponses(rawGeneratedImages, {
+        maxImages: MAX_UPLOAD_ATTACHMENTS,
+        maxImageBytes: MAX_UPLOAD_BYTES,
+      });
+    } catch (error) {
+      return res.status(400).json({ error: error?.message || 'Invalid generated images payload' });
+    }
 
-    if (!trimmedText && !terminalFailure) return res.status(400).json({ error: 'Empty response' });
+    if (!shouldAcceptAssistantResponsePayload({ text: trimmedText, terminalFailure, generatedImages })) {
+      return res.status(400).json({ error: 'Empty response' });
+    }
     if (!messageId) return res.status(400).json({ error: 'Missing messageId' });
 
     const q = stmts.findQById.get(messageId);
@@ -4151,7 +4736,7 @@ export function registerMessagesRoutes(app, deps) {
         return !!(stmts.findRecentlyAnsweredQuestionByMessage?.get(msgId, holdCutoffIso));
       },
     });
-    if (!resolvedText) return res.status(400).json({ error: 'Empty response' });
+    if (!resolvedText && generatedImages.length === 0) return res.status(400).json({ error: 'Empty response' });
 
     const responseId = uuidv4();
     const requestedModel = String(q?.model || '').trim() || null;
@@ -4160,6 +4745,21 @@ export function registerMessagesRoutes(app, deps) {
     const resolvedAssistantModel = explicitModel
       || (modelOrigin === 'auto' ? 'unknown' : requestedModel)
       || null;
+    const conversationRow = stmts.getConvAnyStatus?.get?.(targetConversationId) || null;
+    const sdkSessionId = String(conversationRow?.sdk_session_id || targetConversationId || '').trim() || targetConversationId;
+    let generatedImageAttachments = [];
+    try {
+      generatedImageAttachments = persistGeneratedImagesForAssistantResponse({
+        images: generatedImages,
+        messageId: responseId,
+        conversationId: targetConversationId,
+        sdkSessionId,
+        resolveSessionStateRoot,
+      });
+    } catch (error) {
+      return res.status(500).json({ error: error?.message || 'Failed to persist generated images' });
+    }
+    const assistantAttachments = generatedImageAttachments.length ? JSON.stringify(generatedImageAttachments) : null;
     const now = new Date().toISOString();
     const finalize = db.transaction(() => {
       const result = stmts.setDone.run(resolvedText, messageId);
@@ -4172,7 +4772,7 @@ export function registerMessagesRoutes(app, deps) {
         resolvedText,
         resolvedAssistantModel,
         relayMode,
-        null,
+        assistantAttachments,
         now,
         requestedModel,
         explicitModel,
@@ -4186,8 +4786,21 @@ export function registerMessagesRoutes(app, deps) {
       return true;
     });
 
-    const finalized = finalize();
+    let finalized = false;
+    try {
+      finalized = finalize();
+    } catch (error) {
+      cleanupPersistedGeneratedImagesForAssistantResponse({
+        attachments: generatedImageAttachments,
+        resolveSessionStateRoot,
+      });
+      throw error;
+    }
     if (!finalized) {
+      cleanupPersistedGeneratedImagesForAssistantResponse({
+        attachments: generatedImageAttachments,
+        resolveSessionStateRoot,
+      });
       const currentRow = stmts.findQById?.get(messageId) || null;
       const currentStatus = String(currentRow?.status || 'unknown');
       console.log(`[${ts()}] RESPONSE  ${messageId?.slice(0,8)} ignored=not_pending_or_processing actual_status=${currentStatus}`);
@@ -4305,7 +4918,8 @@ export function registerMessagesRoutes(app, deps) {
     const activities = relayActivityForResponse(responseId);
     const thoughts = relayThoughtsForResponse ? relayThoughtsForResponse(responseId) : [];
 
-    console.log(`[${ts()}] RESPONSE  ${messageId?.slice(0,8)} conv=${targetConversationId?.slice(0,8)} mode=${relayMode} len=${text.length} preview="${text.slice(0,60)}"`);
+    const responseLogText = String(resolvedText || '');
+    console.log(`[${ts()}] RESPONSE  ${messageId?.slice(0,8)} conv=${targetConversationId?.slice(0,8)} mode=${relayMode} len=${responseLogText.length} preview="${responseLogText.slice(0,60)}"${generatedImageAttachments.length ? ` images=${generatedImageAttachments.length}` : ''}`);
 
     io.emit('assistant_message', {
       conversationId: targetConversationId,
@@ -4314,6 +4928,7 @@ export function registerMessagesRoutes(app, deps) {
       message: {
         role: 'assistant',
         text: resolvedText,
+        attachments: generatedImageAttachments.length ? generatedImageAttachments : undefined,
         model: resolvedAssistantModel,
         modelOrigin: modelOrigin || undefined,
         reasoningEffort: String(q?.reasoning_effort || '').trim() || null,

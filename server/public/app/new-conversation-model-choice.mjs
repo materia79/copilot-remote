@@ -1,6 +1,9 @@
 export function shouldPromptForNewConversationModel({ provider = '' } = {}) {
   const normalizedProvider = String(provider || '').trim().toLowerCase();
-  return normalizedProvider === 'openai' || normalizedProvider === 'openai-byok';
+  return normalizedProvider === 'openai'
+    || normalizedProvider === 'openai-byok'
+    || normalizedProvider === 'openai-image'
+    || normalizedProvider === 'openai-image-byok';
 }
 
 export function buildNewConversationModelChoices(options = []) {

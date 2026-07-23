@@ -526,6 +526,7 @@ async function startPolling() {
       sendAndWaitWithHardTimeout,
       sendWithBestEffortStreaming,
       extractFinalText,
+      extractGeneratedImages,
       getLastActivityText: () => getScopedLastActivityText(),
       getCurrentModelId,
       getPreferredConversationSessionMode: () => preferredConversationSessionMode,
@@ -980,5 +981,6 @@ async function ensureRelayActive(reason) {
 }
 
 const extractFinalText = sessionIo.extractFinalText;
+const extractGeneratedImages = sessionIo.extractGeneratedImages;
 const sendAndWaitWithHardTimeout = sessionIo.sendAndWaitWithHardTimeout;
 const sendWithBestEffortStreaming = sessionIo.sendWithBestEffortStreaming;

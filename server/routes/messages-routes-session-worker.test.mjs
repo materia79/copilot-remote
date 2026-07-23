@@ -1,8 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 import {
   dequeuePendingMessageForWorkerLoop,
+  normalizeOpenAIImageApiGeneratedImages,
+  normalizeOpenAIImageGenerateRequestBody,
+  resolveOpenAIImageEditAttachment,
   resolveOpenAIReasoningEffort,
   shouldRequireNewOpenAIConversation,
   validateSubagentRunBinding,
@@ -18,6 +24,11 @@ test('OpenAI reasoning uses model capabilities instead of always forcing none', 
     ok: true,
     effort: 'none',
     supported: ['none'],
+  });
+  assert.deepEqual(resolveOpenAIReasoningEffort('', 'gpt-image-2'), {
+    ok: true,
+    effort: 'auto',
+    supported: ['auto', 'low', 'medium', 'high'],
   });
   assert.deepEqual(resolveOpenAIReasoningEffort('high', 'gpt-5.6-luna'), {
     ok: true,
@@ -153,4 +164,59 @@ test('validateSubagentRunBinding returns authoritative conversation id when vali
   });
   assert.equal(result.ok, true);
   assert.equal(result.conversationId, 'conv-A');
+});
+
+test('normalizeOpenAIImageGenerateRequestBody accepts direct generation parameters', () => {
+  const parsed = normalizeOpenAIImageGenerateRequestBody({
+    messageId: 'msg-1',
+    conversationId: 'conv-1',
+    model: 'gpt-image-1',
+    prompt: 'draw a lighthouse',
+    n: 2,
+    size: '1024x1024',
+    quality: 'high',
+  }, { maxImages: 4 });
+  assert.equal(parsed.messageId, 'msg-1');
+  assert.equal(parsed.n, 2);
+  assert.equal(parsed.size, '1024x1024');
+  assert.equal(parsed.quality, 'high');
+  assert.deepEqual(parsed.attachments, []);
+});
+
+test('resolveOpenAIImageEditAttachment parses first image attachment data URL', () => {
+  const image = resolveOpenAIImageEditAttachment([
+    { name: 'photo.png', type: 'image/png', dataUrl: 'data:image/png;base64,aGVsbG8=' },
+  ], { maxImageBytes: 1024 });
+  assert.ok(image);
+  assert.equal(image.mimeType, 'image/png');
+  assert.equal(image.bytes.toString('utf8'), 'hello');
+});
+
+test('resolveOpenAIImageEditAttachment rejects paths outside allowed upload root', () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-image-edit-'));
+  const uploadRoot = path.join(tempRoot, 'uploads');
+  const outsidePath = path.join(tempRoot, 'outside.png');
+  fs.mkdirSync(uploadRoot, { recursive: true });
+  fs.writeFileSync(outsidePath, Buffer.from('hello'));
+  assert.throws(() => {
+    resolveOpenAIImageEditAttachment([
+      { name: 'outside.png', type: 'image/png', path: outsidePath },
+    ], {
+      maxImageBytes: 1024,
+      allowedRootPath: uploadRoot,
+    });
+  }, /outside the upload directory/i);
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+});
+
+test('normalizeOpenAIImageApiGeneratedImages normalizes OpenAI image API output', () => {
+  const normalized = normalizeOpenAIImageApiGeneratedImages({
+    data: [
+      { b64_json: 'aGVsbG8=', revised_prompt: 'refined prompt' },
+    ],
+  });
+  assert.equal(normalized.length, 1);
+  assert.equal(normalized[0].data, 'aGVsbG8=');
+  assert.equal(normalized[0].mimeType, 'image/png');
+  assert.equal(normalized[0].revisedPrompt, 'refined prompt');
 });

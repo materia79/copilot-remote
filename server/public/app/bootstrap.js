@@ -965,6 +965,18 @@ function modelProvidersForId(modelId, providersByModel = {}) {
   return providers.map((provider) => String(provider || '').trim().toLowerCase()).filter(Boolean);
 }
 
+function isOpenAIImageModelId(modelId = '') {
+  const normalized = String(modelId || '').trim().toLowerCase().replace(/^openai\//, '');
+  return normalized.startsWith('gpt-image-') || normalized.startsWith('dall-e-');
+}
+
+function openAIImageSizesForModel(modelId = '') {
+  const normalized = String(modelId || '').trim().toLowerCase().replace(/^openai\//, '');
+  if (normalized.startsWith('dall-e-2')) return ['256x256', '512x512', '1024x1024'];
+  if (normalized.startsWith('dall-e-3')) return ['1024x1024', '1792x1024', '1024x1792'];
+  return ['auto', '1024x1024', '1536x1024', '1024x1536'];
+}
+
 function modelVisibleForActiveProvider(modelId, activeProviderType, providersByModel = {}) {
   const normalizedModelId = String(modelId || '').trim().toLowerCase();
   if (!normalizedModelId) return false;
@@ -1027,6 +1039,7 @@ function selectedReasoningEffortValue() {
 function updateReasoningSelectorForModel(modelId, preferredEffort = '') {
   const select = document.getElementById('reasoning-effort-select');
   if (!select) return;
+  select.title = isOpenAIImageModelId(modelId) ? 'Quality' : 'Reasoning effort';
   const options = reasoningOptionsForModel(modelId);
   const selectedBefore = String(select.value || '').trim().toLowerCase();
   const mode = String(document.getElementById('mode-select')?.value || '').trim() || FALLBACK_MODE;
@@ -1227,6 +1240,21 @@ function selectedModelValue() {
 function updateContextTierSelector(modelId) {
   const select = document.getElementById('context-tier-select');
   if (!select) return;
+  if (isOpenAIImageModelId(modelId)) {
+    const current = String(select.value || '').trim().toLowerCase();
+    const imageSizes = openAIImageSizesForModel(modelId);
+    select.innerHTML = '';
+    for (const size of imageSizes) {
+      const option = document.createElement('option');
+      option.value = size;
+      option.textContent = size;
+      select.appendChild(option);
+    }
+    select.value = imageSizes.includes(current) ? current : 'auto';
+    select.title = 'Image size';
+    updateModelPricingDetails(modelId, 'default');
+    return;
+  }
   const metadata = modelCatalogState.modelMetadataByModel?.[modelId] || {};
   const defaultLimit = Number(metadata.defaultContextLimitTokens);
   const longLimit = Number(metadata.longContextLimitTokens);
@@ -1247,6 +1275,7 @@ function updateContextTierSelector(modelId) {
   select.value = current === 'long_context' && select.querySelector('option[value="long_context"]')
     ? 'long_context'
     : 'default';
+  select.title = 'Context window';
   updateModelPricingDetails(modelId, select.value);
 }
 
@@ -1681,6 +1710,19 @@ async function reconcileOpenModelVariantModal() {
 }
 
 function renderModelVariantCatalogBody() {
+  const providersByModel = modelCatalogState.providersByModel || {};
+  const variantBelongsToTab = (entry, tab) => {
+    const activeTab = String(tab || 'copilot').trim().toLowerCase();
+    const baseModelId = String(entry?.baseModelId || '').trim().toLowerCase();
+    const providers = modelProvidersForId(baseModelId, providersByModel);
+    const hasOpenAIByok = providers.includes('openai-byok');
+    const hasNonByokProvider = providers.some((provider) => provider !== 'openai-byok');
+    if (activeTab === 'openai') {
+      return hasOpenAIByok || String(entry?.provider || '').trim().toLowerCase() === 'openai-byok';
+    }
+    if (hasOpenAIByok) return hasNonByokProvider;
+    return true;
+  };
   const grouped = new Map();
   for (const entry of modelVariantCatalogState.variants) {
     const providerKey = String(entry.provider || 'other').trim().toLowerCase() || 'other';
@@ -1688,7 +1730,8 @@ function renderModelVariantCatalogBody() {
     grouped.get(providerKey).push(entry);
   }
   const openAIBaseModelsAlreadyListed = new Set(
-    (grouped.get('openai-byok') || [])
+    modelVariantCatalogState.variants
+      .filter((entry) => variantBelongsToTab(entry, 'openai'))
       .map((entry) => String(entry.baseModelId || '').trim().toLowerCase())
       .filter(Boolean),
   );
@@ -1739,12 +1782,10 @@ function renderModelVariantCatalogBody() {
   const refreshedLabel = modelVariantCatalogState.refreshedAt
     ? new Date(modelVariantCatalogState.refreshedAt).toLocaleString()
     : 'Never';
-  const providerBelongsToTab = (providerKey, tab) => {
-    const key = String(providerKey || '').trim().toLowerCase();
-    return tab === 'openai'
-      ? key === 'openai-byok'
-      : key !== 'openai-byok';
-  };
+  const providerBelongsToTab = (providerKey, tab) => (
+    (grouped.get(String(providerKey || '').trim().toLowerCase()) || [])
+      .some((entry) => variantBelongsToTab(entry, tab))
+  );
   const hasOpenAITab = providerOrder.some((providerKey) => providerBelongsToTab(providerKey, 'openai'));
   const hasCopilotTab = providerOrder.some((providerKey) => providerBelongsToTab(providerKey, 'copilot'));
   if (modelVariantCatalogProviderTab === 'openai' && !hasOpenAITab) modelVariantCatalogProviderTab = 'copilot';
@@ -1766,7 +1807,8 @@ function renderModelVariantCatalogBody() {
   );
   const groupsHtml = visibleProviderOrder.map((providerKey) => {
     const providerLabel = PROVIDER_LABELS[providerKey] || providerKey;
-    const rows = grouped.get(providerKey) || [];
+    const rows = (grouped.get(providerKey) || [])
+      .filter((entry) => variantBelongsToTab(entry, modelVariantCatalogProviderTab));
     rows.sort((a, b) => {
       const aSelected = selected.has(a.variantId);
       const bSelected = selected.has(b.variantId);
