@@ -3547,10 +3547,17 @@ export function registerSessionsRoutes(app, deps) {
     const discovery = !shouldDiscover
       ? { ok: true, models: [], error: null }
       : await refreshOpenAIProviderModels();
-    const reconciliationResult = await reconcileUnstartedConversationProviders({
-      enabled: result.enabled === true,
-      model: result.model,
-    });
+    const reconciliationResult = parsed.remove === true
+      ? await reconcileUnstartedConversationProviders({
+          enabled: false,
+          model: result.model,
+        })
+      : {
+          updatedUnstartedConversations: 0,
+          skippedStartedConversations: 0,
+          skippedActiveQueueConversations: 0,
+          failedConversations: [],
+        };
     const reconciliation = {
       updatedUnstartedConversations: Number(reconciliationResult?.updatedUnstartedConversations || 0),
       skippedStartedConversations: Number(reconciliationResult?.skippedStartedConversations || 0),

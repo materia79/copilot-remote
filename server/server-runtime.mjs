@@ -2950,11 +2950,10 @@ const featureFlags = normalizeFeatureFlags(FEATURES);
 
 async function stopSessionWorkerForProviderRebind(sdkSessionId) {
   const sessionId = String(sdkSessionId || '').trim();
-  if (!sessionId) return;
+  if (!sessionId) return false;
   const currentWorker = sessionWorkerRegistry?.getWorker?.(sessionId) || null;
   sessionWorkerSupervisor?.markKilled?.(sessionId);
-  await sessionWorkerSupervisor?.cancelPendingStart?.(sessionId);
-
+  const cancelledStart = await sessionWorkerSupervisor?.cancelPendingStart?.(sessionId, { wait: true });
   const discoveredProcesses = process.platform === 'win32'
     ? (
         sessionWorkerProcessInspector?.findWindowsProcessTreeForSession?.(sessionId)
@@ -2963,9 +2962,20 @@ async function stopSessionWorkerForProviderRebind(sdkSessionId) {
         || []
       )
     : (sessionWorkerProcessInspector?.findProcessesForSession?.(sessionId) || []);
+  const currentWorkerPid = Number(currentWorker?.pid);
+  const hadActiveWorker = discoveredProcesses.some((entry) => isProcessAlive(Number(entry?.processId)))
+    || (Number.isInteger(currentWorkerPid) && currentWorkerPid > 0 && isProcessAlive(currentWorkerPid))
+    || cancelledStart?.hadPending === true;
+  if (!hadActiveWorker) {
+    sessionWorkerRegistry?.removeWorker?.(sessionId);
+    sessionWorkerSupervisor?.clearRestartSchedule?.(sessionId, { resetKilledMarker: true });
+    sessionWorkerSupervisor?.resetHealth?.(sessionId, { clearFailureCount: false });
+    return false;
+  }
+
   const pids = [...new Set([
     ...discoveredProcesses.map((entry) => Number(entry?.processId)).filter((pid) => Number.isInteger(pid) && pid > 0),
-    Number(currentWorker?.pid),
+    currentWorkerPid,
   ].filter((pid) => Number.isInteger(pid) && pid > 0))];
 
   if (process.platform === 'win32') {
@@ -2992,6 +3002,7 @@ async function stopSessionWorkerForProviderRebind(sdkSessionId) {
   sessionWorkerRegistry?.removeWorker?.(sessionId);
   sessionWorkerSupervisor?.clearRestartSchedule?.(sessionId);
   sessionWorkerSupervisor?.resetHealth?.(sessionId, { clearFailureCount: false });
+  return true;
 }
 
 async function reconcileUnstartedConversationProviders({ enabled, model } = {}) {
@@ -3036,8 +3047,7 @@ async function reconcileUnstartedConversationProviders({ enabled, model } = {}) 
     let providerWasUpdated = false;
     try {
       if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true && ownerSessionId) {
-        workerWasStopped = true;
-        await stopSessionWorkerForProviderRebind(ownerSessionId);
+        workerWasStopped = await stopSessionWorkerForProviderRebind(ownerSessionId);
       }
       stmts.updateRuntimeSessionProvider.run(
         providerType,
@@ -3047,7 +3057,7 @@ async function reconcileUnstartedConversationProviders({ enabled, model } = {}) 
         row.id,
       );
       providerWasUpdated = true;
-      if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true && ownerSessionId) {
+      if (workerWasStopped && ownerSessionId) {
         sessionWorkerSupervisor?.clearRestartSchedule?.(ownerSessionId, { resetKilledMarker: true });
         const ensured = await sessionWorkerSupervisor?.ensureWorker?.(ownerSessionId, {
           allowProcessReuse: false,
@@ -3108,10 +3118,11 @@ async function rebindUnstartedOpenAIConversationModel({ conversationId, model } 
     || stmts.getConv.get(normalizedConversationId)?.sdk_session_id
     || normalizedConversationId,
   ).trim();
+  let workerWasStopped = false;
   let providerWasUpdated = false;
   try {
     if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true && ownerSessionId) {
-      await stopSessionWorkerForProviderRebind(ownerSessionId);
+      workerWasStopped = await stopSessionWorkerForProviderRebind(ownerSessionId);
     }
     stmts.updateRuntimeSessionProvider.run(
       'openai',
@@ -3121,7 +3132,7 @@ async function rebindUnstartedOpenAIConversationModel({ conversationId, model } 
       runtimeSession.id,
     );
     providerWasUpdated = true;
-    if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true && ownerSessionId) {
+    if (workerWasStopped && ownerSessionId) {
       sessionWorkerSupervisor?.clearRestartSchedule?.(ownerSessionId, { resetKilledMarker: true });
       const ensured = await sessionWorkerSupervisor?.ensureWorker?.(ownerSessionId, {
         allowProcessReuse: false,
@@ -3139,7 +3150,7 @@ async function rebindUnstartedOpenAIConversationModel({ conversationId, model } 
         runtimeSession.id,
       );
     }
-    if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true && ownerSessionId) {
+    if (workerWasStopped && ownerSessionId) {
       sessionWorkerSupervisor?.clearRestartSchedule?.(ownerSessionId, { resetKilledMarker: true });
       await sessionWorkerSupervisor?.ensureWorker?.(ownerSessionId, {
         allowProcessReuse: false,

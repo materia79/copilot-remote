@@ -50,6 +50,12 @@ function createRuntimeDeps({
   openAISettings = { configured: false, enabled: false, model: 'gpt-4o', models: [] },
   onOpenAIRefresh = async () => ({ ok: true, models: [], error: null }),
   onSetOpenAISettings = () => ({ ok: true, configured: false, enabled: false, model: 'gpt-4o' }),
+  onReconcileOpenAIConversations = async () => ({
+    updatedUnstartedConversations: 0,
+    skippedStartedConversations: 0,
+    skippedActiveQueueConversations: 0,
+    failedConversations: [],
+  }),
 }) {
   const app = createMockApp();
   const db = createMockDb();
@@ -91,12 +97,7 @@ function createRuntimeDeps({
     },
     getOpenAIProviderSettings: () => openAISettings,
     setOpenAIProviderSettings: onSetOpenAISettings,
-    reconcileUnstartedConversationProviders: async () => ({
-      updatedUnstartedConversations: 0,
-      skippedStartedConversations: 0,
-      skippedActiveQueueConversations: 0,
-      failedConversations: [],
-    }),
+    reconcileUnstartedConversationProviders: onReconcileOpenAIConversations,
     refreshOpenAIProviderModels: onOpenAIRefresh,
     setEnabledModelVariants: () => modelState.current,
     SUPPORTED_REASONING_EFFORTS: ['none', 'low', 'medium'],
@@ -204,6 +205,89 @@ test('POST /api/settings/openai returns 409 when key removal is blocked by activ
   assert.equal(response.body.activeConversationCount, 2);
   assert.equal(response.body.startedConversationCount, 2);
   assert.equal(response.body.activeQueueConversationCount, 1);
+});
+
+test('POST /api/settings/openai does not rebind existing conversations when settings change', async () => {
+  const rows = { current: [] };
+  const modelState = {
+    current: {
+      models: ['gpt-5.4'],
+      currentModel: 'gpt-5.4',
+      defaultModel: 'gpt-5.4',
+    },
+  };
+  let reconciliationCalls = 0;
+  const settings = {
+    configured: true,
+    enabled: true,
+    model: 'gpt-5.4-mini',
+    models: ['gpt-5.4-mini'],
+  };
+  const { app } = createRuntimeDeps({
+    rows,
+    modelState,
+    openAISettings: settings,
+    onRefresh: async () => {},
+    onSetOpenAISettings: () => ({ ok: true, ...settings }),
+    onReconcileOpenAIConversations: async () => {
+      reconciliationCalls += 1;
+      return {};
+    },
+  });
+
+  const response = await callRoute(app.routes.get('POST /api/settings/openai'), {
+    headers: {},
+    body: { enabled: true, model: 'gpt-5.4-mini' },
+    query: {},
+    params: {},
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(reconciliationCalls, 0);
+  assert.equal(response.body.reconciliation.updatedUnstartedConversations, 0);
+});
+
+test('POST /api/settings/openai rebinds empty OpenAI conversations when the key is removed', async () => {
+  const rows = { current: [] };
+  const modelState = {
+    current: {
+      models: ['gpt-5.4'],
+      currentModel: 'gpt-5.4',
+      defaultModel: 'gpt-5.4',
+    },
+  };
+  let reconciliationArgs = null;
+  const disabledSettings = {
+    configured: false,
+    enabled: false,
+    model: 'gpt-5.4-mini',
+    models: [],
+  };
+  const { app } = createRuntimeDeps({
+    rows,
+    modelState,
+    openAISettings: disabledSettings,
+    onRefresh: async () => {},
+    onSetOpenAISettings: () => ({ ok: true, ...disabledSettings }),
+    onReconcileOpenAIConversations: async (args) => {
+      reconciliationArgs = args;
+      return { updatedUnstartedConversations: 2 };
+    },
+  });
+
+  const response = await callRoute(app.routes.get('POST /api/settings/openai'), {
+    headers: {},
+    body: { remove: true, model: 'gpt-5.4-mini' },
+    query: {},
+    params: {},
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(reconciliationArgs, {
+    enabled: false,
+    model: 'gpt-5.4-mini',
+  });
+  assert.equal(response.body.reconciliation.updatedUnstartedConversations, 2);
 });
 
 test('POST /api/model-variants/refresh keeps enabled unavailable variants and rpc-snapshot source', async () => {
