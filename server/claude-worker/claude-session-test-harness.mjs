@@ -22,17 +22,31 @@ export async function waitFor(predicate, { timeoutMs = 3000, label = 'condition'
   }
 }
 
-export function makeApiStub({ failRoutes = new Set(), continuationIds = [] } = {}) {
+/**
+ * `routeResponses` maps a route to its response body, or to a function of
+ * `(body, callIndexForThatRoute)` — which is how a test drives a route that
+ * answers (or throws) differently per attempt. `/api/continuation-turn`
+ * answers like the relay route: a fresh `messageId` plus the `attemptId` the
+ * synthetic row was dequeued under.
+ */
+export function makeApiStub({ failRoutes = new Set(), continuationIds = [], routeResponses = {} } = {}) {
   const calls = [];
+  const routeCounts = new Map();
   let continuationCounter = 0;
   return {
     calls,
     api: async (method, routePath, body) => {
       calls.push({ method, routePath, body });
       if (failRoutes.has(routePath)) throw new Error(`stubbed failure for ${routePath}`);
+      const attempt = routeCounts.get(routePath) || 0;
+      routeCounts.set(routePath, attempt + 1);
+      const canned = routeResponses[routePath];
+      if (typeof canned === 'function') return canned(body, attempt);
+      if (canned !== undefined) return canned;
       if (routePath === '/api/continuation-turn') {
         continuationCounter += 1;
-        return { messageId: continuationIds[continuationCounter - 1] || `cont-${continuationCounter}` };
+        const messageId = continuationIds[continuationCounter - 1] || `cont-${continuationCounter}`;
+        return { messageId, attemptId: `attempt-${messageId}` };
       }
       return { ok: true };
     },

@@ -90,19 +90,24 @@ test('a turn the runtime starts by itself becomes a continuation row and publish
   // A synthetic row was requested, with the fields the relay route reads.
   const registrations = bodiesFor(stub, '/api/continuation-turn');
   assert.equal(registrations.length, 1);
-  assert.deepEqual(registrations[0], {
+  const { operationId, ...registered } = registrations[0];
+  assert.deepEqual(registered, {
     conversationId: 'conv-1',
     sdkSessionId: 'conv-1',
     relayMode: 'agent',
     trigger: CONTINUATION_TRIGGER,
   });
+  // The idempotency key the relay dedupes retries on.
+  assert.match(String(operationId), /^[0-9a-f-]{36}$/);
 
-  // 3. The reply landed IN that row — the thing the live session lost.
+  // 3. The reply landed IN that row — the thing the live session lost — and it
+  // echoes the attempt id the row was minted under.
   const continuation = responsesFor(stub, 'cont-1')[0];
   assert.equal(continuation.conversationId, 'conv-1');
   assert.equal(continuation.text, TIMER_REPLY);
   assert.equal(continuation.model, 'gpt-5.6-luna');
   assert.equal(continuation.terminalError, undefined);
+  assert.equal(continuation.attemptId, 'attempt-cont-1');
 
   // ...and nothing was cross-published into the user's already-settled row.
   assert.equal(responsesFor(stub, 'q-1').length, 1);
@@ -126,6 +131,9 @@ test('a continuation streams and narrates into its own row', async () => {
   const streams = bodiesFor(stub, '/api/stream').filter((body) => body.messageId === 'cont-1');
   assert.ok(streams.length >= 1);
   assert.equal(streams.every((body) => body.conversationId === 'conv-1'), true);
+  // Every write on the synthetic row is fenced to the attempt it was minted
+  // under, buffered-then-flushed actions included.
+  assert.equal(streams.every((body) => body.attemptId === 'attempt-cont-1'), true);
   assert.equal(streams[streams.length - 1].done, true);
   assert.equal(streams[streams.length - 1].text, TIMER_REPLY);
 
@@ -175,7 +183,9 @@ test('the heartbeat claims the synthetic row, or the relay recovers it mid-fligh
 
   fireTimer(client, TIMER_CONTINUATION.slice(0, -1)); // everything but session.idle
   await waitFor(() => runner.getActiveQueueMessageIds().length === 1, { label: 'continuation owned' });
-  assert.deepEqual(runner.getActiveQueueMessageIds(), ['cont-1']);
+  // The crash guard reads these entries whole, so a crash requeue of the
+  // synthetic row stays fenced to the attempt it was minted under.
+  assert.deepEqual(runner.getActiveQueueMessageIds(), [{ id: 'cont-1', attemptId: 'attempt-cont-1' }]);
   assert.equal(runner.getActiveQueueMessageId(), 'cont-1');
   assert.equal(runner._getState().activeTurnKind, 'continuation');
 
@@ -499,7 +509,13 @@ test('a relay that answers without a message id is retried, then honoured', asyn
 
   fireTimer(client);
   await waitFor(() => responsesFor(stub, 'cont-9').length === 1, { label: 'continuation response' });
-  assert.equal(bodiesFor(stub, '/api/continuation-turn').length, 2);
+  const registrations = bodiesFor(stub, '/api/continuation-turn');
+  assert.equal(registrations.length, 2);
+  // The retry is the SAME registration, not a new one: the relay dedupes on
+  // the operationId, so re-minting a key here would mint a second row whenever
+  // the first response was created but lost in flight.
+  assert.ok(registrations[0].operationId, 'the registration carries an idempotency key');
+  assert.equal(registrations[0].operationId, registrations[1].operationId);
   assert.equal(responsesFor(stub, 'cont-9')[0].text, TIMER_REPLY);
   await runner.dispose();
 });

@@ -59,7 +59,8 @@ export function makeApiStub({ failRoutes = new Set(), routeResponses = {} } = {}
 /**
  * An api stub that mints synthetic queue rows, so a test can exercise the
  * continuation path end to end. `POST /api/continuation-turn` answers with a
- * fresh `messageId`, exactly as the relay route does.
+ * fresh `messageId` and the `attemptId` the row was dequeued under, exactly as
+ * the relay route does.
  */
 export function makeContinuationApiStub({
   conversationId = 'conv-1',
@@ -72,8 +73,9 @@ export function makeContinuationApiStub({
     routeResponses: {
       '/api/continuation-turn': (body, attempt) => {
         const messageId = messageIds[Math.min(attempt, messageIds.length - 1)];
-        minted.push({ messageId, body });
-        return { ok: true, messageId, conversationId };
+        const attemptId = `attempt-${messageId}`;
+        minted.push({ messageId, attemptId, body });
+        return { ok: true, messageId, conversationId, attemptId };
       },
       ...(options.routeResponses || {}),
     },

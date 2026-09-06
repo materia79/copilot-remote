@@ -54,6 +54,96 @@ test('a turn that finishes on tool activity alone publishes instead of requeuein
   assert.ok(!response.body.terminalError, 'a silent turn is a success, not a failure');
 });
 
+test('a delivered attempt id is echoed on every write for the row', async () => {
+  // The queue row carries the attempt it was dequeued under; the server
+  // refuses writes whose attempt no longer matches, so every publish that
+  // names the messageId must name the attempt too.
+  const stub = makeApiStub();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => fakeTurn([initMessage('native-1'), assistantText('done'), resultMessage('done', 'native-1')]),
+  });
+
+  await runner.handlePendingPayload({ message: { ...baseMessage, attemptId: 'attempt-1' } });
+
+  const writes = stub.calls.filter((call) => ['/api/response', '/api/stream', '/api/activity'].includes(call.routePath));
+  assert.ok(writes.some((call) => call.routePath === '/api/response'));
+  assert.ok(writes.some((call) => call.routePath === '/api/stream'));
+  assert.equal(writes.every((call) => call.body.attemptId === 'attempt-1'), true);
+});
+
+test('a response rejected with a non-409 still requeues, fenced to the attempt', async () => {
+  const stub = makeApiStub({ failRoutes: new Set(['/api/response']) });
+  const runner = makeRunner({
+    stub,
+    startImpl: () => fakeTurn([initMessage('native-1'), resultMessage('done', 'native-1')]),
+  });
+  await runner.handlePendingPayload({ message: { ...baseMessage, attemptId: 'attempt-1' } });
+  const requeue = stub.calls.find((call) => call.routePath === '/api/requeue');
+  assert.deepEqual(requeue.body, { messageId: 'q-1', attemptId: 'attempt-1' });
+});
+
+test('a stale_attempt 409 on the response drops the reply instead of requeueing', async () => {
+  // The row already moved on to another attempt (requeued and re-delivered
+  // elsewhere); a requeue from this one would 409 the same way, and looping on
+  // it would fight the attempt that now owns the row.
+  const staleError = Object.assign(new Error('HTTP 409 /api/response: stale_attempt'), {
+    status: 409,
+    detail: 'stale_attempt',
+  });
+  const stub = makeApiStub({ routeResponses: { '/api/response': () => { throw staleError; } } });
+  const runner = makeRunner({
+    stub,
+    startImpl: () => fakeTurn([initMessage('native-1'), resultMessage('done', 'native-1')]),
+  });
+  assert.equal(await runner.handlePendingPayload({ message: { ...baseMessage, attemptId: 'attempt-old' } }), true);
+  assert.ok(
+    !stub.calls.find((call) => call.routePath === '/api/requeue'),
+    'a superseded attempt must not yank the row back',
+  );
+});
+
+test('continuation registration retries reuse ONE operationId and adopt the minted attempt', async () => {
+  // First registration answer is truthy but empty (retried); the relay dedupes
+  // the retry on the operationId, so re-minting the key here would create a
+  // second row whenever the first response was created but lost in flight.
+  const stub = makeApiStub({
+    routeResponses: {
+      '/api/continuation-turn': (body, attempt) => (attempt === 0
+        ? { ok: true }
+        : { messageId: 'cont-9', attemptId: 'attempt-cont-9' }),
+    },
+  });
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(backgroundTasksMessage([{ task_id: 'bash-1', task_type: 'local_bash', description: 'e2e suite' }]));
+  turn.emit(resultMessage('Runs started; I will be notified.', 'native-1'));
+  assert.equal(await pending, true);
+
+  turn.emit(backgroundTasksMessage([]));
+  turn.emit(taskNotificationMessage('bash-1'));
+  turn.emit(userReplay('<task-notification>bash-1 completed</task-notification>'));
+  turn.emit(assistantText('All three runs passed.'));
+  turn.emit(resultMessage('All three runs passed.', 'native-1'));
+
+  const continuationResponse = await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-9'),
+    { label: 'continuation response' },
+  );
+  const registrations = stub.calls.filter((call) => call.routePath === '/api/continuation-turn');
+  assert.equal(registrations.length, 2);
+  assert.ok(registrations[0].body.operationId, 'the registration carries an idempotency key');
+  assert.equal(registrations[0].body.operationId, registrations[1].body.operationId);
+  // The turn's writes echo the attempt the row was finally minted under.
+  assert.equal(continuationResponse.body.attemptId, 'attempt-cont-9');
+
+  turn.endInput();
+  await settled(runner);
+});
+
 test('first turn persists the native session id and later spawns resume it', async () => {
   const stub = makeApiStub();
   const capturedSpawns = [];
@@ -554,11 +644,15 @@ test('a backgrounded bash task keeps the process alive and its continuation publ
     { label: 'continuation response' },
   );
   assert.equal(continuationResponse.body.text, 'All three runs passed.');
+  // The synthetic row's writes are fenced to the attempt it was minted under.
+  assert.equal(continuationResponse.body.attemptId, 'attempt-cont-1');
   const registration = stub.calls.find((call) => call.routePath === '/api/continuation-turn');
   assert.equal(registration.body.conversationId, 'conv-1');
+  assert.ok(registration.body.operationId, 'the registration carries an idempotency key');
   // The settled-task activity line lands on the continuation turn.
   const activity = stub.calls.find((call) => call.routePath === '/api/activity' && call.body.messageId === 'cont-1');
   assert.match(activity.body.text, /bash-1 completed/);
+  assert.equal(activity.body.attemptId, 'attempt-cont-1');
   assert.equal(turn.endInputCalls, 0, 'still alive after the continuation');
   turn.endInput();
   await settled(runner);

@@ -131,7 +131,7 @@ async function main() {
   installWorkerCrashGuard({
     api,
     workerName: 'cursor-session-worker',
-    getActiveQueueMessageIds: () => [turnRunner.getActiveQueueMessageId()],
+    getActiveQueueMessageIds: () => [turnRunner.getActiveQueueAttempt()],
   });
 
   dbg(`starting session=${sdkSessionId.slice(0, 8)} server=${serverUrl} cwd=${cwd} model=${defaultModel || 'default'}`);

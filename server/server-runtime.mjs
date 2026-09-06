@@ -5707,7 +5707,10 @@ function failRecoveredRowTerminally(row, reason) {
   const failureText = `Relay recovery limit reached after ${retryCount} attempts (${reason}). The worker kept dying before completing this turn, so the message was failed to keep the queue moving. Send it again to retry.`;
   const requestedModel = String(row?.model || '').trim() || null;
   const tx = db.transaction(() => {
-    stmts.setFailed.run(JSON.stringify({
+    // setFailed is compare-and-set on status (processing/pending/parked): a
+    // row that settled between the sweep's listing and this write must not
+    // grow an orphan failure bubble on top of its real outcome.
+    const result = stmts.setFailed.run(JSON.stringify({
       kind: 'recovery-limit',
       error: 'recovery-limit',
       code: 'recovery-limit',
@@ -5716,6 +5719,7 @@ function failRecoveredRowTerminally(row, reason) {
       retryCount,
       failedAt: now,
     }), row.id);
+    if (result.changes === 0) return false;
     stmts.setQueueResponseMessageId?.run(responseId, row.id);
     stmts.insertMsg.run(
       responseId,
@@ -5734,8 +5738,9 @@ function failRecoveredRowTerminally(row, reason) {
     stmts.linkStreamEventsToResponse?.run(responseId, row.id);
     stmts.linkThoughtsToResponse?.run(responseId, row.id);
     stmts.updateConvTime.run(now, row.conversation_id);
+    return true;
   });
-  tx();
+  if (!tx()) return;
   io.emit('assistant_message', {
     conversationId: row.conversation_id,
     sourceMessageId: row.id,
@@ -6469,16 +6474,24 @@ async function recoverUndeliveredSessionWorkerMessage({ pending = null, sessionI
 
   const retryCount = Number(row.retry_count || 0) + 1;
   const nextAttemptAt = addMsIso(Math.min(5_000, computeRetryDelayMs(retryCount)));
+  // The undelivered payload names the exact attempt that was minted for it, so
+  // this requeue can be fenced precisely: if the row has moved on to another
+  // attempt since the failed send, leave it alone.
+  const deliveredAttemptId = String(pending?.message?.attemptId || '').trim() || null;
   const result = db.prepare(`
     UPDATE queue
     SET status = 'pending',
         processing_at = NULL,
+        attempt_id = NULL,
         retry_count = ?,
         next_attempt_at = ?,
         owner_lease_expires_at = NULL
     WHERE id = ?
-      AND status = 'processing'
-  `).run(retryCount, nextAttemptAt, messageId);
+      AND status = 'processing'${deliveredAttemptId ? `
+      AND attempt_id = ?` : ''}
+  `).run(...(deliveredAttemptId
+    ? [retryCount, nextAttemptAt, messageId, deliveredAttemptId]
+    : [retryCount, nextAttemptAt, messageId]));
   if (result.changes <= 0) return false;
 
   if (requesterSessionId) {

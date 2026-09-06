@@ -2,6 +2,7 @@
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
+import { randomUUID } from 'crypto';
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 import { resolveUploadMimeType } from '../services/mime-sniffer.mjs';
 import { applySafeServedContentHeaders } from '../services/safe-served-content.mjs';
@@ -831,23 +832,29 @@ export function dequeuePendingMessage({
         : stmts.findPending.get(currentIso);
     }
     if (!next) return null;
+    // One processing attempt = one attempt_id. Minted here for every claim —
+    // even for callers that never echo it back — so finalization, requeue, and
+    // question writes can be fenced to the attempt that actually owns the row.
+    const attemptId = randomUUID();
     if (routingEnabled && requesterSid && stmts.setProcessingWithWorkerLease) {
-      stmts.setProcessingWithWorkerLease.run(currentIso, requesterSid, currentIso, leaseExpiresAt, currentIso, next.id);
+      stmts.setProcessingWithWorkerLease.run(currentIso, attemptId, requesterSid, currentIso, leaseExpiresAt, currentIso, next.id);
       return {
         ...next,
         status: 'processing',
         processing_at: currentIso,
+        attempt_id: attemptId,
         owner_sdk_session_id: String(next.owner_sdk_session_id || '').trim() || requesterSid,
         owner_assigned_at: String(next.owner_assigned_at || '').trim() || currentIso,
         owner_lease_expires_at: leaseExpiresAt,
         owner_last_claimed_at: currentIso,
       };
     }
-    stmts.setProcessing.run(currentIso, next.id);
+    stmts.setProcessing.run(currentIso, attemptId, next.id);
     return {
       ...next,
       status: 'processing',
       processing_at: currentIso,
+      attempt_id: attemptId,
     };
   });
   return dequeue();
@@ -1127,6 +1134,7 @@ export function buildDequeuedRelayMessage({
     status: msg.status,
     timestamp: msg.timestamp,
     processingAt: msg.processing_at,
+    attemptId: String(msg.attempt_id || '').trim() || null,
     ownerSessionId: String(msg.owner_sdk_session_id || '').trim() || null,
     ownerAssignedAt: msg.owner_assigned_at || null,
     ownerLeaseExpiresAt: msg.owner_lease_expires_at || null,
@@ -1974,6 +1982,7 @@ export function registerMessagesRoutes(app, deps) {
     failureRecord,
     markWorkerError = true,
     executedProvider = null,
+    attemptId = null,
   }) {
     const now = new Date().toISOString();
     const responseId = uuidv4();
@@ -1983,8 +1992,11 @@ export function registerMessagesRoutes(app, deps) {
       || (modelOrigin === 'auto' ? 'unknown' : requestedModel)
       || null;
     const modelActual = String(model || '').trim() || null;
+    const fencedAttemptId = String(attemptId || '').trim() || null;
     const tx = db.transaction(() => {
-      const result = stmts.setFailed.run(JSON.stringify(failureRecord), messageId);
+      const result = fencedAttemptId
+        ? stmts.setFailedFenced.run(JSON.stringify(failureRecord), messageId, fencedAttemptId)
+        : stmts.setFailed.run(JSON.stringify(failureRecord), messageId);
       if (result.changes === 0) return false;
       stmts.setQueueResponseMessageId?.run(responseId, messageId);
       stmts.insertMsg.run(
@@ -2092,41 +2104,27 @@ export function registerMessagesRoutes(app, deps) {
     return { responseId, now };
   }
 
+  // Cancels question cards left behind by a superseded processing attempt.
+  // Questions carry the attempt_id of the row state they were created under,
+  // so "stale" is exact: any pending card whose attempt differs from the
+  // attempt the row currently records. Cards belonging to that attempt stay
+  // pending — an answer may still be on its way in. A row with NO current
+  // attempt (finalized by a legacy responder after a requeue cleared it) makes
+  // every attempt-stamped card stale: the empty string matches none of them.
   function cancelPendingRelayQuestionsForMessage(messageId) {
     const targetMessageId = String(messageId || '').trim();
-    if (!targetMessageId || typeof stmts.cancelPendingQuestionsByMessage?.run !== 'function') return 0;
-    const pendingRows = typeof stmts.listPendingQuestionsByMessage?.all === 'function'
-      ? stmts.listPendingQuestionsByMessage.all(targetMessageId)
-      : [];
-    if (!pendingRows.length) return 0;
-    
-    // Get the message start time to determine which questions are "stale"
+    if (!targetMessageId || typeof stmts.cancelPendingQuestionsForStaleAttempts?.all !== 'function') return 0;
     const queueRow = stmts.findQById?.get(targetMessageId) || null;
-    const messageStartedAt = queueRow?.created_at || null;
-    
-    // Only cancel questions that were created BEFORE this turn started (stale orphans)
-    // Keep questions created during the turn - they might still be waiting for answers
+    const currentAttemptId = String(queueRow?.attempt_id || '').trim();
     const now = new Date().toISOString();
-    let cancelledCount = 0;
-    
-    for (const row of pendingRows) {
-      const questionCreatedAt = row.created_at || null;
-      const isStale = messageStartedAt && questionCreatedAt && questionCreatedAt < messageStartedAt;
-      
-      if (isStale) {
-        // This is an orphaned question from a previous attempt - cancel it
-        const result = db.prepare(`UPDATE relay_questions SET status = 'cancelled', answered_at = ? WHERE id = ? AND status = 'pending'`).run(now, row.id);
-        if ((result?.changes || 0) > 0) {
-          cancelledCount++;
-          const updated = stmts.getQuestion?.get(row.id) || null;
-          if (updated && typeof deps.formatQuestionRow === 'function') {
-            io.emit('relay_question_updated', { question: deps.formatQuestionRow(updated) });
-          }
-        }
+    const cancelledRows = stmts.cancelPendingQuestionsForStaleAttempts.all(now, targetMessageId, currentAttemptId);
+    for (const row of cancelledRows) {
+      const updated = stmts.getQuestion?.get(row.id) || null;
+      if (updated && typeof deps.formatQuestionRow === 'function') {
+        io.emit('relay_question_updated', { question: deps.formatQuestionRow(updated) });
       }
     }
-    
-    return cancelledCount;
+    return cancelledRows.length;
   }
 
   const strandedPrimeCooldownBySession = new Map();
@@ -2221,6 +2219,7 @@ export function registerMessagesRoutes(app, deps) {
     UPDATE queue
     SET status = 'pending',
         processing_at = NULL,
+        attempt_id = NULL,
         next_attempt_at = ?,
         owner_lease_expires_at = NULL
     WHERE id = ?
@@ -6090,6 +6089,21 @@ export function registerMessagesRoutes(app, deps) {
     if (!targetConversationId) return res.status(400).json({ error: 'Missing conversationId' });
     const responseBridgeIdentity = readBridgeIdentity(req);
 
+    // Attempt fencing: a writer that names its processing attempt may only
+    // settle the row while that attempt is still the row's current one. A
+    // mismatch means the row was requeued (and possibly re-dequeued) after
+    // this writer started — its work is superseded, not mergeable. Writers
+    // that send no attemptId (the extension engine, mid-rollout workers) keep
+    // the legacy conditional semantics.
+    const claimedAttemptId = String(req.body.attemptId || '').trim() || null;
+    if (claimedAttemptId && q && String(q.attempt_id || '') !== claimedAttemptId) {
+      console.warn(`[${ts()}] STALE ATTEMPT ${messageId?.slice(0,8)} route=response claimed=${claimedAttemptId.slice(0,8)} current=${String(q.attempt_id || '').slice(0,8) || 'none'} status=${q.status}`);
+      return res.status(409).json({ error: 'stale_attempt', currentStatus: q.status });
+    }
+    if (!claimedAttemptId && q && q.status === 'processing') {
+      console.log(`[${ts()}] FENCE     ${messageId?.slice(0,8)} legacy unfenced response write`);
+    }
+
     if (q && q.status === 'done') {
       console.log(`[${ts()}] RESPONSE  ${messageId?.slice(0,8)} ignored=already_done`);
       return res.json({ ok: true, ignored: 'already_done' });
@@ -6145,8 +6159,14 @@ export function registerMessagesRoutes(app, deps) {
           requestId: terminalFailure.requestId || null,
           failedAt: new Date().toISOString(),
         },
+        attemptId: claimedAttemptId,
       });
       if (!failed) {
+        const currentRow = stmts.findQById?.get(messageId) || null;
+        if (claimedAttemptId && currentRow && String(currentRow.attempt_id || '') !== claimedAttemptId) {
+          console.warn(`[${ts()}] STALE ATTEMPT ${messageId?.slice(0,8)} route=response-terminal claimed=${claimedAttemptId.slice(0,8)} current=${String(currentRow.attempt_id || '').slice(0,8) || 'none'} status=${currentRow.status}`);
+          return res.status(409).json({ error: 'stale_attempt', currentStatus: String(currentRow.status || 'unknown') });
+        }
         console.log(`[${ts()}] RESPONSE  ${messageId?.slice(0,8)} ignored=not_pending_or_processing`);
         return res.json({ ok: true, ignored: 'not_pending_or_processing' });
       }
@@ -6243,7 +6263,9 @@ export function registerMessagesRoutes(app, deps) {
       ? stmts.getOperation?.get(q.image_operation_id)
       : null;
     const finalize = db.transaction(() => {
-      const result = stmts.setDone.run(resolvedText, messageId);
+      const result = claimedAttemptId
+        ? stmts.setDoneFenced.run(resolvedText, messageId, claimedAttemptId)
+        : stmts.setDone.run(resolvedText, messageId);
       if (result.changes === 0) return false;
       stmts.setQueueResponseMessageId?.run(responseId, messageId);
       stmts.insertMsg.run(
@@ -6353,6 +6375,10 @@ export function registerMessagesRoutes(app, deps) {
       });
       const currentRow = stmts.findQById?.get(messageId) || null;
       const currentStatus = String(currentRow?.status || 'unknown');
+      if (claimedAttemptId && currentRow && String(currentRow.attempt_id || '') !== claimedAttemptId) {
+        console.warn(`[${ts()}] STALE ATTEMPT ${messageId?.slice(0,8)} route=response-finalize claimed=${claimedAttemptId.slice(0,8)} current=${String(currentRow.attempt_id || '').slice(0,8) || 'none'} status=${currentStatus}`);
+        return res.status(409).json({ error: 'stale_attempt', currentStatus });
+      }
       console.log(`[${ts()}] RESPONSE  ${messageId?.slice(0,8)} ignored=not_pending_or_processing actual_status=${currentStatus}`);
       // Ensure UI is updated even if the response was duplicate/late
       if (currentStatus === 'done') {
@@ -6547,27 +6573,56 @@ export function registerMessagesRoutes(app, deps) {
       || normalizeSessionWorkerId(req.body?.sdkSessionId)
       || String(conversation.sdk_session_id || conversationId);
     const relayMode = normalizeRelayMode(req.body?.relayMode) || DEFAULT_RELAY_MODE;
+    // Idempotent registration: the worker mints one operation id before its
+    // first attempt and repeats it on every retry, so a retry whose previous
+    // request committed but lost its response resolves to the same row
+    // instead of minting a twin that nobody will ever settle.
+    const operationId = String(req.body?.operationId || '').trim() || null;
+    const respondWithExistingRow = (row) => {
+      if (String(row.conversation_id || '') !== conversationId) {
+        return res.status(409).json({ error: 'Continuation operation id is bound to another conversation' });
+      }
+      console.log(`[${ts()}] CONTINUATION ${String(row.id).slice(0, 8)} conv=${conversationId.slice(0, 8)} reused op=${operationId.slice(0, 8)}`);
+      return res.json({ ok: true, messageId: row.id, conversationId: row.conversation_id, attemptId: row.attempt_id || null, existing: true });
+    };
+    if (operationId) {
+      const existing = stmts.findQByContinuationOp?.get?.(operationId) || null;
+      if (existing) return respondWithExistingRow(existing);
+    }
     const messageId = uuidv4();
+    const attemptId = uuidv4();
     const now = new Date().toISOString();
     const leaseExpiresAt = addMsToIso(now, SESSION_WORKER_OWNER_LEASE_MS);
-    stmts.insertContinuationQ.run(
-      messageId,
-      conversationId,
-      runtimeSession?.id || null,
-      String(req.body?.model || '').trim() || null,
-      relayMode,
-      '[background continuation]',
-      now,
-      now,
-      ownerSessionId,
-      now,
-      leaseExpiresAt,
-      now,
-    );
-    console.log(`[${ts()}] CONTINUATION ${messageId.slice(0, 8)} conv=${conversationId.slice(0, 8)} owner=${ownerSessionId.slice(0, 8)} trigger=${String(req.body?.trigger || 'background_task')}`);
+    try {
+      stmts.insertContinuationQ.run(
+        messageId,
+        conversationId,
+        runtimeSession?.id || null,
+        String(req.body?.model || '').trim() || null,
+        relayMode,
+        '[background continuation]',
+        now,
+        now,
+        ownerSessionId,
+        now,
+        leaseExpiresAt,
+        now,
+        attemptId,
+        operationId,
+      );
+    } catch (error) {
+      // Lost the race against a concurrent duplicate registration: the unique
+      // index on continuation_op_id guarantees the winner's row exists now.
+      if (operationId && String(error?.code || '').startsWith('SQLITE_CONSTRAINT')) {
+        const existing = stmts.findQByContinuationOp?.get?.(operationId) || null;
+        if (existing) return respondWithExistingRow(existing);
+      }
+      throw error;
+    }
+    console.log(`[${ts()}] CONTINUATION ${messageId.slice(0, 8)} conv=${conversationId.slice(0, 8)} owner=${ownerSessionId.slice(0, 8)} trigger=${String(req.body?.trigger || 'background_task')}${operationId ? ` op=${operationId.slice(0, 8)}` : ''}`);
     io.emit('message_status', { messageId, conversationId, status: 'processing', kind: 'continuation' });
     io.emit('queue_updated', { continuation: 1 });
-    res.json({ ok: true, messageId, conversationId });
+    res.json({ ok: true, messageId, conversationId, attemptId });
   });
 
   // POST /api/background-tasks — a session worker publishes its live
@@ -6616,6 +6671,23 @@ export function registerMessagesRoutes(app, deps) {
   });
 
   // POST /api/activity — relay sends in-flight activity updates (tool/search sections)
+  // Optional attempt fence for the live lanes (stream/thought/activity/
+  // subagent): a writer that names its processing attempt is rejected once
+  // the row's current attempt differs — the row was requeued or re-dequeued
+  // after this writer started, and its output belongs to a superseded turn.
+  // Same-attempt writes pass regardless of row status (trailing writes right
+  // after finalization are legitimate), and writers without an attemptId keep
+  // legacy behavior until the extension engine is retired.
+  function rejectStaleAttemptWrite({ req, res, queueRow, route }) {
+    const claimed = String(req.body?.attemptId || '').trim();
+    if (!claimed || !queueRow) return false;
+    const current = String(queueRow.attempt_id || '');
+    if (current === claimed) return false;
+    console.warn(`[${ts()}] STALE ATTEMPT ${String(queueRow.id || '').slice(0,8)} route=${route} claimed=${claimed.slice(0,8)} current=${current.slice(0,8) || 'none'} status=${queueRow.status}`);
+    res.status(409).json({ error: 'stale_attempt', currentStatus: String(queueRow.status || 'unknown') });
+    return true;
+  }
+
   app.post('/api/activity', auth, (req, res) => {
     touchCli();
     const { messageId, conversationId, text, mode, subagentRunId, metadata } = req.body || {};
@@ -6625,6 +6697,7 @@ export function registerMessagesRoutes(app, deps) {
     }
 
     const q = stmts.findQById.get(messageId);
+    if (rejectStaleAttemptWrite({ req, res, queueRow: q, route: 'activity' })) return;
     const responseMessageId = q?.response_message_id || null;
     const normalizedSubagentRunId = subagentRunId ? String(subagentRunId).trim() : null;
     const normalizedMetadata = sanitizeActivityMetadata(metadata);
@@ -6671,6 +6744,7 @@ export function registerMessagesRoutes(app, deps) {
     if (!queueConversationId || queueConversationId !== requestedConversationId) {
       return res.status(409).json({ error: 'Stream conversationId does not match queue conversation' });
     }
+    if (rejectStaleAttemptWrite({ req, res, queueRow, route: 'stream' })) return;
 
     const isStreamSeqConstraintError = (error) => {
       const message = String(error?.message || '').toLowerCase();
@@ -6791,6 +6865,7 @@ export function registerMessagesRoutes(app, deps) {
     if (!queueConversationId || queueConversationId !== requestedConversationId) {
       return res.status(409).json({ error: 'Thought conversationId does not match queue conversation' });
     }
+    if (rejectStaleAttemptWrite({ req, res, queueRow, route: 'thought' })) return;
 
     const relayMode = normalizeRelayMode(mode) || DEFAULT_RELAY_MODE;
     const normalizedReasoningId = String(reasoningId || '').trim() || null;
@@ -6900,6 +6975,7 @@ export function registerMessagesRoutes(app, deps) {
     }
 
     const q = stmts.findQById.get(messageId);
+    if (rejectStaleAttemptWrite({ req, res, queueRow: q, route: 'subagent-run' })) return;
     const existingRun = stmts.getSubagentRun?.get(normalizedSubagentRunId);
     const binding = validateSubagentRunBinding({
       queueRow: q,
@@ -6953,6 +7029,14 @@ export function registerMessagesRoutes(app, deps) {
     const { messageId } = req.body;
     const q = stmts.findQById.get(messageId);
     const terminalFailure = resolveTerminalFailurePayload(req.body);
+    // A fenced requeue from a superseded attempt is refused outright: honoring
+    // it would yank the row out from under the attempt that now owns it (or
+    // terminal-fail a row that has already been requeued to someone else).
+    const claimedAttemptId = String(req.body?.attemptId || '').trim() || null;
+    if (claimedAttemptId && q && String(q.attempt_id || '') !== claimedAttemptId) {
+      console.warn(`[${ts()}] STALE ATTEMPT ${messageId?.slice(0,8)} route=requeue claimed=${claimedAttemptId.slice(0,8)} current=${String(q.attempt_id || '').slice(0,8) || 'none'} status=${q.status}`);
+      return res.status(409).json({ error: 'stale_attempt', currentStatus: String(q.status || 'unknown') });
+    }
     const ownerSessionId = isSessionWorkerRoutingEnabled(featureFlags)
       ? normalizeSessionWorkerId(q?.owner_sdk_session_id)
       : null;
@@ -6980,6 +7064,7 @@ export function registerMessagesRoutes(app, deps) {
           retryCount: Number(q?.retry_count || 0),
           failedAt: new Date().toISOString(),
         },
+        attemptId: claimedAttemptId,
       });
       if (failed) {
         settleRelayAbortControlsForQueueMessage(messageId, {
@@ -7011,9 +7096,9 @@ export function registerMessagesRoutes(app, deps) {
       // instead of paying a 60s ladder for the relay's mistake.
       db.prepare(`
         UPDATE queue
-        SET status = 'pending', processing_at = NULL, next_attempt_at = NULL, owner_lease_expires_at = NULL
-        WHERE id = ? AND status = 'processing'
-      `).run(messageId);
+        SET status = 'pending', processing_at = NULL, attempt_id = NULL, next_attempt_at = NULL, owner_lease_expires_at = NULL
+        WHERE id = ? AND status = 'processing'${claimedAttemptId ? ` AND attempt_id = ?` : ''}
+      `).run(...(claimedAttemptId ? [messageId, claimedAttemptId] : [messageId]));
       io.emit('message_status', { messageId, conversationId: q.conversation_id, status: 'pending' });
       console.log(`[${ts()}] REQUEUED  ${messageId?.slice(0,8)} class=provider-mismatch retry=${Number(q.retry_count || 0)}`);
       return res.json({ ok: true, mismatch: true });
@@ -7056,6 +7141,7 @@ export function registerMessagesRoutes(app, deps) {
           SET
             status = ?,
             processing_at = NULL,
+            attempt_id = NULL,
             retry_count = ?,
             next_attempt_at = ?,
             owner_lease_expires_at = NULL,
@@ -7063,7 +7149,7 @@ export function registerMessagesRoutes(app, deps) {
             parked_target_session_id = ?,
             parked_transaction_id = ?,
             parked_reason = ?
-          WHERE id = ? AND status = 'processing'
+          WHERE id = ? AND status = 'processing'${claimedAttemptId ? ` AND attempt_id = ?` : ''}
         `).run(
           parkForRestart ? 'parked' : 'pending',
           retryCount,
@@ -7072,7 +7158,7 @@ export function registerMessagesRoutes(app, deps) {
           parkForRestart ? (restartState?.targetSessionId || null) : null,
           parkForRestart ? (restartState?.transactionId || null) : null,
           parkForRestart ? (restartState?.lastError || 'session-rebind-pending') : null,
-          messageId,
+          ...(claimedAttemptId ? [messageId, claimedAttemptId] : [messageId]),
         );
         if (result.changes > 0) {
           settleRelayAbortControlsForQueueMessage(messageId, {

@@ -628,6 +628,19 @@ if (!queueColumns.includes('kind')) {
   // torn down (not requeued) when their worker disappears.
   db.exec(`ALTER TABLE queue ADD COLUMN kind TEXT`);
 }
+if (!queueColumns.includes('attempt_id')) {
+  // One processing attempt = one attempt_id: minted on every pending->processing
+  // transition (and at continuation birth), cleared by every requeue/recovery,
+  // kept on terminal rows so forensics can name the attempt that finalized.
+  // Writers that echo it are fenced; writers that omit it ride legacy semantics
+  // until the extension engine is retired.
+  db.exec(`ALTER TABLE queue ADD COLUMN attempt_id TEXT`);
+}
+if (!queueColumns.includes('continuation_op_id')) {
+  // Worker-supplied idempotency key for POST /api/continuation-turn: a retry
+  // after a lost response must find the row it already created, not mint a twin.
+  db.exec(`ALTER TABLE queue ADD COLUMN continuation_op_id TEXT`);
+}
 
 // recent_workspace_roots gained a case-normalized primary key (path_key). The
 // CREATE TABLE IF NOT EXISTS above only covers fresh databases, so upgrade an
@@ -652,6 +665,7 @@ db.exec(`UPDATE queue SET relay_mode = 'agent' WHERE relay_mode IS NULL OR relay
 db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_next_attempt ON queue(status, next_attempt_at, timestamp)`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_owner_pending ON queue(status, owner_sdk_session_id, next_attempt_at, timestamp)`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_parked_release ON queue(status, parked_transaction_id, parked_target_session_id, parked_at, timestamp)`);
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_continuation_op ON queue(continuation_op_id) WHERE continuation_op_id IS NOT NULL`);
 migrateImageConversationSchema(db);
 
 const runtimeSessionColumns = db.prepare(`PRAGMA table_info(runtime_sessions)`).all().map((c) => c.name);
@@ -820,6 +834,11 @@ if (relayQuestionColumns.length && !relayQuestionColumns.includes('structured_an
 }
 if (relayQuestionColumns.length && !relayQuestionColumns.includes('request_schema')) {
   db.exec(`ALTER TABLE relay_questions ADD COLUMN request_schema TEXT`);
+}
+if (relayQuestionColumns.length && !relayQuestionColumns.includes('attempt_id')) {
+  // Stamped from the queue row at creation so stale-question cleanup can cancel
+  // cards left behind by a superseded processing attempt.
+  db.exec(`ALTER TABLE relay_questions ADD COLUMN attempt_id TEXT`);
 }
 db.exec(`CREATE INDEX IF NOT EXISTS idx_relay_questions_continuation ON relay_questions(continuation_id, continuation_question_id, status, created_at)`);
 

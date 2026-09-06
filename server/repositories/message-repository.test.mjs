@@ -411,19 +411,20 @@ function createRecoveryFixture() {
   const db = createTestDb();
   const stmts = createMessageRepository(db);
   const insertTurn = db.prepare(`
-    INSERT INTO queue (id, conversation_id, status, text, timestamp, processing_at, owner_sdk_session_id, owner_last_claimed_at)
-    VALUES (@id, 'conv-1', 'processing', 'prompt', @timestamp, @processingAt, @owner, @lastClaimedAt)
+    INSERT INTO queue (id, conversation_id, status, text, timestamp, processing_at, owner_sdk_session_id, owner_last_claimed_at, attempt_id)
+    VALUES (@id, 'conv-1', 'processing', 'prompt', @timestamp, @processingAt, @owner, @lastClaimedAt, @attemptId)
   `);
   return {
     db,
     stmts,
-    addTurn({ id, startedMsAgo, lastHeartbeatMsAgo = null, owned = true }) {
+    addTurn({ id, startedMsAgo, lastHeartbeatMsAgo = null, owned = true, attemptId = null }) {
       insertTurn.run({
         id,
         timestamp: recoveryIsoAgo(startedMsAgo),
         processingAt: recoveryIsoAgo(startedMsAgo),
         owner: owned ? 'session-1' : null,
         lastClaimedAt: lastHeartbeatMsAgo === null ? null : recoveryIsoAgo(lastHeartbeatMsAgo),
+        attemptId,
       });
     },
     askQuestion(queueId, status = 'pending') {
@@ -492,8 +493,8 @@ test('a null ceiling disables the elapsed-time cap entirely', () => {
 
 test('recovery keeps ownership and requeues exactly the stale rows', () => {
   const fixture = createRecoveryFixture();
-  fixture.addTurn({ id: 'q-live', startedMsAgo: 90 * 60_000, lastHeartbeatMsAgo: 5_000 });
-  fixture.addTurn({ id: 'q-dead', startedMsAgo: 90 * 60_000, lastHeartbeatMsAgo: 30 * 60_000 });
+  fixture.addTurn({ id: 'q-live', startedMsAgo: 90 * 60_000, lastHeartbeatMsAgo: 5_000, attemptId: 'attempt-live' });
+  fixture.addTurn({ id: 'q-dead', startedMsAgo: 90 * 60_000, lastHeartbeatMsAgo: 30 * 60_000, attemptId: 'attempt-dead' });
   const requeueAt = recoveryIsoAgo(0);
 
   fixture.stmts.recoverProcessingBefore.run({
@@ -503,7 +504,7 @@ test('recovery keeps ownership and requeues exactly the stale rows', () => {
   });
 
   const rows = fixture.db
-    .prepare(`SELECT id, status, processing_at, owner_sdk_session_id, next_attempt_at FROM queue ORDER BY id`)
+    .prepare(`SELECT id, status, processing_at, owner_sdk_session_id, next_attempt_at, attempt_id FROM queue ORDER BY id`)
     .all();
   assert.deepEqual(rows.map((row) => [row.id, row.status]), [['q-dead', 'pending'], ['q-live', 'processing']]);
 
@@ -514,10 +515,27 @@ test('recovery keeps ownership and requeues exactly the stale rows', () => {
   // relay poll — that steal is how a Cursor turn once ran on the Copilot plan.
   assert.equal(dead.owner_sdk_session_id, 'session-1');
   assert.equal(dead.next_attempt_at, requeueAt);
+  // The attempt does NOT survive: recovery supersedes the old execution, and a
+  // cleared attempt_id is what fences its late writes out of the requeued row.
+  assert.equal(dead.attempt_id, null);
 
   const live = rows.find((row) => row.id === 'q-live');
   assert.notEqual(live.processing_at, null);
   assert.equal(live.owner_sdk_session_id, 'session-1');
+  assert.equal(live.attempt_id, 'attempt-live', 'a turn that keeps its row keeps its attempt');
+});
+
+test('the elapsed-time sweep also clears the attempt on rows it requeues', () => {
+  const fixture = createRecoveryFixture();
+  // recoverStale keys on processing_at alone (the legacy elapsed-time sweep),
+  // so an old-enough started-at is all it takes.
+  fixture.addTurn({ id: 'q-elapsed', startedMsAgo: RECOVERY_HOUR_MS, attemptId: 'attempt-elapsed' });
+
+  fixture.stmts.recoverStale.run(recoveryIsoAgo(0), recoveryIsoAgo(10 * 60_000));
+
+  const row = fixture.db.prepare(`SELECT status, attempt_id FROM queue WHERE id = 'q-elapsed'`).get();
+  assert.equal(row.status, 'pending');
+  assert.equal(row.attempt_id, null, 'the superseded attempt must not linger on the recovered row');
 });
 
 test('active-turn lookup reports only conversations with live queue rows', () => {
@@ -544,7 +562,7 @@ test('active-turn lookup reports only conversations with live queue rows', () =>
 // out as deliverable work — a replay would send the CLI's own continuation
 // text back to the CLI as a user prompt — so recovery tears them down instead.
 
-function insertContinuationRow(stmts, { id = 'q-cont', lastClaimedAgoMs = 0 } = {}) {
+function insertContinuationRow(stmts, { id = 'q-cont', lastClaimedAgoMs = 0, attemptId = null, operationId = null } = {}) {
   const now = recoveryIsoAgo(lastClaimedAgoMs);
   stmts.insertContinuationQ.run(
     id,
@@ -559,6 +577,8 @@ function insertContinuationRow(stmts, { id = 'q-cont', lastClaimedAgoMs = 0 } = 
     now,
     now,
     now,
+    attemptId,
+    operationId,
   );
 }
 

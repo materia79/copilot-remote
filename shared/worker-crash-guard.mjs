@@ -28,14 +28,25 @@ export function installWorkerCrashGuard({
     logError(`${workerName} ${kind}:`, error?.stack || error?.message || error);
     (async () => {
       try {
-        const ids = [...new Set(
-          (getActiveQueueMessageIds() || [])
-            .map((id) => String(id || '').trim())
-            .filter(Boolean),
-        )];
-        if (ids.length && typeof api === 'function') {
+        // Entries are plain ids or { id, attemptId } objects. The attempt id,
+        // when known, fences the requeue: a row that has already moved on to
+        // another attempt must not be yanked back by a dying predecessor.
+        const seen = new Set();
+        const entries = (getActiveQueueMessageIds() || [])
+          .map((entry) => (entry && typeof entry === 'object'
+            ? { id: String(entry.id || '').trim(), attemptId: String(entry.attemptId || '').trim() || null }
+            : { id: String(entry || '').trim(), attemptId: null }))
+          .filter((entry) => {
+            if (!entry.id || seen.has(entry.id)) return false;
+            seen.add(entry.id);
+            return true;
+          });
+        if (entries.length && typeof api === 'function') {
           await Promise.race([
-            Promise.allSettled(ids.map((id) => api('POST', '/api/requeue', { messageId: id }))),
+            Promise.allSettled(entries.map((entry) => api('POST', '/api/requeue', {
+              messageId: entry.id,
+              ...(entry.attemptId ? { attemptId: entry.attemptId } : {}),
+            }))),
             new Promise((resolve) => {
               const timer = setTimeout(resolve, Math.max(0, Number(requeueTimeoutMs) || 0));
               timer.unref?.();

@@ -8,6 +8,23 @@ const PLAN_BOARD_ACTIONS = [
   { id: 'exit_only', label: 'Stop here', mode: 'agent' },
 ];
 
+/**
+ * The attempt-fencing echo for a row's write bodies. Every publish that names
+ * a `messageId` also names the attempt it belongs to, so the relay can refuse
+ * writes from a superseded attempt (a requeued row re-delivered elsewhere).
+ * Omitted entirely when the row carries no attempt id (a pre-fencing relay).
+ */
+export function attemptFields(message) {
+  return message?.attemptId ? { attemptId: message.attemptId } : {};
+}
+
+/** A 409 whose detail names `stale_attempt`: this attempt was superseded. */
+export function isStaleAttemptError(error) {
+  if (Number(error?.status) !== 409) return false;
+  const detail = typeof error?.detail === 'string' ? error.detail : JSON.stringify(error?.detail || '');
+  return detail.includes('stale_attempt');
+}
+
 export function buildClaudePlanReadyBoardPayload({ message, planText = '' } = {}) {
   const summary = String(planText || '').trim();
   if (!summary) return null;
@@ -47,6 +64,7 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
       text,
       ...(subagentRunId ? { subagentRunId } : {}),
       ...(metadata && typeof metadata === 'object' ? { metadata } : {}),
+      ...attemptFields(message),
     }).catch(() => {});
   }
 
@@ -69,6 +87,7 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
         text: payload.text,
         done: payload.done === true,
         ...(payload.subagentRunId ? { subagentRunId: payload.subagentRunId } : {}),
+        ...attemptFields(message),
       }).catch(() => {});
       return;
     }
@@ -81,6 +100,7 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
         text: payload.text,
         done: payload.done === true,
         ...(payload.subagentRunId ? { subagentRunId: payload.subagentRunId } : {}),
+        ...attemptFields(message),
       }).catch(() => {});
       return;
     }
@@ -96,6 +116,7 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
         parentSubagentId: payload.parentSubagentId || undefined,
         displayName: payload.displayName || undefined,
         status: payload.status,
+        ...attemptFields(message),
       }).catch(() => {});
       return;
     }
@@ -155,6 +176,7 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
       mode: message.relayMode || 'agent',
       text: String(text || ''),
       done: true,
+      ...attemptFields(message),
     }).catch(() => {});
   }
 
@@ -177,8 +199,16 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
         || (String(message?.model || '').trim().toLowerCase() === 'auto' ? 'auto' : 'manual'),
       ...(Array.isArray(workflowRuns) && workflowRuns.length ? { workflowRuns } : {}),
       ...(terminalError ? { terminalError } : {}),
-    }).catch(async () => {
-      await api('POST', '/api/requeue', { messageId: message.id }).catch(() => {});
+      ...attemptFields(message),
+    }).catch(async (error) => {
+      // A stale_attempt 409 means the row already moved on to another attempt
+      // (requeued and re-delivered); the requeue would 409 the same way, and
+      // the newer attempt owes the row its answer — drop this one.
+      if (isStaleAttemptError(error)) {
+        dbg('response refused as stale_attempt; dropping', message.id);
+        return;
+      }
+      await api('POST', '/api/requeue', { messageId: message.id, ...attemptFields(message) }).catch(() => {});
     });
   }
 

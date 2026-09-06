@@ -102,7 +102,11 @@ async function main() {
     getHeartbeatTimer: () => heartbeatTimer,
     setHeartbeatTimer: (timer) => { heartbeatTimer = timer; },
     getActiveQueueMessageId: () => turnRunner.getActiveQueueMessageId(),
-    getActiveQueueMessageIds: () => turnRunner.getActiveQueueMessageIds(),
+    // The runner reports { id, attemptId } entries; the heartbeat's claim
+    // payload is id-only (its String() coercion would mangle an object), while
+    // the crash guard below takes the entries whole so its requeues stay
+    // fenced to this attempt.
+    getActiveQueueMessageIds: () => turnRunner.getActiveQueueMessageIds().map((entry) => entry.id),
   });
 
   const wsLink = createWorkerWebSocketLink({

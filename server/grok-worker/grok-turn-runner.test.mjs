@@ -229,10 +229,11 @@ test('a turn without result or streamed text requeues instead of failing termina
     startGrokTurnImpl: () => emptyTurn(),
   });
   const ok = await runner.handlePendingPayload({
-    message: { id: 'msg-q', conversationId: 'conv-empty', text: 'x', relayMode: 'agent' },
+    message: { id: 'msg-q', conversationId: 'conv-empty', text: 'x', relayMode: 'agent', attemptId: 'attempt-rq' },
   });
   assert.equal(ok, true);
-  assert.ok(api.calls.some((c) => c.path === '/api/requeue'));
+  const requeue = api.calls.find((c) => c.path === '/api/requeue');
+  assert.deepEqual(requeue.body, { messageId: 'msg-q', attemptId: 'attempt-rq' }, 'the requeue is fenced');
   assert.ok(!api.calls.some((c) => c.path === '/api/response'));
   await runner.dispose();
 });
@@ -446,6 +447,91 @@ test('the Grok preview block is sent once per worker and looked up once', async 
   assert.equal(prompts[1], 'second');
   const previewLookups = api.calls.filter((c) => c.method === 'GET' && c.path === '/api/previews');
   assert.equal(previewLookups.length, 1);
+  await runner.dispose();
+});
+
+test('a delivered attemptId is echoed on stream and response writes and absent for legacy rows', async () => {
+  const api = createMockApi();
+  async function* fencedTurn() {
+    yield { channel: 'stream', payload: { text: 'fenced', done: false, subagentRunId: null } };
+    yield {
+      channel: 'result',
+      payload: { text: 'fenced answer', isError: false, errorMessage: '', stopReason: 'end_turn', model: 'grok-4.5' },
+    };
+  }
+  let midTurnAttempt = 'unset';
+  const runner = createGrokTurnRunner({
+    api,
+    sdkSessionId: 'conv-fence',
+    cwd: process.cwd(),
+    defaultModel: 'grok-4.5',
+    createAgentHandleImpl: async () => makeHandle(),
+    startGrokTurnImpl: () => {
+      midTurnAttempt = runner.getActiveQueueAttempt();
+      return fencedTurn();
+    },
+  });
+
+  await runner.handlePendingPayload({
+    message: { id: 'msg-a1', conversationId: 'conv-fence', text: 'x', relayMode: 'agent', attemptId: 'attempt-7' },
+  });
+  assert.deepEqual(
+    midTurnAttempt,
+    { id: 'msg-a1', attemptId: 'attempt-7' },
+    'the crash guard must see the fenced { id, attemptId } shape mid-turn',
+  );
+  assert.equal(runner.getActiveQueueAttempt(), null, 'no fenced attempt outside a turn');
+  const response = api.calls.find((c) => c.path === '/api/response');
+  assert.equal(response.body.attemptId, 'attempt-7');
+  const streams = api.calls.filter((c) => c.path === '/api/stream');
+  assert.ok(streams.length >= 1);
+  for (const stream of streams) assert.equal(stream.body.attemptId, 'attempt-7');
+
+  api.calls.length = 0;
+  await runner.handlePendingPayload({
+    message: { id: 'msg-a2', conversationId: 'conv-fence', text: 'y', relayMode: 'agent' },
+  });
+  const legacyResponse = api.calls.find((c) => c.path === '/api/response');
+  assert.ok(!('attemptId' in legacyResponse.body), 'a row without attemptId keeps the legacy body');
+  const legacyStream = api.calls.find((c) => c.path === '/api/stream');
+  assert.ok(!('attemptId' in legacyStream.body));
+  await runner.dispose();
+});
+
+test('a stale_attempt 409 on the response is dropped instead of requeued', async () => {
+  const calls = [];
+  const api = async (method, path, body) => {
+    calls.push({ method, path, body });
+    if (path === '/api/response') {
+      const error = new Error('HTTP 409 /api/response: stale_attempt');
+      error.status = 409;
+      error.detail = { error: 'stale_attempt' };
+      throw error;
+    }
+    return { ok: true };
+  };
+  async function* supersededTurn() {
+    yield {
+      channel: 'result',
+      payload: { text: 'superseded', isError: false, errorMessage: '', stopReason: 'end_turn', model: 'grok-4.5' },
+    };
+  }
+  const runner = createGrokTurnRunner({
+    api,
+    sdkSessionId: 'conv-stale-attempt',
+    cwd: process.cwd(),
+    defaultModel: 'grok-4.5',
+    createAgentHandleImpl: async () => makeHandle(),
+    startGrokTurnImpl: () => supersededTurn(),
+  });
+  const ok = await runner.handlePendingPayload({
+    message: { id: 'msg-st', conversationId: 'conv-stale-attempt', text: 'x', relayMode: 'agent', attemptId: 'attempt-old' },
+  });
+  assert.equal(ok, true);
+  assert.ok(
+    !calls.some((c) => c.path === '/api/requeue'),
+    'a superseded attempt must not requeue the row it lost',
+  );
   await runner.dispose();
 });
 

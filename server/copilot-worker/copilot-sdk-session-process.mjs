@@ -44,6 +44,8 @@
 //     its usage is captured and posted, and a user message delivered while it
 //     runs is steered into it (answered from its own prompt segment) rather
 //     than cross-published into the continuation's row.
+import { randomUUID } from 'crypto';
+
 import {
   USER_INPUT_UNSUPPORTED_ANSWER,
   classifyCopilotSessionError,
@@ -172,6 +174,23 @@ export const DEFAULT_INFINITE_SESSION_CONFIG = Object.freeze({
 
 /** `steerIntoActiveTurn` could not adopt the row; run it as a normal turn. */
 const NOT_STEERED = Symbol('not-steered');
+
+/**
+ * The attempt-fencing echo for a row's write bodies. Every publish that names
+ * a `messageId` also names the attempt it belongs to, so the relay can refuse
+ * writes from a superseded attempt (a requeued row re-delivered elsewhere).
+ * Omitted entirely when the row carries no attempt id (a pre-fencing relay).
+ */
+function attemptFields(message) {
+  return message?.attemptId ? { attemptId: message.attemptId } : {};
+}
+
+/** A 409 whose detail names `stale_attempt`: this attempt was superseded. */
+function isStaleAttemptError(error) {
+  if (Number(error?.status) !== 409) return false;
+  const detail = typeof error?.detail === 'string' ? error.detail : JSON.stringify(error?.detail || '');
+  return detail.includes('stale_attempt');
+}
 
 export function createCopilotSdkSessionRunner({
   api,
@@ -346,6 +365,7 @@ export function createCopilotSdkSessionRunner({
       mode: message.relayMode || 'agent',
       text,
       ...(subagentRunId ? { subagentRunId } : {}),
+      ...attemptFields(message),
     }).catch(() => {});
   }
 
@@ -367,6 +387,7 @@ export function createCopilotSdkSessionRunner({
         text: payload.text,
         done: payload.done === true,
         ...(payload.subagentRunId ? { subagentRunId: payload.subagentRunId } : {}),
+        ...attemptFields(message),
       }).catch(() => {});
       return;
     }
@@ -379,6 +400,7 @@ export function createCopilotSdkSessionRunner({
         text: payload.text,
         done: payload.done === true,
         ...(payload.subagentRunId ? { subagentRunId: payload.subagentRunId } : {}),
+        ...attemptFields(message),
       }).catch(() => {});
       return;
     }
@@ -397,6 +419,7 @@ export function createCopilotSdkSessionRunner({
         ...(payload.parentSubagentId ? { parentSubagentId: payload.parentSubagentId } : {}),
         ...(payload.displayName ? { displayName: payload.displayName } : {}),
         status: payload.status,
+        ...attemptFields(message),
       }).catch(() => {});
     }
   }
@@ -449,6 +472,7 @@ export function createCopilotSdkSessionRunner({
       mode: message.relayMode || 'agent',
       text: String(text || ''),
       done: true,
+      ...attemptFields(message),
     }).catch(() => {});
   }
 
@@ -461,8 +485,16 @@ export function createCopilotSdkSessionRunner({
       modelOrigin: modelOrigin
         || (String(message?.model || '').trim().toLowerCase() === 'auto' ? 'auto' : 'manual'),
       ...(terminalError ? { terminalError } : {}),
-    }).catch(async () => {
-      await api('POST', '/api/requeue', { messageId: message.id }).catch(() => {});
+      ...attemptFields(message),
+    }).catch(async (error) => {
+      // A stale_attempt 409 means the row already moved on to another attempt
+      // (requeued and re-delivered); the requeue would 409 the same way, and
+      // the newer attempt owes the row its answer — drop this one.
+      if (isStaleAttemptError(error)) {
+        dbg('response refused as stale_attempt; dropping', message.id);
+        return;
+      }
+      await api('POST', '/api/requeue', { messageId: message.id, ...attemptFields(message) }).catch(() => {});
     });
   }
 
@@ -1389,6 +1421,10 @@ export function createCopilotSdkSessionRunner({
    * session.
    */
   async function registerContinuationRow(turn) {
+    // One idempotency key for the whole loop: a retry whose predecessor was
+    // created server-side but whose response was lost must get the SAME row
+    // back, not mint a sibling nobody will ever settle.
+    const operationId = randomUUID();
     let response = null;
     for (let attempt = 0; attempt < 3 && !response?.messageId; attempt += 1) {
       if (turn.discarded) return;
@@ -1397,6 +1433,7 @@ export function createCopilotSdkSessionRunner({
         sdkSessionId,
         relayMode: turn.message.relayMode,
         trigger: CONTINUATION_TRIGGER,
+        operationId,
       }).catch((error) => {
         dbg('continuation turn registration failed', error?.message || String(error));
         return null;
@@ -1412,6 +1449,9 @@ export function createCopilotSdkSessionRunner({
       return;
     }
     turn.message.id = String(response.messageId);
+    // The attempt the row was minted under; every publish echoes it, exactly
+    // as a delivered row echoes the attempt id its delivery carried.
+    turn.message.attemptId = String(response.attemptId || '') || null;
     // The route reports which conversation the synthetic row landed on;
     // trusting it beats assuming worker session id === conversation id.
     const conversationId = String(response.conversationId || '').trim();
@@ -1590,7 +1630,7 @@ export function createCopilotSdkSessionRunner({
       // row is safe to requeue — unlike an accepted one.
       turn.steeredRows = turn.steeredRows.filter((entry) => entry !== steered);
       dbg('steering send failed, requeuing the row', message.id, error?.message || String(error));
-      await api('POST', '/api/requeue', { messageId: message.id }).catch(() => {});
+      await api('POST', '/api/requeue', { messageId: message.id, ...attemptFields(message) }).catch(() => {});
       return true;
     }
     // Resolves when the interaction settles this row in `settleSteeredRows`.
@@ -1672,23 +1712,27 @@ export function createCopilotSdkSessionRunner({
   }
 
   /**
-   * Every row this worker owns — the turn's own, plus any steered into it.
+   * Every row this worker owns — the turn's own, plus any steered into it —
+   * as `{ id, attemptId }` entries. A steered row missing from it would be
+   * recovered mid-flight as `owner-heartbeat-mismatch` and re-delivered while
+   * the runtime was still answering it.
    *
    * Both the heartbeat (lease renewal) and the crash guard (requeue-on-exit)
-   * read this. A steered row missing from it would be recovered mid-flight as
-   * `owner-heartbeat-mismatch` and re-delivered while the runtime was still
-   * answering it.
+   * read this: the crash guard takes the entries whole so its requeues stay
+   * fenced to this attempt, while the worker's heartbeat call site unwraps the
+   * ids (the claim payload is id-only).
    */
   function getActiveQueueMessageIds() {
     if (!activeTurn) return [];
-    const ids = [];
-    const primary = String(activeTurn.message?.id || '');
-    if (primary) ids.push(primary);
-    for (const steered of activeTurn.steeredRows || []) {
-      const id = String(steered.message?.id || '');
-      if (id && !ids.includes(id)) ids.push(id);
-    }
-    return ids;
+    const entries = [];
+    const push = (message) => {
+      const id = String(message?.id || '');
+      if (!id || entries.some((entry) => entry.id === id)) return;
+      entries.push({ id, attemptId: message?.attemptId || null });
+    };
+    push(activeTurn.message);
+    for (const steered of activeTurn.steeredRows || []) push(steered.message);
+    return entries;
   }
 
   async function dispose() {

@@ -112,7 +112,10 @@ export function createMessageRepository(db) {
         // A background-continuation turn: born 'processing' and owned by its
         // session worker — the CLI already started it on its own, so it must
         // never be handed out as deliverable work.
-        insertContinuationQ: db.prepare(`INSERT INTO queue (id, conversation_id, runtime_session_id, is_new_conversation, model, relay_mode, text, status, kind, timestamp, processing_at, retry_count, owner_sdk_session_id, owner_assigned_at, owner_lease_expires_at, owner_last_claimed_at) VALUES (?, ?, ?, 0, ?, ?, ?, 'processing', 'continuation', ?, ?, 0, ?, ?, ?, ?)`),
+        insertContinuationQ: db.prepare(`INSERT INTO queue (id, conversation_id, runtime_session_id, is_new_conversation, model, relay_mode, text, status, kind, timestamp, processing_at, retry_count, owner_sdk_session_id, owner_assigned_at, owner_lease_expires_at, owner_last_claimed_at, attempt_id, continuation_op_id) VALUES (?, ?, ?, 0, ?, ?, ?, 'processing', 'continuation', ?, ?, 0, ?, ?, ?, ?, ?, ?)`),
+        // Idempotent continuation registration: a worker retry after a lost
+        // response resolves to the row its operation id already created.
+        findQByContinuationOp: db.prepare(`SELECT * FROM queue WHERE continuation_op_id = ?`),
         setMessageKind: db.prepare(`UPDATE messages SET kind = ? WHERE id = ?`),
         // Quiet teardown for a continuation whose worker died: there is no
         // user to answer, so it fails without the terminal-failure ceremony.
@@ -267,12 +270,13 @@ export function createMessageRepository(db) {
         `),
         countStatus:    db.prepare(`SELECT status, COUNT(*) as cnt FROM queue WHERE status IN ('pending','processing','parked') GROUP BY status`),
         countRuntimeSessions: db.prepare(`SELECT COUNT(*) AS cnt FROM runtime_sessions WHERE status = 'active'`),
-        setProcessing:  db.prepare(`UPDATE queue SET status = 'processing', processing_at = ? WHERE id = ?`),
+        setProcessing:  db.prepare(`UPDATE queue SET status = 'processing', processing_at = ?, attempt_id = ? WHERE id = ?`),
         setProcessingWithWorkerLease: db.prepare(`
           UPDATE queue
           SET
             status = 'processing',
             processing_at = ?,
+            attempt_id = ?,
             owner_sdk_session_id = COALESCE(NULLIF(owner_sdk_session_id, ''), ?),
             owner_assigned_at = COALESCE(owner_assigned_at, ?),
             owner_lease_expires_at = ?,
@@ -281,15 +285,23 @@ export function createMessageRepository(db) {
         `),
         setQueueRuntimeSession: db.prepare(`UPDATE queue SET runtime_session_id = ? WHERE id = ?`),
         setQueueResponseMessageId: db.prepare(`UPDATE queue SET response_message_id = ? WHERE id = ?`),
+        // Legacy (unfenced) finalization keeps 'pending' in the set so a
+        // response landing after a stale-sweep requeue still finalizes; fenced
+        // finalization deliberately does not — a fenced writer whose row went
+        // back to pending has by definition been superseded.
         setDone:        db.prepare(`UPDATE queue SET status = 'done', response = ?, processing_at = NULL, next_attempt_at = NULL, owner_lease_expires_at = NULL WHERE id = ? AND status IN ('processing', 'pending')`),
-        setFailed:      db.prepare(`UPDATE queue SET status = 'failed', response = ?, processing_at = NULL, next_attempt_at = NULL, owner_lease_expires_at = NULL WHERE id = ?`),
+        setDoneFenced:  db.prepare(`UPDATE queue SET status = 'done', response = ?, processing_at = NULL, next_attempt_at = NULL, owner_lease_expires_at = NULL WHERE id = ? AND status = 'processing' AND attempt_id = ?`),
+        // The status set mirrors canTerminalFail (processing/pending/parked):
+        // failure must never overwrite a row another attempt already settled.
+        setFailed:      db.prepare(`UPDATE queue SET status = 'failed', response = ?, processing_at = NULL, next_attempt_at = NULL, owner_lease_expires_at = NULL WHERE id = ? AND status IN ('processing', 'pending', 'parked')`),
+        setFailedFenced: db.prepare(`UPDATE queue SET status = 'failed', response = ?, processing_at = NULL, next_attempt_at = NULL, owner_lease_expires_at = NULL WHERE id = ? AND status = 'processing' AND attempt_id = ?`),
         deleteConvQ:    db.prepare(`DELETE FROM queue WHERE conversation_id = ?`),
         findQById:      db.prepare(`SELECT * FROM queue WHERE id = ?`),
         pruneQueue:     db.prepare(`DELETE FROM queue WHERE status = 'done' AND id NOT IN (SELECT id FROM queue WHERE status = 'done' ORDER BY timestamp DESC LIMIT 200)`),
         // Recovery clears only the lease, never the owner: a recovered row must
         // stay routed to its provider worker so the primer respawns that worker
         // instead of the row becoming claimable by the global relay poll.
-        recoverStale:   db.prepare(`UPDATE queue SET status = 'pending', processing_at = NULL, next_attempt_at = ?, owner_lease_expires_at = NULL, owner_last_claimed_at = NULL WHERE status = 'processing' AND COALESCE(kind, '') != 'continuation' AND processing_at < ?`),
+        recoverStale:   db.prepare(`UPDATE queue SET status = 'pending', processing_at = NULL, attempt_id = NULL, next_attempt_at = ?, owner_lease_expires_at = NULL, owner_last_claimed_at = NULL WHERE status = 'processing' AND COALESCE(kind, '') != 'continuation' AND processing_at < ?`),
         // Staleness is inactivity, not elapsed turn time: owner_last_claimed_at is
         // refreshed by every worker heartbeat for the message it is working on, so a
         // long-but-alive turn keeps moving the cutoff. processing_at is only the
@@ -313,6 +325,7 @@ export function createMessageRepository(db) {
           UPDATE queue
           SET status = 'pending',
               processing_at = NULL,
+              attempt_id = NULL,
               next_attempt_at = @requeueAt,
               owner_lease_expires_at = NULL,
               owner_last_claimed_at = NULL,
@@ -343,6 +356,7 @@ export function createMessageRepository(db) {
           UPDATE queue
           SET status = 'pending',
               processing_at = NULL,
+              attempt_id = NULL,
               next_attempt_at = ?,
               owner_lease_expires_at = NULL,
               owner_last_claimed_at = NULL,

@@ -1,5 +1,6 @@
 import nodeFs from 'node:fs';
 import nodePath from 'node:path';
+import { randomUUID } from 'crypto';
 
 import { buildClaudeUserContent } from './claude-attachments.mjs';
 import {
@@ -25,7 +26,7 @@ import {
 } from './claude-sdk-adapter.mjs';
 import { parseThinkingDisplay, parseThinkingEnabled } from '../../shared/claude-thinking.mjs';
 import { relocateClaudeTranscriptForCwd } from './claude-transcript-relocator.mjs';
-import { createClaudeTurnPublisher } from './claude-turn-publisher.mjs';
+import { attemptFields, createClaudeTurnPublisher, isStaleAttemptError } from './claude-turn-publisher.mjs';
 import { createAskUserBridge } from '../../shared/ask-user-bridge.mjs';
 
 /**
@@ -469,16 +470,23 @@ export function createClaudeSessionRunner({
     return String(proc.activeCtx?.message?.id || proc.pendingDelivered[0]?.ctx.message?.id || '');
   }
 
-  // Every queue row this worker currently owes work for: the running turn
-  // (delivered or continuation) plus any delivered message queued behind it.
-  // The heartbeat reports all of them so the server's owner-recovery never
-  // replays a row the process still holds.
+  // Every queue row this worker currently owes work for, as { id, attemptId }
+  // entries: the running turn (delivered or continuation) plus any delivered
+  // message queued behind it. The heartbeat reports all of them (id-only — its
+  // call site unwraps) so the server's owner-recovery never replays a row the
+  // process still holds; the crash guard takes the entries whole so its
+  // requeues stay fenced to this attempt.
   function getActiveQueueMessageIds() {
     if (!proc) return [];
     return [
-      proc.activeCtx?.message?.id,
-      ...proc.pendingDelivered.map((entry) => entry.ctx.message?.id),
-    ].map((id) => String(id || '').trim()).filter(Boolean);
+      proc.activeCtx?.message,
+      ...proc.pendingDelivered.map((entry) => entry.ctx.message),
+    ]
+      .map((message) => ({
+        id: String(message?.id || '').trim(),
+        attemptId: message?.attemptId || null,
+      }))
+      .filter((entry) => entry.id);
   }
 
   function isTurnActive() {
@@ -648,6 +656,10 @@ export function createClaudeSessionRunner({
     ctx.registered = false;
     activateContext(ctx);
     (async () => {
+      // One idempotency key for the whole loop: a retry whose predecessor was
+      // created server-side but whose response was lost must get the SAME row
+      // back, not mint a sibling nobody will ever settle.
+      const operationId = randomUUID();
       let response = null;
       // Retry on any registration that produced no message id — a truthy but
       // empty response body must not end the loop early.
@@ -659,6 +671,7 @@ export function createClaudeSessionRunner({
           sdkSessionId,
           relayMode: ctx.message.relayMode,
           trigger: 'background_task',
+          operationId,
         }).catch((error) => {
           dbg('continuation turn registration failed', error?.message || String(error));
           return null;
@@ -673,17 +686,24 @@ export function createClaudeSessionRunner({
         dbg('continuation turn discarded (no relay message id)');
         return;
       }
+      const attemptId = String(response.attemptId || '') || null;
       if (ctx.discarded || ctx.finalized) {
         // The context was handed off or settled while registration was in
         // flight; drop the just-created server row (requeue fails a
         // processing continuation quietly) instead of leaving it orphaned.
-        await api('POST', '/api/requeue', { messageId: String(response.messageId) }).catch(() => {});
+        await api('POST', '/api/requeue', {
+          messageId: String(response.messageId),
+          ...(attemptId ? { attemptId } : {}),
+        }).catch(() => {});
         controlPoller?.stop?.(ctx.controlState);
         ctx.controlState = null;
         dbg('continuation turn dropped (handed off during registration)');
         return;
       }
       ctx.message.id = String(response.messageId);
+      // The attempt the row was minted under; every publish echoes it, exactly
+      // as a delivered row echoes the attempt id its delivery carried.
+      ctx.message.attemptId = attemptId;
       // The route reports which conversation the synthetic row landed on;
       // trusting it beats assuming worker session id === conversation id.
       if (String(response.conversationId || '').trim()) {
@@ -985,7 +1005,12 @@ export function createClaudeSessionRunner({
         model: ctx.state.responseModel || model || null,
       });
     } else if (ctx.message?.id) {
-      await api('POST', '/api/requeue', { messageId: ctx.message.id }).catch(() => {});
+      await api('POST', '/api/requeue', { messageId: ctx.message.id, ...attemptFields(ctx.message) })
+        .catch((error) => {
+          // Superseded attempt: the row already belongs to a newer delivery,
+          // so there is nothing left for this one to put back.
+          if (isStaleAttemptError(error)) dbg('requeue refused as stale_attempt', ctx.message.id);
+        });
     }
     closeContext(ctx, true);
   }
@@ -1037,7 +1062,10 @@ export function createClaudeSessionRunner({
       // A discarded continuation that already has its server row must still
       // drop it (requeue fails a processing continuation quietly).
       if (ctx.message?.id) {
-        await api('POST', '/api/requeue', { messageId: ctx.message.id }).catch(() => {});
+        await api('POST', '/api/requeue', { messageId: ctx.message.id, ...attemptFields(ctx.message) })
+          .catch((error) => {
+            if (isStaleAttemptError(error)) dbg('requeue refused as stale_attempt', ctx.message.id);
+          });
       }
       closeContext(ctx, true);
       return;
@@ -1056,7 +1084,10 @@ export function createClaudeSessionRunner({
       await publisher.publishFinalStream(ctx.message, fallbackText);
       await publisher.publishResponse(ctx.message, { text: fallbackText, model });
     } else if (ctx.message?.id) {
-      await api('POST', '/api/requeue', { messageId: ctx.message.id }).catch(() => {});
+      await api('POST', '/api/requeue', { messageId: ctx.message.id, ...attemptFields(ctx.message) })
+        .catch((error) => {
+          if (isStaleAttemptError(error)) dbg('requeue refused as stale_attempt', ctx.message.id);
+        });
     }
     closeContext(ctx, true);
   }

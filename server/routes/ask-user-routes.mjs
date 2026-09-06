@@ -128,6 +128,15 @@ export function registerAskUserRoutes(app, deps) {
     if (!q || q.status !== 'processing') {
       return res.status(409).json({ error: 'No active relay turn' });
     }
+    // Attempt fencing: a caller that names its processing attempt may only
+    // open a card while that attempt still owns the row. The stored value is
+    // always the row's own attempt_id (server-authoritative), so stale-attempt
+    // cleanup covers questions from unfenced callers too.
+    const claimedAttemptId = String(req.body.attemptId || '').trim() || null;
+    if (claimedAttemptId && String(q.attempt_id || '') !== claimedAttemptId) {
+      console.warn(`[${ts()}] STALE ATTEMPT ${String(q.id).slice(0,8)} route=relay-question claimed=${claimedAttemptId.slice(0,8)} current=${String(q.attempt_id || '').slice(0,8) || 'none'}`);
+      return res.status(409).json({ error: 'stale_attempt' });
+    }
 
     const effectiveMessageId = messageId || q.id;
     
@@ -199,6 +208,7 @@ export function registerAskUserRoutes(app, deps) {
       continuation.continuationQuestionId,
       now,
       expiresAt,
+      String(q.attempt_id || '').trim() || null,
     );
 
     const question = formatQuestionRow(stmts.getQuestion.get(questionId));

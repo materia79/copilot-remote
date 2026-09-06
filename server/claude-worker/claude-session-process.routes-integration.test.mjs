@@ -311,6 +311,93 @@ test('an absorbed steering turn settles the real queue rows through the real rou
   await settled(runner);
 });
 
+// ---------------------------------------------------------------------------
+// Idempotent continuation registration. The worker mints one operationId
+// before its first POST and repeats it on retries, so a retry whose previous
+// request committed but lost its HTTP response must resolve to the row it
+// already created — never mint a twin row nobody will ever settle.
+
+test('repeating a continuation registration with one operation id resolves to the same row', async () => {
+  const { db, api } = bootRelayRoutes();
+
+  const first = await api('POST', '/api/continuation-turn', {
+    conversationId: CONV,
+    operationId: 'op-cont-repeat-1',
+  });
+  assert.equal(first.ok, true);
+  assert.ok(first.messageId, 'registration returns the minted row id');
+  assert.ok(first.attemptId, 'a continuation is born with its processing attempt');
+  assert.notEqual(first.existing, true, 'the first registration is not a reuse');
+
+  // The retry: same operation id, same conversation — same row back.
+  const second = await api('POST', '/api/continuation-turn', {
+    conversationId: CONV,
+    operationId: 'op-cont-repeat-1',
+  });
+  assert.equal(second.ok, true);
+  assert.equal(second.messageId, first.messageId, 'the retry resolves to the original row');
+  assert.equal(second.existing, true, 'the retry is flagged as a reuse');
+  assert.equal(second.attemptId, first.attemptId, 'the reused row keeps its birth attempt');
+
+  const rows = db.prepare(`SELECT * FROM queue WHERE kind = 'continuation' AND continuation_op_id = ?`).all('op-cont-repeat-1');
+  assert.equal(rows.length, 1, 'exactly one continuation row exists for the operation id');
+  assert.equal(rows[0].id, first.messageId);
+  assert.equal(rows[0].status, 'processing');
+  assert.equal(rows[0].attempt_id, first.attemptId);
+});
+
+test('distinct continuation operation ids mint distinct rows', async () => {
+  const { db, api } = bootRelayRoutes();
+
+  const first = await api('POST', '/api/continuation-turn', {
+    conversationId: CONV,
+    operationId: 'op-cont-a',
+  });
+  const second = await api('POST', '/api/continuation-turn', {
+    conversationId: CONV,
+    operationId: 'op-cont-b',
+  });
+  assert.notEqual(second.messageId, first.messageId, 'each operation id owns its own row');
+  assert.equal(
+    db.prepare(`SELECT COUNT(*) AS cnt FROM queue WHERE kind = 'continuation'`).get().cnt,
+    2,
+  );
+});
+
+test('a continuation operation id bound to another conversation is refused', async () => {
+  const { db, api } = bootRelayRoutes();
+  // Second claude-bound conversation, same shape as the primary seed.
+  db.prepare(`
+    INSERT INTO conversations (id, title, sdk_session_id, status, created_at, updated_at)
+    VALUES ('conv-cont-other', 'Other conversation', 'conv-cont-other', 'active', ?, ?)
+  `).run(NOW, NOW);
+  db.prepare(`
+    INSERT INTO runtime_sessions (id, conversation_id, sdk_session_id, strategy, runtime_key, model, provider_type, provider_model, status, created_at, last_used_at)
+    VALUES ('rs-cont-other', 'conv-cont-other', 'conv-cont-other', 'isolated', 'runtime-key-rs-cont-other', ?, 'claude', ?, 'active', ?, ?)
+  `).run(MODEL, MODEL, NOW, NOW);
+
+  const first = await api('POST', '/api/continuation-turn', {
+    conversationId: CONV,
+    operationId: 'op-cont-crossed',
+  });
+  assert.equal(first.ok, true);
+
+  // A stale worker replaying the id against a different conversation must be
+  // refused, not handed the other conversation's row.
+  await assert.rejects(
+    () => api('POST', '/api/continuation-turn', {
+      conversationId: 'conv-cont-other',
+      operationId: 'op-cont-crossed',
+    }),
+    /409.*another conversation/i,
+  );
+  // The refusal minted nothing for the other conversation.
+  assert.equal(
+    db.prepare(`SELECT COUNT(*) AS cnt FROM queue WHERE conversation_id = 'conv-cont-other'`).get().cnt,
+    0,
+  );
+});
+
 test('the continuation gate admits copilot providers and fails closed otherwise', async () => {
   const { db, api } = bootRelayRoutes();
   const seed = (conv, provider) => {

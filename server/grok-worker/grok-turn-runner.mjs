@@ -43,6 +43,17 @@ export function buildGrokPlanReadyBoardPayload({
   };
 }
 
+// Delivered rows carry an attemptId the worker echoes on every write so the
+// server can fence out a superseded attempt (HTTP 409 stale_attempt) instead
+// of letting two attempts interleave writes on the same row. The real api
+// client reports the rejection body as a string; tolerate a parsed object too.
+function isStaleAttemptRejection(error) {
+  if (error?.status !== 409) return false;
+  const detail = error?.detail;
+  const text = typeof detail === 'string' ? detail : String(detail?.error || '');
+  return text.includes('stale_attempt');
+}
+
 function buildGrokTerminalError(classified, message) {
   return {
     kind: 'grok-turn-failed',
@@ -119,6 +130,13 @@ export function createGrokTurnRunner({
     return waitingForTurn ? String(activeMessage?.id || '') : '';
   }
 
+  // Crash-guard shape: the attempt id, when known, fences the dying worker's
+  // requeue so it cannot yank back a row a successor attempt now owns.
+  function getActiveQueueAttempt() {
+    if (!waitingForTurn || !activeMessage?.id) return null;
+    return { id: String(activeMessage.id), attemptId: activeMessage.attemptId || null };
+  }
+
   function isTurnActive() {
     return waitingForTurn;
   }
@@ -176,6 +194,7 @@ export function createGrokTurnRunner({
       mode: message.relayMode || 'agent',
       text,
       ...(subagentRunId ? { subagentRunId } : {}),
+      ...(message.attemptId ? { attemptId: message.attemptId } : {}),
     }).catch(() => {});
   }
 
@@ -195,6 +214,7 @@ export function createGrokTurnRunner({
         text: payload.text,
         done: payload.done === true,
         ...(payload.subagentRunId ? { subagentRunId: payload.subagentRunId } : {}),
+        ...(message.attemptId ? { attemptId: message.attemptId } : {}),
       }).catch(() => {});
       return;
     }
@@ -207,6 +227,7 @@ export function createGrokTurnRunner({
         text: payload.text,
         done: payload.done === true,
         ...(payload.subagentRunId ? { subagentRunId: payload.subagentRunId } : {}),
+        ...(message.attemptId ? { attemptId: message.attemptId } : {}),
       }).catch(() => {});
       return;
     }
@@ -222,6 +243,7 @@ export function createGrokTurnRunner({
         parentSubagentId: payload.parentSubagentId || undefined,
         displayName: payload.displayName || undefined,
         status: payload.status,
+        ...(message.attemptId ? { attemptId: message.attemptId } : {}),
       }).catch(() => {});
       return;
     }
@@ -289,6 +311,7 @@ export function createGrokTurnRunner({
       mode: message.relayMode || 'agent',
       text: String(text || ''),
       done: true,
+      ...(message.attemptId ? { attemptId: message.attemptId } : {}),
     }).catch(() => {});
   }
 
@@ -301,8 +324,18 @@ export function createGrokTurnRunner({
       modelOrigin: modelOrigin
         || (String(message?.model || '').trim().toLowerCase() === 'auto' ? 'auto' : 'manual'),
       ...(terminalError ? { terminalError } : {}),
-    }).catch(async () => {
-      await api('POST', '/api/requeue', { messageId: message.id }).catch(() => {});
+      ...(message.attemptId ? { attemptId: message.attemptId } : {}),
+    }).catch(async (error) => {
+      // A stale_attempt rejection means the server already handed this row to
+      // a newer attempt; requeueing would yank it back, so drop instead.
+      if (isStaleAttemptRejection(error)) {
+        dbg('response rejected as stale_attempt; dropping superseded turn', message.id);
+        return;
+      }
+      await api('POST', '/api/requeue', {
+        messageId: message.id,
+        ...(message.attemptId ? { attemptId: message.attemptId } : {}),
+      }).catch(() => {});
     });
   }
 
@@ -433,7 +466,10 @@ export function createGrokTurnRunner({
         await publishFinalStream(message, fallbackText);
         await publishResponse(message, { text: fallbackText, model: responseModel });
       } else {
-        await api('POST', '/api/requeue', { messageId: message.id }).catch(() => {});
+        await api('POST', '/api/requeue', {
+          messageId: message.id,
+          ...(message.attemptId ? { attemptId: message.attemptId } : {}),
+        }).catch(() => {});
       }
       return true;
     }
@@ -513,6 +549,7 @@ export function createGrokTurnRunner({
   return {
     handlePendingPayload,
     getActiveQueueMessageId,
+    getActiveQueueAttempt,
     isTurnActive,
     dispose,
     setTurnCeilingMs(value) {

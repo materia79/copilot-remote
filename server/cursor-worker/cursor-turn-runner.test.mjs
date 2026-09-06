@@ -843,6 +843,79 @@ test('the auth retry clears the failed attempt\'s stream and leaves an activity 
   assert.ok(note, 'the retry must leave an activity trace');
 });
 
+test('a delivered attemptId is echoed on write lanes and absent for legacy rows', async () => {
+  const stub = makeApiStub();
+  let midTurnAttempt = 'unset';
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes: [] }),
+    startCursorRunImpl: queuedTurns([
+      () => {
+        midTurnAttempt = runner.getActiveQueueAttempt();
+        return fakeCursorTurn([evInit(), evDelta('fenced answer.'), evFinished()]);
+      },
+      [evInit(), evDelta('legacy answer.'), evFinished()],
+    ]),
+  }));
+
+  await runner.handlePendingPayload({ message: { ...baseMessage, attemptId: 'attempt-1' } });
+  assert.deepEqual(
+    midTurnAttempt,
+    { id: 'q-1', attemptId: 'attempt-1' },
+    'the crash guard must see the fenced { id, attemptId } shape mid-turn',
+  );
+  assert.equal(runner.getActiveQueueAttempt(), null, 'no fenced attempt outside a turn');
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(response.body.attemptId, 'attempt-1');
+  const streams = stub.calls.filter((call) => call.routePath === '/api/stream');
+  assert.ok(streams.length >= 1);
+  for (const stream of streams) assert.equal(stream.body.attemptId, 'attempt-1');
+
+  stub.calls.length = 0;
+  await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2' } });
+  const legacyResponse = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.ok(!('attemptId' in legacyResponse.body), 'a row without attemptId keeps the legacy body');
+  const legacyStream = stub.calls.find((call) => call.routePath === '/api/stream');
+  assert.ok(!('attemptId' in legacyStream.body));
+});
+
+test('a stale_attempt 409 on the response is dropped; other failures still requeue with the fence', async () => {
+  const staleCalls = [];
+  const staleApi = async (method, routePath, body) => {
+    staleCalls.push({ method, routePath, body });
+    if (routePath === '/api/response') {
+      const error = new Error('HTTP 409 /api/response: stale_attempt');
+      error.status = 409;
+      error.detail = { error: 'stale_attempt' };
+      throw error;
+    }
+    return { ok: true };
+  };
+  const staleRunner = createCursorTurnRunner(baseRunnerOptions({ api: staleApi }, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes: [] }),
+    startCursorRunImpl: queuedTurns([[evInit(), evDelta('superseded answer.'), evFinished()]]),
+  }));
+  await staleRunner.handlePendingPayload({ message: { ...baseMessage, attemptId: 'attempt-old' } });
+  assert.ok(
+    !staleCalls.find((call) => call.routePath === '/api/requeue'),
+    'a superseded attempt must not requeue the row it lost',
+  );
+
+  const failCalls = [];
+  const failApi = async (method, routePath, body) => {
+    failCalls.push({ method, routePath, body });
+    if (routePath === '/api/response') throw new Error('HTTP 500 /api/response');
+    return { ok: true };
+  };
+  const failRunner = createCursorTurnRunner(baseRunnerOptions({ api: failApi }, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes: [] }),
+    startCursorRunImpl: queuedTurns([[evInit(), evDelta('retry me.'), evFinished()]]),
+  }));
+  await failRunner.handlePendingPayload({ message: { ...baseMessage, attemptId: 'attempt-1' } });
+  const requeue = failCalls.find((call) => call.routePath === '/api/requeue');
+  assert.ok(requeue, 'a non-stale response failure still falls back to requeue');
+  assert.deepEqual(requeue.body, { messageId: 'q-1', attemptId: 'attempt-1' }, 'the requeue itself is fenced');
+});
+
 test('a mode nudge swallowed by a failed turn is re-injected on the next attempt', async () => {
   const stub = makeApiStub();
   const started = [];

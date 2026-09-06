@@ -11,8 +11,15 @@ remains the default and is untouched; this file tracks the SDK engine only.
 
 **Status:** implemented (phases 0–4), **burn-in in progress**. Default engine is still Extension.
 Burn-in finding #2 (self-initiated turns were dropped; live session `10a1a9ad`, 2026-08-31) is fixed
-worker-side — but its relay route still refuses Copilot, so it cannot be exercised live yet. See
-[Self-initiated turns](#self-initiated-continuation-turns).
+worker-side, and `/api/continuation-turn` accepts `github`/`openai` alongside `claude`
+(`CONTINUATION_PROVIDER_TYPES`, `server/routes/messages-routes.mjs`), so self-initiated turns are
+live-testable. See [Self-initiated turns](#self-initiated-continuation-turns).
+
+**Hardening (2026-09-06):** every dequeued row now carries a per-attempt `attemptId` which the
+worker echoes on all writes (response/failure/requeue/stream/thought/activity/subagent/questions);
+the server rejects writes from a superseded attempt with 409 `stale_attempt`, and the worker drops
+(never requeues) on that signal. Continuation registration is idempotent: one `operationId` per
+registration, retried verbatim, so a lost response cannot mint a duplicate row.
 
 ## Engine selection
 
@@ -59,7 +66,7 @@ Shared modules it reuses rather than reimplements: `shared/worker-bootstrap.mjs`
 | Steering mid-turn | Implemented | `steerIntoActiveTurn` sends with `mode: 'enqueue'` (live-probed: `immediate` does **not** preempt an in-flight model call, and the whole interaction closes with a single `session.idle`), adopts the row onto the running turn so the lease is renewed and the crash guard requeues both, and answers each row from its own prompt segment indexed by **send order** (`settleSteeredRows`; a row that never got a segment gets `STEERED_ROW_MERGED_NOTE` rather than a requeue that would run it twice). |
 | Abort / Stop | Implemented | `controlPoller.start({ queueMessageId, onAbortTurn })` → `session.abort()`; the runtime's `agent.interrupted` → `session.idle{aborted:true}` settles through the normal terminator. An abort landing before `send()` settles locally; a runtime-initiated abort publishes `RUNTIME_INTERRUPTED_NOTE`. |
 | Idle shutdown | Implemented | `evaluateLifecycle` closes only the runtime (`stopRuntime('idle')`), never the process, after `DEFAULT_IDLE_SHUTDOWN_MS` (10 min, `COPILOT_SDK_RELAY_IDLE_SHUTDOWN_MS`); suppressed while a turn of **either kind** is active, a question card is open, a detached shell is live, or a settled shell's continuation is still due. Stall watchdog `DEFAULT_TURN_STALL_TIMEOUT_MS` (120 s, `COPILOT_SDK_RELAY_TURN_STALL_TIMEOUT_MS`, `0` disables). |
-| Self-initiated (continuation) turns | Implemented | See [the section below](#self-initiated-continuation-turns). **Blocked live**: the relay route refuses non-Claude conversations. |
+| Self-initiated (continuation) turns | Implemented | See [the section below](#self-initiated-continuation-turns). Registration is idempotent (`operationId`) and returns the row's `attemptId`. |
 | Background-task gating | Implemented (shells, not "tasks") | `session.background_tasks_changed` is still useless — empty payload, ~23 per bash call, no id or state — so gating keys on **detached shells** tracked from tool events and `system.notification`'s typed `shell_detached_completed` / `shell_completed` kinds instead (`copilot-continuation-signals.mjs`). Capped by `getBackgroundTaskTimeoutMs()` (`COPILOT_SDK_RELAY_BACKGROUND_TASK_TIMEOUT_MS`, 30 min, `0` = unlimited). Worker `stop_background_task` controls are still logged and ignored: the runtime exposes no host-side stop RPC. |
 | Runtime death detection | Partial (version-fragile) | The SDK exposes no public exit signal, so `observeRuntimeExit` attaches to `client.processExitPromise` — TS-private but present at runtime — degrading to no detection if a future bundle drops it (fallback would be polling `client.ping()` during a turn). `session.shutdown` is deliberately **not** treated as death: the resume fixture shows it arriving from a graceful disconnect right before a healthy turn. |
 | Version skew reporting | Implemented | `describeVersionSkew` / `readRuntimeVersion` (`copilot-sdk-adapter.mjs`) — the SDK is per-CLI-version and never vendored. |
@@ -95,12 +102,12 @@ being dropped — `routeEvent` returned early with no active turn — so the use
 | Question | Answer / evidence |
 | -------- | ----------------- |
 | What opens a continuation? | A live (non-replayed) event in `CONTINUATION_OPENING_EVENT_TYPES` arriving with no active turn. An **allowlist**: a missing opener costs one dropped continuation, a spurious one puts an empty synthetic turn in the transcript. Terminators (`session.idle`/`error`) and connection bookkeeping are excluded by construction. |
-| What row does it publish into? | `POST /api/continuation-turn` (`trigger: 'background_task'`, matching the Claude worker so the relay's `CONTINUATION …` log line reads the same for both engines). The turn buffers its actions until the row has an id, then flushes them in arrival order; 3 attempts, then the output is **discarded** — the turn still lands in the runtime's own transcript, and the worker stays healthy. |
+| What row does it publish into? | `POST /api/continuation-turn` (`trigger: 'background_task'`, matching the Claude worker so the relay's `CONTINUATION …` log line reads the same for both engines). One `operationId` is minted per registration and repeated on every retry, so a committed-but-lost response resolves to the same row instead of a twin; the response's `attemptId` fences all of the turn's writes. The turn buffers its actions until the row has an id, then flushes them in arrival order; 3 attempts, then the output is **discarded** — the turn still lands in the runtime's own transcript, and the worker stays healthy. |
 | How does it end? | Exactly like a delivered turn: `session.idle` / `session.error`, the same stall watchdog, the same abort control (started once the row has an id), the same `finishTurn` publish path, and the same fire-and-forget usage ingest. A continuation spends real quota — the live capture burned a premium request on it. |
 | How is replay kept out? | `createReplayGate`: after `session.resume`, suppress events whose own `timestamp` predates `resumeTime`, at most `eventCount` of them, disarming at the first event that is not older. Both halves are needed — see [the plan's §4e](../plans/copilot-sdk-worker.md) for what each one alone gets wrong. There is no SDK replay flag (`ephemeral` marks transience, not replay). |
 | Steering during one | A delivered row steers into the running continuation like any other interaction. The continuation owns the normalizer's **implicit segment 0** (it sent no prompt), so the first steered prompt opens segment **1** — tracked by `turn.nextSegmentIndex` / `turn.firstSentSegment` rather than derived, because the two turn kinds differ. Getting it wrong cross-publishes the continuation's reply into the user's row. |
 | Relay mode | Inherited from the last delivered turn (`lastRelayMode`): a self-initiated turn has no delivery to read a mode off, and it is a continuation *of* that work. |
-| **Live status** | **Blocked.** `POST /api/continuation-turn` answers **409** unless the runtime session's `provider_type` is `claude`; Copilot binds to `github`/`openai`. The worker degrades correctly (retry, then discard) but no continuation can reach a live relay until that gate is widened — a one-line relay change outside this lane. |
+| **Live status** | **Unblocked.** `POST /api/continuation-turn` accepts `claude`, `github`, and `openai` (`CONTINUATION_PROVIDER_TYPES`); the burn-in checklist row below is live-testable. |
 
 **Do not set `includeSubAgentStreamingEvents: false`.** It defaults to true, and turning it off also
 collapses the *parent's* tool-call argument streaming (live-reproduced twice each way).
@@ -223,10 +230,8 @@ sustained period. Extension removal is a separate future decision.
 - [ ] Resume across worker restart
 - [ ] Relay restart survival
 - [ ] **Self-initiated turns** — ask for a timer longer than a minute; the "it fired" reply must
-      arrive as its own transcript entry (relay log: `CONTINUATION … trigger=background_task`).
-      **Gated on the relay's `/api/continuation-turn` provider check being widened past `claude`;**
-      until then the expected observation is three refused registrations in the worker log and no
-      relay output.
+      arrive as its own transcript entry (relay log: `CONTINUATION … trigger=background_task`,
+      with an `op=` idempotency key).
 - [ ] **Background shell outliving the idle window** — start a shell that takes >10 min; the runtime
       must still be up when it settles (it is the shell's parent), and the reply must arrive.
 - [ ] **The cap** — a shell that never finishes must stop pinning after 30 min

@@ -99,6 +99,10 @@ export function createCopilotQuestionBridge({
       choices,
       allowFreeform,
       sdk_session_id: sdkSessionId || undefined,
+      // Fences the card to the delivering attempt: the server refuses creation
+      // once the row has been requeued to a newer attempt (same field the
+      // shared bridge sends).
+      attemptId: activeMsg?.attemptId || undefined,
       timeout_ms: questionTimeoutMs,
       context: {
         source,

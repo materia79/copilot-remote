@@ -3,7 +3,7 @@
 export function createQuestionRepository(db) {
     return {
         // relay questions
-        insertQuestion: db.prepare(`INSERT INTO relay_questions (id, queue_id, conversation_id, message_id, relay_mode, prompt, choices, request, request_schema, status, answer, structured_answer, sdk_session_id, owner_worker_id, continuation_id, continuation_question_id, created_at, answered_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?, ?, ?, ?, NULL, ?)`),
+        insertQuestion: db.prepare(`INSERT INTO relay_questions (id, queue_id, conversation_id, message_id, relay_mode, prompt, choices, request, request_schema, status, answer, structured_answer, sdk_session_id, owner_worker_id, continuation_id, continuation_question_id, created_at, answered_at, expires_at, attempt_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?, ?, ?, ?, NULL, ?, ?)`),
         getQuestion:    db.prepare(`SELECT * FROM relay_questions WHERE id = ?`),
         findPendingQuestionByMessage: db.prepare(`SELECT * FROM relay_questions WHERE message_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1`),
         listPendingQuestionsByMessage: db.prepare(`SELECT * FROM relay_questions WHERE message_id = ? AND status = 'pending' ORDER BY created_at ASC`),
@@ -11,6 +11,9 @@ export function createQuestionRepository(db) {
         listQuestions:  db.prepare(`SELECT * FROM relay_questions WHERE status = ? AND (? IS NULL OR conversation_id = ?) ORDER BY created_at ASC`),
         timeoutQuestion:db.prepare(`UPDATE relay_questions SET status = 'timed_out' WHERE id = ? AND status = 'pending'`),
         cancelPendingQuestionsByMessage: db.prepare(`UPDATE relay_questions SET status = 'cancelled', answered_at = COALESCE(answered_at, ?) WHERE message_id = ? AND status = 'pending'`),
+        // Cards left behind by a superseded processing attempt. NULL-attempt
+        // rows (created before the fencing deploy) are deliberately left alone.
+        cancelPendingQuestionsForStaleAttempts: db.prepare(`UPDATE relay_questions SET status = 'cancelled', answered_at = COALESCE(answered_at, ?) WHERE message_id = ? AND status = 'pending' AND attempt_id IS NOT NULL AND attempt_id != ? RETURNING id`),
         deleteConvQuestions: db.prepare(`DELETE FROM relay_questions WHERE conversation_id = ?`),
         // RETURNING (run via .all) so the expiry log names exactly the rows
         // that flipped — a separate pre-SELECT could race an answer landing

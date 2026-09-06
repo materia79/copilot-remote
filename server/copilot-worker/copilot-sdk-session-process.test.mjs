@@ -241,7 +241,7 @@ test('the row stays claimed until every publish for it has landed', async () => 
   await runner.handlePendingPayload({ message: baseMessage });
 
   const responsePublish = seen.find((entry) => entry.routePath === '/api/response');
-  assert.deepEqual(responsePublish.ids, ['q-1']);
+  assert.deepEqual(responsePublish.ids, [{ id: 'q-1', attemptId: null }]);
   assert.equal(seen.every((entry) => entry.ids.length === 1), true);
   // …and released once the turn is done.
   assert.deepEqual(runner.getActiveQueueMessageIds(), []);
@@ -575,6 +575,42 @@ test('a rejected /api/response requeues the row', async () => {
   assert.deepEqual(bodyOf(stub, '/api/requeue'), { messageId: 'q-1' });
 });
 
+test('a delivered attempt id is echoed on every write for the row', async () => {
+  // The queue row carries the attempt it was dequeued under; the server
+  // refuses writes whose attempt no longer matches, so every publish that
+  // names the messageId must name the attempt too.
+  const { stub, runner } = setup();
+  await runner.handlePendingPayload({ message: { ...baseMessage, attemptId: 'attempt-1' } });
+
+  const streams = stub.bodiesFor('/api/stream');
+  assert.ok(streams.length >= 2);
+  assert.equal(streams.every((body) => body.attemptId === 'attempt-1'), true);
+  assert.equal(bodyOf(stub, '/api/response').attemptId, 'attempt-1');
+  const activities = stub.bodiesFor('/api/activity');
+  assert.equal(activities.every((body) => body.attemptId === 'attempt-1'), true);
+});
+
+test('a response rejected with a non-409 still requeues, fenced to the attempt', async () => {
+  const { stub, runner } = setup({ apiStubOptions: { failRoutes: new Set(['/api/response']) } });
+  await runner.handlePendingPayload({ message: { ...baseMessage, attemptId: 'attempt-1' } });
+  assert.deepEqual(bodyOf(stub, '/api/requeue'), { messageId: 'q-1', attemptId: 'attempt-1' });
+});
+
+test('a stale_attempt 409 on the response drops the reply instead of requeueing', async () => {
+  // The row already moved on to another attempt (requeued and re-delivered
+  // elsewhere); a requeue from this one would 409 the same way, and looping on
+  // it would fight the attempt that now owns the row.
+  const staleError = Object.assign(new Error('HTTP 409 /api/response: stale_attempt'), {
+    status: 409,
+    detail: 'stale_attempt',
+  });
+  const { stub, runner } = setup({
+    apiStubOptions: { routeResponses: { '/api/response': () => { throw staleError; } } },
+  });
+  assert.equal(await runner.handlePendingPayload({ message: { ...baseMessage, attemptId: 'attempt-old' } }), true);
+  assert.equal(stub.bodiesFor('/api/requeue').length, 0);
+});
+
 test('a turn that ends with no prose publishes the completion note, never a requeue', async () => {
   // Only the terminator: a turn can legitimately end on tool activity alone.
   const { stub, runner } = setup({ events: [{ type: 'session.idle', data: { mode: 'interactive' } }] });
@@ -600,9 +636,10 @@ test('the active queue message id is exposed only while a turn runs', async () =
   const pending = runner.handlePendingPayload({ message: baseMessage });
   await waitFor(() => runner.isTurnActive(), { label: 'turn active' });
   // The claim happens before the runtime is even built — a cold-start delivery
-  // still owns its row.
+  // still owns its row. The entries carry the delivery's attempt id (null
+  // here) so the crash guard's requeues stay fenced.
   assert.equal(runner.getActiveQueueMessageId(), 'q-1');
-  assert.deepEqual(runner.getActiveQueueMessageIds(), ['q-1']);
+  assert.deepEqual(runner.getActiveQueueMessageIds(), [{ id: 'q-1', attemptId: null }]);
 
   await waitFor(() => runner._getState().hasSession, { label: 'session created' });
   client.session.emit({ type: 'session.idle', data: { mode: 'interactive' } });
@@ -952,12 +989,16 @@ test('the heartbeat claims the steered row too, or the relay recovers it mid-fli
 
   const first = runner.handlePendingPayload({ message: baseMessage });
   await waitFor(() => client.session?.sends.length === 1, { label: 'first send' });
-  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2' } });
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', attemptId: 'attempt-q2' } });
   await waitFor(() => runner.getActiveQueueMessageIds().length === 2, { label: 'both rows owned' });
 
   // A row missing from this list is recovered as `owner-heartbeat-mismatch` and
-  // re-delivered while the runtime is still answering it.
-  assert.deepEqual(runner.getActiveQueueMessageIds(), ['q-1', 'q-2']);
+  // re-delivered while the runtime is still answering it. Each entry carries
+  // its OWN row's attempt id, never the host turn's.
+  assert.deepEqual(runner.getActiveQueueMessageIds(), [
+    { id: 'q-1', attemptId: null },
+    { id: 'q-2', attemptId: 'attempt-q2' },
+  ]);
 
   client.session.emit({ type: 'session.idle', data: {} });
   await first;

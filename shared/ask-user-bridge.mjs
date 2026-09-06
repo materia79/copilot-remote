@@ -87,6 +87,9 @@ export function createAskUserBridge({
       choices,
       allowFreeform: true,
       sdk_session_id: sdkSessionId || undefined,
+      // Fences the card to the delivering attempt: the server refuses creation
+      // once the row has been requeued to a newer attempt.
+      attemptId: activeMsg?.attemptId || undefined,
       timeout_ms: questionTimeoutMs,
       context: {
         source: questionSource,
