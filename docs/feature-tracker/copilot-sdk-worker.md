@@ -21,6 +21,15 @@ the server rejects writes from a superseded attempt with 409 `stale_attempt`, an
 (never requeues) on that signal. Continuation registration is idempotent: one `operationId` per
 registration, retried verbatim, so a lost response cannot mint a duplicate row.
 
+Same-day follow-ups (phases 2–5 of the hardening plan): runtime-event ownership separates from
+queue-row publishing (`publishingTurns`), so a fast continuation landing during a prior turn's
+publish window is re-dispatched instead of dropped; continuation registration is cancellable and a
+row created after local abandonment is torn down with a fenced requeue; interactive callbacks await
+`rowReady`; the question bridge expires cards that land after shutdown began. Per-turn reasoning
+effort is applied and model switches are **observed** (`copilot-model-switch.mjs`, below);
+structured elicitation is bridged; the worker publishes model-catalog snapshots; and the transport
+quartet moved to `shared/worker-runtime/` ahead of extension deletion.
+
 ## Engine selection
 
 | Question | Answer / evidence |
@@ -42,7 +51,8 @@ registration, retried verbatim, so a lost response cannot mint a duplicate row.
 | `copilot-sdk-adapter.mjs` | The only module that touches the real SDK: path/version resolution, client start, runtime-exit observation, permission policy, error classification. | `resolveCopilotSdkPaths`, `startCopilotClient`, `observeRuntimeExit`, `describeVersionSkew`, `createCopilotPermissionHandler`, `copilotPermissionDecision`, `isReadOnlyPermissionRequest`, `copilotAgentModeForRelayMode`, `classifyCopilotSessionError`, `classifyCopilotTurnException`, `isCopilotQuotaError`, `isCopilotAuthError`, `isSessionNotFoundError` |
 | `copilot-sdk-event-normalizer.mjs` | Pure `SessionEvent` → relay channel/action mapping. No I/O, no SDK import; one instance per turn. | `createCopilotEventNormalizer`, `isSubagentEvent`, `subagentDisplayName`, `formatToolActivityText`, `summarizeToolInput`, `formatSubagentStats` |
 | `copilot-continuation-signals.mjs` | Pure signal extraction for self-initiated turns: detached-shell liveness, resume-replay discrimination, and which events mean "the runtime started work". No I/O, no SDK import. | `createBackgroundShellTracker`, `createReplayGate`, `isContinuationOpeningEvent`, `describeSettledShell`, `CONTINUATION_OPENING_EVENT_TYPES`, `SHELL_SETTLED_NOTIFICATION_KINDS` |
-| `copilot-question-bridge.mjs` | The runtime's two blocking human surfaces (`ask_user`, ask-mode tool approval) → relay question cards, over `shared/ask-user-bridge.mjs`. | `createCopilotQuestionBridge`, `normalizeUserInputChoices`, `deriveWasFreeform`, `PERMISSION_APPROVE_CHOICE`, `PERMISSION_DENY_CHOICE` |
+| `copilot-question-bridge.mjs` | The runtime's blocking human surfaces (`ask_user`, ask-mode tool approval, structured elicitation) → relay question cards, over `shared/ask-user-bridge.mjs`; tracks in-flight creates + a closing state so shutdown can't strand a card. | `createCopilotQuestionBridge`, `normalizeUserInputChoices`, `deriveWasFreeform`, `PERMISSION_APPROVE_CHOICE`, `PERMISSION_DENY_CHOICE` |
+| `copilot-model-switch.mjs` | Observed model/effort switching: drives `rpc.model.switchTo` / `rpc.model.setReasoningEffort` directly (the `setModel` facade discards results), caches one `rpc.model.list()` per session, waits out `deferred` switches on the `session.model_change` drain, and fails unconfirmed explicit selections (`relay.model-switch-unconfirmed`) instead of running on the wrong model. Relay effort `none` maps to the model's `defaultReasoningEffort` (the SDK union has no `none`). | `createCopilotModelSwitcher` |
 | `copilot-plan-board.mjs` | `plan_ready` board payload, when the text-shape fallback may post one, and the exit-plan feedback strings. | `buildCopilotPlanReadyBoardPayload`, `shouldPostPlanBoard`, `planTextFromExitRequest`, `PLAN_BOARD_ACTIONS`, `PLAN_LINE_THRESHOLD` |
 | `copilot-prompt-context.mjs` | Per-turn relay prompt prefix: mode marker, mode instructions (only on change), `server/relay-tools.md` guidance, live preview block. | `createCopilotPromptContextBuilder`, `withRelayContext`, `loadDefaultRelayToolInstructions` |
 | `copilot-byok-provider.mjs` | `SessionConfig.provider` for OpenAI-compatible BYOK, built from `COPILOT_PROVIDER_*`. | `resolveCopilotProviderConfig`, `resolveOpenAiModelTokenLimits` |
@@ -53,9 +63,10 @@ Shared modules it reuses rather than reimplements: `shared/worker-bootstrap.mjs`
 (`parseSessionIdArg`, `createWorkerDebug`, `readOptionalMs`), `shared/control-poller.mjs`,
 `shared/worker-crash-guard.mjs`, `shared/ask-user-bridge.mjs`, `shared/question-timeout.mjs`,
 `shared/stream-emit-gating.mjs`, `shared/thought-cap.mjs`, `shared/subagent-run-id.mjs`,
-`shared/context-window-fallbacks.mjs`, plus the extension runtime's relay transport
-(`runtime/config-loader.mjs`, `runtime/api-client.mjs`, `runtime/worker-websocket-link.mjs`,
-`polling/heartbeat.mjs`).
+`shared/context-window-fallbacks.mjs`, plus the relay transport quartet in
+`shared/worker-runtime/` (`config-loader.mjs`, `api-client.mjs`, `worker-websocket-link.mjs`,
+`heartbeat.mjs` — relocated 2026-09-06 from `.github/extensions/web-relay/`, where one-line
+re-export shims remain for the extension until its deletion).
 
 ## Relay contract
 
@@ -120,7 +131,7 @@ collapses the *parent's* tool-call argument streaming (live-reproduced twice eac
 | `onPermissionRequest` | Implemented | `createCopilotPermissionHandler` + `copilotPermissionDecision`: read-only tools short-circuit, agent/autopilot auto-approve, plan rejects non-read tools with feedback, ask routes to a relay question card; timeout → `{ kind: 'user-not-available' }`. The decision vocabulary is `approve-once` / `reject` / `user-not-available` only — `{kind:'allow'}` does not exist and is rejected by the runtime. |
 | `onExitPlanModeRequest` | Implemented | Posts the board via `publishPlanBoard(..., 'exit_plan_mode')` and always returns `approved: false` — approving tells the runtime the plan was accepted and the same turn rolls straight into implementing while the board sits unanswered. |
 | Plan-mode text fallback | Implemented | `shouldPostPlanBoard` (`countPlanLikeLines >= PLAN_LINE_THRESHOLD`), gated on plan **and** ask — one mode wider than the siblings, so ask mode additionally requires `!turn.acted` (no non-read permission approved this turn), otherwise the board would offer "Implement in autopilot" for work already done. |
-| `onElicitationRequest` | Not implemented | Declined (`{ action: 'decline' }`) — the relay has no card type for the SDK's structured elicitation on this path. |
+| `onElicitationRequest` | Implemented | → schema question card (`askStructured` in `copilot-question-bridge.mjs`; the create payload carries `requestedSchema`, the validated `structuredAnswer` comes back as `{ action: 'accept', content }`). Url mode, missing schema, timeout, bridge closing, or an unvalidated answer → `{ action: 'decline' }` (the old blanket behavior, now the fallback). Continuation turns await `rowReady` first. |
 | Compaction | Implemented | `DEFAULT_INFINITE_SESSION_CONFIG` sets `enabled: true`, `backgroundCompactionThreshold: 0.80`, `bufferExhaustionThreshold: 0.95` **explicitly** — the runtime's own defaults today, pinned so a future runtime change cannot silently move where a long conversation starts compacting. |
 
 ## BYOK (OpenAI-compatible)
@@ -130,9 +141,12 @@ collapses the *parent's* tool-call argument streaming (live-reproduced twice eac
 `COPILOT_PROVIDER_TYPE === 'openai'` and a key is present. `modelId` is deliberately left unset so
 `setModel()` stays authoritative.
 
-- **Model switch is a different mechanism per session type.** Hosted sessions call
-  `session.setModel()`. BYOK sessions **dispose and resume** — `session.disconnect()`, then
-  `ensureSession()` rebuilds the config with freshly resolved ceilings — because
+- **Model switch is a different mechanism per session type.** Hosted sessions go through
+  `copilot-model-switch.mjs` (`rpc.model.switchTo` with the result observed — deferred switches
+  wait on the `session.model_change` drain, unconfirmed ones fail the row). BYOK sessions try the
+  same RPCs only when the freshly resolved provider ceilings are unchanged; otherwise they
+  **dispose and resume** — `session.disconnect()`, then `ensureSession()` rebuilds the config
+  (now carrying `reasoningEffort`) with freshly resolved ceilings — because
   `SessionConfig.provider` is immutable mid-session in runtime 1.0.82. Nothing is lost: the SDK
   session id is the relay session id, so the rebuild takes the ordinary resume path.
 - **Token ceilings** come from `resolveModelTokenCeilings(model)` in
@@ -173,8 +187,12 @@ on its own, and after a switch back to the extension engine nothing would ever r
 - **No tmux TUI inspector** for SDK sessions — a headless runtime has no TUI to attach to.
   `tmux attach` shows the worker's own log lines (as for Claude/Cursor/Grok).
 - **No thinking stream** for hosted models (encrypted reasoning; see the event table).
-- **Structured elicitation forms** are declined rather than bridged.
-- Built-in slash-command parity headless is unverified — an open item for burn-in.
+- **Built-in slash commands**: feasible but deferred. SDK 1.0.13 exposes an `@experimental`
+  `rpc.commands` namespace (`list`/`invoke`/`execute`/`enqueue` — `generated/rpc.d.ts:24603-24652`)
+  that covers built-ins headless; the caveat is that `invoke` results of kind `agent-prompt`,
+  `show-dialog`, and `set-model`/`set-plan-model` require the client to enact the effect itself,
+  so full parity is real integration work, not a flag flip. Custom commands would ride
+  `SessionConfig.commands` + the `command.execute` event.
 
 ## Test topology
 
@@ -188,8 +206,8 @@ JSON-RPC protocol exists, and none is planned — see [the plan's §4c](../plans
 
 | Suite | Tests | Covers |
 | ----- | ----- | ------ |
-| `server/copilot-worker/copilot-sdk-session-process.test.mjs` | 74 | turn state machine, resume, steering, abort, idle/stall, plan boards, usage capture |
-| `server/copilot-worker/copilot-sdk-continuation-turn.test.mjs` | 22 | self-initiated turns end to end over the live timer capture: row registration, reply attribution, streams/activity, usage, heartbeat ownership, replay suppression, lifecycle pinning + cap expiry, steering during a continuation, degraded relay |
+| `server/copilot-worker/copilot-sdk-session-process.test.mjs` | 87 | turn state machine, resume, steering, abort, idle/stall, plan boards, usage capture, attempt-fencing echo, observed model/effort switching, elicitation round-trip |
+| `server/copilot-worker/copilot-sdk-continuation-turn.test.mjs` | 27 | self-initiated turns end to end over the live timer capture: idempotent registration, reply attribution, streams/activity, usage, heartbeat ownership, replay suppression, lifecycle pinning + cap expiry, steering during a continuation, degraded relay, publish-window event rerouting, late-registration teardown, rowReady-gated questions |
 | `server/copilot-worker/copilot-continuation-signals.test.mjs` | 19 | shell open/settle/close signals, replay-window arithmetic, opener allowlist |
 <!-- The continuation suite's fake client replays its fixture on the FIRST send only, so a
      steered second prompt does not re-answer with the first turn's transcript. A test that
@@ -197,13 +215,15 @@ JSON-RPC protocol exists, and none is planned — see [the plan's §4c](../plans
      turn never sees a terminator and sits out the whole 120 s stall watchdog before passing, which
      reads as a hung suite rather than a slow one. -->
 
-| `server/copilot-worker/copilot-sdk-event-normalizer.test.mjs` | 33 | event → channel mapping, subagent lane, terminal guards |
-| `server/copilot-worker/copilot-sdk-adapter.test.mjs` | 28 | path/version resolution, permission policy, error classification |
+| `server/copilot-worker/copilot-sdk-event-normalizer.test.mjs` | 38 | event → channel mapping, subagent lane, terminal guards |
+| `server/copilot-worker/copilot-sdk-adapter.test.mjs` | 30 | path/version resolution, permission policy, error classification (structured auth + current quota wording) |
+| `server/copilot-worker/copilot-model-switch.test.mjs` | 20 | switchTo/setReasoningEffort selection, none→default mapping, deferred drain/expiry, confirmation-required, BYOK RPC-first vs rebuild |
+| `server/copilot-worker/copilot-sdk-model-snapshot.test.mjs` | 7 | catalog snapshots on start/resume/model_change, dedupe, BYOK skip |
 | `server/copilot-worker/copilot-byok-provider.test.mjs` | 14 | provider config, ceilings, override validation |
-| `server/copilot-worker/copilot-question-bridge.test.mjs` | 11 | ask_user + approval cards, freeform flag |
-| `server/copilot-worker/copilot-attachments.test.mjs` | 10 | inline blob vs file refs |
+| `server/copilot-worker/copilot-question-bridge.test.mjs` | 16 | ask_user + approval cards, freeform flag, schema cards, closing-state expiry |
+| `server/copilot-worker/copilot-attachments.test.mjs` | 14 | inline blob vs file refs, decoded-size ceiling for data URLs |
 | `server/copilot-worker/copilot-plan-board.test.mjs` | 8 | board payload, fallback gating |
-| `server/copilot-worker/copilot-prompt-context.test.mjs` | 8 | prompt prefix composition |
+| `server/copilot-worker/copilot-prompt-context.test.mjs` | 9 | prompt prefix composition, commit-after-send |
 | `server/services/session-worker-launch-service.copilot-sdk.test.mjs` | 12 | launch env, refusal reasons |
 | `server/routes/sessions-routes-copilot-settings.test.mjs` | 10 | engine GET/POST, 400 vs 409, broadcast suppression on refusal |
 | `server/public/app/copilot-engine-ui.test.mjs` | 6 | panel state machine (JSDOM over the real `index.html`) |

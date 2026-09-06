@@ -270,3 +270,33 @@ test('the unconfirmed error carries the stable code the relay keys on', () => {
   assert.equal(isModelSwitchUnconfirmedError(new Error('x')), false);
   assert.equal(DEFAULT_MODEL_SWITCH_TIMEOUT_MS, 10_000);
 });
+
+test('catalogEntries shares the effort-validation cache: one list() serves both', async () => {
+  const switcher = createCopilotModelSwitcher();
+  const session = makeSession({ catalog: [REASONING_MODEL, PLAIN_MODEL] });
+
+  const entries = await switcher.catalogEntries(session);
+  assert.deepEqual(entries.map((entry) => entry.id), ['gpt-5.4', 'gpt-4o']);
+  // The raw ModelInfo rides through untouched — the snapshot publisher needs
+  // the capability/billing fields, not a projection.
+  assert.equal(entries[0], REASONING_MODEL);
+  assert.equal(session.rpc.model.listCalls, 1);
+
+  // An effort validation after the snapshot read costs no second RPC…
+  await switcher.apply(session, { model: 'gpt-5.4', effort: 'high' });
+  assert.equal(session.rpc.model.listCalls, 1);
+  // …and neither does a repeat snapshot read.
+  await switcher.catalogEntries(session);
+  assert.equal(session.rpc.model.listCalls, 1);
+});
+
+test('catalogEntries on a refused list is empty and cached, not retried', async () => {
+  const switcher = createCopilotModelSwitcher();
+  let listAttempts = 0;
+  const session = makeSession({ list: async () => { listAttempts += 1; throw new Error('list refused'); } });
+
+  assert.deepEqual(await switcher.catalogEntries(session), []);
+  assert.deepEqual(await switcher.catalogEntries(session), []);
+  // Cached-as-empty is the standing degradation policy for a failed list.
+  assert.equal(listAttempts, 1);
+});

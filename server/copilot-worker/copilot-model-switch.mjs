@@ -190,25 +190,41 @@ export function createCopilotModelSwitcher({
     };
   }
 
+  /** Populate the per-session catalog cache from one `rpc.model.list()` call. */
+  async function ensureCatalog(session) {
+    if (catalog) return;
+    const list = typeof session?.rpc?.model?.list === 'function'
+      ? await session.rpc.model.list().catch((error) => {
+        dbg('rpc.model.list failed; effort validation degrades to the runtime', error?.message || String(error));
+        return null;
+      })
+      : null;
+    // A failed list is cached as empty rather than retried per turn: the
+    // degradation (send the effort, let the runtime validate) is safe.
+    catalog = new Map();
+    for (const entry of (Array.isArray(list?.list) ? list.list : [])) {
+      const id = String(entry?.id || '').trim();
+      if (id) catalog.set(id, entry);
+    }
+  }
+
   /** The catalog entry for a model, from one cached per-session list() call. */
   async function modelInfo(session, model) {
     if (!model) return null;
-    if (!catalog) {
-      const list = typeof session?.rpc?.model?.list === 'function'
-        ? await session.rpc.model.list().catch((error) => {
-          dbg('rpc.model.list failed; effort validation degrades to the runtime', error?.message || String(error));
-          return null;
-        })
-        : null;
-      // A failed list is cached as empty rather than retried per turn: the
-      // degradation (send the effort, let the runtime validate) is safe.
-      catalog = new Map();
-      for (const entry of (Array.isArray(list?.list) ? list.list : [])) {
-        const id = String(entry?.id || '').trim();
-        if (id) catalog.set(id, entry);
-      }
-    }
+    await ensureCatalog(session);
     return catalog.get(model) || null;
+  }
+
+  /**
+   * The cached catalog as raw ModelInfo entries, fetching it on first use —
+   * the SAME single list() the effort validation reads, so a snapshot publish
+   * never adds a second RPC to a session that already validated an effort.
+   * Empty when the runtime refused the list; callers treat that as "nothing
+   * to publish" rather than an error.
+   */
+  async function catalogEntries(session) {
+    await ensureCatalog(session);
+    return [...catalog.values()];
   }
 
   /**
@@ -375,5 +391,6 @@ export function createCopilotModelSwitcher({
     noteApplied,
     reset,
     current,
+    catalogEntries,
   };
 }

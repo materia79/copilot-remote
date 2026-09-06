@@ -428,7 +428,6 @@ export function createPollingLoop({
   setModelForMessage,
   buildPromptWithRelayContext,
   sendAndWaitWithHardTimeout,
-  sendWithBestEffortStreaming,
   extractFinalText,
   extractGeneratedImages = () => [],
   getLastActivityText,

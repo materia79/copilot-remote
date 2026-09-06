@@ -223,17 +223,7 @@ function extractGeneratedImages(finalEvent) {
   return deduped.slice(0, 8);
 }
 
-export function createSessionIoHelpers({ getSession, sleep, dbg = () => {} }) {
-  const STREAM_WAIT_POLL_MS = 5_000;
-  const WAIT_TICK = Symbol("relay-stream-wait-tick");
-
-  function buildRelayStreamTimeoutError(timeoutMs) {
-    const error = new Error(`Hard timeout after ${timeoutMs}ms while streaming session.send`);
-    error.code = "RELAY_STREAM_TIMEOUT";
-    error.stableCode = "relay.stream-timeout";
-    return error;
-  }
-
+export function createSessionIoHelpers({ getSession, dbg = () => {} }) {
   async function sendAndWaitWithHardTimeout(payload, timeoutMs) {
     // The loser timer is cancelled when the race settles: a fast turn must
     // not leave a five-minute timer armed to fire a rejection into a settled
@@ -252,65 +242,6 @@ export function createSessionIoHelpers({ getSession, sleep, dbg = () => {} }) {
     } finally {
       if (timer) clearTimeout(timer);
     }
-  }
-
-  async function sendWithBestEffortStreaming(payload, timeoutMs, onEvent, options = {}) {
-    const session = getSession();
-    if (!session) throw new Error("No active Copilot session");
-    if (typeof session.send !== "function") {
-      return sendAndWaitWithHardTimeout(payload, timeoutMs);
-    }
-
-    const streamOrResult = await session.send(payload);
-    if (streamOrResult && typeof streamOrResult[Symbol.asyncIterator] === "function") {
-      const deadline = Date.now() + timeoutMs + 5_000;
-      let finalEvent = null;
-      const iterator = streamOrResult[Symbol.asyncIterator]();
-      const onWaiting = typeof options?.onWaiting === "function" ? options.onWaiting : null;
-      const waitPollMs = Math.max(250, Math.min(Number(options?.waitPollMs) || STREAM_WAIT_POLL_MS, 30_000));
-
-      try {
-        while (true) {
-          const remainingMs = deadline - Date.now();
-          if (remainingMs <= 0) {
-            throw buildRelayStreamTimeoutError(timeoutMs);
-          }
-
-          const nextOrTick = await Promise.race([
-            iterator.next(),
-            sleep(Math.min(waitPollMs, remainingMs)).then(() => WAIT_TICK),
-          ]);
-
-          if (nextOrTick === WAIT_TICK) {
-            if (onWaiting) {
-              await onWaiting({
-                timeoutMs,
-                deadline,
-                remainingMs: Math.max(0, deadline - Date.now()),
-              });
-            }
-            continue;
-          }
-
-          if (nextOrTick?.done) break;
-          const event = nextOrTick?.value;
-          finalEvent = event;
-          if (typeof onEvent === "function") {
-            try { await onEvent(event); } catch {}
-          }
-        }
-      } finally {
-        if (typeof iterator?.return === "function") {
-          try { await iterator.return(); } catch {}
-        }
-      }
-      return finalEvent || {};
-    }
-
-    if (typeof onEvent === "function") {
-      try { await onEvent(streamOrResult); } catch {}
-    }
-    return streamOrResult;
   }
 
   function extractFinalTextWithLogging(finalEvent) {
@@ -344,6 +275,5 @@ export function createSessionIoHelpers({ getSession, sleep, dbg = () => {} }) {
     extractFinalText: extractFinalTextWithLogging,
     extractGeneratedImages: extractGeneratedImagesWithLogging,
     sendAndWaitWithHardTimeout,
-    sendWithBestEffortStreaming,
   };
 }

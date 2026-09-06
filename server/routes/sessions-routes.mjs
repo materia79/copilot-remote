@@ -1976,6 +1976,11 @@ export function registerSessionsRoutes(app, deps) {
     refreshOpenAIProviderModels = async () => ({ ok: false, models: [], error: 'OpenAI model discovery is unavailable' }),
     getCopilotProviderSettings = () => ({ engine: 'extension', engines: ['extension', 'sdk'] }),
     setCopilotProviderSettings = () => ({ ok: false, error: 'Copilot settings are unavailable' }),
+    // Server-side Copilot model discovery (Phase 5A) — optional so route tests
+    // that don't exercise the catalog can omit it. When present it also gets
+    // the models_updated broadcaster, since only this module knows how to
+    // layer provider models onto the base catalog payload.
+    copilotModelDiscoveryService = null,
     getClaudeProviderSettings = () => ({ configured: false, enabled: false, model: 'claude-sonnet-5', models: [] }),
     setClaudeProviderSettings = () => ({ ok: false, error: 'Claude settings are unavailable' }),
     refreshClaudeProviderModels = async () => ({ ok: false, models: [], error: 'Claude model discovery is unavailable' }),
@@ -2218,6 +2223,12 @@ export function registerSessionsRoutes(app, deps) {
       getGrokProviderSettings(),
     );
   }
+
+  // A discovery that lands outside any route (the deferred boot refresh) still
+  // has to reach connected pickers the way a snapshot POST does.
+  copilotModelDiscoveryService?.setOnCatalogUpdated?.(() => {
+    io.emit('models_updated', buildModelCatalogWithProviders(getModelCatalogState()));
+  });
 
   function extractClientIp(req) {
     const forwardedForHeader = String(req.headers?.['x-forwarded-for'] || '').trim();
@@ -4975,6 +4986,10 @@ export function registerSessionsRoutes(app, deps) {
     // which models exist, only which process runs them. Running workers are
     // deliberately left alone — the new engine applies to the next spawn.
     io.emit('copilot_settings_updated', settingsPayload);
+    // Fire-and-forget: an engine flip to SDK is exactly when the extension
+    // stops publishing snapshots, so re-run the server-side discovery in the
+    // background (it dedupes/skips on its own; a failure keeps the catalog).
+    void copilotModelDiscoveryService?.refresh?.('settings-change');
     return res.json({ ok: true, ...settingsPayload });
   });
 
@@ -6122,8 +6137,14 @@ export function registerSessionsRoutes(app, deps) {
         grokSettings?.enabled === true
           ? refreshGrokProviderModels()
           : Promise.resolve({ ok: true, skipped: true, models: [], error: null }),
+        // Copilot SDK discovery self-gates on an installed CLI (skipped:true
+        // when there is none), so unlike the providers above it has no
+        // enablement flag to check here.
+        typeof copilotModelDiscoveryService?.refresh === 'function'
+          ? copilotModelDiscoveryService.refresh('manual-refresh')
+          : Promise.resolve({ ok: true, skipped: true, models: [], error: null }),
       ];
-      const [cliRefresh, openAIRefresh, claudeRefresh, cursorRefresh, grokRefresh] = await Promise.allSettled(refreshTasks);
+      const [cliRefresh, openAIRefresh, claudeRefresh, cursorRefresh, grokRefresh, copilotDiscoveryRefresh] = await Promise.allSettled(refreshTasks);
       if (cliRefresh.status === 'rejected') throw cliRefresh.reason;
       const openAIModelDiscovery = openAIRefresh.status === 'fulfilled'
         ? openAIRefresh.value
@@ -6153,6 +6174,9 @@ export function registerSessionsRoutes(app, deps) {
             models: Array.isArray(grokSettings?.models) ? grokSettings.models : [],
             error: grokRefresh.reason?.message || 'Grok model discovery failed',
           };
+      const copilotModelDiscovery = copilotDiscoveryRefresh.status === 'fulfilled'
+        ? copilotDiscoveryRefresh.value
+        : { ok: false, models: [], error: copilotDiscoveryRefresh.reason?.message || 'Copilot model discovery failed' };
       io.emit('models_updated', buildModelCatalogWithProviders(
         getModelCatalogState(),
       ));
@@ -6163,6 +6187,7 @@ export function registerSessionsRoutes(app, deps) {
         claudeModelDiscovery,
         cursorModelDiscovery,
         grokModelDiscovery,
+        copilotModelDiscovery,
       });
     } catch (error) {
       return res.status(500).json({

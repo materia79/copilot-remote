@@ -88,6 +88,7 @@ import {
   withRelayContext,
 } from './copilot-prompt-context.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
+import { extractModelDescriptors } from '../../shared/model-descriptors.mjs';
 
 // How long the runtime may sit with no session activity before the worker
 // closes it. The worker process itself stays up and reconnects lazily on the
@@ -292,6 +293,13 @@ export function createCopilotSdkSessionRunner({
   // The in-flight ingest POST, exposed only as a test seam. Never awaited by
   // the turn path — that is the entire point of it.
   let usagePostChain = Promise.resolve();
+  // The last catalog content this worker POSTed to `/api/models/snapshot`,
+  // as a serialized signature. Identity of CONTENT, not of session: an idle
+  // shutdown and resume onto the same catalog must not re-publish it.
+  let lastModelSnapshotSignature = '';
+  // The in-flight snapshot POST — a chain like `usagePostChain`, and equally a
+  // test seam only: the turn path never awaits a snapshot.
+  let modelSnapshotChain = Promise.resolve();
   let starting = null;
   let disposed = false;
   let detachRuntimeExit = () => {};
@@ -657,6 +665,68 @@ export function createCopilotSdkSessionRunner({
       .catch((error) => { dbg('usage ingest failed', error?.message || String(error)); });
   }
 
+  /**
+   * Publish the session's model catalog to `/api/models/snapshot` (Phase 5A:
+   * with the extension retired, worker snapshots and the server-side discovery
+   * service are what keep the relay's catalog populated).
+   *
+   * Fire-and-forget on a chain, exactly like `postTurnUsage`: a catalog is
+   * never worth a millisecond of a turn, and the failure mode is "the relay
+   * keeps its previous catalog" — swallowed after a debug line. The entries
+   * come from the switcher's cached per-session `rpc.model.list()`, so the
+   * common case adds zero RPCs; an unchanged catalog is deduped by content
+   * signature rather than re-POSTed on every resume.
+   *
+   * BYOK sessions never publish: their list is the OpenAI-compatible
+   * endpoint's per-key lineup, not the Copilot catalog, and a snapshot from
+   * one would overwrite the relay-wide picker with it.
+   */
+  function publishModelSnapshot(reason) {
+    if (byokProvider || !session) return;
+    const target = session;
+    modelSnapshotChain = modelSnapshotChain
+      .then(async () => {
+        const entries = await modelSwitch.catalogEntries(target);
+        const descriptors = extractModelDescriptors(entries);
+        // An empty list is the runtime refusing to answer, not an empty
+        // catalog — publishing it would only blank the pickers' metadata.
+        if (!descriptors.length) return;
+        const models = descriptors.map((entry) => entry.modelId);
+        const contextLimitsByModel = Object.fromEntries(
+          descriptors
+            .filter((entry) => entry.contextLimitTokens !== null)
+            .map((entry) => [entry.modelId, entry.contextLimitTokens]),
+        );
+        const modelMetadataByModel = Object.fromEntries(
+          descriptors.map((entry) => [entry.modelId, {
+            defaultContextLimitTokens: entry.contextLimitTokens,
+            longContextLimitTokens: entry.longContextLimitTokens,
+            pricing: entry.pricing,
+          }]),
+        );
+        const currentModel = appliedModel() || defaultModel || null;
+        const payload = {
+          // Same field set the extension and the standalone relay publish;
+          // the route reads exactly these seven keys and nothing else.
+          source: `copilot-sdk-worker:${reason}`,
+          models,
+          contextLimitsByModel,
+          modelMetadataByModel,
+          currentModel,
+          defaultModel: currentModel || models[0] || null,
+          error: null,
+        };
+        const signature = JSON.stringify([models, contextLimitsByModel, modelMetadataByModel, currentModel]);
+        if (signature === lastModelSnapshotSignature) return;
+        await api('POST', '/api/models/snapshot', payload);
+        // Recorded only after the POST lands, so a transient relay failure
+        // retries on the next trigger instead of being deduped away.
+        lastModelSnapshotSignature = signature;
+        dbg('model snapshot published', reason, `models=${models.length}`, `current=${currentModel || 'unknown'}`);
+      })
+      .catch((error) => { dbg('model snapshot publish failed', reason, error?.message || String(error)); });
+  }
+
   // ---------------------------------------------------------------- session --
 
   function routeEvent(event) {
@@ -675,6 +745,9 @@ export function createCopilotSdkSessionRunner({
     // Behind the replay gate on purpose: a historical `session.model_change`
     // must not confirm a pending switch.
     modelSwitch.observeEvent(event);
+    // A LIVE model change moves the catalog's currentModel; replays cannot get
+    // here (the gate above), so this cannot re-publish days-old state.
+    if (event?.type === 'session.model_change') publishModelSnapshot('model-change');
     let turn = activeTurn;
     if (!turn) {
       // The runtime started work with no row open. Anything that is not the
@@ -1131,6 +1204,12 @@ export function createCopilotSdkSessionRunner({
           await modelSwitch.apply(session, { model, effort, byok: false });
         }
       }
+      // The freshly (re)built session is the first chance to see the runtime's
+      // catalog — publish it so a restarted relay repopulates without waiting
+      // for a model switch. Off the turn's critical path (fire-and-forget) and
+      // deduped, so an unchanged catalog on every resume costs one list() and
+      // no POST.
+      publishModelSnapshot(resumed ? 'session-resume' : 'session-start');
       return session;
     }
     return applySelection(model, effort, relayMode);
@@ -2056,6 +2135,8 @@ export function createCopilotSdkSessionRunner({
     // never awaits this, which is what keeps a slow relay from holding a
     // finished reply.
     whenUsagePosted: () => usagePostChain,
+    // The in-flight model-catalog snapshot POST — the same kind of seam.
+    whenModelSnapshotPosted: () => modelSnapshotChain,
     // Test seams / observability.
     _getState: () => ({
       hasClient: !!client,

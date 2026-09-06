@@ -64,7 +64,8 @@ import { createCursorDashboardUsageFetcher, readCursorIdeSessionToken } from './
 import { fetchPersonalBillingUsage } from './services/github-billing-usage.mjs';
 import { createSessionTranscriptService } from './services/session-transcript-service.mjs';
 import { createSdkSessionImportService } from './services/sdk-session-import-service.mjs';
-import { createInstalledCopilotClient, getCopilotBaseDirs } from './copilot-sdk-runtime.mjs';
+import { createCopilotModelDiscoveryService } from './services/copilot-model-discovery-service.mjs';
+import { createInstalledCopilotClient, getCopilotBaseDirs, resolveInstalledCopilotPaths } from './copilot-sdk-runtime.mjs';
 import { createSessionHistoryRefreshService } from './services/session-history-refresh-service.mjs';
 import { createContextSnapshotService } from './services/context-snapshot-service.mjs';
 import { createClaudeSessionRootResolver } from './services/claude-session-root-service.mjs';
@@ -2986,7 +2987,9 @@ async function refreshModelVariantCatalogFromCli() {
   let source = 'rpc-snapshot';
   let modelIds = [];
   let reasoningEfforts = SUPPORTED_REASONING_EFFORTS.slice();
-  const hasAuthoritativeSnapshot = /^(web-relay-extension|standalone-relay):/.test(String(modelCatalog.source || ''));
+  // All four publishers read the runtime's real model list, so any of their
+  // snapshots outranks the CLI help-text fallback below.
+  const hasAuthoritativeSnapshot = /^(web-relay-extension|standalone-relay|copilot-sdk-worker|server-discovery):/.test(String(modelCatalog.source || ''));
   const refreshSelectionFromSnapshot = selectModelIdsForVariantRefresh({
     snapshotModels: hasAuthoritativeSnapshot && Array.isArray(modelCatalog.models) ? modelCatalog.models : [],
     currentModel: modelCatalog.currentModel,
@@ -6100,6 +6103,23 @@ const sdkSessionImportService = createSdkSessionImportService({
   ),
   logger: console,
 });
+// Phase 5A: server-side Copilot model discovery. Once the extension retires,
+// nothing populates the model catalog on a fresh boot until a worker spawns;
+// this asks the installed CLI runtime for `listModels()` directly (deferred —
+// see the listen callback) and feeds updateModelCatalog in-process. It
+// feature-detects the CLI before spawning anything, so a relay without Copilot
+// stays silent.
+const copilotModelDiscoveryService = createCopilotModelDiscoveryService({
+  createClient: () => createInstalledCopilotClient({
+    config,
+    cwd: currentWorkspaceRootPath(),
+    baseDirectory: path.dirname(resolveSessionStateRoot()),
+    logLevel: 'error',
+  }),
+  resolveInstalledPaths: () => resolveInstalledCopilotPaths({ config }),
+  updateModelCatalog,
+  logger: console,
+});
 const contextSnapshotService = createContextSnapshotService({
   fs,
   path,
@@ -6913,6 +6933,7 @@ const sharedRouteDeps = {
   readContextFromSessionEvents,
   sessionHistoryRefreshService,
   sdkSessionImportService,
+  copilotModelDiscoveryService,
   readSessionTranscriptMessages,
   readSessionUsageSummary,
   collectOrphanedUploadsFromConversation,
@@ -7496,6 +7517,12 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
   const importerShutdown = sdkSessionImportService.dispose().catch((error) => {
     console.warn(`${runtimeLogPrefix()}SDK session importer shutdown failed: ${error?.message || error}`);
   });
+  // Same treatment for a model discovery in flight: its dispose() tears the
+  // live client down first, so this settles promptly rather than waiting out
+  // the discovery timeout (the force-exit timer below still caps everything).
+  const discoveryShutdown = copilotModelDiscoveryService.dispose().catch((error) => {
+    console.warn(`${runtimeLogPrefix()}Copilot model discovery shutdown failed: ${error?.message || error}`);
+  });
   try { claudeAuthService.dispose(); } catch (error) {
     console.warn(`${runtimeLogPrefix()}Claude auth service shutdown failed: ${error?.message || error}`);
   }
@@ -7554,9 +7581,12 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
     // inside the 2s force-exit budget above.
     // Deliberately not unref'd: this timer must fire for the process to exit
     // cleanly. The unref'd force-exit timer above is the backstop if it does not.
-    // Importer disposal is awaited first so an in-flight session import settles
-    // before the process exits; the force-exit timer caps how long that can take.
-    setTimeout(() => { void importerShutdown.finally(closeTransports); }, SHUTDOWN_SOCKET_FLUSH_MS);
+    // Importer and discovery disposal are awaited first so an in-flight
+    // session import or model discovery settles before the process exits; the
+    // force-exit timer caps how long that can take.
+    setTimeout(() => {
+      void Promise.allSettled([importerShutdown, discoveryShutdown]).then(closeTransports);
+    }, SHUTDOWN_SOCKET_FLUSH_MS);
   });
 
   return runtimeShutdownPromise;
@@ -7652,4 +7682,7 @@ httpServer.listen(config.port, listenHost, () => {
   void sdkSessionImportService.runStartupImport().catch((error) => {
     console.warn(`${runtimeLogPrefix()}SDK session import startup failed: ${error?.message || error}`);
   });
+  // Deferred and unref'd (a few seconds behind the startup import's own CLI
+  // spawn); a relay without an installed Copilot CLI skips it entirely.
+  copilotModelDiscoveryService.scheduleStartupRefresh();
 });

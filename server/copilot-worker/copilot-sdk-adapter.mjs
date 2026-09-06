@@ -23,7 +23,7 @@ import {
   isStructuredQuotaError,
   normalizeTerminalSendAndWaitError,
   toKebabToken,
-} from '../../.github/extensions/web-relay/runtime/send-and-wait-errors.mjs';
+} from '../../shared/worker-runtime/send-and-wait-errors.mjs';
 import {
   MODEL_SWITCH_UNCONFIRMED_CODE,
   MODEL_SWITCH_UNCONFIRMED_STABLE_CODE,

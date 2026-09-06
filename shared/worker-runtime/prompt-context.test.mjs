@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { createPreviewInstructionsProvider, createRelayPromptBuilder } from "./prompt-context.mjs";
-import { PREVIEW_TOOL_DESCRIPTION } from "../../../../shared/preview-tool-core.mjs";
+import { PREVIEW_TOOL_DESCRIPTION } from "../preview-tool-core.mjs";
 
 const TOOL_INSTRUCTIONS = [
   "# Relay Tool Guidance",

@@ -9,10 +9,10 @@ import { fileURLToPath } from 'url';
 import {
   loadTokenFromConfig,
   resolveRelayServerUrl,
-} from '../../.github/extensions/web-relay/runtime/config-loader.mjs';
-import { createApiClient } from '../../.github/extensions/web-relay/runtime/api-client.mjs';
-import { createWorkerWebSocketLink } from '../../.github/extensions/web-relay/runtime/worker-websocket-link.mjs';
-import { createHeartbeatController } from '../../.github/extensions/web-relay/polling/heartbeat.mjs';
+} from '../../shared/worker-runtime/config-loader.mjs';
+import { createApiClient } from '../../shared/worker-runtime/api-client.mjs';
+import { createWorkerWebSocketLink } from '../../shared/worker-runtime/worker-websocket-link.mjs';
+import { createHeartbeatController } from '../../shared/worker-runtime/heartbeat.mjs';
 import { createControlPoller } from '../../shared/control-poller.mjs';
 import { installWorkerCrashGuard } from '../../shared/worker-crash-guard.mjs';
 import { createCursorTurnRunner } from './cursor-turn-runner.mjs';

@@ -3,9 +3,10 @@
 // block.
 //
 // This mirrors the extension's `createRelayPromptBuilder`
-// (`.github/extensions/web-relay/skills/prompt-context.mjs`) and reuses its
-// text verbatim through `buildModePrompt`, so a conversation reads the same
-// guidance whichever engine ran it. It does NOT reuse the extension's builder
+// (`shared/worker-runtime/prompt-context.mjs`, relocated from the extension
+// tree for its retirement) and reuses its text verbatim through
+// `buildModePrompt`, so a conversation reads the same guidance whichever
+// engine ran it. It does NOT reuse the extension's builder
 // wholesale for one reason: that builder also composes the message BODY via its
 // own `buildPrompt`, which renders attachments as a text note. This worker
 // passes real `MessageOptions.attachments` to the runtime
@@ -24,8 +25,8 @@ import {
   applyPreviewInstructions,
   createPreviewInstructionsProvider,
 } from '../../shared/preview-instructions.mjs';
-import { buildModePrompt } from '../../.github/extensions/web-relay/skills/prompt-context.mjs';
-import { loadRelayInstructionsFromFile } from '../../.github/extensions/web-relay/runtime/config-loader.mjs';
+import { buildModePrompt } from '../../shared/worker-runtime/prompt-context.mjs';
+import { loadRelayInstructionsFromFile } from '../../shared/worker-runtime/config-loader.mjs';
 
 export { createPreviewInstructionsProvider, loadRelayInstructionsFromFile };
 

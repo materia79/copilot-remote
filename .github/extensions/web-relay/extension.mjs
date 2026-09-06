@@ -423,7 +423,6 @@ async function ensureSessionForConversation(conversationId, reason = "dequeue") 
 
 const sessionIo = createSessionIoHelpers({
   getSession: () => session,
-  sleep,
   dbg,
 });
 
@@ -510,7 +509,6 @@ async function startPolling() {
       setModelForMessage,
       buildPromptWithRelayContext,
       sendAndWaitWithHardTimeout,
-      sendWithBestEffortStreaming,
       extractFinalText,
       extractGeneratedImages,
       getLastActivityText: () => getScopedLastActivityText(),
@@ -969,4 +967,3 @@ async function ensureRelayActive(reason) {
 const extractFinalText = sessionIo.extractFinalText;
 const extractGeneratedImages = sessionIo.extractGeneratedImages;
 const sendAndWaitWithHardTimeout = sessionIo.sendAndWaitWithHardTimeout;
-const sendWithBestEffortStreaming = sessionIo.sendWithBestEffortStreaming;
