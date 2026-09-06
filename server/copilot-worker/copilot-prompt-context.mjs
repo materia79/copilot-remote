@@ -54,6 +54,14 @@ export function loadDefaultRelayToolInstructions({ env = process.env } = {}) {
  * its standing instructions every message. The mode marker itself is always
  * present.
  *
+ * Returns `{ prefix, commit }`, and the mode is recorded as prompted only when
+ * the caller invokes `commit()` — AFTER `session.send()` accepted the message
+ * (audit #32). Committing at build time was the bug: a failed send meant the
+ * runtime never received the guidance, yet the same-mode retry omitted it
+ * because the builder believed it had already been delivered. The rare double
+ * delivery the late commit allows (two builds racing before either send lands)
+ * costs a repeated instruction block, which is harmless; the omission was not.
+ *
  * `agentMode` is threaded to the runtime natively as well
  * (`copilotAgentModeForRelayMode`); the text is not a substitute for it but a
  * reinforcement, same as on the extension path.
@@ -75,8 +83,10 @@ export function createCopilotPromptContextBuilder({
       instructions = applyPreviewInstructions(toolInstructions, previewBlock);
     }
     const prefix = buildModePrompt(relayMode, instructions, { includeInstructions });
-    lastPromptedRelayMode = relayMode;
-    return prefix;
+    return {
+      prefix,
+      commit: () => { lastPromptedRelayMode = relayMode; },
+    };
   };
 }
 

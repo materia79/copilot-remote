@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { createAskUserBridge } from './ask-user-bridge.mjs';
 import { QUESTION_TIMEOUT_CONTINUATION_TEXT } from './question-timeout.mjs';
 
-function makeApiStub({ answers = [], statuses = [] } = {}) {
+function makeApiStub({ answers = [], statuses = [], structuredAnswers = [] } = {}) {
   const calls = [];
   let questionCounter = 0;
   const statusById = new Map();
@@ -18,6 +18,9 @@ function makeApiStub({ answers = [], statuses = [] } = {}) {
         statusById.set(id, {
           status: statuses[questionCounter - 1] || 'answered',
           answer: answers[questionCounter - 1] || '',
+          ...(structuredAnswers[questionCounter - 1]
+            ? { structuredAnswer: structuredAnswers[questionCounter - 1] }
+            : {}),
         });
         return { question: { id } };
       }
@@ -112,6 +115,66 @@ test('empty question input yields empty answers without API calls', async () => 
   const result = await bridge.handleAskUserQuestion({ questions: [] });
   assert.deepEqual(result.answers, {});
   assert.equal(stub.calls.length, 0);
+});
+
+test('a requestedSchema on a question rides top-level into the create payload', async () => {
+  // Structured-elicitation parity: the create route reads a TOP-LEVEL
+  // `requestedSchema`; flat questions (every existing caller) omit it.
+  const schema = { type: 'object', properties: { env: { type: 'string' } }, required: ['env'] };
+  const stub = makeApiStub({ answers: ['done'], structuredAnswers: [{ env: 'prod' }] });
+  const bridge = createAskUserBridge({
+    api: stub.api,
+    getActiveMessage: () => activeMessage,
+    sleep: async () => {},
+  });
+
+  const result = await bridge.handleAskUserQuestion({
+    questions: [{ question: 'Deployment env?', requestedSchema: schema, options: [] }],
+  });
+
+  const created = stub.calls.find((call) => call.routePath === '/api/relay-question');
+  assert.deepEqual(created.body.requestedSchema, schema);
+  // The validated structured submission comes back alongside the flat answer.
+  assert.deepEqual(result.answers, { 'Deployment env?': 'done' });
+  assert.deepEqual(result.structuredAnswers, { 'Deployment env?': { env: 'prod' } });
+
+  // A flat question sends no schema field at all and yields no structured map
+  // entry — nothing changes for existing consumers.
+  const flatStub = makeApiStub({ answers: ['A'] });
+  const flatResult = await createAskUserBridge({
+    api: flatStub.api,
+    getActiveMessage: () => activeMessage,
+    sleep: async () => {},
+  }).handleAskUserQuestion({ questions: [{ question: 'Pick?', options: [{ label: 'A', description: '' }] }] });
+  const flatCreated = flatStub.calls.find((call) => call.routePath === '/api/relay-question');
+  assert.equal('requestedSchema' in flatCreated.body, false);
+  assert.deepEqual(flatResult.structuredAnswers, {});
+});
+
+test('the waiter surfaces structuredAnswer and honours a per-call timeout', async () => {
+  const stub = makeApiStub({ answers: ['ok'], structuredAnswers: [{ a: 1 }] });
+  const bridge = createAskUserBridge({
+    api: stub.api,
+    getActiveMessage: () => activeMessage,
+    sleep: async () => {},
+  });
+  const { question } = await stub.api('POST', '/api/relay-question', {});
+  const answered = await bridge.waitForRelayQuestionAnswer(question.id);
+  assert.equal(answered.answer, 'ok');
+  assert.deepEqual(answered.structuredAnswer, { a: 1 });
+
+  // Per-call timeoutMs overrides the bridge-wide default for one wait: a
+  // 0ms deadline times the pending card out on the first poll.
+  const pendingStub = makeApiStub({ statuses: ['pending'] });
+  const pendingBridge = createAskUserBridge({
+    api: pendingStub.api,
+    getActiveMessage: () => activeMessage,
+    sleep: async () => {},
+  });
+  const { question: pendingQuestion } = await pendingStub.api('POST', '/api/relay-question', {});
+  const timedOut = await pendingBridge.waitForRelayQuestionAnswer(pendingQuestion.id, { timeoutMs: 0 });
+  assert.equal(timedOut.timedOut, true);
+  assert.equal(pendingStub.calls.some((call) => call.routePath.endsWith('/timeout')), true);
 });
 
 test('question source and rationale default to the Claude wire payload and are overridable', async () => {

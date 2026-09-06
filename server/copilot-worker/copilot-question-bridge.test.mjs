@@ -14,7 +14,7 @@ const ACTIVE_MESSAGE = { id: 'q-1', conversationId: 'conv-1', relayMode: 'ask' }
  * A relay stand-in. `answerWith` settles the question on the Nth poll, so a
  * test can prove the bridge actually waited rather than returning early.
  */
-function makeRelay({ answerWith = null, status = 'answered', neverSettles = false } = {}) {
+function makeRelay({ answerWith = null, structuredAnswerWith = null, status = 'answered', neverSettles = false } = {}) {
   const calls = [];
   let timedOut = false;
   async function api(method, path, body) {
@@ -31,7 +31,15 @@ function makeRelay({ answerWith = null, status = 'answered', neverSettles = fals
       // it, which is how a cancelled waiter unblocks.
       if (timedOut) return { question: { id: 'question-1', status: 'timed_out' } };
       if (neverSettles) return { question: { id: 'question-1', status: 'pending' } };
-      return { question: { id: 'question-1', status, answer: answerWith } };
+      return {
+        question: {
+          id: 'question-1',
+          status,
+          answer: answerWith,
+          // What formatQuestionRow serves for an answered schema card.
+          ...(structuredAnswerWith ? { structuredAnswer: structuredAnswerWith } : {}),
+        },
+      };
     }
     return {};
   }
@@ -186,6 +194,118 @@ test('shutdown settles the cards this worker is still waiting on', async () => {
   // cancel must not leave the handler hanging forever either.
   const result = await pending;
   assert.equal(result.timedOut, true);
+});
+
+test('a question created while shutdown is in flight is expired at birth, never left pending', async () => {
+  // `cancelPendingQuestions` snapshots the pending ids — but a create POST
+  // still in flight resolves AFTER that snapshot, and its card used to be left
+  // pending in the UI with nothing left to poll for its answer.
+  let releaseCreate;
+  const createGate = new Promise((resolve) => { releaseCreate = resolve; });
+  const calls = [];
+  async function api(method, path, body) {
+    calls.push({ method, path, body });
+    if (method === 'POST' && path === '/api/relay-question') return createGate;
+    return { ok: true };
+  }
+  const bridge = makeBridge(api);
+
+  const lateQuestionId = 'question-9';
+  const pending = bridge.askUserInput({ question: 'which one?' });
+  // Catch the create mid-flight, not before it started.
+  await new Promise((resolve) => { setTimeout(resolve, 1); });
+  const cancelled = bridge.cancelPendingQuestions();
+  releaseCreate({ question: { id: lateQuestionId } });
+
+  const result = await pending;
+  // Shaped like a timeout, so the runner's handlers degrade exactly as they do
+  // for an unanswered card.
+  assert.equal(result.timedOut, true);
+  assert.equal(result.answer, QUESTION_TIMEOUT_CONTINUATION_TEXT);
+  // The late card was never pending: the shutdown awaited the create and the
+  // create expired its own card the moment it saw the bridge closing.
+  assert.equal(await cancelled, 0);
+  assert.equal(bridge.pendingQuestionCount(), 0);
+  const expiries = calls.filter((c) => c.path.endsWith('/timeout'));
+  assert.equal(expiries.length, 1);
+  assert.equal(expiries[0].path, `/api/relay-question/${lateQuestionId}/timeout`);
+  // And nothing ever polled for an answer nobody is left to read.
+  assert.equal(calls.filter((c) => c.method === 'GET').length, 0);
+
+  // Once closing, no further card is minted at all.
+  const late = await bridge.askUserInput({ question: 'still there?' });
+  assert.equal(late.timedOut, true);
+  assert.equal(calls.filter((c) => c.method === 'POST' && c.path === '/api/relay-question').length, 1);
+});
+
+test('a structured card round-trips the schema and returns the validated answer', async () => {
+  // Audit #17: the elicitation path. The create payload carries a TOP-LEVEL
+  // requestedSchema (that is the field the create route reads), and the
+  // answered card comes back with the relay-validated structuredAnswer.
+  const schema = {
+    type: 'object',
+    properties: { env: { type: 'string' }, replicas: { type: 'number' } },
+    required: ['env'],
+  };
+  const api = makeRelay({ answerWith: 'submitted', structuredAnswerWith: { env: 'prod', replicas: 2 } });
+  const bridge = makeBridge(api);
+
+  const result = await bridge.askStructured({
+    prompt: 'Deployment details?',
+    requestedSchema: schema,
+    timeoutMs: 30_000,
+  });
+
+  assert.deepEqual(result.structuredAnswer, { env: 'prod', replicas: 2 });
+  assert.equal(result.timedOut, false);
+  const created = api.created();
+  assert.deepEqual(created.requestedSchema, schema);
+  assert.equal(created.prompt, 'Deployment details?');
+  // A schema card is free-text plus form; it offers no choice buttons.
+  assert.deepEqual(created.choices, []);
+  // The per-call deadline reaches the card's own expiry.
+  assert.equal(created.timeout_ms, 30_000);
+  assert.equal(created.context.source, 'onElicitationRequest');
+  assert.equal(created.queueId, 'q-1');
+});
+
+test('an answered schema card without a validated structured body yields null, not a forgery', async () => {
+  const api = makeRelay({ answerWith: 'freeform words instead of the form' });
+  const bridge = makeBridge(api);
+  const result = await bridge.askStructured({
+    prompt: 'Details?',
+    requestedSchema: { type: 'object', properties: { a: { type: 'string' } } },
+  });
+  assert.equal(result.structuredAnswer, null);
+  assert.equal(result.timedOut, false);
+});
+
+test('an unanswered structured card times out with no structured answer', async () => {
+  const api = makeRelay({ status: 'timed_out' });
+  const bridge = makeBridge(api);
+  const result = await bridge.askStructured({
+    prompt: 'Details?',
+    requestedSchema: { type: 'object', properties: { a: { type: 'string' } } },
+  });
+  assert.equal(result.timedOut, true);
+  assert.equal(result.structuredAnswer, null);
+});
+
+test('askStructured after shutdown mints no card and reads as a timeout', async () => {
+  const api = makeRelay({ neverSettles: true });
+  const bridge = makeBridge(api);
+  await bridge.cancelPendingQuestions();
+
+  const result = await bridge.askStructured({
+    prompt: 'Details?',
+    requestedSchema: { type: 'object', properties: { a: { type: 'string' } } },
+  });
+
+  // Shaped like a timeout so the elicitation handler declines, exactly as it
+  // does for an unanswered card.
+  assert.equal(result.timedOut, true);
+  assert.equal(result.structuredAnswer, null);
+  assert.equal(api.calls.filter((c) => c.method === 'POST' && c.path === '/api/relay-question').length, 0);
 });
 
 test('a relay that will not create the card raises rather than hanging', async () => {

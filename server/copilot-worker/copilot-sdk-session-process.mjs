@@ -67,6 +67,12 @@ import {
   isContinuationOpeningEvent,
 } from './copilot-continuation-signals.mjs';
 import { createCopilotEventNormalizer } from './copilot-sdk-event-normalizer.mjs';
+import {
+  DEFAULT_MODEL_SWITCH_TIMEOUT_MS,
+  createCopilotModelSwitcher,
+  isModelSwitchUnconfirmedError,
+  normalizeRelayEffort,
+} from './copilot-model-switch.mjs';
 import { createCopilotQuestionBridge } from './copilot-question-bridge.mjs';
 import {
   EXIT_PLAN_BOARD_POSTED_FEEDBACK,
@@ -238,6 +244,10 @@ export function createCopilotSdkSessionRunner({
   // fails terminally instead of holding the queue row until the relay's own
   // delivery watchdog gives up.
   turnStallTimeoutMs = DEFAULT_TURN_STALL_TIMEOUT_MS,
+  // How long a `deferred: true` model switch may wait for its
+  // `session.model_change` drain before the explicit selection counts as
+  // unconfirmed and fails the row (`COPILOT_SDK_RELAY_MODEL_SWITCH_TIMEOUT_MS`).
+  modelSwitchTimeoutMs = DEFAULT_MODEL_SWITCH_TIMEOUT_MS,
   // How long live detached shells alone may keep the runtime up (0 = no
   // limit). Read through a getter, like the Claude worker's
   // `getBackgroundTaskTimeoutMs`, so a future settings push can move it without
@@ -253,8 +263,24 @@ export function createCopilotSdkSessionRunner({
   let client = null;
   let session = null;
   let sdkPaths = null;
-  let appliedModel = '';
+  // The single owner of "what model/effort is the live session CONFIRMED to be
+  // on" (audit #9/#13): tracks the last confirmed pair, caches the per-session
+  // model catalog for effort validation, and observes `session.model_change`
+  // drains for deferred switches. `appliedModel()` is the runner-side read.
+  const modelSwitch = createCopilotModelSwitcher({ switchTimeoutMs: modelSwitchTimeoutMs, dbg });
+  const appliedModel = () => modelSwitch.current().model;
   let activeTurn = null;
+  // Turns that have SETTLED but whose relay publishes have not all landed yet.
+  // Ownership of a turn is split in two: `activeTurn` is runtime-EVENT
+  // ownership (which turn the session callback feeds), this set is QUEUE-ROW
+  // ownership (which rows the heartbeat must keep claiming and the crash guard
+  // must requeue). The split exists because the runtime does not wait for the
+  // relay: a fast follow-on continuation can open, run and terminate while the
+  // previous turn's `/api/response` is still in flight, and holding the event
+  // stream hostage to that POST is exactly how a whole continuation vanished
+  // (audit #5). A Set, not a slot: the follow-on turn's own publish can block
+  // too, so several turns can be publishing at once.
+  const publishingTurns = new Set();
   let lifecycleTimer = null;
   let lastActivityAt = Date.now();
   let lastTurnUsage = null;
@@ -323,6 +349,33 @@ export function createCopilotSdkSessionRunner({
     }
   }
 
+  /**
+   * Hold an interactive callback until the active turn's queue row exists.
+   *
+   * A continuation becomes the active turn synchronously but gets its row
+   * asynchronously, and the runtime can block on `user_input.requested` (or an
+   * ask-mode approval) in that gap — the question bridge would then see no
+   * active message and degrade to an unsupported answer / local rejection for
+   * a card that was milliseconds from having a real row id. Bounded by the
+   * registration timeout (the registration itself can hang on a dead relay);
+   * on expiry — or on a registration that gave up (`rowReady` → false) — the
+   * caller proceeds and degrades exactly as before. Delivered turns are
+   * registered from birth and skip straight through.
+   */
+  async function awaitInteractiveRow() {
+    const turn = activeTurn;
+    if (!turn || turn.registered || !turn.rowReady) return;
+    let timer = null;
+    await Promise.race([
+      turn.rowReady,
+      new Promise((resolve) => {
+        timer = setTimeout(resolve, continuationRegistrationTimeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+    clearTimeout(timer);
+  }
+
   // The relay question bridge serves `ask_user` and (in ask mode) tool
   // approvals. `getActiveMessage` must resolve to the row that is CURRENTLY
   // `processing`, because `/api/relay-question` 409s otherwise.
@@ -353,6 +406,32 @@ export function createCopilotSdkSessionRunner({
 
   function touch() {
     lastActivityAt = Date.now();
+  }
+
+  /**
+   * A turn's terminal event ends its runtime-event ownership IMMEDIATELY, while
+   * queue-row ownership persists until every publish has landed.
+   *
+   * Called from `settle`/`fail`, so it runs the instant the terminator is
+   * dispatched: from here on `routeEvent` sees no active turn and a genuinely
+   * new event can open the next continuation — it must not wait out a blocked
+   * `/api/response`. The row itself stays owned (heartbeat lease, crash-guard
+   * requeue) via `publishingTurns` until `releaseTurnOwnership`.
+   */
+  function beginPublishing(turn) {
+    publishingTurns.add(turn);
+    if (activeTurn === turn) activeTurn = null;
+  }
+
+  /**
+   * Every publish for the turn has landed (or terminally failed); nothing owns
+   * its rows any more. Guarded on identity: by the time a publish window
+   * closes, `activeTurn` may already belong to a NEWER turn, and clearing it
+   * unconditionally would strip that turn's heartbeat ownership mid-flight.
+   */
+  function releaseTurnOwnership(turn) {
+    publishingTurns.delete(turn);
+    if (activeTurn === turn) activeTurn = null;
   }
 
   // ---------------------------------------------------------------- publish --
@@ -523,7 +602,7 @@ export function createCopilotSdkSessionRunner({
       conversationId: message.conversationId,
       sdkSessionId,
       messageId: message.id,
-      model: result?.model || appliedModel || defaultModel || '',
+      model: result?.model || appliedModel() || defaultModel || '',
       usage,
       contextUsage,
       capturedAt: new Date().toISOString(),
@@ -591,6 +670,11 @@ export function createCopilotSdkSessionRunner({
     }
     touch();
     observeBackgroundShells(event);
+    // Keeps the confirmed-model tracking truthful for switches this worker did
+    // not ask for, and resolves the bounded wait on a deferred switch's drain.
+    // Behind the replay gate on purpose: a historical `session.model_change`
+    // must not confirm a pending switch.
+    modelSwitch.observeEvent(event);
     let turn = activeTurn;
     if (!turn) {
       // The runtime started work with no row open. Anything that is not the
@@ -600,13 +684,13 @@ export function createCopilotSdkSessionRunner({
       if (!isContinuationOpeningEvent(event)) return;
       turn = openContinuationTurn();
     }
-    // `activeTurn` is deliberately still set (and still settled) while a turn
-    // publishes its response, so a continuation cannot open inside that window
-    // and clobber the row being written. Events landing there are dropped by
-    // `handleTurnEvent`'s settled guard — and cost nothing, because the opener
-    // allowlist spans the whole of a turn: the next `assistant.message` or
-    // `tool.execution_start` opens the continuation once the row is closed,
-    // with the normalizer still capturing the reply text.
+    // The owner is captured HERE, synchronously, but settlement happens later
+    // on the dispatch chain — so an event can be captured to a turn that is
+    // settled by the time its link runs. `handleTurnEvent`'s settled guard
+    // re-routes such an event (in arrival order, on the same chain) to
+    // whatever now owns the stream, opening a continuation if the event is an
+    // opener. A settled turn that is still publishing holds only its QUEUE
+    // rows (`publishingTurns`); it never holds the event stream.
     dispatchChain = dispatchChain
       .then(() => handleTurnEvent(turn, event))
       .catch((error) => { dbg('event dispatch failed', error?.message || String(error)); });
@@ -634,7 +718,10 @@ export function createCopilotSdkSessionRunner({
       dbg('detached shell settled', shell.shellId);
       const note = describeSettledShell(shell);
       // Only carried when there is no turn to publish into: inside a turn the
-      // normalizer already narrates the `read_bash` that reads the output.
+      // normalizer already narrates the `read_bash` that reads the output. A
+      // settled turn mid-publish does NOT count as a turn here — its row is
+      // closed to new lines, so the note belongs to the continuation this
+      // notification is about to trigger.
       if (note && !activeTurn && pendingActivities.length < MAX_PENDING_ACTIVITIES) {
         pendingActivities.push(note);
       }
@@ -649,8 +736,31 @@ export function createCopilotSdkSessionRunner({
     if (changed.heralded) continuationDueSince = Date.now();
   }
 
+  /**
+   * A live event was captured to a turn that settled before its chain link
+   * ran. It is NOT history — it belongs to whatever the runtime is doing now:
+   * an already-open successor turn, or a continuation this very event should
+   * open. Runs on the dispatch chain, so re-routed events keep arrival order
+   * relative to everything captured after them.
+   */
+  async function redispatchSettledEvent(event) {
+    let turn = activeTurn;
+    // A settled `activeTurn` cannot happen — `settle`/`fail` release the slot
+    // — but it is guarded anyway: re-routing INTO a settled turn would recurse
+    // through this function forever, so it is treated as "no owner".
+    if (!turn || turn.settled) {
+      // Same rule as `routeEvent`: only the start of work opens a row.
+      if (!isContinuationOpeningEvent(event)) return;
+      turn = openContinuationTurn();
+    }
+    await handleTurnEvent(turn, event);
+  }
+
   async function handleTurnEvent(turn, event) {
-    if (turn.settled) return;
+    if (turn.settled) {
+      await redispatchSettledEvent(event);
+      return;
+    }
     turn.armStall?.();
     let actions = [];
     try {
@@ -683,7 +793,7 @@ export function createCopilotSdkSessionRunner({
     }
   }
 
-  function buildSessionConfig(model, relayMode) {
+  function buildSessionConfig(model, relayMode, reasoningEffort = null) {
     // Built once per session, not per request. Reads the mode off the LIVE turn
     // rather than closing over the one the session was built with, because one
     // session serves every turn and the user can switch modes between them.
@@ -691,9 +801,12 @@ export function createCopilotSdkSessionRunner({
       // Only the ask-mode branch actually blocks on a human; wrapping it keeps
       // the stall watchdog off a turn where someone is deciding.
       bridge: {
-        askToolApproval: (permissionRequest, options) => whileAwaitingHuman(
-          () => questionBridge.askToolApproval(permissionRequest, options),
-        ),
+        askToolApproval: (permissionRequest, options) => whileAwaitingHuman(async () => {
+          // An ask-mode approval raised the moment a continuation opens must
+          // wait for the row its card will hang off — see `awaitInteractiveRow`.
+          await awaitInteractiveRow();
+          return questionBridge.askToolApproval(permissionRequest, options);
+        }),
       },
       getRelayMode: () => activeTurn?.message?.relayMode || relayMode,
       // An aborted turn must not leave the human staring at a card whose answer
@@ -708,9 +821,10 @@ export function createCopilotSdkSessionRunner({
     // hosted (`github`) session, which is the common case.
     //
     // The resolved block is remembered: its token ceilings describe THIS model,
-    // and `session.setModel()` cannot update them (see `applyModel`).
+    // and no model-switch RPC can update them (see `applySelection`).
     const provider = resolveProviderConfigImpl({ env, model: model || defaultModel, dbg });
     byokProvider = provider;
+    const effort = normalizeRelayEffort(reasoningEffort);
     return {
       // The relay session id IS the SDK session id, so the runtime's own state
       // under ~/.copilot/session-state/<id> is addressable by conversation and
@@ -718,6 +832,13 @@ export function createCopilotSdkSessionRunner({
       sessionId: sdkSessionId,
       ...(model ? { model } : {}),
       ...(provider ? { provider } : {}),
+      // BYOK only: the rebuilt config is the switch mechanism for these
+      // sessions, so the effort must ride in it or a dispose+resume model
+      // switch silently drops it. Hosted sessions apply effort through the
+      // validated RPC path instead (`SessionConfigBase.reasoningEffort` is
+      // only valid for models that support it, which cannot be checked before
+      // the session exists).
+      ...(provider && effort ? { reasoningEffort: effort } : {}),
       // Not a default: without this the SDK emits no deltas at all and the
       // transcript only updates when the whole message lands.
       streaming: true,
@@ -749,9 +870,14 @@ export function createCopilotSdkSessionRunner({
       // the deserializer is strict, so it is always a real boolean.
       onUserInputRequest: async (request) => {
         try {
-          const { answer, wasFreeform } = await whileAwaitingHuman(() => questionBridge.askUserInput(request, {
-            signal: activeTurn?.abortController?.signal || null,
-          }));
+          const { answer, wasFreeform } = await whileAwaitingHuman(async () => {
+            // Same gate as the approval path: an `ask_user` fired straight
+            // after a continuation opened must get the row, not a null id.
+            await awaitInteractiveRow();
+            return questionBridge.askUserInput(request, {
+              signal: activeTurn?.abortController?.signal || null,
+            });
+          });
           return { answer, wasFreeform };
         } catch (error) {
           dbg('user input question failed', error?.message || String(error));
@@ -768,10 +894,57 @@ export function createCopilotSdkSessionRunner({
           feedback: posted ? EXIT_PLAN_BOARD_POSTED_FEEDBACK : EXIT_PLAN_NO_BOARD_FEEDBACK,
         };
       },
-      // Structured elicitation has no relay card type of its own; declining is
-      // in-band and lets the model continue, which a hang would not.
-      onElicitationRequest: () => ({ action: 'decline' }),
+      // Structured elicitation (audit #17): a form-mode request with a schema
+      // becomes a relay question card carrying `requestedSchema`; the relay's
+      // answer route validates the submission and stores `structuredAnswer`,
+      // which maps 1:1 onto the SDK's `ElicitationResult.content`. Everything
+      // that cannot round-trip — url mode (a browser redirect), a missing or
+      // non-object schema, a bridge without the structured surface, a timeout,
+      // a closing bridge, an answer the relay could not validate — declines
+      // in-band exactly as before, which lets the model continue where a hang
+      // or a throw would fail the tool call silently.
+      onElicitationRequest: (request) => handleElicitationRequest(request),
     };
+  }
+
+  /**
+   * `onElicitationRequest` → a schema-carrying relay question card →
+   * `{ action: 'accept', content }` with the validated structured answer, or
+   * `{ action: 'decline' }` for everything that cannot round-trip.
+   *
+   * Runs under the same human-gating as `ask_user`: the stall watchdog is held
+   * off while the card waits, and an elicitation raised the moment a
+   * continuation opens waits for the row its card will hang off (`rowReady`)
+   * instead of minting a card against a null message id.
+   */
+  async function handleElicitationRequest(request) {
+    try {
+      const mode = String(request?.mode || 'form').trim().toLowerCase();
+      const schema = request?.requestedSchema;
+      const hasSchema = !!schema && typeof schema === 'object' && !Array.isArray(schema)
+        && !!schema.properties && typeof schema.properties === 'object';
+      if (mode === 'url' || !hasSchema || typeof questionBridge.askStructured !== 'function') {
+        return { action: 'decline' };
+      }
+      const source = String(request?.elicitationSource || '').trim();
+      const message = String(request?.message || '').trim()
+        || 'Copilot needs structured input to continue this turn.';
+      const result = await whileAwaitingHuman(async () => {
+        await awaitInteractiveRow();
+        return questionBridge.askStructured({
+          prompt: source ? `${message}\n\n(Requested by ${source}.)` : message,
+          requestedSchema: schema,
+        }, { signal: activeTurn?.abortController?.signal || null });
+      });
+      const content = result?.structuredAnswer;
+      if (result?.timedOut || !content || typeof content !== 'object' || Array.isArray(content)) {
+        return { action: 'decline' };
+      }
+      return { action: 'accept', content };
+    } catch (error) {
+      dbg('elicitation bridging failed, declining', error?.message || String(error));
+      return { action: 'decline' };
+    }
   }
 
   /**
@@ -847,65 +1020,69 @@ export function createCopilotSdkSessionRunner({
   }
 
   /**
-   * Best-effort model switch: a rejected switch must not fail the turn, it
-   * just runs on the session's current model (and says so in the log).
+   * Bring the live session onto the dequeued row's (model, effort) selection.
    *
-   * This is the HOSTED path only. A BYOK session cannot switch this way — see
-   * `switchModel`.
+   * Hosted sessions go through `modelSwitch.apply` and its OBSERVED RPCs
+   * (audit #9/#13): a selection the runtime does not confirm — a thrown
+   * switchTo, a confirmation-required result, a deferred switch that never
+   * drains, an unsupported effort level — THROWS the unconfirmed error, which
+   * fails the row terminally before the prompt is ever sent. The common path
+   * (same model, same effort) costs zero RPCs.
+   *
+   * BYOK sessions try the same RPCs first, but only when the freshly resolved
+   * `SessionConfig.provider` block for the target model matches the one the
+   * session was built with: the block carries MODEL-SPECIFIC token ceilings
+   * that no RPC can update (runtime 1.0.82 has no setProvider, and the
+   * registry surface is rejected alongside the singular whole-session
+   * `provider`), so an in-place switch is only sufficient when the ceilings do
+   * not move. A block that differs — or an RPC the runtime rejects — falls
+   * back to the dispose+resume rebuild, which carries the effort in the
+   * rebuilt config. Nothing is lost either way: the relay session id IS the
+   * SDK session id, so the rebuild takes the ordinary resume path.
    */
-  async function applyModel(model) {
-    if (!model || typeof session?.setModel !== 'function') return;
-    try {
-      await session.setModel(model);
-      appliedModel = model;
-    } catch (error) {
-      dbg('copilot setModel failed', model, error?.message || String(error));
+  async function applySelection(model, effort, relayMode) {
+    if (!byokProvider) {
+      await modelSwitch.apply(session, { model, effort, byok: false });
+      return session;
     }
+    const nextProvider = resolveProviderConfigImpl({ env, model: model || defaultModel, dbg });
+    const ceilingsMatch = JSON.stringify(nextProvider) === JSON.stringify(byokProvider);
+    if (ceilingsMatch) {
+      const attempt = await modelSwitch.apply(session, { model, effort, byok: true });
+      if (attempt.ok) return session;
+      dbg('BYOK model RPC not honoured, rebuilding the session', model, attempt.detail || '');
+    } else {
+      dbg('BYOK ceilings differ for the target model; rebuilding the session', model);
+    }
+    return rebuildByokSession(model, effort, relayMode);
   }
 
   /**
-   * Switch a live session onto a different model.
-   *
-   * Hosted sessions just call `setModel()`. BYOK sessions cannot: their token
-   * ceilings live in `SessionConfig.provider`, which is fixed at session
-   * creation. Runtime 1.0.82 exposes **no** way to update it — `setModel()`
-   * takes reasoning/context options but no provider, there is no
-   * `setProvider`, and the one runtime registry-add RPC belongs to the
-   * experimental named-`providers`/`models` surface, which the runtime
-   * explicitly REJECTS when combined with the singular whole-session
-   * `provider` this worker uses.
-   *
-   * So a bare `setModel()` on a BYOK session leaves the previous model's
-   * ceilings in place, and both directions of that are harmful: ceilings too
-   * high turn compaction into hard API rejections, ceilings too low compact a
-   * conversation that had plenty of room left.
-   *
-   * The session is therefore disposed and rebuilt with freshly resolved
-   * ceilings. Nothing is lost: the relay session id IS the SDK session id, the
-   * runtime's state persists under it, and the rebuild takes the ordinary
-   * resume path — the same one every worker restart already uses.
+   * Dispose the BYOK session and rebuild it with freshly resolved ceilings —
+   * the switch mechanism of last resort for a session whose
+   * `SessionConfig.provider` is immutable. The rebuilt config carries the
+   * requested model AND effort, and the resumed session is trusted to be on
+   * them by construction (`ProviderConfig.modelId` falls back to
+   * `SessionConfig.model`), so this path never re-enters the RPC attempt —
+   * which is also what makes it terminate: RPC refusal → rebuild → done.
    */
-  async function switchModel(model, relayMode) {
-    if (!byokProvider) {
-      await applyModel(model);
-      return session;
-    }
-    dbg('rebuilding the copilot session for a BYOK model switch', model);
+  async function rebuildByokSession(model, effort, relayMode) {
+    dbg('rebuilding the copilot session for a BYOK model/effort switch', model);
     const closing = session;
     session = null;
-    appliedModel = '';
+    modelSwitch.reset();
     // Disconnect first so the runtime is not holding two handles on one
     // session id while the resume runs.
     try { await closing?.disconnect?.(); } catch (error) {
       dbg('session disconnect before model switch failed', error?.message || String(error));
     }
-    return ensureSession(model, relayMode);
+    return ensureSession(model, effort, relayMode);
   }
 
-  async function ensureSession(model, relayMode) {
+  async function ensureSession(model, effort, relayMode) {
     await ensureClient();
     if (!session) {
-      const config = buildSessionConfig(model, relayMode);
+      const config = buildSessionConfig(model, relayMode, effort);
       // Resume first, always. On a brand-new conversation this costs one
       // failed RPC; on every other path (worker restart, idle shutdown,
       // relay restart) it is the difference between continuing the
@@ -931,21 +1108,32 @@ export function createCopilotSdkSessionRunner({
         session = await client.createSession(config);
         dbg(`created copilot session ${sdkSessionId.slice(0, 8)}`);
       }
-      if (resumed) {
-        // A resumed session keeps whatever model it was created with —
+      if (resumed && !byokProvider) {
+        // A resumed HOSTED session keeps whatever model it was created with —
         // `config.model` is not guaranteed to be honoured on resume — so the
-        // requested model is applied explicitly rather than assumed. Assuming
-        // it is what made a mismatch permanent: `appliedModel` would already
-        // equal the request, so the per-turn switch below could never fire.
-        appliedModel = '';
-        await applyModel(model);
+        // selection is applied explicitly (and observably) rather than
+        // assumed. Assuming it is what made a mismatch permanent: the tracked
+        // model would already equal the request, so the per-turn switch below
+        // could never fire.
+        modelSwitch.reset();
+        await modelSwitch.apply(session, { model, effort, byok: false });
       } else {
-        appliedModel = model || '';
+        // A created session is on `config.model` by construction; a resumed
+        // BYOK session is trusted the same way because `config.model` feeds
+        // `ProviderConfig.modelId` — and an RPC attempt here would recurse
+        // through the rebuild path that just built this config.
+        modelSwitch.noteApplied(model || '', byokProvider ? effort : null);
+        if (!byokProvider) {
+          // A hosted CREATE carries no effort in the config (the field is only
+          // valid for models that support it, unknowable pre-session), so an
+          // explicit level on the conversation's first turn still goes through
+          // the validated effort-only RPC. `null` effort is a no-op here.
+          await modelSwitch.apply(session, { model, effort, byok: false });
+        }
       }
       return session;
     }
-    if (model && model !== appliedModel) return switchModel(model, relayMode);
-    return session;
+    return applySelection(model, effort, relayMode);
   }
 
   async function stopRuntime(reason) {
@@ -956,7 +1144,7 @@ export function createCopilotSdkSessionRunner({
     const closingClient = client;
     session = null;
     client = null;
-    appliedModel = '';
+    modelSwitch.reset();
     // Detached shells are children of the runtime process, so stopping it ends
     // them: the tracked set is state about a process that no longer exists and
     // must not pin the next one. The replay gate is reset for the same reason —
@@ -1021,8 +1209,9 @@ export function createCopilotSdkSessionRunner({
 
   function evaluateLifecycle() {
     // A pending question card means a human is mid-answer; tearing the runtime
-    // down under them would discard the session the answer belongs to.
-    if (disposed || activeTurn || pendingHumanRequests > 0 || !client) return;
+    // down under them would discard the session the answer belongs to. A turn
+    // that is still publishing counts too: it settled, but its rows are live.
+    if (disposed || activeTurn || publishingTurns.size > 0 || pendingHumanRequests > 0 || !client) return;
     if (!(idleShutdownMs > 0)) return;
     // Evaluated before the idle clock so the caps still expire on a runtime
     // that has been quiet far longer than the idle window.
@@ -1116,6 +1305,22 @@ export function createCopilotSdkSessionRunner({
       // under a single `session.idle`, so nothing else will settle them.
       steeredRows: [],
     };
+    if (continuation) {
+      // The single in-flight registration for this turn's synthetic row, and
+      // the signal that abandons it. One promise, stored ON the turn, so the
+      // drive path and a late HTTP response reason about the SAME attempt —
+      // registration and abandonment used to run blind of each other, and a
+      // registration resolving after the local deadline would adopt a row into
+      // a turn already torn down (audit #6).
+      turn.registration = null;
+      turn.registrationAbort = new AbortController();
+      // Resolves `true` once the row exists, `false` once registration gave up
+      // or was abandoned. Interactive handlers gate question creation on it: a
+      // `user_input.requested` in the gap between "continuation opened" and
+      // "row registered" would otherwise mint its card against no row id and
+      // degrade to an unsupported answer (audit #7).
+      turn.rowReady = new Promise((resolve) => { turn.resolveRowReady = resolve; });
+    }
     turn.done = new Promise((resolve, reject) => {
       turn.resolveDone = resolve;
       turn.rejectDone = reject;
@@ -1130,12 +1335,16 @@ export function createCopilotSdkSessionRunner({
       if (turn.settled) return;
       turn.settled = true;
       turn.disarmStall();
+      // The terminal event releases the event stream at once — see
+      // `beginPublishing`. The queue row stays owned until the publish lands.
+      beginPublishing(turn);
       turn.resolveDone();
     };
     turn.fail = (error) => {
       if (turn.settled) return;
       turn.settled = true;
       turn.disarmStall();
+      beginPublishing(turn);
       turn.rejectDone(error);
     };
     turn.disarmStall = () => {
@@ -1164,11 +1373,14 @@ export function createCopilotSdkSessionRunner({
     return turn;
   }
 
-  async function runTurn(message) {
+  async function runTurn(turn) {
+    const { message } = turn;
     const model = resolvePerTurnModel(message);
+    // The dequeued row's reasoning effort (audit #9). Normalisation happens in
+    // the switcher: `none`/absent mean "the model's default".
+    const effort = message?.reasoningEffort ?? null;
     const relayMode = message?.relayMode || 'agent';
     lastRelayMode = relayMode;
-    const turn = createTurn(message);
     // Set before the session is touched: the heartbeat's owner-recovery guard
     // reads the active ids, so a cold-start delivery must already own its row.
     activeTurn = turn;
@@ -1189,7 +1401,7 @@ export function createCopilotSdkSessionRunner({
     });
 
     try {
-      await ensureSession(model, relayMode);
+      await ensureSession(model, effort, relayMode);
       if (turn.aborted) {
         // The abort landed while the session was still being built. Nothing
         // was sent, so there is no runtime turn to interrupt — ask anyway (a
@@ -1206,8 +1418,8 @@ export function createCopilotSdkSessionRunner({
         const { prompt: body, attachments } = buildMessageOptionsImpl(message);
         // Relay mode marker + (on a mode change) the standing mode instructions,
         // the relay tool guidance and the live preview-lane block.
-        const prefix = await buildRelayContextPrefix(message).catch(() => '');
-        const prompt = withRelayContext(prefix, body);
+        const context = await buildRelayContextPrefix(message).catch(() => null);
+        const prompt = withRelayContext(context?.prefix, body);
         // `mode` and `attachments` are FIELDS of the single MessageOptions
         // argument — `send()` takes no second parameter, so passing options
         // positionally drops them silently.
@@ -1217,6 +1429,10 @@ export function createCopilotSdkSessionRunner({
           ...(sendMode ? { mode: sendMode } : {}),
           agentMode: copilotAgentModeForRelayMode(relayMode),
         });
+        // Committed only now that `send()` accepted the prompt (audit #32): a
+        // failed send means the runtime never READ the mode guidance, and
+        // committing before it would make the same-mode retry omit it.
+        context?.commit();
         // `send()` resolves once the runtime accepted the prompt — it is NOT
         // the turn's completion; the event stream is.
         await turn.done;
@@ -1392,23 +1608,40 @@ export function createCopilotSdkSessionRunner({
     // Both are fire-and-forget by design (the SDK's event callback is
     // synchronous and cannot await a turn), so both must swallow: an unhandled
     // rejection here would reach the worker crash guard and take the whole
-    // process down over one lost continuation.
-    registerContinuationRow(turn).catch((error) => {
+    // process down over one lost continuation. The caught chain is what lives
+    // on the turn, so `awaitContinuationRow` can race it without re-handling.
+    turn.registration = registerContinuationRow(turn).catch((error) => {
       dbg('continuation registration threw', error?.message || String(error));
       if (turn.message.id) {
         // The row was created and only the bookkeeping after it failed. Release
         // the buffer to the drive path rather than throwing away a turn that
         // has somewhere to go.
         turn.registered = true;
+        turn.resolveRowReady?.(true);
         return;
       }
-      turn.discarded = true;
-      turn.bufferedActions = [];
+      abandonContinuationRegistration(turn, 'registration threw');
     });
     driveContinuation(turn).catch((error) => {
       dbg('continuation driver threw', error?.message || String(error));
     });
     return turn;
+  }
+
+  /**
+   * Give up on a continuation's synthetic row: nothing buffered will ever
+   * publish, and a registration still in flight must not adopt a row into this
+   * turn when it finally answers. The one place all three abandonment paths
+   * (retries exhausted, local deadline expired, registration threw) converge,
+   * so none of them can forget the abort signal or leave `rowReady` hanging.
+   */
+  function abandonContinuationRegistration(turn, reason) {
+    turn.discarded = true;
+    turn.bufferedActions = [];
+    turn.registrationAbort?.abort?.();
+    // Interactive handlers stop waiting and take their degraded path.
+    turn.resolveRowReady?.(false);
+    dbg('continuation registration abandoned:', reason);
   }
 
   /**
@@ -1425,9 +1658,15 @@ export function createCopilotSdkSessionRunner({
     // created server-side but whose response was lost must get the SAME row
     // back, not mint a sibling nobody will ever settle.
     const operationId = randomUUID();
+    // Abandonment is decided elsewhere (the drive path's deadline) while this
+    // loop is parked on an HTTP await, so the state is RE-checked after every
+    // await — the transport has no abort plumbing, which makes these recheck
+    // points the only cancellation this request has.
+    const signal = turn.registrationAbort?.signal || null;
+    const abandoned = () => turn.discarded || signal?.aborted === true;
     let response = null;
     for (let attempt = 0; attempt < 3 && !response?.messageId; attempt += 1) {
-      if (turn.discarded) return;
+      if (abandoned()) return;
       response = await api('POST', '/api/continuation-turn', {
         conversationId: sdkSessionId,
         sdkSessionId,
@@ -1439,19 +1678,35 @@ export function createCopilotSdkSessionRunner({
         return null;
       });
       if (!response?.messageId) {
+        if (abandoned()) return;
         await new Promise((resolve) => { setTimeout(resolve, continuationRetryDelayMs); });
       }
     }
     if (!response?.messageId) {
-      turn.discarded = true;
-      turn.bufferedActions = [];
-      dbg('continuation turn discarded (no relay message id)');
+      abandonContinuationRegistration(turn, 'no relay message id after 3 attempts');
       return;
     }
-    turn.message.id = String(response.messageId);
+    const messageId = String(response.messageId);
+    const attemptId = String(response.attemptId || '') || null;
+    if (abandoned()) {
+      // The drive path gave up on this turn while the request was in flight,
+      // and the server has just created a row nobody will publish into.
+      // Starting controls or flushing output here would resurrect an abandoned
+      // turn; instead the orphan row is settled explicitly — the requeue
+      // route's continuation branch tears a processing continuation down as
+      // `dropped: 'continuation'` (the same teardown the Claude worker uses
+      // for a registration that outlived its hand-off).
+      dbg('late continuation registration; tearing the orphan row down', messageId);
+      await api('POST', '/api/requeue', {
+        messageId,
+        ...(attemptId ? { attemptId } : {}),
+      }).catch(() => {});
+      return;
+    }
+    turn.message.id = messageId;
     // The attempt the row was minted under; every publish echoes it, exactly
     // as a delivered row echoes the attempt id its delivery carried.
-    turn.message.attemptId = String(response.attemptId || '') || null;
+    turn.message.attemptId = attemptId;
     // The route reports which conversation the synthetic row landed on;
     // trusting it beats assuming worker session id === conversation id.
     const conversationId = String(response.conversationId || '').trim();
@@ -1468,13 +1723,27 @@ export function createCopilotSdkSessionRunner({
     }) || null;
     await flushBufferedActions(turn);
     turn.registered = true;
+    turn.resolveRowReady?.(true);
   }
 
-  /** Resolve once the continuation's row exists, or its registration gave up. */
+  /**
+   * Resolve once the continuation's row exists, its registration gave up, or
+   * the local deadline expires — in which case the turn is ABANDONED, so the
+   * registration cannot later adopt a row into it (it tears the row down
+   * instead; see `registerContinuationRow`'s late-response branch).
+   */
   async function awaitContinuationRow(turn, timeoutMs = continuationRegistrationTimeoutMs) {
-    const deadline = Date.now() + timeoutMs;
-    while (!turn.registered && !turn.discarded && Date.now() < deadline) {
-      await new Promise((resolve) => { setTimeout(resolve, 25); });
+    if (turn.registered || turn.discarded) return;
+    let timer = null;
+    const expired = new Promise((resolve) => {
+      timer = setTimeout(() => resolve('expired'), timeoutMs);
+      timer.unref?.();
+    });
+    // `turn.registration` is the caught chain and never rejects.
+    const outcome = await Promise.race([turn.registration || Promise.resolve(), expired]);
+    clearTimeout(timer);
+    if (outcome === 'expired' && !turn.registered && !turn.message.id) {
+      abandonContinuationRegistration(turn, 'registration outlived the local deadline');
     }
   }
 
@@ -1482,10 +1751,13 @@ export function createCopilotSdkSessionRunner({
    * Run a continuation to its terminator and publish it, mirroring
    * `handlePendingPayload`'s outer shape.
    *
-   * `activeTurn` is cleared only after every publish has landed, exactly as for
-   * a delivered turn: a heartbeat firing inside the publish window with no
+   * Row ownership is released only after every publish has landed, exactly as
+   * for a delivered turn: a heartbeat firing inside the publish window with no
    * active ids would tell the relay this worker owns nothing, and the
-   * still-`processing` synthetic row would be recovered underneath it.
+   * still-`processing` synthetic row would be recovered underneath it. (The
+   * EVENT stream was already released at the terminator — see
+   * `beginPublishing` — so the runtime's next self-initiated turn can open
+   * while this one is still writing.)
    */
   async function driveContinuation(turn) {
     let failure = null;
@@ -1505,8 +1777,7 @@ export function createCopilotSdkSessionRunner({
       // publishing against `messageId: null` would attribute the whole turn to
       // nothing at all.
       if (!turn.message.id) {
-        turn.discarded = true;
-        turn.bufferedActions = [];
+        if (!turn.discarded) abandonContinuationRegistration(turn, 'no relay row at publish time');
         dbg('continuation output dropped (no relay row)');
         // The steering path is still waiting on any row it handed us, and it
         // has no row of its own to fall back to.
@@ -1533,7 +1804,7 @@ export function createCopilotSdkSessionRunner({
     } finally {
       controlPoller?.stop?.(turn.controlState);
       turn.controlState = null;
-      if (activeTurn === turn) activeTurn = null;
+      releaseTurnOwnership(turn);
       touch();
       // A continuation spends real quota (the live capture burned a premium
       // request on `read_bash` + the reply), so its numbers ride the same
@@ -1596,8 +1867,8 @@ export function createCopilotSdkSessionRunner({
     const { prompt: body, attachments } = buildMessageOptionsImpl(message);
     // A real relay round trip on the first turn of a mode — long enough for the
     // turn to finish underneath us.
-    const prefix = await buildRelayContextPrefix(message).catch(() => '');
-    const prompt = withRelayContext(prefix, body);
+    const context = await buildRelayContextPrefix(message).catch(() => null);
+    const prompt = withRelayContext(context?.prefix, body);
     // Re-checked AFTER the awaits and before anything is sent or registered.
     // `settleSteeredRows` has already run if the turn settled during them, so a
     // row pushed now would never be settled and its caller would wait forever —
@@ -1633,6 +1904,10 @@ export function createCopilotSdkSessionRunner({
       await api('POST', '/api/requeue', { messageId: message.id, ...attemptFields(message) }).catch(() => {});
       return true;
     }
+    // Same commit-after-send rule as `runTurn` (audit #32): a steered prompt
+    // whose send failed never delivered its guidance, so the retry must
+    // include it again.
+    context?.commit();
     // Resolves when the interaction settles this row in `settleSteeredRows`.
     await steered.done;
     return true;
@@ -1666,15 +1941,26 @@ export function createCopilotSdkSessionRunner({
         return true;
       }
     }
+    // Created here rather than inside `runTurn` so the catch and finally below
+    // act on THIS turn by identity: under split ownership, `activeTurn` may
+    // already belong to a newer turn (a continuation the runtime opened while
+    // this one was publishing) by the time they run.
+    const turn = createTurn(message);
     try {
-      return await runTurn(message);
+      return await runTurn(turn);
     } catch (error) {
       const classified = classifyCopilotTurnException(error);
       dbg('copilot turn failed', message.id, classified.detail);
       // A failure that killed the session (or came from starting it) leaves a
       // handle nothing else can use; drop it so the next delivery rebuilds and
-      // resumes rather than sending into a dead runtime.
-      await stopRuntime('turn-failure').catch(() => {});
+      // resumes rather than sending into a dead runtime. An UNCONFIRMED MODEL
+      // SWITCH is the exception: the session is healthy and merely still on
+      // its previous model, and tearing the runtime down over it would kill
+      // any live detached shells for a selection problem the user fixes by
+      // picking another model.
+      if (!isModelSwitchUnconfirmedError(error)) {
+        await stopRuntime('turn-failure').catch(() => {});
+      }
       await publishResponse(message, {
         text: classified.text,
         model: null,
@@ -1684,18 +1970,16 @@ export function createCopilotSdkSessionRunner({
       // and, more urgently, `steerIntoActiveTurn` is still awaiting their
       // settle. Skipping this would wedge that caller (and its queue row)
       // forever behind a heartbeat that keeps renewing the lease.
-      if (activeTurn) {
-        await settleSteeredRows(activeTurn, null, null, classified).catch(() => {});
-        await closeStraySubagentRuns(activeTurn).catch(() => {});
-      }
+      await settleSteeredRows(turn, null, null, classified).catch(() => {});
+      await closeStraySubagentRuns(turn).catch(() => {});
       return true;
     } finally {
-      // Cleared only once every publish for this row has landed. A heartbeat
-      // that fired during the publish window with no active ids would tell the
-      // relay this worker owns nothing, and the still-processing row would be
-      // recovered (`owner-heartbeat-idle`) and re-delivered — a duplicate
+      // Released only once every publish for this row has landed. A heartbeat
+      // that fired during the publish window with the row unowned would tell
+      // the relay this worker owns nothing, and the still-processing row would
+      // be recovered (`owner-heartbeat-idle`) and re-delivered — a duplicate
       // execution racing the response that was already on its way.
-      activeTurn = null;
+      releaseTurnOwnership(turn);
       touch();
       // Every path through the turn — published, failed, aborted, threw — has
       // finished by here, which is the only safe place for the ingest: it is
@@ -1708,14 +1992,24 @@ export function createCopilotSdkSessionRunner({
   // --------------------------------------------------------------- teardown --
 
   function getActiveQueueMessageId() {
-    return activeTurn ? String(activeTurn.message?.id || '') : '';
+    if (activeTurn) return String(activeTurn.message?.id || '');
+    // A settled turn still publishing owns its row every bit as much: the
+    // heartbeat's owner-recovery guard must keep seeing it until the publish
+    // lands, or the relay recovers the row underneath the response in flight.
+    for (const turn of publishingTurns) {
+      const id = String(turn.message?.id || '');
+      if (id) return id;
+    }
+    return '';
   }
 
   /**
-   * Every row this worker owns — the turn's own, plus any steered into it —
-   * as `{ id, attemptId }` entries. A steered row missing from it would be
+   * Every row this worker owns — the running turn's own plus any steered into
+   * it, and the same for every settled turn still publishing — as
+   * `{ id, attemptId }` entries. A steered row missing from it would be
    * recovered mid-flight as `owner-heartbeat-mismatch` and re-delivered while
-   * the runtime was still answering it.
+   * the runtime was still answering it; a publishing row missing from it would
+   * be recovered as `owner-heartbeat-idle` while its response was on the wire.
    *
    * Both the heartbeat (lease renewal) and the crash guard (requeue-on-exit)
    * read this: the crash guard takes the entries whole so its requeues stay
@@ -1723,15 +2017,19 @@ export function createCopilotSdkSessionRunner({
    * ids (the claim payload is id-only).
    */
   function getActiveQueueMessageIds() {
-    if (!activeTurn) return [];
     const entries = [];
     const push = (message) => {
       const id = String(message?.id || '');
       if (!id || entries.some((entry) => entry.id === id)) return;
       entries.push({ id, attemptId: message?.attemptId || null });
     };
-    push(activeTurn.message);
-    for (const steered of activeTurn.steeredRows || []) push(steered.message);
+    const collect = (turn) => {
+      if (!turn) return;
+      push(turn.message);
+      for (const steered of turn.steeredRows || []) push(steered.message);
+    };
+    collect(activeTurn);
+    for (const turn of publishingTurns) collect(turn);
     return entries;
   }
 
@@ -1748,7 +2046,9 @@ export function createCopilotSdkSessionRunner({
     handlePendingPayload,
     getActiveQueueMessageId,
     getActiveQueueMessageIds,
-    isTurnActive: () => !!activeTurn,
+    // "Active" spans both ownerships: a settled turn still publishing must
+    // keep the worker's idle/shutdown gates closed just like a running one.
+    isTurnActive: () => !!activeTurn || publishingTurns.size > 0,
     dispose,
     // The turn's tokens/cost/TTFT, as posted to `/api/copilot-plan-usage`.
     getLastTurnUsage: () => lastTurnUsage,
@@ -1760,11 +2060,15 @@ export function createCopilotSdkSessionRunner({
     _getState: () => ({
       hasClient: !!client,
       hasSession: !!session,
-      appliedModel,
+      appliedModel: appliedModel(),
+      // The confirmed reasoning effort (null = the model's default).
+      appliedEffort: modelSwitch.current().effort,
       lastActivityAt,
       // 'delivered' | 'continuation' | '' — which kind of turn, if any, owns
-      // the worker right now.
+      // the runtime-event stream right now.
       activeTurnKind: activeTurn?.kind || '',
+      // Settled turns whose relay publishes have not all landed yet.
+      publishingTurnCount: publishingTurns.size,
       backgroundShells: backgroundShells.live(),
       continuationDueSince,
     }),

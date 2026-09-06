@@ -55,6 +55,78 @@ test('an image that exists only as a data URL is still embedded', () => {
   assert.deepEqual(attachments, [{ type: 'blob', data: 'AAEC', mimeType: 'image/png', displayName: 'paste.png' }]);
 });
 
+test('the decoded ceiling applies to data URLs exactly at the boundary', () => {
+  // Audit #33: disk images enforced the 5 MiB DECODED limit, data URLs did
+  // not, so a ~9 MiB decoded image could ride in under the server's larger
+  // encoded ceiling. Boundary: exactly at the limit embeds, one byte over
+  // does not.
+  const max = 8;
+  const atLimit = `data:image/png;base64,${Buffer.alloc(max, 1).toString('base64')}`;
+  const overLimit = `data:image/png;base64,${Buffer.alloc(max + 1, 1).toString('base64')}`;
+
+  const embedded = buildCopilotMessageOptions({
+    text: 'x',
+    attachments: [{ name: 'ok.png', type: 'image/png', dataUrl: atLimit }],
+  }, { fsImpl: fakeFs({}), maxInlineImageBytes: max });
+  assert.equal(embedded.attachments.length, 1);
+  assert.equal(embedded.attachments[0].type, 'blob');
+
+  const rejected = buildCopilotMessageOptions({
+    text: 'x',
+    attachments: [{ name: 'big.png', type: 'image/png', dataUrl: overLimit }],
+  }, { fsImpl: fakeFs({}), maxInlineImageBytes: max });
+  assert.deepEqual(rejected.attachments, []);
+});
+
+test('an oversized data URL degrades to a file reference when a path exists', () => {
+  // This is also the hole where an oversized DISK image with a dataUrl twin
+  // used to sneak inline: the disk read refused it, the data URL did not.
+  const max = 8;
+  const bigBytes = Buffer.alloc(64, 1);
+  const { prompt, attachments } = buildCopilotMessageOptions({
+    text: 'look',
+    attachments: [{
+      name: 'huge.png',
+      type: 'image/png',
+      path: '/home/dev/huge.png',
+      dataUrl: `data:image/png;base64,${bigBytes.toString('base64')}`,
+    }],
+  }, { fsImpl: fakeFs({ '/home/dev/huge.png': bigBytes }), maxInlineImageBytes: max });
+
+  assert.deepEqual(attachments, [{ type: 'file', path: '/home/dev/huge.png', displayName: 'huge.png' }]);
+  assert.match(prompt, /Attached image "huge\.png" \(image\/png\): \/home\/dev\/huge\.png/);
+});
+
+test('an oversized data URL with no path is dropped with a note, never silently', () => {
+  const max = 8;
+  const { prompt, attachments } = buildCopilotMessageOptions({
+    text: 'look',
+    attachments: [{
+      name: 'huge.png',
+      type: 'image/png',
+      dataUrl: `data:image/png;base64,${Buffer.alloc(64, 1).toString('base64')}`,
+    }],
+  }, { fsImpl: fakeFs({}), maxInlineImageBytes: max });
+
+  assert.deepEqual(attachments, []);
+  // The model must not be left answering about an image it never received.
+  assert.match(prompt, /Attached image "huge\.png" \(image\/png\) was too large to embed/);
+});
+
+test('invalid base64 in a data URL is never decoded into a corrupt blob', () => {
+  // Buffer.from(..., 'base64') is lenient and would happily decode garbage;
+  // strict validation drops it instead (silently, matching how other invalid
+  // attachments degrade today).
+  for (const data of ['not base64!!!', 'AAE', 'AA==C']) {
+    const { prompt, attachments } = buildCopilotMessageOptions({
+      text: 'x',
+      attachments: [{ name: 'bad.png', type: 'image/png', dataUrl: `data:image/png;base64,${data}` }],
+    }, { fsImpl: fakeFs({}) });
+    assert.deepEqual(attachments, [], data);
+    assert.equal(prompt, 'x', data);
+  }
+});
+
 test('non-image files become file attachments with their absolute path', () => {
   const { prompt, attachments } = buildCopilotMessageOptions({
     text: 'review',

@@ -218,6 +218,33 @@ test('a quota error is classified structurally, never by forging prose', () => {
   }
 });
 
+test('the current "reached your …" quota wording classifies terminal from prose alone', () => {
+  // Integration-shaped (audit #16): the SDK's own error conversion rebuilds a
+  // PLAIN Error from the session error message (session.js ~467-495 — message
+  // and stack only, no structured fields survive), and the worker's
+  // session.error path sees the same wording. GitHub currently says "reached",
+  // not "exceeded", so the prose branch must carry it on its own.
+  for (const message of [
+    'You have reached your monthly quota of premium requests.',
+    'You have reached your quota.',
+    "You've reached your usage limit for this billing period.",
+    'You have reached your allowance of AI credits.',
+  ]) {
+    const sdkShapedError = new Error(message);
+    sdkShapedError.stack = 'Error: stack from the runtime event';
+    assert.equal(isCopilotQuotaError(sdkShapedError), true, message);
+    // The worker's two entry points both land on the non-retryable record.
+    assert.equal(classifyCopilotSessionError({ message }).stableCode, 'relay.quota-exhausted', message);
+    assert.equal(classifyCopilotSessionError({ message }).quota, true, message);
+    assert.equal(classifyCopilotTurnException(sdkShapedError).stableCode, 'relay.quota-exhausted', message);
+  }
+  // Rate limits reset in seconds and must stay retryable; impersonal limits
+  // (no "your") are not billing quota.
+  assert.equal(isCopilotQuotaError({ message: 'You have reached your rate limit, retry shortly' }), false);
+  assert.equal(isCopilotQuotaError({ message: 'context length limit reached for this request' }), false);
+  assert.equal(classifyCopilotSessionError({ message: 'You have reached your rate limit' }).quota, false);
+});
+
 test('a rate limit is not a quota failure', () => {
   const classified = classifyCopilotSessionError({
     errorType: 'rate_limit',
@@ -269,6 +296,33 @@ test('auth classification still fires on the real thing', () => {
     classifyCopilotTurnException(Object.assign(new Error('request rejected'), { errorType: 'authentication' })).stableCode,
     'copilot.authentication_failed',
   );
+});
+
+test('a session error with structured auth signals gets the relay-host sign-in remediation', () => {
+  // Audit #15: `classifyCopilotSessionError` checked quota but never applied
+  // the structured auth classifier, so a session.error tagged
+  // `errorType: "authentication"` (or HTTP 401) got generic retry guidance for
+  // a problem no retry can fix. The auth branch is now SHARED with the
+  // thrown-exception path — same code, same wording.
+  for (const data of [
+    { errorType: 'authentication', message: 'token validation failed' },
+    { errorType: 'authorization', message: 'access to this model is not permitted' },
+    { errorCode: 'not_logged_in', message: 'no active login' },
+    { statusCode: 401, message: 'request rejected' },
+    // Prose-only fallback, same wording the exception path accepts.
+    { message: 'not logged in to GitHub Copilot' },
+  ]) {
+    const classified = classifyCopilotSessionError(data);
+    assert.equal(classified.code, 'authentication_failed', JSON.stringify(data));
+    assert.equal(classified.stableCode, 'copilot.authentication_failed', JSON.stringify(data));
+    assert.match(classified.text, /Run `copilot` on the relay host and sign in/, JSON.stringify(data));
+    assert.equal(classified.quota, false);
+    // The runtime's real message survives as the detail.
+    assert.equal(classified.detail, data.message);
+  }
+  // Not auth: a 402 stays quota, plain network noise stays generic.
+  assert.equal(classifyCopilotSessionError({ statusCode: 402, message: 'Payment required' }).stableCode, 'relay.quota-exhausted');
+  assert.equal(classifyCopilotSessionError({ errorType: 'network', message: 'connection reset' }).stableCode, 'copilot.network');
 });
 
 test('only a definitive "no such session" counts as a missing session', () => {

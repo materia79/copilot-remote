@@ -25,9 +25,11 @@ import {
   makeApiStub,
   makeContinuationApiStub,
   makeRunner,
+  tick,
   waitFor,
 } from './copilot-sdk-test-harness.mjs';
 import { CONTINUATION_TRIGGER } from './copilot-sdk-session-process.mjs';
+import { createCopilotQuestionBridge } from './copilot-question-bridge.mjs';
 
 const TIMER_TURN = loadFixture('background-timer-turn');
 const TIMER_CONTINUATION = loadFixture('background-timer-continuation');
@@ -568,6 +570,206 @@ test('the continuation inherits the relay mode of the turn it continues', async 
   fireTimer(client);
   await waitFor(() => responsesFor(stub, 'cont-1').length === 1, { label: 'continuation response' });
   assert.equal(bodiesFor(stub, '/api/continuation-turn')[0].relayMode, 'autopilot');
+  await runner.dispose();
+});
+
+// ------------------------------------ the publishing window (audit #5) ------
+
+test('a continuation completing while the previous turn publishes loses nothing', async () => {
+  // `/api/response` for the delivered row is held open, and the WHOLE
+  // follow-on continuation — opener, reply, idle — lands inside that window.
+  // Before runtime-event ownership was split from publish ownership, the
+  // settled turn still owned the event stream during its publish and every one
+  // of those events was routed to it and dropped: the continuation vanished
+  // with no later event left to recover it from.
+  let releaseResponse;
+  const gate = new Promise((resolve) => { releaseResponse = resolve; });
+  const stub = makeContinuationApiStub({
+    routeResponses: {
+      '/api/response': (body) => (body.messageId === 'q-1' ? gate : {}),
+    },
+  });
+  const { client, runner } = setup({ stub });
+
+  const delivery = runner.handlePendingPayload({ message: baseMessage });
+  // The delivered turn has settled; its response POST is now parked in flight.
+  await waitFor(() => responsesFor(stub, 'q-1').length === 1, { label: 'first publish in flight' });
+
+  fireTimer(client);
+  await waitFor(() => responsesFor(stub, 'cont-1').length === 1, { label: 'continuation published' });
+
+  // Releasing the EVENT stream must not release the QUEUE row: the blocked row
+  // keeps its heartbeat claim for as long as its publish is in flight, or the
+  // relay would recover it underneath the response on the wire.
+  assert.ok(
+    runner.getActiveQueueMessageIds().some((entry) => entry.id === 'q-1'),
+    'the publishing row keeps its heartbeat claim',
+  );
+
+  releaseResponse({ ok: true });
+  assert.equal(await delivery, true);
+
+  // BOTH rows registered, BOTH published, each with its own reply.
+  assert.equal(bodiesFor(stub, '/api/continuation-turn').length, 1);
+  assert.match(responsesFor(stub, 'q-1')[0].text, /Timer set for 1 minute/);
+  assert.equal(responsesFor(stub, 'cont-1')[0].text, TIMER_REPLY);
+  // The settled-shell notification kept feeding the continuation pending set
+  // even though it arrived while the previous turn was mid-publish.
+  const activities = bodiesFor(stub, '/api/activity').filter((body) => body.messageId === 'cont-1');
+  assert.ok(
+    activities.some((body) => /Background shell 1 finished/.test(body.text)),
+    `expected the settled-shell note, got ${JSON.stringify(activities.map((a) => a.text))}`,
+  );
+  // And no cross-publishing into the user's row.
+  assert.equal(
+    bodiesFor(stub, '/api/stream').filter((b) => b.messageId === 'q-1' && b.text.includes(TIMER_REPLY)).length,
+    0,
+  );
+  assert.equal(runner.isTurnActive(), false);
+  await runner.dispose();
+});
+
+test('continuation events captured by a turn that settles before dispatch are rerouted, not dropped', async () => {
+  // The terminator and the follow-on continuation can arrive in ONE synchronous
+  // batch: `routeEvent` captures every event to the delivered turn at arrival,
+  // and the idle only settles that turn later, on the dispatch chain — so the
+  // tail is captured to a turn that is settled by the time it dispatches. The
+  // settled guard must re-route it, in arrival order, into a fresh continuation
+  // instead of dropping it.
+  const { stub, client, runner } = setup({ events: [...TIMER_TURN, ...TIMER_CONTINUATION] });
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+
+  await waitFor(() => responsesFor(stub, 'cont-1').length === 1, { label: 'continuation published' });
+  assert.equal(bodiesFor(stub, '/api/continuation-turn').length, 1);
+  assert.match(responsesFor(stub, 'q-1')[0].text, /Timer set for 1 minute/);
+  assert.equal(responsesFor(stub, 'cont-1')[0].text, TIMER_REPLY);
+  await runner.dispose();
+});
+
+// ---------------------------------------- late registration (audit #6) ------
+
+test('a registration that lands after local abandonment tears its row down instead of resurrecting the turn', async () => {
+  // The local wait expires and abandons the turn while the registration HTTP
+  // request is still in flight. A late success used to adopt the row anyway:
+  // assign the message id, start a control poller nothing would ever stop, and
+  // flush output into a turn already torn down.
+  let releaseRegistration;
+  const registrationGate = new Promise((resolve) => { releaseRegistration = resolve; });
+  const pollerStarts = [];
+  const stub = makeApiStub({
+    routeResponses: { '/api/continuation-turn': () => registrationGate },
+  });
+  const { client, runner } = setup({
+    stub,
+    continuationRegistrationTimeoutMs: 30,
+    controlPoller: {
+      start: (options) => { pollerStarts.push(String(options.queueMessageId)); return options; },
+      stop: () => {},
+    },
+  });
+  await runner.handlePendingPayload({ message: baseMessage });
+  const responsesBefore = bodiesFor(stub, '/api/response').length;
+
+  fireTimer(client);
+  await waitFor(() => runner.isTurnActive() === false, { label: 'continuation abandoned' });
+
+  // The server answers only now, with a freshly minted row.
+  releaseRegistration({ ok: true, messageId: 'cont-9', conversationId: 'conv-1', attemptId: 'attempt-cont-9' });
+  await waitFor(() => bodiesFor(stub, '/api/requeue').length === 1, { label: 'orphan row torn down' });
+
+  // The orphan row is settled through the requeue route's continuation branch
+  // (`dropped: 'continuation'`), fenced to the attempt it was minted under.
+  assert.deepEqual(bodiesFor(stub, '/api/requeue')[0], { messageId: 'cont-9', attemptId: 'attempt-cont-9' });
+  // No orphan control poller, and no late publication into the abandoned turn.
+  assert.deepEqual(pollerStarts.filter((id) => id.startsWith('cont-')), []);
+  await tick(20);
+  assert.equal(bodiesFor(stub, '/api/response').length, responsesBefore);
+  assert.equal(responsesFor(stub, 'cont-9').length, 0);
+  assert.equal(runner.isTurnActive(), false);
+  await runner.dispose();
+});
+
+// -------------------------- interactive callbacks vs rowReady (audit #7) ----
+
+/**
+ * A relay whose `/api/continuation-turn` answers only after `delayMs`, plus the
+ * question routes the REAL bridge needs: the card create and its answered poll.
+ */
+function delayedRegistrationStub({ delayMs = 40, answer = 'prod' } = {}) {
+  return makeApiStub({
+    routeResponses: {
+      '/api/continuation-turn': () => new Promise((resolve) => {
+        setTimeout(() => resolve({
+          ok: true, messageId: 'cont-1', conversationId: 'conv-1', attemptId: 'attempt-cont-1',
+        }), delayMs);
+      }),
+      '/api/relay-question': { question: { id: 'rq-1' } },
+      '/api/relay-question/rq-1': { question: { id: 'rq-1', status: 'answered', answer } },
+    },
+  });
+}
+
+test('user input raised the instant a continuation opens waits for its row', async () => {
+  // The runtime can block on `ask_user` before the continuation's synthetic
+  // row exists. Without the `rowReady` gate the bridge saw no active message,
+  // minted its card against no row id and degraded to an unsupported answer —
+  // for a card that was milliseconds from having a real row.
+  const stub = delayedRegistrationStub();
+  const { client, runner } = setup({
+    stub,
+    // The real bridge: the assertion is about the card it creates.
+    createQuestionBridgeImpl: (options) => createCopilotQuestionBridge(options),
+    questionPollMs: 1,
+  });
+  await runner.handlePendingPayload({ message: baseMessage });
+
+  // Open the continuation; its registration is still in flight.
+  fireTimer(client, TIMER_CONTINUATION.slice(0, 3));
+  await waitFor(() => runner._getState().activeTurnKind === 'continuation', { label: 'continuation open' });
+
+  const config = client.createAttempts[0];
+  const answer = await config.onUserInputRequest({
+    requestId: 'r1', question: 'which env?', choices: ['prod', 'staging'],
+  });
+  assert.deepEqual(answer, { answer: 'prod', wasFreeform: false });
+
+  // The card was created against the continuation's REAL row, not degraded.
+  const created = bodiesFor(stub, '/api/relay-question')[0];
+  assert.equal(created.queueId, 'cont-1');
+  assert.equal(created.messageId, 'cont-1');
+  assert.equal(created.attemptId, 'attempt-cont-1');
+  assert.equal(created.context.source, 'onUserInputRequest');
+
+  client.session.emit({ type: 'session.idle', data: {} });
+  await waitFor(() => responsesFor(stub, 'cont-1').length === 1, { label: 'continuation response' });
+  await runner.dispose();
+});
+
+test('an ask-mode approval raised before the continuation row exists waits for it too', async () => {
+  const stub = delayedRegistrationStub({ answer: 'Approve' });
+  const { client, runner } = setup({
+    stub,
+    createQuestionBridgeImpl: (options) => createCopilotQuestionBridge(options),
+    questionPollMs: 1,
+  });
+  // The continuation inherits its relay mode from the last delivered turn, so
+  // an ask-mode conversation routes its permission to the human.
+  await runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'ask' } });
+
+  fireTimer(client, TIMER_CONTINUATION.slice(0, 3));
+  await waitFor(() => runner._getState().activeTurnKind === 'continuation', { label: 'continuation open' });
+
+  const config = client.createAttempts[0];
+  const decision = await config.onPermissionRequest({ kind: 'write', fileName: 'notes.md' });
+  assert.deepEqual(decision, { kind: 'approve-once' });
+
+  const created = bodiesFor(stub, '/api/relay-question')[0];
+  assert.equal(created.queueId, 'cont-1');
+  assert.equal(created.attemptId, 'attempt-cont-1');
+  assert.equal(created.context.source, 'onPermissionRequest');
+
+  client.session.emit({ type: 'session.idle', data: {} });
+  await waitFor(() => responsesFor(stub, 'cont-1').length === 1, { label: 'continuation response' });
   await runner.dispose();
 });
 

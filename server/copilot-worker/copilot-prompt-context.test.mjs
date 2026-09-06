@@ -9,13 +9,20 @@ import {
 
 const TOOLS = '# Relay Tool Guidance\n\nUse ask_user.\n\n## Preview servers\n\nstatic placeholder text\n\n## After\n\nkept';
 
+/** Build and immediately commit, as a successful send does. */
+async function buildCommitted(build, message) {
+  const context = await build(message);
+  context.commit();
+  return context.prefix;
+}
+
 test('the preview block replaces the static section of the tool guidance', async () => {
   const build = createCopilotPromptContextBuilder({
     toolInstructions: TOOLS,
     getPreviewInstructions: () => '## Preview servers\n\nLIVE preview text',
   });
 
-  const prefix = await build({ relayMode: 'agent' });
+  const { prefix } = await build({ relayMode: 'agent' });
 
   assert.match(prefix, /LIVE preview text/);
   assert.doesNotMatch(prefix, /static placeholder text/);
@@ -29,7 +36,7 @@ test('a disabled preview lane drops the section rather than advertising a 503', 
     getPreviewInstructions: () => '',
   });
 
-  const prefix = await build({ relayMode: 'agent' });
+  const { prefix } = await build({ relayMode: 'agent' });
 
   assert.doesNotMatch(prefix, /static placeholder text/);
   assert.doesNotMatch(prefix, /Preview servers/);
@@ -42,29 +49,47 @@ test('the heavy guidance rides along only when the relay mode changes', async ()
     getPreviewInstructions: () => '',
   });
 
-  const first = await build({ relayMode: 'agent' });
+  const first = await buildCommitted(build, { relayMode: 'agent' });
   assert.match(first, /Use ask_user/);
 
   // Same mode again: the marker stays, the instructions do not repeat.
-  const second = await build({ relayMode: 'agent' });
+  const second = await buildCommitted(build, { relayMode: 'agent' });
   assert.equal(second, '[Relay mode: agent]');
 
   // A mode change re-sends them, because the standing instructions changed.
-  const third = await build({ relayMode: 'plan' });
+  const third = await buildCommitted(build, { relayMode: 'plan' });
   assert.match(third, /^\[Relay mode: plan\]/);
   assert.match(third, /Draft a concise plan only/);
   assert.match(third, /Use ask_user/);
 });
 
+test('an uncommitted build does not count as prompted (failed-send retry)', async () => {
+  // Audit #32: the mode used to be recorded as prompted while BUILDING the
+  // prefix, so a send that failed left the builder believing the runtime had
+  // read guidance it never received — and the same-mode retry omitted it.
+  const build = createCopilotPromptContextBuilder({ toolInstructions: TOOLS, getPreviewInstructions: () => '' });
+
+  const first = await build({ relayMode: 'agent' });
+  assert.match(first.prefix, /Use ask_user/);
+  // The send failed: commit never runs. The retry must carry the guidance again.
+  const retry = await build({ relayMode: 'agent' });
+  assert.match(retry.prefix, /Use ask_user/);
+
+  // Once a send lands, repeats go back to the cheap marker.
+  retry.commit();
+  const { prefix } = await build({ relayMode: 'agent' });
+  assert.equal(prefix, '[Relay mode: agent]');
+});
+
 test('the mode marker is always present, even with no guidance at all', async () => {
   const build = createCopilotPromptContextBuilder({ toolInstructions: '', getPreviewInstructions: null });
-  assert.equal(await build({ relayMode: 'autopilot' }), '[Relay mode: autopilot] Act directly on the request and use tools when needed. Keep moving unless user input is truly blocking. These instructions remain in effect until relay mode changes.');
-  assert.equal(await build({ relayMode: 'autopilot' }), '[Relay mode: autopilot]');
+  assert.equal(await buildCommitted(build, { relayMode: 'autopilot' }), '[Relay mode: autopilot] Act directly on the request and use tools when needed. Keep moving unless user input is truly blocking. These instructions remain in effect until relay mode changes.');
+  assert.equal(await buildCommitted(build, { relayMode: 'autopilot' }), '[Relay mode: autopilot]');
 });
 
 test('an unknown relay mode falls back to agent rather than inventing one', async () => {
   const build = createCopilotPromptContextBuilder({ toolInstructions: '' });
-  const prefix = await build({ relayMode: 'nonsense' });
+  const { prefix } = await build({ relayMode: 'nonsense' });
   assert.match(prefix, /^\[Relay mode: agent\]/);
 });
 
@@ -74,7 +99,7 @@ test('a preview lookup that throws costs the block, never the turn', async () =>
     getPreviewInstructions: () => { throw new Error('relay unreachable'); },
   });
 
-  const prefix = await build({ relayMode: 'agent' });
+  const { prefix } = await build({ relayMode: 'agent' });
   assert.match(prefix, /Use ask_user/);
   assert.doesNotMatch(prefix, /Preview servers/);
 });

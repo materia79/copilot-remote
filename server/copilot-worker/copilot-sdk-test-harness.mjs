@@ -89,8 +89,16 @@ export function makeContinuationApiStub({
  * real signature: there is no second parameter) and, like the real SDK,
  * resolves immediately — the turn's completion arrives on the event callback,
  * which is what `onSend` is for.
+ *
+ * The `rpc.model` surface mirrors SDK 1.0.13's, which the runner talks to
+ * DIRECTLY (the facade's `setModel` discards the switch result). Defaults model
+ * a healthy runtime: `switchTo` confirms the requested model immediately,
+ * `setReasoningEffort` echoes the level, `list` answers with `modelCatalog`
+ * (empty by default — effort validation then degrades to attempting the RPC).
+ * `modelRpc.{switchTo,setReasoningEffort,list}` override per test, each called
+ * as `(params, session)`.
  */
-export function createFakeCopilotSession({ config, onSend = null, onAbort = null }) {
+export function createFakeCopilotSession({ config, onSend = null, onAbort = null, modelRpc = {} }) {
   const session = {
     sessionId: config?.sessionId || 'fake-session',
     config,
@@ -120,6 +128,28 @@ export function createFakeCopilotSession({ config, onSend = null, onAbort = null
     },
     async disconnect() {
       session.disconnected = true;
+    },
+  };
+  session.rpc = {
+    model: {
+      switchToCalls: [],
+      effortCalls: [],
+      listCalls: 0,
+      async switchTo(params) {
+        session.rpc.model.switchToCalls.push(params);
+        if (modelRpc.switchTo) return modelRpc.switchTo(params, session);
+        return { modelId: params.modelId };
+      },
+      async setReasoningEffort(params) {
+        session.rpc.model.effortCalls.push(params);
+        if (modelRpc.setReasoningEffort) return modelRpc.setReasoningEffort(params, session);
+        return { reasoningEffort: params.reasoningEffort };
+      },
+      async list(params) {
+        session.rpc.model.listCalls += 1;
+        if (modelRpc.list) return modelRpc.list(params, session);
+        return { list: Array.isArray(modelRpc.catalog) ? modelRpc.catalog : [] };
+      },
     },
   };
   return session;
@@ -158,6 +188,9 @@ export function createFakeCopilotClient({
   resumeFailure = 'missing',
   onSend = null,
   onAbort = null,
+  // `rpc.model` behaviour for every session this client mints; see
+  // `createFakeCopilotSession`.
+  modelRpc = {},
 } = {}) {
   const client = {
     stopped: 0,
@@ -169,7 +202,7 @@ export function createFakeCopilotClient({
     async resumeSession(sessionId, config) {
       client.resumeAttempts.push({ sessionId, config });
       if (!client.resumeAvailable) throw makeResumeFailure(client.resumeFailure, sessionId);
-      const session = createFakeCopilotSession({ config, onSend, onAbort });
+      const session = createFakeCopilotSession({ config, onSend, onAbort, modelRpc });
       session.resumed = true;
       client.sessions.push(session);
       // A session that exists once exists forever, so later reconnects resume.
@@ -178,7 +211,7 @@ export function createFakeCopilotClient({
     },
     async createSession(config) {
       client.createAttempts.push(config);
-      const session = createFakeCopilotSession({ config, onSend, onAbort });
+      const session = createFakeCopilotSession({ config, onSend, onAbort, modelRpc });
       client.sessions.push(session);
       client.resumeAvailable = true;
       return session;
@@ -223,11 +256,16 @@ export function makeFakeQuestionBridge({
   approve = true,
   approvalTimedOut = false,
   approvalFeedback = 'The user declined this action.',
+  // Structured elicitation: the validated form submission the fake "relay"
+  // hands back, or null for a card that produced none.
+  structuredAnswer = null,
+  structuredTimedOut = false,
   onAsk = null,
 } = {}) {
   const bridge = {
     userInputCalls: [],
     approvalCalls: [],
+    structuredCalls: [],
     cancelledCount: 0,
     async askUserInput(request, options) {
       bridge.userInputCalls.push({ request, options });
@@ -249,6 +287,16 @@ export function makeFakeQuestionBridge({
         feedback: approvalFeedback,
         timedOut: approvalTimedOut,
         description: 'a tool',
+      };
+    },
+    async askStructured(spec, options) {
+      bridge.structuredCalls.push({ spec, options });
+      if (onAsk) await onAsk(spec, options);
+      const answer = typeof structuredAnswer === 'function' ? structuredAnswer(spec) : structuredAnswer;
+      return {
+        structuredAnswer: structuredTimedOut ? null : answer,
+        answer: '',
+        timedOut: structuredTimedOut,
       };
     },
     async cancelPendingQuestions() {

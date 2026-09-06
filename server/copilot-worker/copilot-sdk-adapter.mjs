@@ -24,6 +24,11 @@ import {
   normalizeTerminalSendAndWaitError,
   toKebabToken,
 } from '../../.github/extensions/web-relay/runtime/send-and-wait-errors.mjs';
+import {
+  MODEL_SWITCH_UNCONFIRMED_CODE,
+  MODEL_SWITCH_UNCONFIRMED_STABLE_CODE,
+  isModelSwitchUnconfirmedError,
+} from './copilot-model-switch.mjs';
 import { copilotRuntimeEntry } from '../copilot-sdk-runtime.mjs';
 
 const VERSION_DIR_RE = /^\d+\.\d+\.\d+$/;
@@ -344,7 +349,18 @@ export function copilotAgentModeForRelayMode(relayMode) {
 export function isCopilotQuotaError(data) {
   if (isStructuredQuotaError(data)) return true;
   const message = String(data?.message || '');
-  return /quota/i.test(message) && /(exceed|exhaust)/i.test(message);
+  if (/quota/i.test(message) && /(exceed|exhaust)/i.test(message)) return true;
+  // GitHub's CURRENT wording ("You have reached your monthly quota …",
+  // "reached your usage limit/allowance") says "reached", not "exceeded" — and
+  // the SDK's `sendAndWait` rebuilds a plain Error from the session error's
+  // MESSAGE alone (session.js ~467-495), so a `session.error` can arrive with
+  // no structured field to save it from the prose branch. The possessive
+  // ("your") keeps this off impersonal transient limits ("context length
+  // limit reached"), and rate limits are excluded outright: they reset in
+  // seconds, quota resets with the billing window.
+  if (/rate.?limit/i.test(message)) return false;
+  return /\b(?:reached|hit|used up|exhausted)\b[^.!\n]{0,60}\byour\b[^.!\n]{0,40}\b(?:quota|limit|allowance)\b/i
+    .test(message);
 }
 
 /**
@@ -372,6 +388,14 @@ export function classifyCopilotSessionError(data) {
       detail,
       quota,
     };
+  }
+  // The SAME auth branch the thrown-exception path takes (audit #15): a
+  // `session.error` tagged `errorType: "authentication"`/`"authorization"`, an
+  // auth `errorCode`, or HTTP 401 is a relay-host sign-in problem, and generic
+  // "retry" guidance sends the user in circles. `isCopilotAuthError` reads the
+  // structured `ErrorData` fields first and falls back to prose.
+  if (isCopilotAuthError(data)) {
+    return { ...copilotAuthClassification(detail), quota: false };
   }
   const code = toKebabToken(data?.errorType) || toKebabToken(data?.errorCode) || 'session-error';
   return {
@@ -416,6 +440,21 @@ const AUTH_ERROR_CODES = new Set([
 ]);
 
 /**
+ * The one auth failure record, shared verbatim by the session-event and
+ * thrown-exception classifiers so the remediation cannot drift between them:
+ * the fix is a user action on the relay host, never a retry.
+ */
+function copilotAuthClassification(detail) {
+  return {
+    code: 'authentication_failed',
+    stableCode: 'copilot.authentication_failed',
+    text: `System note: the Copilot runtime could not authenticate (${detail}). `
+      + 'Run `copilot` on the relay host and sign in, then retry.',
+    detail,
+  };
+}
+
+/**
  * Structured auth signals first (the runtime tags `errorType: "authentication"`
  * and HTTP 401), prose only as the fallback.
  */
@@ -437,23 +476,32 @@ export function isCopilotAuthError(error) {
  */
 export function classifyCopilotTurnException(error) {
   const detail = String(error?.message || error || '').trim() || 'unknown error';
-  const terminal = normalizeTerminalSendAndWaitError(error);
+  // An unconfirmed explicit model selection (audit #13). The error's own
+  // message already names requested vs actual model, so it IS the user-facing
+  // text; the stable code is what lets the UI (and tests) key on it.
+  if (isModelSwitchUnconfirmedError(error)) {
+    return {
+      code: MODEL_SWITCH_UNCONFIRMED_CODE,
+      stableCode: MODEL_SWITCH_UNCONFIRMED_STABLE_CODE,
+      text: detail,
+      detail,
+    };
+  }
+  // The quota hint mirrors the session-event path: sendAndWait-shaped errors
+  // carry only the prose, and "reached your monthly quota" must be terminal
+  // however the error arrived.
+  const hint = { quota: isCopilotQuotaError(error) };
+  const terminal = normalizeTerminalSendAndWaitError(error, hint);
   if (terminal) {
     return {
       code: terminal.code,
       stableCode: terminal.stableCode,
-      text: buildTerminalFailureText(error),
+      text: buildTerminalFailureText(error, hint),
       detail,
     };
   }
   if (isCopilotAuthError(error)) {
-    return {
-      code: 'authentication_failed',
-      stableCode: 'copilot.authentication_failed',
-      text: `System note: the Copilot runtime could not authenticate (${detail}). `
-        + 'Run `copilot` on the relay host and sign in, then retry.',
-      detail,
-    };
+    return copilotAuthClassification(detail);
   }
   return {
     code: 'turn-error',

@@ -79,6 +79,9 @@ async function main() {
     controlPoller,
     idleShutdownMs: readOptionalMs('COPILOT_SDK_RELAY_IDLE_SHUTDOWN_MS'),
     turnStallTimeoutMs: readOptionalMs('COPILOT_SDK_RELAY_TURN_STALL_TIMEOUT_MS'),
+    // How long a deferred model switch may wait for its drain before the
+    // explicit selection fails the row (default 10s).
+    modelSwitchTimeoutMs: readOptionalMs('COPILOT_SDK_RELAY_MODEL_SWITCH_TIMEOUT_MS'),
     // How long live detached shells alone may hold the runtime open (0 = no
     // limit). Deliberately NOT the relay's `background_task_timeout_minutes`
     // slider that rides every delivery payload: that slider defaults to

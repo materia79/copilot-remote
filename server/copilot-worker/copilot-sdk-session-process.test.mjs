@@ -315,12 +315,16 @@ test('a session that already exists is resumed with the relay session id', async
 
 test('a resumed session has the requested model applied explicitly', async () => {
   // `config.model` is not guaranteed to be honoured on resume, and assuming it
-  // was made a mismatch permanent: `appliedModel` already equalled the request,
-  // so the per-turn switch could never fire to correct it.
+  // was made a mismatch permanent: the tracked model already equalled the
+  // request, so the per-turn switch could never fire to correct it. The
+  // application goes through rpc.model.switchTo DIRECTLY — the facade's
+  // setModel discards the switch result (SDK 1.0.13), so a refused switch
+  // would be indistinguishable from one that landed.
   const { client, runner } = setup({ clientOptions: { resumeAvailable: true } });
   await runner.handlePendingPayload({ message: baseMessage });
 
-  assert.deepEqual(client.session.setModelCalls, ['gpt-5-mini']);
+  assert.deepEqual(client.session.rpc.model.switchToCalls, [{ modelId: 'gpt-5-mini' }]);
+  assert.deepEqual(client.session.setModelCalls, []);
   assert.equal(runner._getState().appliedModel, 'gpt-5-mini');
 });
 
@@ -510,7 +514,8 @@ test('a question bridge failure answers in-band rather than failing the tool cal
     answer: USER_INPUT_UNSUPPORTED_ANSWER,
     wasFreeform: true,
   });
-  assert.deepEqual(config.onElicitationRequest({}), { action: 'decline' });
+  // No schema, no card: a request that cannot round-trip declines in-band.
+  assert.deepEqual(await config.onElicitationRequest({}), { action: 'decline' });
 });
 
 test('attachments travel as MessageOptions.attachments, with paths in the prompt', async () => {
@@ -662,18 +667,158 @@ test('a per-turn model change switches the live session instead of rebuilding it
   await runner.handlePendingPayload({ message: baseMessage });
   await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', model: 'claude-sonnet-5' } });
 
-  assert.deepEqual(client.session.setModelCalls, ['claude-sonnet-5']);
+  assert.deepEqual(client.session.rpc.model.switchToCalls, [{ modelId: 'claude-sonnet-5' }]);
   assert.equal(client.sessions.length, 1);
   assert.equal(runner._getState().appliedModel, 'claude-sonnet-5');
 });
 
-test('a rejected model switch runs the turn anyway', async () => {
+test('a rejected model switch fails the row instead of running on the old model', async () => {
+  // The #13 policy: an explicit selection the runtime does not confirm must
+  // never silently run the prompt on the previous model. The row fails
+  // terminally with a record naming requested vs actual.
   const { stub, client, runner } = setup();
   await runner.handlePendingPayload({ message: baseMessage });
-  client.session.setModel = async () => { throw new Error('model unavailable'); };
+  client.session.rpc.model.switchTo = async () => { throw new Error('model unavailable'); };
 
   assert.equal(await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', model: 'nope' } }), true);
-  assert.equal(stub.bodiesFor('/api/response').length, 2);
+
+  const responses = stub.bodiesFor('/api/response');
+  assert.equal(responses.length, 2);
+  const failed = responses[1];
+  assert.equal(failed.terminalError.stableCode, 'relay.model-switch-unconfirmed');
+  assert.match(failed.text, /"nope"/);
+  assert.match(failed.text, /"gpt-5-mini"/);
+  // The prompt was never sent on the wrong model...
+  assert.equal(client.session.sends.length, 1);
+  // ...and the healthy session survives: a selection problem is not a dead
+  // runtime, and tearing it down would kill live detached shells.
+  assert.equal(runner._getState().hasSession, true);
+});
+
+test('the dequeued reasoningEffort is applied before the prompt is sent', async () => {
+  // Audit #9: the worker changed models but dropped the row's effort on the
+  // floor entirely (and SDK 1.0.13 silently discards it in MessageOptions).
+  const { client, runner } = setup();
+  await runner.handlePendingPayload({ message: { ...baseMessage, reasoningEffort: 'high' } });
+
+  // Same turn-one model as always, with the effort riding the switch.
+  assert.deepEqual(client.session.rpc.model.effortCalls, [{ reasoningEffort: 'high' }]);
+  assert.equal(runner._getState().appliedEffort, 'high');
+
+  // Same model, same effort: the next turn costs zero model RPCs.
+  await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', reasoningEffort: 'high' } });
+  assert.equal(client.session.rpc.model.effortCalls.length, 1);
+  assert.equal(client.session.rpc.model.switchToCalls.length, 0);
+
+  // An effort-only change uses the effort RPC, not a model switch.
+  await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3', reasoningEffort: 'low' } });
+  assert.deepEqual(client.session.rpc.model.effortCalls, [
+    { reasoningEffort: 'high' },
+    { reasoningEffort: 'low' },
+  ]);
+  assert.equal(client.session.rpc.model.switchToCalls.length, 0);
+  assert.equal(client.session.sends.length, 3);
+});
+
+test('a model change carries the row effort in one switchTo', async () => {
+  const { client, runner } = setup();
+  await runner.handlePendingPayload({ message: baseMessage });
+  await runner.handlePendingPayload({
+    message: { ...baseMessage, id: 'q-2', model: 'gpt-5.4', reasoningEffort: 'xhigh' },
+  });
+  assert.deepEqual(client.session.rpc.model.switchToCalls, [{ modelId: 'gpt-5.4', reasoningEffort: 'xhigh' }]);
+  assert.equal(runner._getState().appliedModel, 'gpt-5.4');
+  assert.equal(runner._getState().appliedEffort, 'xhigh');
+});
+
+test('a deferred switch that drains in time proceeds; one that expires fails the row', async () => {
+  // `deferred: true` means the switch is queued behind an active turn and the
+  // LIVE model is unchanged until it drains; the worker waits (bounded) for
+  // the session.model_change that proves the drain.
+  const drained = setup({
+    clientOptions: {
+      modelRpc: {
+        switchTo: (params, session) => {
+          setTimeout(() => session.emit({
+            type: 'session.model_change',
+            data: { newModel: params.modelId, reasoningEffort: params.reasoningEffort || null },
+          }), 5);
+          return { deferred: true };
+        },
+      },
+    },
+    modelSwitchTimeoutMs: 2_000,
+  });
+  await drained.runner.handlePendingPayload({ message: baseMessage });
+  assert.equal(await drained.runner.handlePendingPayload({
+    message: { ...baseMessage, id: 'q-2', model: 'gpt-5.4' },
+  }), true);
+  assert.equal(drained.stub.bodiesFor('/api/response')[1].terminalError, undefined);
+  assert.equal(drained.runner._getState().appliedModel, 'gpt-5.4');
+  assert.equal(drained.client.session.sends.length, 2);
+
+  const expired = setup({
+    clientOptions: { modelRpc: { switchTo: () => ({ deferred: true }) } },
+    modelSwitchTimeoutMs: 20,
+  });
+  await expired.runner.handlePendingPayload({ message: baseMessage });
+  assert.equal(await expired.runner.handlePendingPayload({
+    message: { ...baseMessage, id: 'q-2', model: 'gpt-5.4' },
+  }), true);
+  const failed = expired.stub.bodiesFor('/api/response')[1];
+  assert.equal(failed.terminalError.stableCode, 'relay.model-switch-unconfirmed');
+  assert.match(failed.text, /"gpt-5\.4"/);
+  assert.match(failed.text, /"gpt-5-mini"/);
+  // The unconfirmed prompt never went out.
+  assert.equal(expired.client.session.sends.length, 1);
+});
+
+test('a confirmation-required switch fails the row rather than deciding for the user', async () => {
+  const { stub, client, runner } = setup({
+    clientOptions: {
+      modelRpc: {
+        switchTo: () => ({ confirmation: { targetModelDisplayName: 'X', currentTokens: 1, targetLimit: 2 } }),
+      },
+    },
+  });
+  await runner.handlePendingPayload({ message: baseMessage });
+  await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', model: 'gpt-5.4' } });
+  assert.equal(stub.bodiesFor('/api/response')[1].terminalError.stableCode, 'relay.model-switch-unconfirmed');
+  assert.equal(client.session.sends.length, 1);
+});
+
+test('effort none resets to the model default the catalog reports', async () => {
+  const catalog = [{
+    id: 'gpt-5-mini',
+    supportedReasoningEfforts: ['low', 'medium', 'high'],
+    defaultReasoningEffort: 'medium',
+  }];
+  const { client, runner } = setup({ clientOptions: { modelRpc: { catalog } } });
+  await runner.handlePendingPayload({ message: { ...baseMessage, reasoningEffort: 'high' } });
+  await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', reasoningEffort: 'none' } });
+
+  assert.deepEqual(client.session.rpc.model.effortCalls, [
+    { reasoningEffort: 'high' },
+    { reasoningEffort: 'medium' },
+  ]);
+  assert.equal(runner._getState().appliedEffort, 'medium');
+});
+
+test('an effort the model does not support fails the row before anything is sent', async () => {
+  const catalog = [{
+    id: 'gpt-5-mini',
+    supportedReasoningEfforts: ['low', 'medium'],
+    defaultReasoningEffort: 'medium',
+  }];
+  const { stub, client, runner } = setup({ clientOptions: { modelRpc: { catalog } } });
+  await runner.handlePendingPayload({ message: baseMessage });
+  await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', reasoningEffort: 'max' } });
+
+  const failed = stub.bodiesFor('/api/response')[1];
+  assert.equal(failed.terminalError.stableCode, 'relay.model-switch-unconfirmed');
+  assert.match(failed.text, /"max"/);
+  assert.equal(client.session.rpc.model.effortCalls.length, 0);
+  assert.equal(client.session.sends.length, 1);
 });
 
 test('the send mode seam threads MessageOptions.mode through to send', async () => {
@@ -1165,12 +1310,14 @@ test('an openai-provider session carries its BYOK provider into the session conf
   assert.equal('modelId' in provider, false);
 });
 
-test('a hosted model switch uses setModel and keeps the one session', async () => {
+test('a hosted model switch uses the observed switchTo RPC and keeps the one session', async () => {
   const { client, runner } = setup({ env: {} });
   await runner.handlePendingPayload({ message: baseMessage });
   await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', model: 'gpt-5.4' } });
 
-  assert.deepEqual(client.session.setModelCalls, ['gpt-5.4']);
+  assert.deepEqual(client.session.rpc.model.switchToCalls, [{ modelId: 'gpt-5.4' }]);
+  // The facade's setModel is bypassed: it discards the ModelSwitchToResult.
+  assert.deepEqual(client.session.setModelCalls, []);
   // One session for the whole conversation: nothing was torn down.
   assert.equal(client.sessions.length, 1);
   assert.equal(client.session.disconnected, false);
@@ -1210,6 +1357,125 @@ test('a BYOK model switch rebuilds the session so the ceilings follow the model'
   assert.equal(client.createAttempts.length, 1);
   // Both turns still published their reply.
   assert.equal(client.sessions[1].sends.length, 1);
+  // No RPC attempt preceded the rebuild: the two models' provider blocks
+  // differ (ceilings follow the model) and no RPC can carry ceilings, so an
+  // in-place switch could never be sufficient.
+  assert.equal(firstSession.rpc.model.switchToCalls.length, 0);
+});
+
+test('a BYOK switch with unchanged ceilings tries the RPC first and rebuilds only on rejection', async () => {
+  // Explicit ceiling overrides make the provider block model-independent, so
+  // an in-place switch IS sufficient — the live RPC is tried first and a
+  // confirmed switch keeps the one session.
+  const { client, runner } = setup({
+    env: {
+      COPILOT_PROVIDER_TYPE: 'openai',
+      COPILOT_PROVIDER_API_KEY: 'sk-test',
+      COPILOT_PROVIDER_MAX_PROMPT_TOKENS: '100000',
+      COPILOT_PROVIDER_MAX_OUTPUT_TOKENS: '20000',
+      COPILOT_MODEL: 'gpt-4o',
+    },
+  });
+  await runner.handlePendingPayload({ message: { ...baseMessage, model: 'gpt-4o' } });
+  await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', model: 'gpt-4.1' } });
+
+  assert.deepEqual(client.session.rpc.model.switchToCalls, [{ modelId: 'gpt-4.1' }]);
+  assert.equal(client.sessions.length, 1);
+  assert.equal(client.session.disconnected, false);
+
+  // The runtime rejects the next switch (a singular-provider session may not
+  // accept bare model ids at all) → the dispose+resume fallback, carrying the
+  // row's effort into the rebuilt config. Never a terminal failure: BYOK has
+  // this second mechanism, so an RPC refusal is not an unhonoured selection.
+  const firstSession = client.session;
+  firstSession.rpc.model.switchTo = async () => { throw new Error('registry rejected the model'); };
+  await runner.handlePendingPayload({
+    message: { ...baseMessage, id: 'q-3', model: 'gpt-4o', reasoningEffort: 'high' },
+  });
+
+  assert.equal(firstSession.disconnected, true);
+  assert.equal(client.sessions.length, 2);
+  const rebuilt = client.resumeAttempts[client.resumeAttempts.length - 1].config;
+  assert.equal(rebuilt.model, 'gpt-4o');
+  assert.equal(rebuilt.reasoningEffort, 'high');
+  assert.equal(rebuilt.sessionId, 'conv-1');
+  // All three turns answered.
+  assert.equal(client.sessions[1].sends.length, 1);
+});
+
+test('a failed send re-sends the mode guidance on the same-mode retry', async () => {
+  // Audit #32: the mode used to be recorded as prompted while BUILDING the
+  // prefix, so a send that failed left the retry without guidance the runtime
+  // never received. The commit now happens only after send() resolves.
+  const stub = makeApiStub();
+  const client = createFakeCopilotClient({ onSend: (session) => session.replay(loadFixture('happy-turn')) });
+  const originalCreate = client.createSession.bind(client);
+  client.createSession = async (config) => {
+    const session = await originalCreate(config);
+    session.send = async () => { throw new Error('socket dropped before the prompt landed'); };
+    return session;
+  };
+  const { runner } = makeRunner({ stub, client });
+
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+  assert.equal(bodyOf(stub, '/api/response').terminalError.stableCode, 'copilot.turn-error');
+
+  // The retry (a fresh delivery after the teardown) resumes and must carry the
+  // FULL agent-mode guidance again, not just the cheap marker.
+  await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2' } });
+  assert.equal(client.session.sends.length, 1);
+  assert.equal(client.session.sends[0].prompt, promptWithPrefix('hello'));
+});
+
+test('an elicitation with a schema round-trips as a structured card and accepts', async () => {
+  const bridge = makeFakeQuestionBridge({ structuredAnswer: { env: 'prod', replicas: 2 } });
+  const { client, runner } = setup({ questionBridge: bridge });
+  await runner.handlePendingPayload({ message: baseMessage });
+
+  const config = client.createAttempts[0];
+  const schema = {
+    type: 'object',
+    properties: { env: { type: 'string' }, replicas: { type: 'number' } },
+    required: ['env'],
+  };
+  const result = await config.onElicitationRequest({
+    sessionId: 'conv-1',
+    message: 'Deployment details?',
+    requestedSchema: schema,
+    mode: 'form',
+    elicitationSource: 'deploy-mcp',
+  });
+
+  // The validated structuredAnswer maps 1:1 onto ElicitationResult.content.
+  assert.deepEqual(result, { action: 'accept', content: { env: 'prod', replicas: 2 } });
+  const call = bridge.structuredCalls[0];
+  assert.deepEqual(call.spec.requestedSchema, schema);
+  assert.match(call.spec.prompt, /Deployment details\?/);
+  // The requesting MCP server is named, so the human knows who is asking.
+  assert.match(call.spec.prompt, /deploy-mcp/);
+});
+
+test('an elicitation declines on timeout, on url mode, and without a schema', async () => {
+  const bridge = makeFakeQuestionBridge({ structuredTimedOut: true });
+  const { client, runner } = setup({ questionBridge: bridge });
+  await runner.handlePendingPayload({ message: baseMessage });
+  const config = client.createAttempts[0];
+  const schema = { type: 'object', properties: { env: { type: 'string' } } };
+
+  // An unanswered card declines — the current behaviour, preserved.
+  assert.deepEqual(
+    await config.onElicitationRequest({ message: 'x', requestedSchema: schema }),
+    { action: 'decline' },
+  );
+  // A browser redirect cannot render as a relay card.
+  assert.deepEqual(
+    await config.onElicitationRequest({ mode: 'url', url: 'https://example.test/auth' }),
+    { action: 'decline' },
+  );
+  // No schema, no form.
+  assert.deepEqual(await config.onElicitationRequest({ message: 'x' }), { action: 'decline' });
+  // Only the schema-carrying form request reached the bridge at all.
+  assert.equal(bridge.structuredCalls.length, 1);
 });
 
 test('the usage ingest never delays a finished reply', async () => {

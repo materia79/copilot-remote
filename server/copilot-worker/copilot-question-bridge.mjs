@@ -1,10 +1,13 @@
-// Bridges the Copilot runtime's two blocking interactive surfaces onto the
+// Bridges the Copilot runtime's blocking interactive surfaces onto the
 // relay's question cards:
 //
 //   * `onUserInputRequest` — the model called `ask_user`. Phase 1 answered these
 //     in-band with a "not supported" note; this asks the human.
 //   * `onPermissionRequest` in **ask** mode — the model wants to run a mutating
 //     tool. Phase 1 blanket-rejected; this offers approve/deny.
+//   * `onElicitationRequest` — a structured form (MCP elicitation). The card
+//     carries the `requestedSchema`, the relay validates the submission, and
+//     the answer comes back as `structuredAnswer` (`askStructured`).
 //
 // Both are wired to the SAME relay endpoints the extension's
 // `skills/question-bridge.mjs` uses, so a question raised by the SDK engine
@@ -85,8 +88,22 @@ export function createCopilotQuestionBridge({
   // walks these so a pending card is timed out deliberately rather than left
   // spinning in the UI until the relay's 10s expiry sweeper notices.
   const pendingQuestionIds = new Set();
+  // Creates still in flight. Shutdown's snapshot of `pendingQuestionIds` only
+  // covers cards whose create already RETURNED — a POST in flight when
+  // `cancelPendingQuestions` runs would otherwise resolve just after the
+  // snapshot and leave its card pending forever. Each tracked promise also
+  // covers the expiry the create performs itself when it lands after closing
+  // started, so awaiting the set is awaiting the whole late-card teardown.
+  const inflightCreates = new Set();
+  // One-way: set by `cancelPendingQuestions`. From then on no new card is
+  // minted and any card a late create produces is expired at birth.
+  let closing = false;
 
-  async function createQuestion({ prompt, choices, allowFreeform, source, rationale, extra = {} }) {
+  async function expireQuestion(questionId) {
+    await api('POST', `/api/relay-question/${questionId}/timeout`, {}).catch(() => {});
+  }
+
+  async function createQuestion({ prompt, choices, allowFreeform, source, rationale, requestedSchema, timeoutMs, extra = {} }) {
     const activeMsg = typeof getActiveMessage === 'function' ? getActiveMessage() : null;
     const payload = {
       // The relay 409s ("No active relay turn") unless this queue row is
@@ -98,12 +115,16 @@ export function createCopilotQuestionBridge({
       prompt,
       choices,
       allowFreeform,
+      // Top-level, as the create route reads it: the relay stores it as the
+      // card's `requestSchema` and validates the eventual `structuredAnswer`
+      // against it.
+      ...(requestedSchema ? { requestedSchema } : {}),
       sdk_session_id: sdkSessionId || undefined,
       // Fences the card to the delivering attempt: the server refuses creation
       // once the row has been requeued to a newer attempt (same field the
       // shared bridge sends).
       attemptId: activeMsg?.attemptId || undefined,
-      timeout_ms: questionTimeoutMs,
+      timeout_ms: timeoutMs ?? questionTimeoutMs,
       context: {
         source,
         rationale,
@@ -120,14 +141,72 @@ export function createCopilotQuestionBridge({
   }
 
   async function ask(spec, { signal } = {}) {
-    const questionId = await createQuestion(spec);
-    pendingQuestionIds.add(questionId);
+    // Shutdown already began: nothing will ever poll an answer, so minting a
+    // card would only strand it in the UI. Shaped like a timeout so the caller
+    // degrades exactly as it does for an unanswered card.
+    if (closing) return { answer: QUESTION_TIMEOUT_CONTINUATION_TEXT, timedOut: true };
+    const create = (async () => {
+      const questionId = await createQuestion(spec);
+      if (closing) {
+        // The create raced `cancelPendingQuestions` and lost: its card was
+        // born after the shutdown snapshot, so it is expired here, at birth —
+        // the one place that still knows its id.
+        dbg('relay question expired at birth (bridge closing)', questionId);
+        await expireQuestion(questionId);
+        return null;
+      }
+      pendingQuestionIds.add(questionId);
+      return questionId;
+    })();
+    inflightCreates.add(create);
+    let questionId;
+    try {
+      questionId = await create;
+    } finally {
+      inflightCreates.delete(create);
+    }
+    if (questionId === null) return { answer: QUESTION_TIMEOUT_CONTINUATION_TEXT, timedOut: true };
     dbg('relay question created', questionId, spec.source, spec.prompt.slice(0, 80));
     try {
-      return await shared.waitForRelayQuestionAnswer(questionId, { signal });
+      return await shared.waitForRelayQuestionAnswer(questionId, {
+        signal,
+        ...(spec.timeoutMs === undefined ? {} : { timeoutMs: spec.timeoutMs }),
+      });
     } finally {
       pendingQuestionIds.delete(questionId);
     }
+  }
+
+  /**
+   * A structured elicitation (audit #17) → a schema-carrying relay card →
+   * `{ structuredAnswer, answer, timedOut }`.
+   *
+   * The card is created with a top-level `requestedSchema`; the relay's answer
+   * route validates the submission against it and stores `structuredAnswer`,
+   * which the shared waiter reads back off the GET payload. A card that times
+   * out, is cancelled, or was answered without a validatable structured body
+   * comes back with `structuredAnswer: null` — the caller declines in that
+   * case, so a half-valid submission can never be forced into a form result.
+   */
+  async function askStructured({ prompt, requestedSchema, timeoutMs }, { signal } = {}) {
+    const result = await ask({
+      prompt: String(prompt || '').trim() || 'Copilot needs structured input to continue this turn.',
+      choices: [],
+      allowFreeform: true,
+      requestedSchema,
+      ...(timeoutMs === undefined ? {} : { timeoutMs }),
+      source: 'onElicitationRequest',
+      rationale: 'Copilot requested a structured form answer to continue this turn.',
+    }, { signal });
+    const structuredAnswer = result?.structuredAnswer && typeof result.structuredAnswer === 'object'
+      && !Array.isArray(result.structuredAnswer)
+      ? result.structuredAnswer
+      : null;
+    return {
+      structuredAnswer,
+      answer: String(result?.answer ?? ''),
+      timedOut: result?.timedOut === true,
+    };
   }
 
   /**
@@ -198,18 +277,26 @@ export function createCopilotQuestionBridge({
    * Settle every card this worker is still waiting on. Called on shutdown: the
    * process is about to stop polling, so a card left `pending` would sit in the
    * UI inviting an answer that nothing will ever read.
+   *
+   * `closing` is set FIRST, then the in-flight creates are awaited, so the
+   * snapshot below cannot miss a card: a create that resolves after this line
+   * sees `closing` and expires its own card before its tracked promise
+   * settles. Returns only the count of cards timed out from the snapshot —
+   * late-born cards are torn down but were never pending.
    */
   async function cancelPendingQuestions() {
+    closing = true;
+    if (inflightCreates.size) await Promise.allSettled([...inflightCreates]);
     const ids = [...pendingQuestionIds];
     pendingQuestionIds.clear();
-    await Promise.all(ids.map((questionId) => api('POST', `/api/relay-question/${questionId}/timeout`, {})
-      .catch(() => {})));
+    await Promise.all(ids.map((questionId) => expireQuestion(questionId)));
     return ids.length;
   }
 
   return {
     askUserInput,
     askToolApproval,
+    askStructured,
     cancelPendingQuestions,
     pendingQuestionCount: () => pendingQuestionIds.size,
     // Re-exported so the runner can wait on a question id it created itself.

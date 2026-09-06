@@ -9,7 +9,24 @@ function isImageAttachment(att) {
   return String(att?.type || '').toLowerCase().startsWith('image/');
 }
 
-function imageFromDataUrl(att) {
+/** Strict base64: the alphabet, optional padding, block length a multiple of 4. */
+const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+
+/**
+ * Decode-and-validate an inline data URL (audit #33).
+ *
+ * Disk-backed images have always enforced the decoded 5 MiB ceiling; data URLs
+ * used to skip it entirely, so a ~9 MiB decoded image (the server's ENCODED
+ * ceiling is larger) could ride straight past a limit this module claims to
+ * enforce. The ceiling is now applied to the DECODED byte count, uniformly with
+ * the disk path, and the base64 itself is validated first — `Buffer.from` is
+ * lenient and would silently decode garbage into a corrupt blob.
+ *
+ * Returns `{ data, mimeType }` for an embeddable image, `{ tooLarge: true }`
+ * for a valid image over the ceiling (so the caller can degrade explicitly),
+ * and `null` for anything invalid.
+ */
+function imageFromDataUrl(att, maxBytes) {
   const dataUrl = String(att?.dataUrl || '').trim();
   if (!dataUrl.startsWith('data:')) return null;
   const match = dataUrl.match(/^data:([^;,]+);base64,(.+)$/i);
@@ -17,6 +34,8 @@ function imageFromDataUrl(att) {
   const mimeType = String(match[1] || '').trim().toLowerCase();
   const data = String(match[2] || '').trim();
   if (!mimeType.startsWith('image/') || !data) return null;
+  if (data.length % 4 !== 0 || !BASE64_RE.test(data)) return null;
+  if (Buffer.from(data, 'base64').length > maxBytes) return { tooLarge: true };
   return { data, mimeType };
 }
 
@@ -59,6 +78,7 @@ export function buildCopilotMessageOptions(message, {
 
     if (isImageAttachment(att)) {
       let blob = null;
+      let tooLarge = false;
       if (filePath && fsImpl.existsSync(filePath)) {
         try {
           const bytes = fsImpl.readFileSync(filePath);
@@ -72,13 +92,26 @@ export function buildCopilotMessageOptions(message, {
           blob = null;
         }
       }
-      if (!blob) blob = imageFromDataUrl(att);
+      if (!blob) {
+        // The decoded ceiling applies to data URLs exactly as to disk reads —
+        // this is also the path an OVERSIZED disk image with a dataUrl twin
+        // used to sneak through.
+        const decoded = imageFromDataUrl(att, maxInlineImageBytes);
+        if (decoded?.tooLarge) tooLarge = true;
+        else blob = decoded;
+      }
       if (blob) {
         attachments.push({ type: 'blob', data: blob.data, mimeType: blob.mimeType, displayName: name });
         noteLines.push(`Attached image "${name}" (${mime}) is embedded in this message.`);
       } else if (filePath) {
         attachments.push({ type: 'file', path: filePath, displayName: name });
         noteLines.push(`Attached image "${name}" (${mime}): ${filePath}`);
+      } else if (tooLarge) {
+        // A valid image with nowhere to degrade to: too big to embed, no path
+        // for a file reference. Dropping it SILENTLY would leave the model
+        // answering about an image it never saw, so the omission is stated in
+        // the same note channel every other attachment uses.
+        noteLines.push(`Attached image "${name}" (${mime}) was too large to embed and has no file path, so it was omitted.`);
       }
       continue;
     }
