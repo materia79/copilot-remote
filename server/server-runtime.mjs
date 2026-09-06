@@ -64,7 +64,7 @@ import { createCursorDashboardUsageFetcher, readCursorIdeSessionToken } from './
 import { fetchPersonalBillingUsage } from './services/github-billing-usage.mjs';
 import { createSessionTranscriptService } from './services/session-transcript-service.mjs';
 import { createSdkSessionImportService } from './services/sdk-session-import-service.mjs';
-import { createInstalledCopilotClient } from './copilot-sdk-runtime.mjs';
+import { createInstalledCopilotClient, getCopilotBaseDirs } from './copilot-sdk-runtime.mjs';
 import { createSessionHistoryRefreshService } from './services/session-history-refresh-service.mjs';
 import { createContextSnapshotService } from './services/context-snapshot-service.mjs';
 import { createClaudeSessionRootResolver } from './services/claude-session-root-service.mjs';
@@ -3378,21 +3378,32 @@ function buildSessionWorkerLaunchEnv() {
       const candidate = path.join(versionDir, 'preloads', 'extension_bootstrap.mjs');
       if (fs.existsSync(candidate)) return candidate;
     }
-    const platformName = process.platform === 'linux'
-      ? (process.arch === 'x64' ? 'linux-x64' : `linux-${process.arch}`)
-      : `${process.platform}-${process.arch}`;
-    const cacheRoot = path.join(os.homedir(), '.cache', 'copilot', 'pkg', platformName);
-    try {
-      const versions = fs.readdirSync(cacheRoot)
-        .filter((entry) => fs.existsSync(path.join(cacheRoot, entry, 'preloads', 'extension_bootstrap.mjs')))
-        .sort()
-        .reverse();
-      if (versions.length) {
-        return path.join(cacheRoot, versions[0], 'preloads', 'extension_bootstrap.mjs');
+    // The CLI cache lives in a per-platform location (LOCALAPPDATA on Windows,
+    // Application Support on macOS, XDG dirs on Linux) — scan the same base
+    // dirs as the SDK client instead of assuming the Linux layout. Selection
+    // deliberately keys on the bootstrap file itself rather than the bundled
+    // SDK: CLI versions without a copilot-sdk directory must still resolve
+    // here for the extension engine.
+    const subdirs = [`${process.platform}-${process.arch}`, 'universal'];
+    const candidates = [];
+    for (const [baseDirIdx, baseDir] of getCopilotBaseDirs().entries()) {
+      for (const [subdirIdx, subdir] of subdirs.entries()) {
+        let entries = [];
+        try { entries = fs.readdirSync(path.join(baseDir, subdir)); } catch { continue; }
+        for (const version of entries) {
+          if (!/^\d+\.\d+\.\d+$/.test(version)) continue;
+          const candidate = path.join(baseDir, subdir, version, 'preloads', 'extension_bootstrap.mjs');
+          if (fs.existsSync(candidate)) candidates.push({ version, baseDirIdx, subdirIdx, candidate });
+        }
       }
-    } catch {
-      // The CLI cache is optional; retain the normal fallback when unavailable.
     }
+    candidates.sort((a, b) => {
+      const aVersion = a.version.split('.').map(Number);
+      const bVersion = b.version.split('.').map(Number);
+      return bVersion[0] - aVersion[0] || bVersion[1] - aVersion[1] || bVersion[2] - aVersion[2]
+        || a.baseDirIdx - b.baseDirIdx || a.subdirIdx - b.subdirIdx;
+    });
+    if (candidates.length) return candidates[0].candidate;
     return null;
   };
 
