@@ -60,6 +60,53 @@ test('deduplicates repeated shared reads by token and full IP within the TTL', (
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM status_events').get().count, 2);
 });
 
+test('a failed insert does not poison the dedupe window', () => {
+  const db = new Database(':memory:');
+  db.exec(`
+    CREATE TABLE status_events (
+      id TEXT PRIMARY KEY,
+      timestamp INTEGER NOT NULL,
+      type TEXT NOT NULL,
+      source TEXT NOT NULL,
+      payload_json TEXT NOT NULL
+    );
+  `);
+  // Wraps the real db so the first shared-access insert throws like a disk
+  // failure would; every other statement passes through untouched.
+  let failNextInsert = false;
+  const failingDb = {
+    prepare(sql) {
+      const statement = db.prepare(sql);
+      if (!/INSERT INTO status_events/.test(String(sql))) return statement;
+      return {
+        run: (...args) => {
+          if (failNextInsert) {
+            failNextInsert = false;
+            throw new Error('disk I/O error');
+          }
+          return statement.run(...args);
+        },
+      };
+    },
+    transaction: (fn) => db.transaction(fn),
+  };
+  const service = createStatusEventService(failingDb, { sharedAccessDedupeTtlMs: 60_000 });
+  const event = {
+    shareToken: 'd'.repeat(64),
+    viewerIp: '203.0.113.55',
+    conversationId: 'conversation-1',
+  };
+
+  failNextInsert = true;
+  assert.throws(() => service.recordSharedAccess({ ...event, timestamp: 1_000 }), /disk I\/O error/);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM status_events').get().count, 0);
+
+  // The immediate retry must persist instead of reporting "deduplicated".
+  assert.equal(service.recordSharedAccess({ ...event, timestamp: 2_000 }).deduped, false);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM status_events').get().count, 1);
+  assert.equal(service.recordSharedAccess({ ...event, timestamp: 3_000 }).deduped, true);
+});
+
 test('returns stable, cursor-based pages in timeline order', () => {
   const { service } = createService();
   const common = {

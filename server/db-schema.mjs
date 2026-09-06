@@ -168,7 +168,8 @@ export const SCHEMA_SQL = `
     source_started_at TEXT,
     source_modified_at TEXT,
     updated_at TEXT NOT NULL,
-    last_error TEXT
+    last_error TEXT,
+    origin TEXT
   );
 
   CREATE INDEX IF NOT EXISTS idx_sdk_session_imports_status
@@ -571,6 +572,19 @@ if (!sdkSessionImportColumns.includes('source_started_at')) {
 }
 if (!sdkSessionImportColumns.includes('source_modified_at')) {
   db.exec(`ALTER TABLE sdk_session_imports ADD COLUMN source_modified_at TEXT`);
+}
+if (!sdkSessionImportColumns.includes('origin')) {
+  // 'imported' = the importer created the conversation's runtime binding, so a
+  // later re-import/refresh is safe; 'relay' = the relay queued or executed a
+  // turn, making the relay's history authoritative (re-importing would replace
+  // it with the raw CLI transcript, instruction preambles included). Completed
+  // rows predating the column were written by the importer (relay-born
+  // conversations never get a ledger row — the import guards skip them before
+  // claiming), so backfilling 'imported' restores refreshability; any that the
+  // relay has since continued are re-flagged 'relay' from queue/worker evidence
+  // on their next import attempt.
+  db.exec(`ALTER TABLE sdk_session_imports ADD COLUMN origin TEXT`);
+  db.exec(`UPDATE sdk_session_imports SET origin = 'imported' WHERE status = 'completed'`);
 }
 
 const queueColumns = db.prepare(`PRAGMA table_info(queue)`).all().map((c) => c.name);

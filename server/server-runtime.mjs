@@ -6091,6 +6091,13 @@ const sdkSessionImportService = createSdkSessionImportService({
   parseSessionEventsToMessages,
   replaceRetrievableHistory: sessionHistoryRefreshService.replaceRetrievableHistory,
   ensureRuntimeSessionBinding,
+  // A registered/supervised worker means the relay executes this session even
+  // when no queue row is visible (e.g. between turns) — the importer must not
+  // overwrite its history.
+  hasRelayExecutionSignal: (sdkSessionId) => !!(
+    sessionWorkerRegistry?.getWorker?.(sdkSessionId)
+    || sessionWorkerSupervisor?.getWorkerState?.(sdkSessionId)
+  ),
   logger: console,
 });
 const contextSnapshotService = createContextSnapshotService({
@@ -6513,7 +6520,11 @@ async function recoverUndeliveredSessionWorkerMessage({ pending = null, sessionI
 const WORKER_DEATH_GRACE_MS = 15_000;
 
 function isWorkerSessionProcessAlive(sessionId, hintPid = null) {
-  if (sessionWorkerWebSocketService?.hasWorkerSocket?.(sessionId)) return true;
+  // A merely-retained socket is not proof of life: a dead worker's socket
+  // lingers until its close event lands, and counting it stalled recovery.
+  // The socket only counts with a recent heartbeat or a PID that probes
+  // alive; otherwise fall through to the process probes below.
+  if (sessionWorkerWebSocketService?.hasLiveWorkerSocket?.(sessionId)) return true;
   try {
     if (sessionWorkerProcessInspector?.findProcessForSession?.(sessionId)) return true;
   } catch {}
@@ -7131,7 +7142,10 @@ function ensureRuntimeSessionBinding(
   const normalizedModel = String(model || '').trim() || null;
   const normalizedSdkSessionId = String(sdkSessionId || '').trim() || null;
   if (normalizedSdkSessionId) {
-    stmts.setConvSdkSessionIdIfMissing.run(normalizedConversationId, nowIso, normalizedSdkSessionId);
+    // Statement shape is (sdk_session_id, updated_at, WHERE id): these args
+    // were swapped for as long as sdk session ids equalled conversation ids,
+    // which made the bug invisible — distinct ids made it a silent no-op.
+    stmts.setConvSdkSessionIdIfMissing.run(normalizedSdkSessionId, nowIso, normalizedConversationId);
   }
   const existing = stmts.getRuntimeSessionByConversation.get(normalizedConversationId);
   if (existing?.id) {
@@ -7476,7 +7490,10 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
   console.log(`${runtimeLogPrefix()}Runtime shutdown started (${reason}, exitCode=${runtimeShutdownExitCode})`);
   clearRuntimeTimers();
   try { updateCheckService?.stop(); } catch {}
-  void sdkSessionImportService.dispose().catch((error) => {
+  // Started here (flips the importer's closing flag synchronously) but awaited
+  // below before the transports close: fire-and-forget disposal let a
+  // mid-import sweep keep running while the process exited under it.
+  const importerShutdown = sdkSessionImportService.dispose().catch((error) => {
     console.warn(`${runtimeLogPrefix()}SDK session importer shutdown failed: ${error?.message || error}`);
   });
   try { claudeAuthService.dispose(); } catch (error) {
@@ -7537,7 +7554,9 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
     // inside the 2s force-exit budget above.
     // Deliberately not unref'd: this timer must fire for the process to exit
     // cleanly. The unref'd force-exit timer above is the backstop if it does not.
-    setTimeout(closeTransports, SHUTDOWN_SOCKET_FLUSH_MS);
+    // Importer disposal is awaited first so an in-flight session import settles
+    // before the process exits; the force-exit timer caps how long that can take.
+    setTimeout(() => { void importerShutdown.finally(closeTransports); }, SHUTDOWN_SOCKET_FLUSH_MS);
   });
 
   return runtimeShutdownPromise;

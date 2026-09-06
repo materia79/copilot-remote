@@ -393,3 +393,118 @@ test('a worker socket closing invokes the death-detection hook with its identity
   assert.equal(closedEvents[0].reason, 'close');
   assert.equal(service.hasWorkerSocket('sdk-dead'), false);
 });
+
+test('a frame claiming a different session identity closes the socket', async () => {
+  // Identity binds once. Rebinding mid-connection would let one socket drain
+  // deliveries for two sessions, so the offending socket is dropped instead.
+  const httpServer = new EventEmitter();
+  const closedEvents = [];
+  const requestedSessions = [];
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    queueCounts: () => ({ pendingCount: 1, processingCount: 0, parkedCount: 0 }),
+    onWorkerSocketClosed: (payload) => { closedEvents.push(payload); },
+    requestWork: async ({ sessionId }) => {
+      requestedSessions.push(sessionId);
+      return { message: null };
+    },
+    logger: { warn: () => {}, debug: () => {} },
+  });
+  service.start();
+  httpServer.emit('upgrade',
+    { url: '/api/session-worker/ws?token=secret-token&sessionId=sdk-original&pid=101', headers: { host: 'localhost:3333' } },
+    {},
+    Buffer.alloc(0),
+  );
+  const socket = lastWss?.sockets?.[0] || null;
+  assert.ok(socket);
+  socket.emit('message', JSON.stringify({ type: 'worker.hello', sessionId: 'sdk-hijacker', pid: 101 }));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(socket.closeCalls, 1, 'the rebinding socket is closed');
+  assert.equal(service.hasWorkerSocket('sdk-original'), false);
+  assert.equal(service.hasWorkerSocket('sdk-hijacker'), false);
+  assert.deepEqual(requestedSessions, [], 'the rejected frame never asks for work');
+  assert.equal(closedEvents.length, 1);
+  assert.equal(closedEvents[0].sessionId, 'sdk-original');
+  assert.equal(closedEvents[0].reason, 'identity-rebind');
+  service.stop();
+});
+
+test('a newer socket for a session supersedes and closes the prior one', async () => {
+  const httpServer = new EventEmitter();
+  const closedEvents = [];
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    queueCounts: () => ({ pendingCount: 0, processingCount: 0, parkedCount: 0 }),
+    onWorkerSocketClosed: (payload) => { closedEvents.push(payload); },
+    logger: { warn: () => {}, debug: () => {} },
+  });
+  service.start();
+  httpServer.emit('upgrade',
+    { url: '/api/session-worker/ws?token=secret-token&sessionId=sdk-gen&pid=201', headers: { host: 'localhost:3333' } },
+    {},
+    Buffer.alloc(0),
+  );
+  httpServer.emit('upgrade',
+    { url: '/api/session-worker/ws?token=secret-token&sessionId=sdk-gen&pid=202', headers: { host: 'localhost:3333' } },
+    {},
+    Buffer.alloc(0),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const [first, second] = lastWss.sockets;
+  assert.ok(first && second);
+  assert.equal(first.closeCalls, 1, 'the prior generation is closed');
+  assert.equal(second.closeCalls, 0, 'the new generation stays open');
+  assert.equal(service.status().connectedCount, 1);
+  assert.equal(service.hasWorkerSocket('sdk-gen'), true);
+  assert.equal(closedEvents.length, 1);
+  assert.equal(closedEvents[0].sessionId, 'sdk-gen');
+  assert.equal(closedEvents[0].pid, 201);
+  assert.equal(closedEvents[0].reason, 'superseded');
+  service.stop();
+});
+
+test('a stale socket no longer counts as live without a fresh heartbeat or live pid', async () => {
+  const httpServer = new EventEmitter();
+  let currentMs = 100_000;
+  let pidAlive = false;
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    queueCounts: () => ({ pendingCount: 0, processingCount: 0, parkedCount: 0 }),
+    isWorkerProcessAlive: () => pidAlive,
+    nowMs: () => currentMs,
+  });
+  service.start();
+  httpServer.emit('upgrade',
+    { url: '/api/session-worker/ws?token=secret-token&sessionId=sdk-stale&pid=301', headers: { host: 'localhost:3333' } },
+    {},
+    Buffer.alloc(0),
+  );
+  const socket = lastWss?.sockets?.[0] || null;
+  assert.ok(socket);
+  socket.emit('message', JSON.stringify({ type: 'worker.ping', sessionId: 'sdk-stale', pid: 301 }));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(service.hasLiveWorkerSocket('sdk-stale'), true, 'fresh heartbeat counts as live');
+
+  // Three missed 10s heartbeats: retention alone must stop counting as life.
+  currentMs += 30_001;
+  assert.equal(service.hasLiveWorkerSocket('sdk-stale'), false, 'stale socket with a dead pid is not live');
+  assert.equal(service.hasWorkerSocket('sdk-stale'), true, 'the socket itself is still retained');
+
+  pidAlive = true;
+  assert.equal(service.hasLiveWorkerSocket('sdk-stale'), true, 'a verified pid keeps a silent socket live');
+
+  socket.emit('message', JSON.stringify({ type: 'worker.ping', sessionId: 'sdk-stale', pid: 301 }));
+  pidAlive = false;
+  assert.equal(service.hasLiveWorkerSocket('sdk-stale'), true, 'a new heartbeat restores socket-backed liveness');
+  service.stop();
+});

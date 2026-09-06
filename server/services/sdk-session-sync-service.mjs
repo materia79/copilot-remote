@@ -65,12 +65,27 @@ export function createSdkSessionSyncService(db) {
     WHERE id = ?
   `);
 
+  // Rekeying a placeholder must carry every live queue row with it: a
+  // processing/parked row left under the placeholder id would be orphaned the
+  // moment the real session id takes over (audit #22). attempt_id is
+  // deliberately untouched — owner migration must not invalidate the Phase 1
+  // attempt fence on an in-flight row.
   const migrateQueueOwnerSessionId = db.prepare(`
     UPDATE queue
     SET owner_sdk_session_id = ?
-    WHERE status = 'pending'
+    WHERE status IN ('pending', 'processing', 'parked')
       AND owner_sdk_session_id = ?
       AND conversation_id = ?
+  `);
+
+  // Once a session syncs, the relay drives it: its ledger row (if it was ever
+  // imported) flips to relay ownership so the startup import sweep can never
+  // again overwrite relay history with the raw CLI transcript. One-way by
+  // design; rows that never existed are a no-op.
+  const markImportRelayOwned = db.prepare(`
+    UPDATE sdk_session_imports
+    SET origin = 'relay', updated_at = ?
+    WHERE sdk_session_id = ? AND (origin IS NULL OR origin != 'relay')
   `);
 
   const insertRuntimeSession = db.prepare(runtimeSessionsSupportProviders
@@ -85,24 +100,27 @@ export function createSdkSessionSyncService(db) {
       ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)
     `);
 
-  const syncSessionTx = db.transaction((sdkSessionIdRaw, conversationIdRaw) => {
-    const sdkSessionId = normalizeId(sdkSessionIdRaw);
-    const conversationId = normalizeId(conversationIdRaw);
-    const nowIso = new Date().toISOString();
-
+  // Every conflict check, no writes. syncSessionTx runs it immediately before
+  // mutating; the session-sync route additionally runs it (via validateBinding,
+  // with requireConversation off — workspace learning may legitimately create
+  // the conversation afterwards) BEFORE workspace learning is allowed to touch
+  // any table, so a doomed request is vetoed while everything is pristine
+  // (audit #21).
+  function assertNoBindingConflicts(sdkSessionId, conversationId, { requireConversation = true } = {}) {
     if (!sdkSessionId || !conversationId) {
       throw makeError('Missing sdk_session_id or conversation_id', 400);
     }
 
-    const conversation = getConversation.get(conversationId);
-    if (!conversation || String(conversation.status || '').trim() === 'deleted') {
+    const conversation = getConversation.get(conversationId) || null;
+    const conversationMissing = !conversation || String(conversation.status || '').trim() === 'deleted';
+    if (conversationMissing && requireConversation) {
       throw makeError('Conversation not found', 404);
     }
 
-    const existingConversationSdkSessionId = normalizeId(conversation.sdk_session_id);
-    const placeholderConversationBinding = existingConversationSdkSessionId
+    const existingConversationSdkSessionId = conversationMissing ? '' : normalizeId(conversation.sdk_session_id);
+    const placeholderConversationBinding = !!(existingConversationSdkSessionId
       && existingConversationSdkSessionId === conversationId
-      && existingConversationSdkSessionId !== sdkSessionId;
+      && existingConversationSdkSessionId !== sdkSessionId);
     if (existingConversationSdkSessionId && existingConversationSdkSessionId !== sdkSessionId && !placeholderConversationBinding) {
       throw makeError(
         `Conversation ${conversationId} is already bound to SDK session ${existingConversationSdkSessionId}`,
@@ -146,14 +164,6 @@ export function createSdkSessionSyncService(db) {
       );
     }
 
-    updateConversationSdkSession.run(sdkSessionId, nowIso, conversationId);
-    if (placeholderConversationBinding) {
-      migrateQueueOwnerSessionId.run(sdkSessionId, conversationId, conversationId);
-    }
-
-    let runtimeSessionId = null;
-    let createdRuntimeSession = false;
-
     if (runtimeSessionByConversation) {
       const currentSdkSessionId = normalizeId(runtimeSessionByConversation.sdk_session_id);
       if (currentSdkSessionId && currentSdkSessionId !== sdkSessionId && currentSdkSessionId !== conversationId) {
@@ -162,18 +172,47 @@ export function createSdkSessionSyncService(db) {
           409,
         );
       }
+    }
 
+    return {
+      placeholderConversationBinding,
+      runtimeSessionByConversation,
+      runtimeSessionBySdkSessionId,
+    };
+  }
+
+  // ORDERING CONTRACT (audit #22): the queue dequeue path reads
+  // owner_sdk_session_id to route pending work, so the placeholder→real rekey
+  // below must be visible before the next dequeue considers this
+  // conversation's rows. Both run on the same better-sqlite3 connection and
+  // this whole rekey is one synchronous transaction, so a dequeue can never
+  // observe a half-rekeyed state; callers must keep the in-memory registry
+  // rekey immediately after this transaction commits (see the session-sync
+  // route) rather than deferring it past other queue work.
+  const syncSessionTx = db.transaction((sdkSessionIdRaw, conversationIdRaw) => {
+    const sdkSessionId = normalizeId(sdkSessionIdRaw);
+    const conversationId = normalizeId(conversationIdRaw);
+    const nowIso = new Date().toISOString();
+
+    const {
+      placeholderConversationBinding,
+      runtimeSessionByConversation,
+      runtimeSessionBySdkSessionId,
+    } = assertNoBindingConflicts(sdkSessionId, conversationId, { requireConversation: true });
+
+    updateConversationSdkSession.run(sdkSessionId, nowIso, conversationId);
+    let migratedQueueRows = 0;
+    if (placeholderConversationBinding) {
+      migratedQueueRows = Number(migrateQueueOwnerSessionId.run(sdkSessionId, conversationId, conversationId).changes || 0);
+    }
+
+    let runtimeSessionId = null;
+    let createdRuntimeSession = false;
+
+    if (runtimeSessionByConversation) {
       updateRuntimeSessionSdkSession.run(conversationId, sdkSessionId, nowIso, runtimeSessionByConversation.id);
       runtimeSessionId = runtimeSessionByConversation.id;
     } else if (runtimeSessionBySdkSessionId) {
-      const currentConversationId = normalizeId(runtimeSessionBySdkSessionId.conversation_id);
-      if (currentConversationId && currentConversationId !== conversationId) {
-        throw makeError(
-          `SDK session ${sdkSessionId} is already bound to conversation ${currentConversationId}`,
-          409,
-        );
-      }
-
       updateRuntimeSessionSdkSession.run(conversationId, sdkSessionId, nowIso, runtimeSessionBySdkSessionId.id);
       runtimeSessionId = runtimeSessionBySdkSessionId.id;
     } else {
@@ -191,17 +230,35 @@ export function createSdkSessionSyncService(db) {
       );
     }
 
+    markImportRelayOwned.run(nowIso, sdkSessionId);
+    if (conversationId !== sdkSessionId) {
+      // A conversation originally imported under its own session id keeps a
+      // ledger row under that id; rebinding to a new CLI session means the
+      // relay owns that history now too.
+      markImportRelayOwned.run(nowIso, conversationId);
+    }
+
     return {
       conversationId,
       sdkSessionId,
       runtimeSessionId,
       createdRuntimeSession,
+      migratedQueueRows,
+      // Non-null when this sync rekeyed a placeholder binding: the caller must
+      // rekey any in-memory worker-registry entry from this id to sdkSessionId.
+      placeholderSdkSessionId: placeholderConversationBinding ? conversationId : null,
     };
   });
 
   return {
     syncSession({ sdk_session_id, conversation_id }) {
       return syncSessionTx(sdk_session_id, conversation_id);
+    },
+    // Read-only conflict probe for the session-sync route's validate-first
+    // ordering. Missing conversations pass — workspace learning creates them.
+    validateBinding({ sdk_session_id, conversation_id }) {
+      assertNoBindingConflicts(normalizeId(sdk_session_id), normalizeId(conversation_id), { requireConversation: false });
+      return true;
     },
   };
 }

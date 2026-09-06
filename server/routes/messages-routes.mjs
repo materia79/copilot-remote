@@ -15,6 +15,7 @@ import {
   persistConversationModelPreference as persistConversationModelPreferenceTx,
 } from '../services/conversation-preferences-service.mjs';
 import { killTmuxSession } from '../services/session-worker-launch-service.mjs';
+import { stopSessionWorkerProcesses } from '../services/session-worker-stop-service.mjs';
 import {
   fetchUsageSummaryPromise,
   staleUsageSnapshotFromRow,
@@ -1764,6 +1765,10 @@ export function registerMessagesRoutes(app, deps) {
     sessionWorkerRegistry,
     sessionWorkerSupervisor,
     sessionWorkerProcessInspector,
+    // Seams for stopSessionWorkerProcesses (platform, killImpl, isPidAliveImpl,
+    // killTmuxSessionImpl). Tests must inject these instead of relying on the
+    // host OS, so the suite behaves identically on Windows and POSIX.
+    sessionWorkerStopOverrides = null,
     resolveSessionStateRoot,
     fetchUsageSummary = null,
     planUsageService = null,
@@ -2566,6 +2571,21 @@ export function registerMessagesRoutes(app, deps) {
     return rows;
   }
 
+  // A worker survives EPERM probes (alive, different owner), so only ESRCH
+  // and bad pids count as dead — the same read as the supervisor's probe.
+  function isWorkerPidAlive(pidValue) {
+    const pid = Number(pidValue);
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      const code = String(error?.code || '').trim().toUpperCase();
+      if (code === 'EPERM') return true;
+      return false;
+    }
+  }
+
   app.post('/api/session-worker/:sdkSessionId/kill', auth, async (req, res) => {
     const sdkSessionId = normalizeSessionWorkerId(req.params.sdkSessionId);
     if (!sdkSessionId) return res.status(400).json({ error: 'Missing session worker id' });
@@ -2573,72 +2593,51 @@ export function registerMessagesRoutes(app, deps) {
     const currentWorker = sessionWorkerRegistry?.getWorker?.(sdkSessionId) || null;
     sessionWorkerSupervisor?.markKilled?.(sdkSessionId);
     try {
-      await sessionWorkerSupervisor?.cancelPendingStart?.(sdkSessionId);
+      // Wait for an in-flight spawn to settle before enumerating processes:
+      // a fire-and-forget cancellation let the spawn's child appear right
+      // after the scan and survive the kill.
+      await sessionWorkerSupervisor?.cancelPendingStart?.(sdkSessionId, { wait: true });
     } catch {
       // If cancellation fails, keep going with the process kill cleanup.
     }
 
-    // Collect ALL matching PIDs (not just first)
-    const discoveredProcesses = process.platform === 'win32'
-      ? (
-          sessionWorkerProcessInspector?.findWindowsProcessTreeForSession?.(sdkSessionId)
-          || sessionWorkerProcessInspector?.findWindowsProcessesForSession?.(sdkSessionId)
-          || sessionWorkerProcessInspector?.findProcessesForSession?.(sdkSessionId)
-          || []
-        )
-      : (sessionWorkerProcessInspector?.findProcessesForSession?.(sdkSessionId) || []);
-    const allPids = [...new Set([
-      ...discoveredProcesses.map((p) => (p.processId ? Number(p.processId) : null)).filter(Boolean),
-      currentWorker?.pid ? Number(currentWorker.pid) : null,
-    ].filter(Boolean))];
-
-    let processStatus = 'not-running';
-    let killedPids = [];
-
-    if (allPids.length) {
-      try {
-        if (process.platform === 'win32') {
-          // On Windows, kill through PowerShell to avoid process-group edge-cases.
-          killedPids = sessionWorkerProcessInspector.stopWindowsPids(allPids);
-        } else {
-          killTmuxSession(sdkSessionId);
-          for (const pid of allPids) {
-            try {
-              process.kill(pid, 'SIGTERM');
-              killedPids.push(pid);
-            } catch {
-              // Ignore missing/already-dead processes.
-            }
-          }
-          await delay(150);
-          for (const pid of allPids) {
-            try {
-              process.kill(pid, 0);
-              process.kill(pid, 'SIGKILL');
-            } catch {
-              // Already exited or inaccessible.
-            }
-          }
-        }
-        processStatus = 'killed';
-      } catch (error) {
-        return res.status(500).json({ error: error?.message || 'Failed to kill session worker', pids: allPids });
-      }
-    }
+    // Deterministic stop — the shared service enumerates every matching PID,
+    // signals, polls, escalates once, and verifies, instead of the one-shot
+    // scan-and-signal pass that used to report success with survivors.
+    const stopped = await stopSessionWorkerProcesses({
+      sdkSessionId,
+      worker: currentWorker,
+      processInspector: sessionWorkerProcessInspector,
+      isPidAliveImpl: isWorkerPidAlive,
+      killTmuxSessionImpl: killTmuxSession,
+      ...(sessionWorkerStopOverrides || {}),
+    });
+    const allPids = stopped.pids || [];
+    const remainingPids = stopped.remainingPids || [];
+    const killedPids = allPids.filter((pid) => !remainingPids.includes(pid));
+    const processStatus = allPids.length
+      ? (stopped.ok ? 'killed' : 'kill-incomplete')
+      : 'not-running';
 
     // Audit marker — always emitted before responding
-    console.log(`[KILL] session=${sdkSessionId} pids=${allPids.join(',') || 'none'} processStatus=${processStatus}`);
+    console.log(`[KILL] session=${sdkSessionId} pids=${allPids.join(',') || 'none'} processStatus=${processStatus}${remainingPids.length ? ` remaining=${remainingPids.join(',')}` : ''}`);
 
-    // Post-kill verification — synchronous re-scan to confirm processes are gone
-    const remainingPids = allPids.length
-      ? (process.platform === 'win32'
-          ? (
-              sessionWorkerProcessInspector?.findWindowsProcessTreeForSession?.(sdkSessionId)
-              || sessionWorkerProcessInspector?.findWindowsProcessesForSession?.(sdkSessionId)
-              || []
-            ).map((p) => p.processId).filter(Boolean)
-          : ((sessionWorkerProcessInspector?.findProcessesForSession?.(sdkSessionId) || []).map((p) => p.processId).filter(Boolean)))
-      : [];
+    if (!stopped.ok) {
+      // Verified survivors (or a failed stop pass): keep the registry entry
+      // and every owned queue row. Clearing them while a CLI is still alive is
+      // what let a "successful" kill leave an orphan worker holding the
+      // session's work.
+      return res.status(409).json({
+        ok: false,
+        error: stopped.error || 'Session worker processes survived the kill',
+        sdkSessionId,
+        killedPids,
+        remainingPids,
+        processStatus,
+        escalated: stopped.escalated === true,
+        timedOut: stopped.timedOut === true,
+      });
+    }
 
     sessionWorkerRegistry?.removeWorker?.(sdkSessionId);
     sessionWorkerSupervisor?.clearRestartSchedule?.(sdkSessionId);

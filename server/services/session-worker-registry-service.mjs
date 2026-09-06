@@ -91,9 +91,18 @@ export function createSessionWorkerRegistry() {
 
   function clearIndexesForSession(entry) {
     if (!entry) return;
-    if (entry.workerId) sessionByWorkerId.delete(entry.workerId);
-    if (entry.conversationId) sessionByConversationId.delete(entry.conversationId);
-    if (entry.runtimeSessionId) sessionByRuntimeSessionId.delete(entry.runtimeSessionId);
+    // Only drop an index that still points at THIS entry's session: a newer
+    // entry may have legitimately claimed the same workerId/conversationId/
+    // runtimeSessionId since, and deleting blindly would orphan it.
+    if (entry.workerId && sessionByWorkerId.get(entry.workerId) === entry.sdkSessionId) {
+      sessionByWorkerId.delete(entry.workerId);
+    }
+    if (entry.conversationId && sessionByConversationId.get(entry.conversationId) === entry.sdkSessionId) {
+      sessionByConversationId.delete(entry.conversationId);
+    }
+    if (entry.runtimeSessionId && sessionByRuntimeSessionId.get(entry.runtimeSessionId) === entry.sdkSessionId) {
+      sessionByRuntimeSessionId.delete(entry.runtimeSessionId);
+    }
   }
 
   function updateIndexesForSession(entry) {
@@ -169,6 +178,34 @@ export function createSessionWorkerRegistry() {
     return bySession.delete(sessionId);
   }
 
+  // Placeholder→real session rekey (audit #22). Session sync migrates the DB
+  // side (conversation binding, runtime session, queue owners) in one
+  // transaction; this is the in-memory half, moving the registry entry and its
+  // secondary indexes so the placeholder never lingers as a phantom worker.
+  function rekeyWorker(fromSdkSessionId, toSdkSessionId) {
+    const from = normalizeSessionId(fromSdkSessionId);
+    const to = normalizeSessionId(toSdkSessionId);
+    if (!from || !to || from === to) return null;
+    const placeholder = bySession.get(from);
+    if (!placeholder) return null;
+    const existingTarget = bySession.get(to) || null;
+    // An entry already registered under the real id is newer than the
+    // placeholder — its fields win, the placeholder only backfills gaps.
+    const next = sanitizeState({
+      ...placeholder,
+      ...(existingTarget || {}),
+      sdkSessionId: to,
+      createdAt: placeholder.createdAt,
+      updatedAt: new Date().toISOString(),
+    });
+    clearIndexesForSession(placeholder);
+    if (existingTarget) clearIndexesForSession(existingTarget);
+    bySession.delete(from);
+    bySession.set(to, next);
+    updateIndexesForSession(next);
+    return toSnapshot(next);
+  }
+
   function clearAll() {
     bySession.clear();
     sessionByWorkerId.clear();
@@ -188,6 +225,7 @@ export function createSessionWorkerRegistry() {
     listWorkers,
     upsertWorker,
     removeWorker,
+    rekeyWorker,
     clearAll,
   };
 }

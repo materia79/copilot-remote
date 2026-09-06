@@ -71,16 +71,68 @@ export function createSdkSessionImportService({
   parseSessionEventsToMessages,
   replaceRetrievableHistory,
   ensureRuntimeSessionBinding,
+  // Live evidence that the relay runs (or ran) a worker for this session in
+  // the current process — queue rows alone miss a worker between turns.
+  hasRelayExecutionSignal = () => false,
   logger = console,
 } = {}) {
   if (!db || !stmts || typeof createClient !== 'function') throw new Error('SDK session importer requires database, statements, and a client factory');
   let runtime = null;
   let activeRun = null;
+  let closing = false;
   const countConversationMessages = db.prepare(`
     SELECT COUNT(*) AS count
     FROM messages
     WHERE conversation_id = ?
   `);
+
+  // Ownership ledger (audit #19). The importer creates a runtime binding for
+  // every conversation it imports, so "a binding exists" cannot double as "the
+  // relay executes this conversation" — that reading froze every imported
+  // session after its first import. The ledger's origin column records who the
+  // binding belongs to; relay evidence flips it durably below.
+  const getImportOwnership = db.prepare(`
+    SELECT status, origin
+    FROM sdk_session_imports
+    WHERE sdk_session_id = ?
+  `);
+  // Any queue row referencing the session — including done/failed ones that
+  // have not been pruned yet — proves the relay queued a turn for it.
+  const getQueueEvidence = db.prepare(`
+    SELECT 1 AS present
+    FROM queue
+    WHERE conversation_id = ? OR owner_sdk_session_id = ?
+    LIMIT 1
+  `);
+  // Durable one-way flip: once the relay owns a session, pruned queue rows or
+  // a restart must not hand it back to the importer.
+  const markImportRelayOwned = db.prepare(`
+    UPDATE sdk_session_imports
+    SET origin = 'relay', updated_at = ?
+    WHERE sdk_session_id = ? AND (origin IS NULL OR origin != 'relay')
+  `);
+  const markImportOriginImported = db.prepare(`
+    UPDATE sdk_session_imports
+    SET origin = 'imported'
+    WHERE sdk_session_id = ? AND (origin IS NULL OR origin = 'imported')
+  `);
+
+  function relayOwnsSession(sdkSessionId) {
+    const ledger = getImportOwnership.get(sdkSessionId) || null;
+    if (ledger?.origin === 'relay') return true;
+    const executed = !!getQueueEvidence.get(sdkSessionId, sdkSessionId)
+      || hasRelayExecutionSignal(sdkSessionId) === true;
+    if (executed) {
+      markImportRelayOwned.run(new Date().toISOString(), sdkSessionId);
+      return true;
+    }
+    // origin = 'imported' is only ever written by a completed import, so it is
+    // the one proof the binding belongs to the importer (and it survives a
+    // later failed refresh attempt). Anything else — no ledger row, no origin —
+    // means the relay created the binding (conversation bootstrap,
+    // session-sync) and owns the history.
+    return ledger?.origin !== 'imported';
+  }
 
   const upsertConversation = db.prepare(`
     INSERT INTO conversations (id, title, sdk_session_id, configured_workspace_root_path, runtime_workspace_root_path, created_at, updated_at)
@@ -94,6 +146,9 @@ export function createSdkSessionImportService({
   `);
 
   async function getRuntime() {
+    // Refusing after dispose() is what stops a mid-shutdown import from
+    // resurrecting a fresh SDK client the server would never tear down.
+    if (closing) throw new Error('SDK session importer is shutting down');
     if (!runtime) runtime = await createClient();
     return runtime;
   }
@@ -136,6 +191,16 @@ export function createSdkSessionImportService({
     const workspaceRoot = text(metadata.workspaceRootPath || metadata.workspace_root_path || metadata.cwd) || null;
     const title = sessionTitle(session, messages);
     db.transaction(() => {
+      // The relay may have queued a turn while this import was reading SDK
+      // events; overwriting now would replace relay history with the raw
+      // transcript. Re-checked inside the transaction so the decision and the
+      // write are one unit. (The durable origin flip happens in the caller —
+      // an UPDATE here would roll back with the throw.)
+      if (getQueueEvidence.get(sdkSessionId, sdkSessionId) || hasRelayExecutionSignal(sdkSessionId) === true) {
+        const error = new Error('Relay queued a turn during import');
+        error.code = 'relay-owned';
+        throw error;
+      }
       upsertConversation.run(sdkSessionId, title, sdkSessionId, workspaceRoot, workspaceRoot, createdAt, updatedAt);
       ensureRuntimeSessionBinding(sdkSessionId, null, updatedAt, sdkSessionId);
       replaceRetrievableHistory(sdkSessionId, messages);
@@ -147,12 +212,15 @@ export function createSdkSessionImportService({
         now,
         sdkSessionId,
       );
+      // The binding above belongs to the import, not to relay execution.
+      markImportOriginImported.run(sdkSessionId);
     })();
   }
 
   async function importSession(session, { force = false } = {}) {
     const sdkSessionId = sessionIdOf(session);
     if (!sdkSessionId) return { status: 'skipped', category: 'unchanged', reason: 'missing-session-id' };
+    if (closing) return { sdkSessionId, status: 'skipped', category: 'unchanged', reason: 'importer-closing' };
     if (isTombstoned(sdkSessionId)) return { sdkSessionId, status: 'skipped', category: 'tombstoned', reason: 'tombstoned' };
     // Sessions the relay created to execute an existing conversation's turns
     // are vehicles, not conversations: their history already lives in the
@@ -165,15 +233,16 @@ export function createSdkSessionImportService({
     // The SDK-engine workers (Copilot SDK, Claude, Cursor, Grok) run a
     // conversation's turns in a CLI session that shares the conversation's OWN
     // id — the exact equality the guard above reads as "external". A runtime
-    // binding for that conversation means the relay executes it and already
-    // owns its history: importing would overwrite relay messages with the raw
-    // runtime transcript, instruction preambles included (burn-in incident
-    // 2026-08-31: "[Relay mode: autopilot] …" surfaced as user bubbles and
-    // conversation titles after a restart). This also protects an imported
-    // conversation the user later CONTINUED in the relay — from that moment
-    // the relay's history is authoritative, not the CLI transcript.
+    // binding for that conversation used to be read as relay ownership
+    // outright, but the importer itself creates a binding on every completed
+    // import — that reading made the first import the last (audit #19). The
+    // binding still matters (importing over relay history reproduces the
+    // burn-in incident 2026-08-31: "[Relay mode: autopilot] …" surfaced as
+    // user bubbles and titles after a restart), so ownership now comes from
+    // the ledger: only a binding the importer did NOT account for, or actual
+    // relay activity (a queued turn, a live worker), blocks the import.
     const runtimeSession = stmts.getRuntimeSessionByConversation?.get?.(sdkSessionId) || null;
-    if (runtimeSession) {
+    if (runtimeSession && relayOwnsSession(sdkSessionId)) {
       return { sdkSessionId, status: 'skipped', category: 'relay-owned', reason: 'relay-execution-session' };
     }
     // Same protection when a live conversation already claims this session id
@@ -202,11 +271,20 @@ export function createSdkSessionImportService({
       persistCompletedImport({ sdkSessionId, session, messages });
       return { sdkSessionId, status: 'completed', category: claimed.category, messageCount: messages.length };
     } catch (error) {
-      stmts.failSdkSessionImport.run(new Date().toISOString(), boundedError(error), sdkSessionId);
+      const now = new Date().toISOString();
+      if (error?.code === 'relay-owned') {
+        // The relay claimed the session mid-import. Flip ownership durably and
+        // release the claim so the ledger row is not stuck in 'processing'.
+        markImportRelayOwned.run(now, sdkSessionId);
+        stmts.failSdkSessionImport.run(now, boundedError(error), sdkSessionId);
+        return { sdkSessionId, status: 'skipped', category: 'relay-owned', reason: 'relay-claimed-during-import' };
+      }
+      stmts.failSdkSessionImport.run(now, boundedError(error), sdkSessionId);
       return { sdkSessionId, status: 'failed', category: 'failed', error: boundedError(error) };
     } finally {
-      try { await resumed?.stop?.(); } catch {}
-      try { await resumed?.dispose?.(); } catch {}
+      // SDK 1.0.13's CopilotSession cleanup API; the previous optional
+      // stop()/dispose() calls matched nothing and leaked every resume.
+      try { await resumed?.disconnect?.(); } catch {}
     }
   }
 
@@ -229,6 +307,9 @@ export function createSdkSessionImportService({
         const sessions = await normalizeEvents(await client.client.listSessions());
         summary.listed = sessions.length;
         for (const session of sessions) {
+          // A shutdown mid-sweep must stop cleanly between sessions instead of
+          // racing dispose() for the runtime.
+          if (closing) break;
           const result = await importSession(session);
           summary[result.category] = Number(summary[result.category] || 0) + 1;
         }
@@ -263,6 +344,11 @@ export function createSdkSessionImportService({
     importSession,
     refreshConversation,
     async dispose() {
+      // Flag first: getRuntime() must refuse before the client goes away, or a
+      // concurrent import observes runtime = null and creates a replacement
+      // while the server is exiting.
+      closing = true;
+      try { await activeRun; } catch {}
       const current = runtime;
       runtime = null;
       await current?.dispose?.();

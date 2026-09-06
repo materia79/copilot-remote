@@ -119,8 +119,13 @@ export async function createInstalledCopilotClient({
     approveAll: sdk.approveAll,
     paths,
     async dispose() {
-      await client.stop?.();
-      await client.dispose?.();
+      // stop() can reject (e.g. the CLI already died); dispose() must still
+      // run or the transport resources leak with it.
+      try {
+        await client.stop?.();
+      } finally {
+        await client.dispose?.();
+      }
     },
   };
 }

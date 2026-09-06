@@ -2,48 +2,51 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
 
+import { applySchema } from '../db-schema.mjs';
+import { createSessionRepository } from '../repositories/session-repository.mjs';
 import { createSdkSessionImportService } from './sdk-session-import-service.mjs';
 
-function makeHarness({ eventsBySession = {}, failSessions = new Set(), sessionMetadata = {} } = {}) {
-  const db = new Database(':memory:');
-  db.exec(`
-    CREATE TABLE conversations (
-      id TEXT PRIMARY KEY, title TEXT NOT NULL, title_source TEXT NOT NULL DEFAULT 'auto',
-      sdk_session_id TEXT, configured_workspace_root_path TEXT, runtime_workspace_root_path TEXT,
-      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-    );
-    CREATE TABLE messages (
-      id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, role TEXT NOT NULL,
-      text TEXT NOT NULL, timestamp TEXT NOT NULL
-    );
-    CREATE TABLE deleted_sdk_sessions (sdk_session_id TEXT PRIMARY KEY);
-    CREATE TABLE runtime_sessions (
-      id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, provider_type TEXT,
-      created_at TEXT, last_used_at TEXT
-    );
-    CREATE TABLE relay_session_links (
-      sdk_session_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, created_at TEXT NOT NULL
-    );
-    CREATE TABLE sdk_session_imports (
-      sdk_session_id TEXT PRIMARY KEY, conversation_id TEXT, status TEXT NOT NULL,
-      attempt_count INTEGER NOT NULL DEFAULT 0, started_at TEXT, completed_at TEXT,
-      source_started_at TEXT, source_modified_at TEXT, updated_at TEXT NOT NULL, last_error TEXT
-    );
+// The audit (#19) traced the frozen-after-first-import bug to a harness that
+// stubbed binding creation to a no-op: production creates a real
+// runtime_sessions row on import, and the old ownership guard then read that
+// row as "the relay executes this conversation". This helper mirrors the
+// import-relevant behavior of server-runtime's ensureRuntimeSessionBinding —
+// reuse the conversation's binding or create one — so the tests see the same
+// state production does.
+function makeEnsureRuntimeSessionBinding(db) {
+  const getByConversation = db.prepare(`SELECT * FROM runtime_sessions WHERE conversation_id = ?`);
+  const touch = db.prepare(`UPDATE runtime_sessions SET model = ?, last_used_at = ?, status = 'active' WHERE id = ?`);
+  const insert = db.prepare(`
+    INSERT INTO runtime_sessions (id, conversation_id, strategy, runtime_key, model, status, created_at, last_used_at, sdk_session_id)
+    VALUES (?, ?, 'isolated', ?, ?, 'active', ?, ?, ?)
   `);
-  const stmts = {
-    getDeletedSdkSession: db.prepare(`SELECT sdk_session_id FROM deleted_sdk_sessions WHERE sdk_session_id = ?`),
-    getRelaySessionLink: db.prepare(`SELECT * FROM relay_session_links WHERE sdk_session_id = ?`),
-    getRuntimeSessionByConversation: db.prepare(`SELECT * FROM runtime_sessions WHERE conversation_id = ? ORDER BY last_used_at DESC LIMIT 1`),
-    getConvBySdkSessionId: db.prepare(`SELECT * FROM conversations WHERE sdk_session_id = ? ORDER BY updated_at DESC LIMIT 1`),
-    getSdkSessionImport: db.prepare(`SELECT * FROM sdk_session_imports WHERE sdk_session_id = ?`),
-    upsertSdkSessionImport: db.prepare(`INSERT INTO sdk_session_imports (sdk_session_id, conversation_id, status, attempt_count, updated_at) VALUES (?, ?, 'pending', 0, ?) ON CONFLICT(sdk_session_id) DO NOTHING`),
-    claimSdkSessionImport: db.prepare(`UPDATE sdk_session_imports SET status = 'processing', attempt_count = attempt_count + 1, started_at = ?, updated_at = ?, last_error = NULL WHERE sdk_session_id = ? AND (? = 1 OR status != 'completed') AND status != 'processing'`),
-    completeSdkSessionImport: db.prepare(`UPDATE sdk_session_imports SET conversation_id = ?, status = 'completed', completed_at = ?, source_started_at = ?, source_modified_at = ?, updated_at = ?, last_error = NULL WHERE sdk_session_id = ?`),
-    failSdkSessionImport: db.prepare(`UPDATE sdk_session_imports SET status = 'failed', updated_at = ?, last_error = ? WHERE sdk_session_id = ?`),
-    resetInterruptedSdkSessionImports: db.prepare(`UPDATE sdk_session_imports SET status = 'failed', updated_at = ?, last_error = 'Interrupted before import completion' WHERE status = 'processing'`),
+  return (conversationId, model, nowIso, sdkSessionId = null) => {
+    const existing = getByConversation.get(conversationId);
+    if (existing?.id) {
+      touch.run(model || null, nowIso, existing.id);
+      return getByConversation.get(conversationId);
+    }
+    const id = `rs-${conversationId}`;
+    insert.run(id, conversationId, id, model || null, nowIso, nowIso, sdkSessionId);
+    return getByConversation.get(conversationId);
   };
+}
+
+function makeHarness({
+  eventsBySession = {},
+  failSessions = new Set(),
+  sessionMetadata = {},
+  hasRelayExecutionSignal = undefined,
+  resumeGates = {},
+} = {}) {
+  const db = new Database(':memory:');
+  applySchema(db);
+  const stmts = createSessionRepository(db);
   const resumed = [];
   const resumeConfigs = [];
+  const disconnected = [];
+  let clientCreations = 0;
+  let clientDisposals = 0;
   const client = {
     async listSessions() {
       return Object.keys(eventsBySession).map((sessionId) => ({
@@ -57,25 +60,50 @@ function makeHarness({ eventsBySession = {}, failSessions = new Set(), sessionMe
     async resumeSession(sessionId, config) {
       resumed.push(sessionId);
       resumeConfigs.push(config);
+      if (resumeGates[sessionId]) await resumeGates[sessionId];
       if (failSessions.has(sessionId)) throw new Error(`resume failed: ${sessionId}`);
-      return { async getEvents() { return eventsBySession[sessionId]; }, async dispose() {} };
+      return {
+        async getEvents() { return eventsBySession[sessionId]; },
+        async disconnect() { disconnected.push(sessionId); },
+      };
     },
   };
   const replaced = [];
   const service = createSdkSessionImportService({
     db,
     stmts,
-    createClient: async () => ({ client, async dispose() {} }),
+    createClient: async () => {
+      clientCreations += 1;
+      return { client, async dispose() { clientDisposals += 1; } };
+    },
     parseSessionEventsToMessages: (events) => events.map((event) => ({ id: event.id, role: event.role, text: event.text })),
     replaceRetrievableHistory: (conversationId, messages) => replaced.push({ conversationId, messages }),
-    ensureRuntimeSessionBinding: () => null,
+    ensureRuntimeSessionBinding: makeEnsureRuntimeSessionBinding(db),
+    ...(hasRelayExecutionSignal ? { hasRelayExecutionSignal } : {}),
     logger: { info() {} },
   });
-  return { db, service, resumed, resumeConfigs, replaced, eventsBySession, sessionMetadata };
+  return {
+    db,
+    service,
+    resumed,
+    resumeConfigs,
+    disconnected,
+    replaced,
+    eventsBySession,
+    sessionMetadata,
+    counters: {
+      get clientCreations() { return clientCreations; },
+      get clientDisposals() { return clientDisposals; },
+    },
+  };
+}
+
+function importOrigin(db, sdkSessionId) {
+  return db.prepare(`SELECT status, origin FROM sdk_session_imports WHERE sdk_session_id = ?`).get(sdkSessionId) || null;
 }
 
 test('imports all SDK sessions sequentially and skips unchanged ledger rows', async () => {
-  const { db, service, resumed, resumeConfigs, replaced } = makeHarness({
+  const { db, service, resumed, resumeConfigs, replaced, disconnected } = makeHarness({
     eventsBySession: {
       first: [{ id: 'm1', role: 'user', text: 'first' }],
       second: [{ id: 'm2', role: 'user', text: 'second' }],
@@ -89,6 +117,11 @@ test('imports all SDK sessions sequentially and skips unchanged ledger rows', as
     { suppressResumeEvent: true, availableTools: [] },
   ]);
   assert.equal(replaced.length, 2);
+  // Every resumed session must be released with the SDK's disconnect() API.
+  assert.deepEqual(disconnected, ['first', 'second']);
+  // The import creates real runtime bindings and records that it owns them.
+  assert.equal(db.prepare(`SELECT COUNT(*) AS c FROM runtime_sessions`).get().c, 2);
+  assert.deepEqual(importOrigin(db, 'first'), { status: 'completed', origin: 'imported' });
 
   const second = await service.runStartupImport();
   assert.deepEqual(second, { listed: 2, new: 0, changed: 0, unchanged: 2, failed: 0, tombstoned: 0, 'relay-owned': 0, 'bound-elsewhere': 0 });
@@ -127,7 +160,10 @@ test('preserves SDK start and modified timestamps when importing', async () => {
   );
 });
 
-test('re-imports a newer SDK snapshot and preserves manual relay titles', async () => {
+test('re-imports a newer SDK snapshot despite its own runtime binding', async () => {
+  // Regression for audit #19: the first import creates a runtime binding, and
+  // the old guard read ANY binding as relay ownership — so the source changing
+  // upstream could never reach the relay again.
   const { db, service, resumed, replaced, eventsBySession, sessionMetadata } = makeHarness({
     eventsBySession: { changed: [{ id: 'm1', role: 'user', text: 'before' }] },
     sessionMetadata: {
@@ -139,6 +175,7 @@ test('re-imports a newer SDK snapshot and preserves manual relay titles', async 
     },
   });
   await service.runStartupImport();
+  assert.ok(db.prepare(`SELECT id FROM runtime_sessions WHERE conversation_id = 'changed'`).get());
   db.prepare(`UPDATE conversations SET title = 'My title', title_source = 'manual' WHERE id = 'changed'`).run();
   eventsBySession.changed = [{ id: 'm2', role: 'user', text: 'after' }];
   sessionMetadata.changed.modifiedTime = '2026-07-12T10:30:00.000Z';
@@ -214,20 +251,111 @@ test('an empty changed snapshot preserves existing history and retries later', a
   assert.deepEqual(resumed, ['protected', 'protected']);
 });
 
-test('forced refresh bypasses the timestamp skip decision', async () => {
-  const { service, resumed } = makeHarness({
+test('forced refresh of an imported-only session re-imports through its real binding', async () => {
+  const { db, service, resumed, replaced, eventsBySession } = makeHarness({
     eventsBySession: { refresh: [{ id: 'm1', role: 'user', text: 'refresh' }] },
     sessionMetadata: { refresh: { modifiedTime: '2026-07-11T10:30:00.000Z' } },
   });
   await service.runStartupImport();
+  // The binding the first import created must not read as relay ownership.
+  assert.ok(db.prepare(`SELECT id FROM runtime_sessions WHERE conversation_id = 'refresh'`).get());
+  eventsBySession.refresh = [{ id: 'm2', role: 'user', text: 'refreshed upstream' }];
 
-  const result = await service.importSession({
-    sessionId: 'refresh',
-    metadata: { modifiedTime: '2026-07-11T10:30:00.000Z' },
-  }, { force: true });
+  const result = await service.refreshConversation({ id: 'refresh', sdk_session_id: 'refresh' });
 
   assert.equal(result.status, 'completed');
   assert.deepEqual(resumed, ['refresh', 'refresh']);
+  assert.deepEqual(replaced.at(-1), {
+    conversationId: 'refresh',
+    messages: [{ id: 'm2', role: 'user', text: 'refreshed upstream' }],
+  });
+});
+
+test('a failed refresh attempt does not surrender the session to the relay', async () => {
+  // The ledger row flips to status 'failed' on a broken refresh while origin
+  // stays 'imported' — ownership must follow origin, or one transient failure
+  // would lock the conversation out of refresh forever.
+  const failSessions = new Set();
+  const { service, resumed } = makeHarness({
+    eventsBySession: { flaky: [{ id: 'm1', role: 'user', text: 'imported' }] },
+    failSessions,
+  });
+  await service.runStartupImport();
+  failSessions.add('flaky');
+  const failed = await service.refreshConversation({ id: 'flaky', sdk_session_id: 'flaky' });
+  assert.equal(failed.status, 'failed');
+
+  failSessions.delete('flaky');
+  const retried = await service.refreshConversation({ id: 'flaky', sdk_session_id: 'flaky' });
+
+  assert.equal(retried.status, 'completed');
+  assert.deepEqual(resumed, ['flaky', 'flaky', 'flaky']);
+});
+
+test('a queued relay turn flips ownership durably and blocks re-import', async () => {
+  const { db, service, resumed } = makeHarness({
+    eventsBySession: { continued: [{ id: 'm1', role: 'user', text: 'imported' }] },
+  });
+  await service.runStartupImport();
+  // The user continued the imported conversation in the relay.
+  db.prepare(`
+    INSERT INTO queue (id, conversation_id, status, owner_sdk_session_id, text, timestamp)
+    VALUES ('q-1', 'continued', 'pending', 'continued', 'go on', '2026-07-12T10:00:00.000Z')
+  `).run();
+
+  const blocked = await service.refreshConversation({ id: 'continued', sdk_session_id: 'continued' });
+  assert.equal(blocked.status, 'skipped');
+  assert.equal(blocked.category, 'relay-owned');
+  assert.deepEqual(importOrigin(db, 'continued'), { status: 'completed', origin: 'relay' });
+
+  // The flip must outlive the queue row (rows are pruned): still relay-owned.
+  db.prepare(`DELETE FROM queue WHERE id = 'q-1'`).run();
+  const stillBlocked = await service.refreshConversation({ id: 'continued', sdk_session_id: 'continued' });
+  assert.equal(stillBlocked.category, 'relay-owned');
+  assert.deepEqual(resumed, ['continued']);
+});
+
+test('a live worker signal marks the session relay-owned', async () => {
+  const liveWorkers = new Set();
+  const { db, service, resumed } = makeHarness({
+    eventsBySession: { worked: [{ id: 'm1', role: 'user', text: 'imported' }] },
+    hasRelayExecutionSignal: (sdkSessionId) => liveWorkers.has(sdkSessionId),
+  });
+  await service.runStartupImport();
+  liveWorkers.add('worked');
+
+  const blocked = await service.refreshConversation({ id: 'worked', sdk_session_id: 'worked' });
+
+  assert.equal(blocked.category, 'relay-owned');
+  assert.deepEqual(importOrigin(db, 'worked'), { status: 'completed', origin: 'relay' });
+  assert.deepEqual(resumed, ['worked']);
+});
+
+test('a turn queued while the import reads events aborts the overwrite', async () => {
+  const { db, service, replaced, eventsBySession } = makeHarness({
+    eventsBySession: { raced: [{ id: 'm1', role: 'user', text: 'imported' }] },
+    sessionMetadata: { raced: { modifiedTime: '2026-07-11T10:30:00.000Z' } },
+  });
+  await service.runStartupImport();
+  // The relay enqueues while the import is reading SDK events: the
+  // transaction-level re-check must refuse to replace relay history.
+  eventsBySession.raced = {
+    async *[Symbol.asyncIterator]() {
+      db.prepare(`
+        INSERT INTO queue (id, conversation_id, status, owner_sdk_session_id, text, timestamp)
+        VALUES ('q-race', 'raced', 'pending', 'raced', 'racing turn', '2026-07-12T10:00:00.000Z')
+      `).run();
+      yield { id: 'm2', role: 'user', text: 'stale transcript' };
+    },
+  };
+
+  const result = await service.refreshConversation({ id: 'raced', sdk_session_id: 'raced' });
+
+  assert.equal(result.status, 'skipped');
+  assert.equal(result.category, 'relay-owned');
+  assert.equal(result.reason, 'relay-claimed-during-import');
+  assert.equal(replaced.length, 1);
+  assert.deepEqual(importOrigin(db, 'raced'), { status: 'failed', origin: 'relay' });
 });
 
 test('relay execution sessions are never imported as conversations', async () => {
@@ -252,10 +380,11 @@ test('relay execution sessions are never imported as conversations', async () =>
 
 test('a conversation the relay executes under its own id is never re-imported', async () => {
   // The SDK-engine workers use the relay conversation id AS the CLI session
-  // id, so the "different id" relay-vehicle guard above does not fire. The
-  // runtime binding is the ownership signal (burn-in incident 2026-08-31:
-  // the import overwrote relay history with the raw runtime transcript,
-  // instruction preambles surfacing as user bubbles and titles).
+  // id, so the "different id" relay-vehicle guard above does not fire. A
+  // runtime binding with no completed import behind it means the relay created
+  // it (burn-in incident 2026-08-31: the import overwrote relay history with
+  // the raw runtime transcript, instruction preambles surfacing as user
+  // bubbles and titles).
   const { db, service, resumed } = makeHarness({
     eventsBySession: {
       'sdk-owned-conv': [{ id: 'm1', role: 'user', text: '[Relay mode: autopilot] preamble' }],
@@ -266,8 +395,8 @@ test('a conversation the relay executes under its own id is never re-imported', 
     VALUES ('sdk-owned-conv', 'Timer test', 'sdk-owned-conv', '2026-08-11T12:00:00.000Z', '2026-08-11T12:00:00.000Z')
   `).run();
   db.prepare(`
-    INSERT INTO runtime_sessions (id, conversation_id, provider_type, created_at, last_used_at)
-    VALUES ('rs-owned-1', 'sdk-owned-conv', 'github', '2026-08-11T12:00:00.000Z', '2026-08-11T12:00:00.000Z')
+    INSERT INTO runtime_sessions (id, conversation_id, strategy, runtime_key, status, created_at, last_used_at, sdk_session_id)
+    VALUES ('rs-owned-1', 'sdk-owned-conv', 'isolated', 'rs-owned-1', 'active', '2026-08-11T12:00:00.000Z', '2026-08-11T12:00:00.000Z', 'sdk-owned-conv')
   `).run();
 
   const summary = await service.runStartupImport();
@@ -294,4 +423,40 @@ test('sessions bound to an existing conversation under another id are not duplic
   assert.equal(summary['bound-elsewhere'], 1);
   assert.deepEqual(resumed, []);
   assert.equal(db.prepare(`SELECT COUNT(*) AS count FROM conversations WHERE id = 'bound-session'`).get().count, 0);
+});
+
+test('shutdown during a multi-session import stops the sweep and never recreates the client', async () => {
+  // Regression for audit #20: disposal used to clear the runtime without a
+  // closing flag, so the next session in the active sweep observed
+  // runtime = null and created a fresh SDK client while the server exited.
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  const { service, resumed, counters } = makeHarness({
+    eventsBySession: {
+      one: [{ id: 'm1', role: 'user', text: 'one' }],
+      two: [{ id: 'm2', role: 'user', text: 'two' }],
+    },
+    resumeGates: { one: firstGate },
+  });
+
+  const sweep = service.runStartupImport();
+  // Wait until the first session's resume is actually in flight.
+  while (resumed.length === 0) await new Promise((resolve) => setImmediate(resolve));
+  const disposal = service.dispose();
+  releaseFirst();
+  const summary = await sweep;
+  await disposal;
+
+  assert.equal(summary.new, 1);
+  assert.deepEqual(resumed, ['one']);
+  assert.equal(counters.clientCreations, 1);
+  assert.equal(counters.clientDisposals, 1);
+
+  // After disposal the importer must refuse work instead of reviving a client.
+  const skipped = await service.importSession({ sessionId: 'two' });
+  assert.equal(skipped.reason, 'importer-closing');
+  const postShutdownSweep = await service.runStartupImport();
+  assert.equal(postShutdownSweep.failed, 1);
+  assert.match(String(postShutdownSweep.error), /shutting down/);
+  assert.equal(counters.clientCreations, 1);
 });

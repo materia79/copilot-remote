@@ -91,9 +91,10 @@ export function createStatusEventService(db, {
     const normalizedConversationId = String(conversationId || '').trim();
     const dedupeKey = `${token}:${ip}`;
     const previousSeenAt = sharedAccessDedupe.get(dedupeKey);
-    sharedAccessDedupe.set(dedupeKey, now);
-    pruneSharedAccessDedupe(now);
     if (Number.isFinite(previousSeenAt) && (now - previousSeenAt) <= normalizedDedupeTtlMs) {
+      // A dedupe hit slides the window — a persisted event already backs it.
+      sharedAccessDedupe.set(dedupeKey, now);
+      pruneSharedAccessDedupe(now);
       return { event: null, deduped: true };
     }
 
@@ -113,6 +114,11 @@ export function createStatusEventService(db, {
       deleteExpiredEvents.run(normalizedMaxEvents);
     });
     persist();
+    // Committed only after the insert lands: marking the key first made a
+    // failed insert report the immediate retry as deduplicated with nothing
+    // persisted.
+    sharedAccessDedupe.set(dedupeKey, now);
+    pruneSharedAccessDedupe(now);
     return { event, deduped: false };
   }
 

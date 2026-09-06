@@ -85,6 +85,12 @@ function queueSnapshotChanged(left, right) {
     || left.parkedCount !== right.parkedCount;
 }
 
+// The worker link heartbeats every ~10s (readyRefreshMs in
+// worker-websocket-link.mjs) and itself abandons a connection after 30s of
+// server silence (staleConnectionMs). Mirror that on this side: three missed
+// heartbeats and a retained socket no longer proves the worker is alive.
+const WORKER_SOCKET_LIVENESS_MAX_SILENCE_MS = 30_000;
+
 export function createSessionWorkerWebSocketService({
   WebSocketServerImpl,
   httpServer,
@@ -104,6 +110,7 @@ export function createSessionWorkerWebSocketService({
   pathPrefix = '',
   pollIntervalMs = 1000,
   nowIso = () => new Date().toISOString(),
+  nowMs = () => Date.now(),
   logger = console,
 } = {}) {
   if (!WebSocketServerImpl) throw new Error('createSessionWorkerWebSocketService requires WebSocketServerImpl');
@@ -122,6 +129,66 @@ export function createSessionWorkerWebSocketService({
   let interval = null;
   let lastSnapshot = null;
   let attached = false;
+
+  function nowMsSafe() {
+    const value = Number(nowMs());
+    return Number.isFinite(value) ? value : Date.now();
+  }
+
+  function removeSocket(socket, reason) {
+    const meta = clientState.get(socket);
+    clients.delete(socket);
+    clientState.delete(socket);
+    // Death-detection hook: a worker socket closing while its session owns
+    // an in-flight processing row used to be silently forgotten, leaving
+    // the row to the 600s stale sweep. The handler PID-probes and recovers.
+    if (meta?.sessionId) {
+      Promise.resolve(onWorkerSocketClosed({
+        sessionId: meta.sessionId,
+        pid: meta.pid || null,
+        reason,
+      })).catch(() => {});
+    }
+  }
+
+  function supersedePriorSockets(ws, sessionId) {
+    for (const socket of Array.from(clients)) {
+      if (socket === ws) continue;
+      const meta = clientState.get(socket);
+      if (meta?.sessionId !== sessionId) continue;
+      // One authoritative socket generation per session: the newest connection
+      // wins, and the prior socket is dropped synchronously so it can neither
+      // be handed work nor count as liveness while its close event is in
+      // flight. Before this, multiple ready sockets could claim one session
+      // and each pull rows for it.
+      logWarn(`[worker-ws] superseding prior socket for ${sessionId.slice(0, 8)}`);
+      removeSocket(socket, 'superseded');
+      try { socket.close(); } catch {}
+    }
+  }
+
+  function bindSocketIdentity(ws, meta, payload) {
+    const claimedSessionId = normalizeText(payload.sessionId);
+    const claimedPid = normalizePositiveInt(payload.pid);
+    // A socket's identity binds once (upgrade URL or first identifying frame).
+    // A later frame claiming a different session or PID is a misidentified or
+    // rekeyed worker; closing is safer than ignoring the frame — the worker
+    // reconnects and re-binds atomically instead of keeping a socket that
+    // receives one session's deliveries while claiming to be another.
+    if ((meta.sessionId && claimedSessionId && claimedSessionId !== meta.sessionId)
+      || (meta.pid && claimedPid && claimedPid !== meta.pid)) {
+      logWarn(`[worker-ws] identity rebind rejected for ${String(meta.sessionId || 'unknown').slice(0, 8)} claimed=${String(claimedSessionId || 'none').slice(0, 8)}`);
+      removeSocket(ws, 'identity-rebind');
+      try { ws.close(); } catch {}
+      return false;
+    }
+    if (!meta.sessionId && claimedSessionId) {
+      meta.sessionId = claimedSessionId;
+      supersedePriorSockets(ws, claimedSessionId);
+    }
+    if (!meta.pid && claimedPid) meta.pid = claimedPid;
+    return true;
+  }
 
   function toQueueChangedEvent(reason = 'queue-update') {
     const snapshot = normalizeQueueSnapshot(queueCounts());
@@ -302,9 +369,11 @@ export function createSessionWorkerWebSocketService({
       ready: false,
       delivering: false,
       connectedAt: nowIso(),
+      lastSeenAtMs: nowMsSafe(),
       lastDeliveredAt: null,
       deliveryFailures: 0,
     });
+    if (identity.sessionId) supersedePriorSockets(ws, identity.sessionId);
     touchCli();
     emitEvent(ws, {
       type: 'server.hello',
@@ -325,8 +394,8 @@ export function createSessionWorkerWebSocketService({
       const meta = clientState.get(ws);
       if (!meta || !payload || typeof payload !== 'object') return;
       if (payload.type === 'worker.hello') {
-        meta.sessionId = normalizeText(payload.sessionId) || meta.sessionId;
-        meta.pid = normalizePositiveInt(payload.pid) || meta.pid;
+        if (!bindSocketIdentity(ws, meta, payload)) return;
+        meta.lastSeenAtMs = nowMsSafe();
         meta.ready = true;
         meta.lastHelloAt = nowIso();
         noteHeartbeat(meta, 'worker-hello');
@@ -341,8 +410,8 @@ export function createSessionWorkerWebSocketService({
         return;
       }
       if (payload.type === 'worker.ready') {
-        meta.sessionId = normalizeText(payload.sessionId) || meta.sessionId;
-        meta.pid = normalizePositiveInt(payload.pid) || meta.pid;
+        if (!bindSocketIdentity(ws, meta, payload)) return;
+        meta.lastSeenAtMs = nowMsSafe();
         meta.ready = true;
         meta.lastReadyAt = nowIso();
         noteHeartbeat(meta, String(payload.reason || 'worker-ready'));
@@ -350,8 +419,8 @@ export function createSessionWorkerWebSocketService({
         return;
       }
       if (payload.type === 'worker.ping') {
-        meta.sessionId = normalizeText(payload.sessionId) || meta.sessionId;
-        meta.pid = normalizePositiveInt(payload.pid) || meta.pid;
+        if (!bindSocketIdentity(ws, meta, payload)) return;
+        meta.lastSeenAtMs = nowMsSafe();
         meta.lastPingAt = nowIso();
         noteHeartbeat(meta, String(payload.reason || 'worker-ping'));
         emitEvent(ws, {
@@ -362,23 +431,8 @@ export function createSessionWorkerWebSocketService({
         });
       }
     });
-    const dropSocket = (reason) => {
-      const meta = clientState.get(ws);
-      clients.delete(ws);
-      clientState.delete(ws);
-      // Death-detection hook: a worker socket closing while its session owns
-      // an in-flight processing row used to be silently forgotten, leaving
-      // the row to the 600s stale sweep. The handler PID-probes and recovers.
-      if (meta?.sessionId) {
-        Promise.resolve(onWorkerSocketClosed({
-          sessionId: meta.sessionId,
-          pid: meta.pid || null,
-          reason,
-        })).catch(() => {});
-      }
-    };
-    ws.on('close', () => dropSocket('close'));
-    ws.on('error', () => dropSocket('error'));
+    ws.on('close', () => removeSocket(ws, 'close'));
+    ws.on('error', () => removeSocket(ws, 'error'));
   }
 
   function hasWorkerSocket(sessionId) {
@@ -386,6 +440,24 @@ export function createSessionWorkerWebSocketService({
     if (!wanted) return false;
     for (const meta of clientState.values()) {
       if (meta?.sessionId === wanted) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Socket-backed liveness for dead-worker recovery. Mere socket retention is
+   * not proof of life — a dead worker's socket lingers until its close event
+   * lands — so the socket must have been heard from within the liveness
+   * window, or its claimed PID must probe alive.
+   */
+  function hasLiveWorkerSocket(sessionId) {
+    const wanted = normalizeText(sessionId);
+    if (!wanted) return false;
+    const cutoffMs = nowMsSafe() - WORKER_SOCKET_LIVENESS_MAX_SILENCE_MS;
+    for (const meta of clientState.values()) {
+      if (meta?.sessionId !== wanted) continue;
+      if (Number(meta.lastSeenAtMs || 0) >= cutoffMs) return true;
+      if (meta.pid && isWorkerProcessAlive(meta.pid) === true) return true;
     }
     return false;
   }
@@ -479,5 +551,6 @@ export function createSessionWorkerWebSocketService({
     handleUpgrade,
     sendControlToSession,
     hasWorkerSocket,
+    hasLiveWorkerSocket,
   };
 }

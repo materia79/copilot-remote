@@ -2081,6 +2081,10 @@ export function registerSessionsRoutes(app, deps) {
     uploadPathForSha,
   } = deps;
   const sdkSessionSyncService = createSdkSessionSyncService(db);
+  // Generic synchronous transaction runner for the session-sync route: binding
+  // validation, workspace learning and the binding writes must commit or roll
+  // back as one unit (audit #21).
+  const sessionSyncTransaction = db.transaction((work) => work());
 
   /**
    * Drops draft references to the given blobs and reclaims any that no longer
@@ -2753,16 +2757,36 @@ export function registerSessionsRoutes(app, deps) {
     }
 
     try {
-      const workspaceRootSync = learnWorkspaceRootFromSessionSync({
-        learnConversationWorkspaceRoot,
-        sdkSessionId,
-        conversationId,
-        workspaceRootPath,
+      // Conflicts veto the request BEFORE workspace learning may create or
+      // mutate rows, and the whole set commits atomically — a 409 leaves every
+      // table exactly as the request found it (audit #21). The placeholder
+      // queue-owner rekey inside syncSession lands in this same transaction,
+      // so a dequeue can never read a half-migrated owner id (audit #22).
+      const { workspaceRootSync, sync } = sessionSyncTransaction(() => {
+        sdkSessionSyncService.validateBinding({
+          sdk_session_id: sdkSessionId,
+          conversation_id: conversationId,
+        });
+        const learned = learnWorkspaceRootFromSessionSync({
+          learnConversationWorkspaceRoot,
+          sdkSessionId,
+          conversationId,
+          workspaceRootPath,
+        });
+        return {
+          workspaceRootSync: learned,
+          sync: sdkSessionSyncService.syncSession({
+            sdk_session_id: sdkSessionId,
+            conversation_id: conversationId,
+          }),
+        };
       });
-      const sync = sdkSessionSyncService.syncSession({
-        sdk_session_id: sdkSessionId,
-        conversation_id: conversationId,
-      });
+      // In-memory half of the placeholder rekey, immediately after the DB half
+      // committed: markWorkerSessionSeen below would otherwise mint a second
+      // registry entry under the real id and strand the placeholder entry.
+      if (sync?.placeholderSdkSessionId) {
+        sessionWorkerRegistry?.rekeyWorker?.(sync.placeholderSdkSessionId, sync.sdkSessionId);
+      }
       const rebind = relayRestartOrchestrator?.applySessionSync?.({
         sdkSessionId,
         conversationId,
@@ -3084,17 +3108,27 @@ export function registerSessionsRoutes(app, deps) {
       const result = await sdkSessionImportService.refreshConversation(existingConversation);
       if (result.status === 'failed') throw new Error(result.error || 'Failed to refresh conversation history');
       if (result.status !== 'completed') {
-        const error = new Error(
-          result.reason === 'tombstoned'
-            ? 'Conversation not found'
-            : 'Conversation history refresh is already in progress',
-        );
-        error.statusCode = result.reason === 'tombstoned' ? 404 : 409;
+        // Each skip gets its precise cause; the old blanket "already in
+        // progress" told users a relay-owned conversation was merely busy and
+        // to try again (audit #19).
+        const skip = result.category === 'relay-owned'
+          ? { statusCode: 409, code: 'relay-owned', message: 'Conversation history is owned by the relay and cannot be re-imported' }
+          : result.category === 'bound-elsewhere'
+            ? { statusCode: 409, code: 'bound-elsewhere', message: 'SDK session is bound to another conversation' }
+            : result.reason === 'tombstoned'
+              ? { statusCode: 404, code: 'not-found', message: 'Conversation not found' }
+              : result.reason === 'importer-closing'
+                ? { statusCode: 503, code: 'shutting-down', message: 'Relay is shutting down' }
+                : { statusCode: 409, code: 'refresh-in-progress', message: 'Conversation history refresh is already in progress' };
+        const error = new Error(skip.message);
+        error.statusCode = skip.statusCode;
+        error.code = skip.code;
         throw error;
       }
     } catch (error) {
       return res.status(error?.statusCode || 500).json({
         error: error?.message || 'Failed to refresh conversation history',
+        ...(error?.code ? { code: error.code } : {}),
       });
     }
 

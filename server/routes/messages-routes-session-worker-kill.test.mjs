@@ -70,7 +70,15 @@ async function invokeKill(handler, sdkSessionId = SESSION_ID) {
   return captured;
 }
 
-function makeDeps({ processingRows = [], emitted = [], calls = [], spies } = {}) {
+function makeDeps({
+  processingRows = [],
+  emitted = [],
+  calls = [],
+  spies,
+  cancelPendingStart = null,
+  processInspector = null,
+  stopOverrides = null,
+} = {}) {
   return {
     auth: (_req, _res, next) => next(),
     db: makeDb({ processingRows }),
@@ -88,16 +96,26 @@ function makeDeps({ processingRows = [], emitted = [], calls = [], spies } = {})
     },
     sessionWorkerSupervisor: {
       markKilled: () => { calls.push('markKilled'); return null; },
-      cancelPendingStart: async () => { calls.push('cancelPendingStart'); return { cancelled: true }; },
+      cancelPendingStart: cancelPendingStart
+        || (async () => { calls.push('cancelPendingStart'); return { cancelled: true }; }),
       clearRestartSchedule: () => { calls.push('clearRestartSchedule'); return null; },
       resetHealth: () => { calls.push('resetHealth'); return null; },
     },
     // No live processes: keeps the handler off every platform-specific kill path.
-    sessionWorkerProcessInspector: {
+    sessionWorkerProcessInspector: processInspector || {
       findWindowsProcessTreeForSession: () => [],
       findWindowsProcessesForSession: () => [],
       findProcessesForSession: () => [],
       stopWindowsPids: () => [],
+    },
+    // Seams for stopSessionWorkerProcesses so the test never signals real
+    // processes and behaves identically on Windows and POSIX.
+    sessionWorkerStopOverrides: stopOverrides || {
+      platform: 'linux',
+      killImpl: () => {},
+      isPidAliveImpl: () => false,
+      killTmuxSessionImpl: () => {},
+      sleepImpl: async () => {},
     },
   };
 }
@@ -146,4 +164,87 @@ test('killing a session drops its background continuation rows instead of answer
   assert.equal(statusEvents.length, 1);
   assert.equal(statusEvents[0].payload.messageId, 'continuation-1');
   assert.equal(statusEvents[0].payload.status, 'failed');
+});
+
+test('a kill during a spawn waits for the cancellation to settle before enumerating', async () => {
+  // Cancelling without waiting let the in-flight spawn's child appear right
+  // after the process scan, survive the kill, and still get an ok:true.
+  const calls = [];
+  const spies = { droppedContinuations: [] };
+  const handler = killHandler(makeDeps({
+    calls,
+    spies,
+    cancelPendingStart: async (_sid, options) => {
+      calls.push('cancelPendingStart:begin');
+      assert.equal(options?.wait, true, 'the route must ask for settlement');
+      await new Promise((resolve) => setImmediate(resolve));
+      calls.push('cancelPendingStart:settled');
+      return { cancelled: true, hadPending: true, waited: true };
+    },
+    processInspector: {
+      findWindowsProcessTreeForSession: () => [],
+      findWindowsProcessesForSession: () => [],
+      findProcessesForSession: () => { calls.push('enumerate'); return []; },
+      stopWindowsPids: () => [],
+    },
+  }));
+
+  const { status, body } = await invokeKill(handler);
+
+  assert.equal(status, 200);
+  assert.equal(body.ok, true);
+  const settledAt = calls.indexOf('cancelPendingStart:settled');
+  const enumeratedAt = calls.indexOf('enumerate');
+  assert.ok(settledAt >= 0 && enumeratedAt >= 0);
+  assert.ok(settledAt < enumeratedAt, 'processes are enumerated only after the spawn cancellation settles');
+});
+
+test('a surviving process yields a degraded response and keeps queue ownership', async () => {
+  const calls = [];
+  const emitted = [];
+  const spies = { droppedContinuations: [] };
+  const handler = killHandler(makeDeps({
+    calls,
+    emitted,
+    spies,
+    processingRows: [{
+      id: 'owned-turn-1',
+      conversation_id: 'conv-1',
+      kind: 'user',
+      status: 'processing',
+      relay_mode: 'agent',
+      model: 'gpt-5.4-mini',
+    }],
+    processInspector: {
+      findWindowsProcessTreeForSession: () => [],
+      findWindowsProcessesForSession: () => [],
+      findProcessesForSession: () => [{ processId: 4242 }],
+      stopWindowsPids: () => [],
+    },
+    stopOverrides: {
+      platform: 'linux',
+      killImpl: () => {},
+      // The process shrugs off SIGTERM and SIGKILL: the stop service times out
+      // with a verified survivor.
+      isPidAliveImpl: () => true,
+      killTmuxSessionImpl: () => {},
+      sleepImpl: async () => {},
+      gracefulTimeoutMs: 0,
+      escalationTimeoutMs: 0,
+    },
+  }));
+
+  const { status, body } = await invokeKill(handler);
+
+  assert.equal(status, 409);
+  assert.equal(body.ok, false);
+  assert.equal(body.processStatus, 'kill-incomplete');
+  assert.deepEqual(body.remainingPids, [4242]);
+  assert.equal(body.timedOut, true);
+  // Ownership is retained: no registry teardown, no drained rows, no kill event.
+  assert.equal(calls.includes('removeWorker'), false);
+  assert.equal(calls.filter((entry) => entry === 'markKilled').length, 1, 'the kill block is not re-armed for a failed kill');
+  assert.deepEqual(spies.droppedContinuations, []);
+  assert.equal(emitted.some((entry) => entry.event === 'session_worker_killed'), false);
+  assert.equal(emitted.some((entry) => entry.event === 'message_status'), false);
 });
