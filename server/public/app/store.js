@@ -1188,12 +1188,24 @@ export function setModelBanner(message) {
 export function showTransientRelayNotice(message, ms = 4000) {
   const text = String(message || '').trim();
   if (!text) return;
-  setModelBanner(text);
+  // Transient notices render in the fixed #relay-toast, not #model-banner:
+  // the banner is composer-scoped and stacks below modals, while these
+  // notices must stay readable over full-screen overlays.
+  const toast = document.getElementById('relay-toast');
+  if (!toast) {
+    setModelBanner(text);
+    setTimeout(() => {
+      const el = document.getElementById('model-banner');
+      if (el && String(el.textContent || '').trim() === text) setModelBanner('');
+    }, Math.max(1500, Number(ms) || 4000));
+    return;
+  }
+  toast.textContent = text;
+  toast.classList.add('visible');
   setTimeout(() => {
-    const el = document.getElementById('model-banner');
-    if (!el) return;
-    if (String(el.textContent || '').trim() === text) {
-      setModelBanner('');
+    if (String(toast.textContent || '').trim() === text) {
+      toast.textContent = '';
+      toast.classList.remove('visible');
     }
   }, Math.max(1500, Number(ms) || 4000));
 }

@@ -261,7 +261,7 @@ test.describe.serial("Change CWD picker on mobile", () => {
     await page.locator("#change-cwd-manual-path").fill("C:\\workspaces\\recent-01");
     await relaunchButton.tap();
 
-    await expect(page.locator("#model-banner")).toContainText("kept its current directory");
+    await expect(page.locator("#relay-toast")).toContainText("kept its current directory");
     expect(posted.idempotencyKey).toBeTruthy();
   });
 });
