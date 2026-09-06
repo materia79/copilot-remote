@@ -1215,6 +1215,25 @@ export function renderSubagentRunsMarkup(subagentRuns, activities, thoughts) {
   return roots.map(renderRun).join('');
 }
 
+// Places the live bubble directly under its owning user message, or leaves a
+// bubble already in the transcript where it is when that row is not rendered.
+// Idempotent so the reuse path can call it every tick: a bubble built before
+// its owning row existed gets re-anchored once the row appears.
+function anchorThinkingBubble(div, messageId) {
+  const el = document.getElementById('messages');
+  if (!el || !div) return;
+  const id = String(messageId || '').trim();
+  const target = id ? el.querySelector(`[data-message-id="${id}"]`) : null;
+  if (target && target.parentNode === el) {
+    if (target.nextSibling === div) return;
+    const next = target.nextSibling;
+    if (next) el.insertBefore(div, next);
+    else el.appendChild(div);
+  } else if (div.parentNode !== el) {
+    el.appendChild(div);
+  }
+}
+
 export function showThinking(messageId = null, autoScroll = true) {
   const nextMessageId = String(messageId || '').trim();
   if (nextMessageId) thinkingMessageId = nextMessageId;
@@ -1229,11 +1248,11 @@ export function showThinking(messageId = null, autoScroll = true) {
       stopBtn.textContent = stopping ? 'Stopping…' : 'Stop';
       stopBtn.classList.toggle('stopping', stopping);
     }
+    anchorThinkingBubble(existing, nextMessageId || existing.dataset.messageId);
     if (autoScroll) scrollBottom();
     return;
   }
   existing?.remove();
-  const el = document.getElementById('messages');
   const div = document.createElement('div');
   div.className = 'msg assistant';
   div.id = 'thinking-indicator';
@@ -1254,14 +1273,7 @@ export function showThinking(messageId = null, autoScroll = true) {
       <div id="thinking-activity" class="thinking-activity"></div>
       <div class="subagent-bubbles-container" data-subagent-bubbles-root="1"></div>
     </div>`;
-  const target = nextMessageId ? el.querySelector(`[data-message-id="${nextMessageId}"]`) : null;
-  if (target && target.parentNode === el) {
-    const next = target.nextSibling;
-    if (next) el.insertBefore(div, next);
-    else el.appendChild(div);
-  } else {
-    el.appendChild(div);
-  }
+  anchorThinkingBubble(div, nextMessageId);
   renderThinkingThoughts();
   renderThinkingStream();
   if (autoScroll) scrollBottom();
@@ -1282,7 +1294,7 @@ export function collapseThinkingThoughts() {
   });
 }
 
-function clearRelayStreamState(messageId = null) {
+export function clearRelayStreamState(messageId = null) {
   const id = String(messageId || '').trim();
   if (!id) {
     relayStreamStateByMessageId.clear();
@@ -1412,9 +1424,13 @@ export function restoreInFlightThinking(inFlight, autoScroll = true) {
   }
   // Skip the rebuild when the payload matches the previous tick: the 900ms
   // live poll would otherwise churn the DOM (and the user's selection) with
-  // identical content.
+  // identical content. The indicator must belong to this turn's message —
+  // skipping on a foreign bubble would let a misplaced one stick around.
   const snapshotKey = buildInFlightSnapshotKey(inFlight);
-  if (snapshotKey === lastInFlightSnapshotKey && document.getElementById('thinking-indicator')) {
+  const liveIndicator = document.getElementById('thinking-indicator');
+  if (snapshotKey === lastInFlightSnapshotKey
+    && liveIndicator
+    && String(liveIndicator.dataset.messageId || '') === messageId) {
     return;
   }
   lastInFlightSnapshotKey = snapshotKey;
@@ -1892,14 +1908,20 @@ export function flushDeferredMessageRender() {
   renderMessages(msgs, scroll, meta);
 }
 
-export function clearRelayStreamStateForMessage(messageId) {
+// Blacklists the id from further live relay_stream frames. Kept separate from
+// the state clearing so mid-flow statuses ('pending'/'parked') can reset the
+// bookkeeping without muting the rest of the turn.
+export function markRelayStreamComplete(messageId) {
   const id = String(messageId || '').trim();
-  if (id) {
-    completedMessageIds.add(id);
-    if (completedMessageIds.size > 100) {
-      completedMessageIds.delete(completedMessageIds.values().next().value);
-    }
+  if (!id) return;
+  completedMessageIds.add(id);
+  if (completedMessageIds.size > 100) {
+    completedMessageIds.delete(completedMessageIds.values().next().value);
   }
+}
+
+export function clearRelayStreamStateForMessage(messageId) {
+  markRelayStreamComplete(messageId);
   clearRelayStreamState(messageId);
 }
 
@@ -2819,7 +2841,12 @@ export async function sendMessage() {
         draftUpdatedByClientId: CLIENT_ID,
       });
     }
-    if (cliOnline && viewingSendConversation()) showThinking(r.messageId || null);
+    if (cliOnline && viewingSendConversation()) {
+      // A turn already running here owns the live bubble; adopting the
+      // just-queued id would re-anchor it under the newest user message.
+      const activeTurn = getActiveTurnForConversation(composerConversationId);
+      if (!activeTurn?.messageId) showThinking(r.messageId || null);
+    }
 
     if (viewingSendConversation()) {
       clearAttachments();

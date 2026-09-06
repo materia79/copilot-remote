@@ -49,6 +49,33 @@ test('child loads survive a tree swap by re-resolving the node by path', () => {
   assert.match(body, /repoBrowserState\.nodeMap\.get\(nodePath\) \|\| null/);
 });
 
+test('a background conversation finishing its turn cannot wipe the viewed live bubble', () => {
+  const source = readSource('./socket-handlers.js');
+  const handlerIndex = source.indexOf("socket.on('assistant_message'");
+  assert.notEqual(handlerIndex, -1, 'expected the assistant_message handler');
+  const handler = source.slice(handlerIndex, handlerIndex + 700);
+  assert.match(
+    handler,
+    /if \(isCurrentConversation\) \{\s*collapseThinkingThoughts\(\);\s*removeThinking\(\);\s*\}/,
+    'the live-bubble teardown must be gated on the viewed conversation',
+  );
+});
+
+test('message_status blacklists live streaming only on terminal statuses', () => {
+  const source = readSource('./socket-handlers.js');
+  assert.match(source, /if \(messageId && isTerminalStatus\) clearRelayStreamStateForMessage\(messageId\);/);
+  assert.match(
+    source,
+    /else if \(messageId\) clearRelayStreamState\(messageId\);/,
+    "the enqueue-time 'pending' ack may reset stream bookkeeping but never mark the message complete",
+  );
+});
+
+test('the live poll stays armed while a locally-sent message is still queued', () => {
+  const poll = functionBody(readSource('./bootstrap.js'), 'pollAuthenticatedCurrentConversationLive');
+  assert.match(poll, /hasPendingUserMessageForConversation\(currentId\)/);
+});
+
 test('the live poll defers while the user selects or drags in the chat', () => {
   const bootstrap = readSource('./bootstrap.js');
   const poll = functionBody(bootstrap, 'pollAuthenticatedCurrentConversationLive');

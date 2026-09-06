@@ -49,6 +49,7 @@ import {
   getConversationWatcherCount,
   generateId,
   imageEditTarget,
+  hasPendingUserMessageForConversation,
 } from './store.js';
 import {
   verifyExistingSession,
@@ -3239,8 +3240,13 @@ async function pollAuthenticatedCurrentConversationLive() {
   const currentId = String(currentConvId || '').trim();
   if (!currentId) return;
   const currentConversation = conversations[currentId] || null;
+  // A locally-sent message still waiting in the queue must keep the poll
+  // armed: while it waits, inFlight is null, so the poll itself tears the
+  // bubble down — leaving neither localTurnStatus nor an indicator to revive
+  // polling once a worker finally picks the message up.
   const isProcessing = String(currentConversation?.localTurnStatus || '').trim().toLowerCase() === 'processing'
-    || !!document.getElementById('thinking-indicator');
+    || !!document.getElementById('thinking-indicator')
+    || hasPendingUserMessageForConversation(currentId);
   if (!isProcessing) return;
   // Refreshing while the user selects or drags in the chat would rebuild the
   // DOM under the selection; the guard's release callback re-polls right away.

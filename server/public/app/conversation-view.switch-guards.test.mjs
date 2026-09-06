@@ -943,6 +943,119 @@ test('quota badge hides when the plan data is null, missing, or NaN', () => {
 // the short-circuit (false).
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Live-bubble anchoring — the thinking indicator belongs to the message whose
+// turn is running: a send during an active turn must not re-adopt it, and the
+// reuse path must re-anchor a bubble that drifted below newer rows.
+// ---------------------------------------------------------------------------
+
+// The harness getElementById map never learns about ids assigned after
+// creation, so the div built by showThinking is found via the transcript.
+function liveIndicators() {
+  return messagesEl.children.filter((node) => node.id === 'thinking-indicator');
+}
+
+function resetThinkingIndicatorStub() {
+  const stub = getById('thinking-indicator');
+  stub.remove();
+  delete stub.dataset.messageId;
+  return stub;
+}
+
+test('live bubble: a send during an active turn does not re-anchor the bubble under the new message', async () => {
+  const convId = nextId('conv-anchor');
+  conversations[convId] = { id: convId, title: 'Anchor' };
+  setCurrentConv(convId);
+  resetThinkingIndicatorStub();
+  store.setCliOnline(true);
+  const msgA = makeMessage(nextId('msg-a'));
+  view.renderMessages([msgA], false, { conversationId: convId });
+  view.showThinking(msgA.id, false);
+  assert.equal(liveIndicators().length, 1, 'precondition: the turn has a live bubble');
+  const aRow = messagesEl.children.find((node) => node.dataset.messageId === msgA.id && node.id !== 'thinking-indicator');
+  assert.equal(aRow.nextSibling, liveIndicators()[0], 'precondition: the bubble sits under its owning message');
+  view.applyConversationTurnStatus({ conversationId: convId, messageId: msgA.id, status: 'processing' });
+
+  resetComposer('a follow-up queued behind the running turn');
+  fetchHandler = async (url) => {
+    if (url.includes(`/api/conversation/${convId}?`)) return validationPayload('sess-anchor', '/root-anchor', 'Anchor');
+    if (url.includes('/api/message')) return { conversationId: convId, messageId: nextId('srv') };
+    if (url.includes(`/api/conversation/${convId}/draft`)) return { ok: true, draftText: '', draftUpdatedAt: new Date().toISOString() };
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  await view.sendMessage();
+
+  const indicators = liveIndicators();
+  assert.equal(indicators.length, 1, 'the running turn keeps a single live bubble');
+  assert.equal(indicators[0].dataset.messageId, msgA.id, 'the bubble still belongs to the active turn');
+  assert.equal(aRow.nextSibling, indicators[0], 'the bubble stays anchored under the active turn\'s message');
+  const bRow = messagesEl.children.find((node) => node.classList.contains('msg')
+    && node.id !== 'thinking-indicator'
+    && node.dataset.messageId !== msgA.id);
+  assert.ok(bRow, 'the queued follow-up is rendered');
+  assert.ok(
+    messagesEl.children.indexOf(bRow) > messagesEl.children.indexOf(indicators[0]),
+    'the queued follow-up lands below the streaming bubble, not above it',
+  );
+
+  view.applyConversationTurnStatus({ conversationId: convId, messageId: msgA.id, status: 'done' });
+  indicators[0].remove();
+  view.removeThinking();
+});
+
+test('live bubble: the reuse branch re-anchors an indicator that drifted below newer rows', () => {
+  const convId = nextId('conv-reanchor');
+  conversations[convId] = { id: convId, title: 'Re' };
+  setCurrentConv(convId);
+  const msgA = makeMessage(nextId('msg-a'));
+  const msgB = makeMessage(nextId('msg-b'), { role: 'assistant' });
+  view.renderMessages([msgA, msgB], false, { conversationId: convId });
+  // Simulate a bubble built while its owning row was still unrendered: right
+  // message id, but stuck at the transcript end.
+  const indicator = resetThinkingIndicatorStub();
+  indicator.dataset.messageId = msgA.id;
+  indicator.className = 'msg assistant';
+  messagesEl.appendChild(indicator);
+  assert.equal(messagesEl.lastElementChild, indicator, 'precondition: the bubble is misplaced at the end');
+
+  view.showThinking(msgA.id, false);
+
+  const aRow = messagesEl.children.find((node) => node.dataset.messageId === msgA.id && node !== indicator);
+  assert.equal(aRow.nextSibling, indicator, 'the reused bubble is re-anchored under its owning message');
+  indicator.remove();
+  delete indicator.dataset.messageId;
+  view.removeThinking();
+});
+
+test('stream blacklist: a mid-flow reset keeps live frames flowing, only completion mutes them', () => {
+  const messageId = nextId('msg-stream');
+  // Pin the live bubble to another turn so the frames below exercise only the
+  // accept/blacklist state machine, not the markdown paint the fake DOM lacks.
+  resetThinkingIndicatorStub();
+  view.showThinking(nextId('msg-decoy'), false);
+  assert.equal(
+    view.applyRelayStreamEvent({ messageId, text: 'chunk one', seq: 1, autoScroll: false }),
+    true,
+    'a fresh message renders live frames',
+  );
+  // What message_status 'pending'/'parked' now do: reset the bookkeeping only.
+  view.clearRelayStreamState(messageId);
+  assert.equal(
+    view.applyRelayStreamEvent({ messageId, text: 'chunk two', seq: 1, autoScroll: false }),
+    true,
+    'a reset message accepts frames again',
+  );
+  // What terminal statuses do: the id is blacklisted from further frames.
+  view.clearRelayStreamStateForMessage(messageId);
+  assert.equal(
+    view.applyRelayStreamEvent({ messageId, text: 'late chunk', seq: 2, autoScroll: false }),
+    false,
+    'a completed message ignores late frames',
+  );
+  for (const node of liveIndicators()) node.remove();
+  view.removeThinking();
+});
+
 test('renderMessages re-renders when only a message\'s workflowRuns change', () => {
   const convId = nextId('conv-wr');
   conversations[convId] = { id: convId, title: 'WR' };

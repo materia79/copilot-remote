@@ -55,6 +55,7 @@ import {
   appendThinkingActivity,
   appendThinkingThought,
   applyRelayStreamEvent,
+  clearRelayStreamState,
   clearRelayStreamStateForMessage,
   applyConversationTurnStatus,
   renderMessages,
@@ -445,8 +446,12 @@ export async function connectSocket(overrideDeps) {
   socket.on('assistant_message', ({ conversationId, message, messageId, sourceMessageId }) => {
     const isCurrentConversation = conversationId === currentConvId;
     const autoScroll = isCurrentConversation ? isMessagesAtBottom() : false;
-    collapseThinkingThoughts();
-    removeThinking();
+    // A background conversation finishing its turn must not wipe the viewed
+    // conversation's live bubble.
+    if (isCurrentConversation) {
+      collapseThinkingThoughts();
+      removeThinking();
+    }
     if ((!message?.activities || !message.activities.length) && sourceMessageId) {
       const cached = relayActivities.get(sourceMessageId) || [];
       if (cached.length) message.activities = cached.slice(0, 48);
@@ -658,9 +663,20 @@ export async function connectSocket(overrideDeps) {
       if (messageId) renderRestoredSubagentBubbles(messageId);
       if (messageId) removeUserBubbleCancelButton(messageId);
     }
-    if (clearsProcessingStatus) {
+    if (normalizedStatus === 'processing') {
+      // A worker owns the message now: dropping the pending entry re-arms the
+      // duplicate-send guard and hands poll liveness over to localTurnStatus.
       clearPendingUserMessage(messageId);
-      if (messageId) clearRelayStreamStateForMessage(messageId);
+    }
+    if (clearsProcessingStatus) {
+      // 'pending'/'parked' mean the message is (still) queued: its pending
+      // entry keeps the live poll armed while it waits, and only a genuinely
+      // terminal status may blacklist the id from relay_stream frames — the
+      // server acks every enqueue with 'pending', which would otherwise mute
+      // live streaming for the whole turn.
+      if (isTerminalStatus) clearPendingUserMessage(messageId);
+      if (messageId && isTerminalStatus) clearRelayStreamStateForMessage(messageId);
+      else if (messageId) clearRelayStreamState(messageId);
       if (messageId) clearBubbleCancelState(messageId);
       if (messageId) removeUserBubbleCancelButton(messageId);
     }

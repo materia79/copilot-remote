@@ -343,6 +343,15 @@ export function hasPendingUserMessageDuplicate(conversationId, text) {
   return false;
 }
 
+export function hasPendingUserMessageForConversation(conversationId) {
+  cleanupStalePendingUserMessages();
+  const conversationKey = pendingConversationKey(conversationId);
+  for (const entry of pendingUserMessageEntries.values()) {
+    if (entry?.conversationKey === conversationKey) return true;
+  }
+  return false;
+}
+
 export function authHeaders() {
   return TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {};
 }
