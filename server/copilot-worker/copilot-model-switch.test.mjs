@@ -8,6 +8,7 @@ import {
   createModelSwitchUnconfirmedError,
   isModelSwitchUnconfirmedError,
   normalizeRelayEffort,
+  supportedEffortsOf,
 } from './copilot-model-switch.mjs';
 import { createFakeCopilotSession } from './copilot-sdk-test-harness.mjs';
 
@@ -126,20 +127,88 @@ test('an unsupported effort level fails like a refused explicit selection', asyn
   assert.equal(session.rpc.model.effortCalls.length, 0);
 });
 
-test('an effort on a model with no reasoning support fails hosted, skips BYOK', async () => {
+test('an entry with no parseable effort list is PERMISSIVE: send and let the runtime decide', async () => {
+  // Regression for burn-in session ed5febdd (2026-09-07): the session-level
+  // rpc.model.list() speaks raw CAPI shape, so the typed field this code once
+  // required was never present and every effort-carrying turn failed closed.
+  // The catalog may only fast-fail on a POSITIVE exclusion; an entry with no
+  // recognisable list defers to the runtime, which is the actual authority.
   const hosted = createCopilotModelSwitcher();
   const hostedSession = makeSession({ catalog: [PLAIN_MODEL] });
   hosted.noteApplied('gpt-4o', null);
-  await assert.rejects(() => hosted.apply(hostedSession, { model: 'gpt-4o', effort: 'high' }), /reasoning effort/);
+  const outcome = await hosted.apply(hostedSession, { model: 'gpt-4o', effort: 'high' });
+  assert.deepEqual(outcome, { ok: true, changed: true });
+  assert.deepEqual(hostedSession.rpc.model.effortCalls, [{ reasoningEffort: 'high' }]);
+});
+
+test('a positive exclusion fails hosted (naming the advertised levels), skips BYOK', async () => {
+  const EXCLUDING_MODEL = { id: 'kimi-k3', supportedReasoningEfforts: ['low', 'high', 'max'] };
+  const hosted = createCopilotModelSwitcher();
+  const hostedSession = makeSession({ catalog: [EXCLUDING_MODEL] });
+  hosted.noteApplied('kimi-k3', null);
+  await assert.rejects(
+    () => hosted.apply(hostedSession, { model: 'kimi-k3', effort: 'medium' }),
+    /reasoning effort "medium".*supports: low, high, max/s,
+  );
+  assert.equal(hostedSession.rpc.model.effortCalls.length, 0);
 
   // BYOK: openai-compatible effort vocabularies differ; a level the catalog
   // rejects is skipped silently rather than failed or rebuilt over.
   const byok = createCopilotModelSwitcher();
-  const byokSession = makeSession({ catalog: [PLAIN_MODEL] });
-  byok.noteApplied('gpt-4o', null);
-  const outcome = await byok.apply(byokSession, { model: 'gpt-4o', effort: 'high', byok: true });
+  const byokSession = makeSession({ catalog: [EXCLUDING_MODEL] });
+  byok.noteApplied('kimi-k3', null);
+  const outcome = await byok.apply(byokSession, { model: 'kimi-k3', effort: 'medium', byok: true });
   assert.deepEqual(outcome, { ok: true, changed: false });
   assert.equal(byokSession.rpc.model.effortCalls.length, 0);
+});
+
+// The raw CAPI entry shape the live session RPC actually returns (captured
+// from runtime 1.0.83 on 2026-09-07); the typed ModelInfo fields do NOT exist
+// on it.
+const RAW_WIRE_MODEL = {
+  id: 'gpt-5.6-terra',
+  name: 'GPT-5.6 Terra',
+  capabilities: {
+    family: 'gpt-5.6-terra',
+    object: 'model_capabilities',
+    supports: {
+      parallel_tool_calls: true,
+      reasoning_effort: ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
+      streaming: true,
+      tool_calls: true,
+      vision: true,
+    },
+  },
+};
+
+test('supportedEffortsOf reads both the typed and the raw CAPI wire shapes', () => {
+  assert.deepEqual(supportedEffortsOf(REASONING_MODEL), ['low', 'medium', 'high', 'xhigh']);
+  assert.deepEqual(supportedEffortsOf(RAW_WIRE_MODEL), ['none', 'low', 'medium', 'high', 'xhigh', 'max']);
+  assert.equal(supportedEffortsOf(PLAIN_MODEL), null);
+  assert.equal(supportedEffortsOf(null), null);
+});
+
+test('a raw-wire catalog entry validates the effort and sends it (burn-in ed5febdd regression)', async () => {
+  const switcher = createCopilotModelSwitcher();
+  const session = makeSession({ catalog: [RAW_WIRE_MODEL] });
+  switcher.noteApplied('gpt-5.6-terra', null);
+  const outcome = await switcher.apply(session, { model: 'gpt-5.6-terra', effort: 'max' });
+  assert.deepEqual(outcome, { ok: true, changed: true });
+  assert.deepEqual(session.rpc.model.effortCalls, [{ reasoningEffort: 'max' }]);
+});
+
+test('relay "none" sends the literal reset when the wire catalog offers it', async () => {
+  const switcher = createCopilotModelSwitcher();
+  const session = makeSession({ catalog: [RAW_WIRE_MODEL] });
+  switcher.noteApplied('gpt-5.6-terra', 'high');
+  const outcome = await switcher.apply(session, { model: 'gpt-5.6-terra', effort: 'none' });
+  assert.deepEqual(outcome, { ok: true, changed: true });
+  assert.deepEqual(session.rpc.model.effortCalls, [{ reasoningEffort: 'none' }]);
+  // Tracked as null (= default), so the steady state stays zero-RPC.
+  assert.deepEqual(switcher.current(), { model: 'gpt-5.6-terra', effort: null });
+  const repeat = await switcher.apply(session, { model: 'gpt-5.6-terra', effort: 'none' });
+  assert.deepEqual(repeat, { ok: true, changed: false });
+  assert.equal(session.rpc.model.effortCalls.length, 1);
 });
 
 test('a deferred switch that drains in time confirms through session.model_change', async () => {

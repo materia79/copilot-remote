@@ -91,7 +91,11 @@ export function buildInstalledCopilotClientOptions({
       path: cliPath,
     },
     mode: 'empty',
-    baseDirectory,
+    // Runtime 1.0.83 made 'empty' mode refuse to construct without an explicit
+    // per-session persistence location. ~/.copilot is exactly what the runtime
+    // defaulted to before (baseDirectory sets COPILOT_HOME), so the import
+    // sweep keeps seeing the CLI's real session state.
+    baseDirectory: String(baseDirectory || '').trim() || path.join(os.homedir(), '.copilot'),
     useLoggedInUser: true,
     logLevel,
     workingDirectory: cwd,

@@ -69,6 +69,24 @@ export function normalizeRelayEffort(value) {
 }
 
 /**
+ * The effort levels a catalog entry advertises, tolerant of both shapes the
+ * runtime speaks: the client-level `ModelInfo` (`supportedReasoningEfforts`)
+ * and the session-level `rpc.model.list()` entry, which is the RAW CAPI
+ * record carrying the list at `capabilities.supports.reasoning_effort`
+ * (live-verified on runtime 1.0.83 — the typed field never appears there;
+ * validating against it failed every effort-carrying turn, burn-in session
+ * ed5febdd). `null` = unknown, and unknown must be PERMISSIVE: the runtime is
+ * the authority on what it supports, this catalog is only a fast-fail.
+ */
+export function supportedEffortsOf(entry) {
+  const typed = entry?.supportedReasoningEfforts;
+  if (Array.isArray(typed)) return typed.map((v) => String(v || '').trim().toLowerCase()).filter(Boolean);
+  const wire = entry?.capabilities?.supports?.reasoning_effort;
+  if (Array.isArray(wire)) return wire.map((v) => String(v || '').trim().toLowerCase()).filter(Boolean);
+  return null;
+}
+
+/**
  * The terminal failure for a selection the runtime would not (or could not
  * provably) honour. Carried as a marked Error so `classifyCopilotTurnException`
  * can route it to the existing terminal-error publish path without prose
@@ -84,11 +102,16 @@ export function createModelSwitchUnconfirmedError({
     ? `"${requestedModel}" (reasoning effort "${requestedEffort}")`
     : `"${requestedModel}"`;
   const actual = actualModel ? `"${actualModel}"` : 'its previous model';
-  const error = new Error(
-    `System note: this message asked for model ${requested}, but the Copilot runtime did not confirm `
-    + `the switch — the session is still on ${actual}${detail ? ` (${detail})` : ''}. `
-    + 'The message was not sent on the wrong model; pick an available model and resend it.',
-  );
+  // An effort-only refusal on the model the session is already on reads
+  // nonsensically as "asked for X but still on X"; name the effort instead.
+  const effortOnly = !!requestedEffort && !!requestedModel && requestedModel === actualModel;
+  const error = new Error(effortOnly
+    ? `System note: this message asked for reasoning effort "${requestedEffort}" on "${requestedModel}", `
+      + `but the Copilot runtime did not confirm it${detail ? ` (${detail})` : ''}. `
+      + 'The message was not sent; pick a supported effort (or another model) and resend it.'
+    : `System note: this message asked for model ${requested}, but the Copilot runtime did not confirm `
+      + `the switch — the session is still on ${actual}${detail ? ` (${detail})` : ''}. `
+      + 'The message was not sent on the wrong model; pick an available model and resend it.');
   error.modelSwitchUnconfirmed = true;
   error.code = MODEL_SWITCH_UNCONFIRMED_CODE;
   error.stableCode = MODEL_SWITCH_UNCONFIRMED_STABLE_CODE;
@@ -273,14 +296,29 @@ export function createCopilotModelSwitcher({
         trackedEffort = null;
       } else {
         const info = await modelInfo(session, effortModel);
-        const fallback = normalizeRelayEffort(info?.defaultReasoningEffort);
-        effortToSend = fallback || undefined;
-        trackedEffort = fallback;
+        const supported = supportedEffortsOf(info);
+        if (supported?.includes('none')) {
+          // The wire catalog offers a literal "none" (GPT-family entries do,
+          // despite the TS union lacking the member): send it as the explicit
+          // reset, tracked as null so steady-state stays zero-RPC.
+          effortToSend = 'none';
+          trackedEffort = null;
+        } else {
+          const fallback = normalizeRelayEffort(info?.defaultReasoningEffort);
+          effortToSend = fallback || undefined;
+          trackedEffort = fallback;
+        }
       }
     } else {
       const info = await modelInfo(session, effortModel);
-      const supported = Array.isArray(info?.supportedReasoningEfforts) ? info.supportedReasoningEfforts : null;
-      if (info && (!supported || !supported.includes(targetEffortRaw))) {
+      const supported = supportedEffortsOf(info);
+      // Fail ONLY on a positive exclusion. An entry with no parseable effort
+      // list — model absent from the catalog, an effort-less model, or a wire
+      // shape this code does not know — sends the level and lets the runtime
+      // confirm or refuse: failing closed here bricked every effort-carrying
+      // turn when the session list turned out to speak raw CAPI shape.
+      if (Array.isArray(supported) && !supported.includes(targetEffortRaw)) {
+        const advertised = supported.length ? ` (it supports: ${supported.join(', ')})` : '';
         if (byok) {
           // Openai-compatible providers define their own effort vocabularies
           // (and many models simply have none); a level the catalog rejects is
@@ -289,12 +327,12 @@ export function createCopilotModelSwitcher({
           effortToSend = undefined;
           trackedEffort = applied.effort;
         } else if (!modelChanged) {
-          return fail(`the model does not support reasoning effort "${targetEffortRaw}"`);
+          return fail(`the model does not support reasoning effort "${targetEffortRaw}"${advertised}`);
         } else {
           // Model change + unsupported effort: the selection as a whole cannot
           // be honoured — running the new model on a different effort than the
           // one explicitly picked is the same silent substitution #13 forbids.
-          return fail(`"${targetModel}" does not support reasoning effort "${targetEffortRaw}"`);
+          return fail(`"${targetModel}" does not support reasoning effort "${targetEffortRaw}"${advertised}`);
         }
       } else {
         effortToSend = targetEffortRaw;
