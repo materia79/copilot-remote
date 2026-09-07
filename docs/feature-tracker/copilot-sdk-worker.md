@@ -9,7 +9,10 @@ drives the CLI's **bundled SDK** (`COPILOT_SDK_PATH`) as a headless JSON-RPC run
 shape as the Claude, Cursor and Grok workers. The extension engine ([copilot-sdk.md](copilot-sdk.md))
 remains the default and is untouched; this file tracks the SDK engine only.
 
-**Status:** implemented (phases 0–4), **burn-in in progress**. Default engine is still Extension.
+**Status:** implemented (phases 0–4), **burn-in in progress**. **Default engine is SDK** as of
+2026-09-07 (hardening Phase 6): an unset `copilot_engine` reads as `sdk` when the relay can run
+it, falling back to `extension` when no Copilot CLI resolves or session-worker routing is off —
+the same guard the save path enforces. Both of Simon's relays run `sdk` by explicit setting.
 Burn-in finding #2 (self-initiated turns were dropped; live session `10a1a9ad`, 2026-08-31) is fixed
 worker-side, and `/api/continuation-turn` accepts `github`/`openai` alongside `claude`
 (`CONTINUATION_PROVIDER_TYPES`, `server/routes/messages-routes.mjs`), so self-initiated turns are
@@ -35,7 +38,7 @@ quartet moved to `shared/worker-runtime/` ahead of extension deletion.
 | Question | Answer / evidence |
 | -------- | ----------------- |
 | Where is it chosen? | Settings → Providers → Copilot → *Copilot engine* (`#copilot-engine-select`), `GET`/`POST /api/settings/copilot` (`server/routes/sessions-routes.mjs` → `buildCopilotSettingsPayload`, `parseCopilotSettingsUpdateRequest`), broadcast as `copilot_settings_updated`. |
-| Where is it stored? | App setting `copilot_engine` (`COPILOT_ENGINE_SETTING_KEY`), values `COPILOT_ENGINES = ['extension','sdk']`, `DEFAULT_COPILOT_ENGINE = 'extension'`; read by `getCopilotEngine()` / `getCopilotProviderSettings()` (`server/server-runtime.mjs`). |
+| Where is it stored? | App setting `copilot_engine` (`COPILOT_ENGINE_SETTING_KEY`), values `COPILOT_ENGINES = ['extension','sdk']`, `DEFAULT_COPILOT_ENGINE = 'sdk'` with `FALLBACK_COPILOT_ENGINE = 'extension'` when `copilotSdkEngineUnavailableReason()` fires; read by `getCopilotEngine()` / `getCopilotProviderSettings()` (`server/server-runtime.mjs`). |
 | When does it take effect? | Per spawn: `buildSessionWorkerLaunchEnvForSession()` reads `getCopilotEngine()` each time a worker launches, so running sessions keep their engine until their worker restarts. Applies to `provider_type` `github` **and** `openai` (BYOK rides the same worker). |
 | Why can a save be refused? | `setCopilotProviderSettings()` answers **409** with `copilotSdkEngineUnavailableReason({ env, routingEnabled })` (`server/services/session-worker-launch-service.mjs`) rather than persisting a setting that cannot take effect: (a) `COPILOT_SDK_PATH` never resolved at boot — the launch env is snapshotted once in `buildSessionWorkerLaunchEnv()`, so a CLI installed since startup needs a relay restart; (b) `SESSION_WORKER_ROUTING_ENABLED` is off, so no node worker is ever spawned. |
 | How is the worker launched? | Worker kind `copilot-sdk` (`COPILOT_WEB_RELAY_WORKER_KIND`) in the launch service's node-worker descriptors (`windowsTitle: 'Copilot SDK Worker'`), env applied by `applyCopilotSdkProviderEnvironment()` (throws `copilot-sdk-path-not-resolved` when the path is empty), script from `resolveCopilotSdkWorkerScriptPath()`. Plain `node <script> --session-id <id>` — no PTY, no tmux wrapper, no extension bootstrap. |

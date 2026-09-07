@@ -1273,7 +1273,12 @@ const DEFAULT_OPENAI_BASE_URL = 'https://api.openai.com/v1';
 // spawn, so model catalogs, usage cards and routing all stay put.
 const COPILOT_ENGINE_SETTING_KEY = 'copilot_engine';
 const COPILOT_ENGINES = ['extension', 'sdk'];
-const DEFAULT_COPILOT_ENGINE = 'extension';
+// Phase 6 of the extension retirement (2026-09-07): the headless SDK worker is
+// the default engine. The extension remains reachable two ways until deletion:
+// an explicit stored setting, or automatically when this relay cannot run the
+// SDK engine at all (no resolvable Copilot CLI, or session-worker routing off).
+const DEFAULT_COPILOT_ENGINE = 'sdk';
+const FALLBACK_COPILOT_ENGINE = 'extension';
 const CLAUDE_ENABLED_SETTING_KEY = 'claude_enabled';
 const CLAUDE_MODEL_SETTING_KEY = 'claude_model';
 const CLAUDE_MODELS_SETTING_KEY = 'claude_models';
@@ -1861,14 +1866,22 @@ function readAppSettingValue(key) {
 }
 
 /**
- * The Copilot engine setting, normalised. An unset or unrecognised stored value
- * reads as the default (`extension`) rather than throwing: this value picks a
- * worker kind at spawn time, and a relay that cannot decide must still be able
- * to start a conversation on the engine that has been shipping.
+ * The Copilot engine setting, normalised. An explicit stored value always
+ * wins. Unset (or unrecognised) reads as the SDK default — but only when this
+ * relay can actually run the SDK engine: the save path refuses to persist
+ * 'sdk' on a relay that cannot honour it, and the default must not sneak past
+ * that same guard. A relay with no resolvable Copilot CLI or with
+ * session-worker routing disabled falls back to the extension engine so a
+ * Copilot conversation can still start at all.
  */
 function getCopilotEngine() {
   const stored = readAppSettingValue(COPILOT_ENGINE_SETTING_KEY).toLowerCase();
-  return COPILOT_ENGINES.includes(stored) ? stored : DEFAULT_COPILOT_ENGINE;
+  if (COPILOT_ENGINES.includes(stored)) return stored;
+  const unavailable = copilotSdkEngineUnavailableReason({
+    env: sessionWorkerLaunchEnv,
+    routingEnabled: featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true,
+  });
+  return unavailable ? FALLBACK_COPILOT_ENGINE : DEFAULT_COPILOT_ENGINE;
 }
 
 function getCopilotProviderSettings() {
