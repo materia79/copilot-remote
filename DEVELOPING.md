@@ -52,6 +52,28 @@ curl -sS \
   -d '{"reason":"manual-restart","requestedBy":"localhost-api","restart":true}'
 ```
 
+### Verifying that a restart actually happened
+
+The restart replaces only the `--relay-runtime` **child**; the supervisor keeps
+its PID (it can be weeks old). Judging restart state from the wrong signal is a
+recurring trap:
+
+- `pgrep -af server/server.js` lists **both** processes. The one that restarts
+  is `pgrep -f relay-runtime`; its start time is the true restart time:
+
+  ```bash
+  ps -o pid,lstart,etime -p "$(pgrep -f -- --relay-runtime)"
+  ```
+
+- Do **not** trust the `[relay] launched runtime pid=NNN` lines in
+  `server/logs/server.log`: the log is heavily trimmed and PIDs wrap on
+  long-uptime hosts, so the last launch line can name a PID that no longer
+  matches the live child.
+- A quick end-to-end health read after a restart: `GET /api/status`
+  (`cliOnline`, queue counts) and `GET /api/model-variants` — its `source` /
+  `refreshedAt` show whether boot-time Copilot model discovery ran on the new
+  process (`server-discovery:boot`).
+
 4. Start one fresh Copilot CLI session:
 
 ```bash
