@@ -28,6 +28,7 @@ import {
 } from './windows-terminal-launcher.mjs';
 import { isValidModelId, normalizeModelIdCandidate } from '../shared/model-id.mjs';
 import {
+  buildModelSnapshotFields,
   extractModelDescriptors,
   normalizeContextLimitTokens,
 } from '../shared/model-descriptors.mjs';
@@ -662,17 +663,28 @@ async function getAvailableModels(session) {
     if (!isValidModelId(modelId)) continue;
     const existing = byModelId.get(modelId);
     const cached = cachedModelMetadataById.get(modelId);
+    // Highest-priority source wins per field; a lower-priority list only
+    // fills what the better one left null. Every field of the shared
+    // descriptor is carried, so the snapshot metadata is as rich as the
+    // richest list that answered.
+    const pick = (field, normalize = (value) => value ?? null) => existing?.[field]
+      ?? normalize(entry?.[field])
+      ?? cached?.[field]
+      ?? null;
     byModelId.set(modelId, {
       modelId,
-      contextLimitTokens: existing?.contextLimitTokens
-        ?? normalizeContextLimitTokens(entry?.contextLimitTokens)
-        ?? cached?.contextLimitTokens
-        ?? null,
-      longContextLimitTokens: existing?.longContextLimitTokens
-        ?? normalizeContextLimitTokens(entry?.longContextLimitTokens)
-        ?? cached?.longContextLimitTokens
-        ?? null,
+      contextLimitTokens: pick('contextLimitTokens', normalizeContextLimitTokens),
+      longContextLimitTokens: pick('longContextLimitTokens', normalizeContextLimitTokens),
       pricing: existing?.pricing || entry?.pricing || cached?.pricing || null,
+      displayName: pick('displayName'),
+      vendor: pick('vendor'),
+      pickerCategory: pick('pickerCategory'),
+      preview: existing?.preview === true || entry?.preview === true || cached?.preview === true,
+      contextWindowTokens: pick('contextWindowTokens', normalizeContextLimitTokens),
+      maxPromptTokens: pick('maxPromptTokens', normalizeContextLimitTokens),
+      supportedEfforts: Array.isArray(existing?.supportedEfforts)
+        ? existing.supportedEfforts
+        : (Array.isArray(entry?.supportedEfforts) ? entry.supportedEfforts : (cached?.supportedEfforts ?? null)),
     });
   }
   const models = byModelId.size ? [...byModelId.values()] : [...cachedModelMetadataById.values()];
@@ -723,19 +735,9 @@ async function publishModelSnapshot(session, reason = 'standalone-relay', force 
   try {
     const currentModel = await getCurrentModelId(session);
     const availableModels = await getAvailableModels(session);
-    const modelIds = availableModels.map((entry) => entry.modelId);
-    const contextLimitsByModel = Object.fromEntries(
-      availableModels
-        .filter((entry) => entry.contextLimitTokens !== null)
-        .map((entry) => [entry.modelId, entry.contextLimitTokens]),
-    );
-    const modelMetadataByModel = Object.fromEntries(
-      availableModels.map((entry) => [entry.modelId, {
-        defaultContextLimitTokens: entry.contextLimitTokens,
-        longContextLimitTokens: entry.longContextLimitTokens,
-        pricing: entry.pricing,
-      }]),
-    );
+    // Same shared builder as the SDK worker and the server-side discovery:
+    // one definition of the per-model metadata the relay publishes.
+    const { models: modelIds, contextLimitsByModel, modelMetadataByModel } = buildModelSnapshotFields(availableModels);
     await apiJson('POST', '/api/models/snapshot', {
       source: `standalone-relay:${reason}`,
       models: modelIds,

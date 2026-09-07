@@ -155,3 +155,63 @@ test('a failed snapshot POST is swallowed and retried on the next trigger', asyn
   await runner.whenModelSnapshotPosted();
   assert.equal(snapshotsOf(stub).length, 2);
 });
+
+// ── The metadata contract, from the live raw catalog ─────────────────────────
+
+import fs from 'node:fs';
+
+const RAW_FIXTURE = JSON.parse(fs.readFileSync(new URL('../../shared/fixtures/copilot-catalog-raw-2026-09-07.json', import.meta.url), 'utf8'));
+
+test('a raw rpc.model.list() catalog publishes the full per-model metadata contract', async () => {
+  const { stub, runner } = setup({ clientOptions: { modelRpc: { catalog: RAW_FIXTURE.list } } });
+  await runner.handlePendingPayload({ message: baseMessage });
+  await runner.whenModelSnapshotPosted();
+
+  const [body] = snapshotsOf(stub);
+  // The seven keys the route reads, nothing else.
+  assert.deepEqual(Object.keys(body).sort(), ['contextLimitsByModel', 'currentModel', 'defaultModel', 'error', 'modelMetadataByModel', 'models', 'source']);
+  assert.equal(body.models.length, 27);
+  assert.ok(body.models.includes('grok-4.6') && body.models.includes('kimi-k3'));
+  const mini = body.modelMetadataByModel['gpt-5.4-mini'];
+  assert.deepEqual(Object.keys(mini), [
+    'defaultContextLimitTokens', 'longContextLimitTokens', 'pricing',
+    'displayName', 'vendor', 'pickerCategory', 'preview',
+    'contextWindowTokens', 'maxPromptTokens', 'supportedEfforts', 'catalogIndex',
+  ]);
+  assert.equal(mini.displayName, 'GPT-5.4 mini');
+  assert.equal(mini.vendor, 'OpenAI');
+  assert.equal(mini.pickerCategory, 'lightweight');
+  assert.equal(mini.contextWindowTokens, 400_000);
+  assert.equal(mini.maxPromptTokens, 272_000);
+  assert.deepEqual(mini.supportedEfforts, ['none', 'low', 'medium', 'high', 'xhigh']);
+  assert.equal(mini.catalogIndex, null, 'the relay assigns the index, not the worker');
+  assert.equal(body.modelMetadataByModel['claude-haiku-4.5'].supportedEfforts, null);
+  assert.equal(body.contextLimitsByModel['claude-haiku-4.5'], 144_000);
+  assert.deepEqual(body.modelMetadataByModel['gemini-3.6-flash'].supportedEfforts, ['minimal', 'low', 'medium', 'high']);
+  assert.equal(body.modelMetadataByModel['claude-opus-4.8-fast'].preview, true);
+  assert.equal(body.modelMetadataByModel['gpt-5.6-terra'].pricing.longContext.input, 400);
+});
+
+test('a metadata-only change (same ids, same limits) still re-publishes', async () => {
+  // Two catalogs with identical ids and context limits but a different effort
+  // list: the dedupe signature must see the metadata, or a runtime that
+  // changes a model's levels would never reach the relay.
+  const catalogs = [
+    [{ id: 'gpt-5.4', capabilities: { limits: { max_context_window_tokens: 400_000 }, supports: { reasoning_effort: ['low', 'high'] } } }],
+    [{ id: 'gpt-5.4', capabilities: { limits: { max_context_window_tokens: 400_000 }, supports: { reasoning_effort: ['low', 'medium', 'high'] } } }],
+  ];
+  let calls = 0;
+  const { stub, client, runner } = setup({
+    clientOptions: { modelRpc: { list: async () => ({ list: catalogs[Math.min(calls++, 1)] }) } },
+  });
+  await runner.handlePendingPayload({ message: baseMessage });
+  await runner.whenModelSnapshotPosted();
+  assert.equal(snapshotsOf(stub).length, 1);
+  assert.deepEqual(snapshotsOf(stub)[0].modelMetadataByModel['gpt-5.4'].supportedEfforts, ['low', 'high']);
+
+  // A new session (resume) re-lists; the changed efforts must post again.
+  client.session.emit({ type: 'session.model_change', data: { newModel: 'gpt-5.4' } });
+  await runner.whenModelSnapshotPosted();
+  const latest = snapshotsOf(stub).at(-1);
+  assert.equal(latest.currentModel, 'gpt-5.4');
+});

@@ -6230,6 +6230,9 @@ export function registerSessionsRoutes(app, deps) {
       reasoningEfforts: modelState.reasoningEfforts || [],
       contextLimitsByModel: modelState.contextLimitsByModel || {},
       modelMetadataByModel: modelState.modelMetadataByModel || {},
+      // Enabled models the last authoritative snapshot no longer listed: they
+      // stay in models[] (a selection must not vanish) but pickers grey them.
+      unavailableModels: Array.isArray(modelState.unavailableModels) ? modelState.unavailableModels : [],
       claudeContextTiersByModel: modelState.claudeContextTiersByModel || {},
       providersByModel: modelState.providersByModel || {},
       stale: modelState.stale,

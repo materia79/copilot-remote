@@ -27,16 +27,26 @@ export const ULTRACODE_EFFORT_LABEL = 'Ultracode';
 export const ULTRACODE_EFFORT_OPTION_TITLE =
   'xhigh effort plus multi-agent workflow orchestration — expect much higher token use';
 
+// Gemini and some OpenAI models offer a rung under "low". It reads like the
+// other plain tiers (lowercase, no rename): an "Off"-style label would promise
+// a switch the runtime does not have, and Title Case would single it out from
+// its neighbours. The tooltip explains the rung instead.
+export const MINIMAL_EFFORT = 'minimal';
+export const MINIMAL_EFFORT_LABEL = 'minimal';
+export const MINIMAL_EFFORT_OPTION_TITLE = 'Lowest reasoning tier this model offers — faster and cheaper than low';
+
 export function reasoningEffortOptionLabel(effort, { reasoningOffUnsupported = false } = {}) {
   const value = String(effort || '').trim().toLowerCase();
   if (!value) return '';
   if (value === 'none' && reasoningOffUnsupported) return PROVIDER_DEFAULT_EFFORT_LABEL;
   if (value === CLAUDE_ULTRACODE_EFFORT) return ULTRACODE_EFFORT_LABEL;
+  if (value === MINIMAL_EFFORT) return MINIMAL_EFFORT_LABEL;
   return value;
 }
 
 export function reasoningEffortOptionTitle(effort) {
-  return String(effort || '').trim().toLowerCase() === CLAUDE_ULTRACODE_EFFORT
-    ? ULTRACODE_EFFORT_OPTION_TITLE
-    : '';
+  const value = String(effort || '').trim().toLowerCase();
+  if (value === CLAUDE_ULTRACODE_EFFORT) return ULTRACODE_EFFORT_OPTION_TITLE;
+  if (value === MINIMAL_EFFORT) return MINIMAL_EFFORT_OPTION_TITLE;
+  return '';
 }

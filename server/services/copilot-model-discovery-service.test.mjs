@@ -219,3 +219,64 @@ test('scheduleStartupRefresh defers the boot refresh and dispose cancels a pendi
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(pending.state.clientsCreated, 0);
 });
+
+// ── The metadata contract from the typed client-level ModelInfo shape ────────
+
+import fs from 'node:fs';
+import { buildModelSnapshotFields, extractModelDescriptors } from '../../shared/model-descriptors.mjs';
+
+const RAW_FIXTURE = JSON.parse(fs.readFileSync(new URL('../../shared/fixtures/copilot-catalog-raw-2026-09-07.json', import.meta.url), 'utf8'));
+
+/** What client.listModels() returns for a raw CAPI record: typed, camelCase billing. */
+function typedModelInfo(raw) {
+  const prices = raw.billing?.token_prices || {};
+  const toTyped = (tier) => (tier ? {
+    inputPrice: tier.input_price,
+    outputPrice: tier.output_price,
+    cacheReadPrice: tier.cache_read_price,
+    cacheWritePrice: tier.cache_write_price,
+    maxPromptTokens: tier.max_prompt_tokens,
+  } : undefined);
+  return {
+    id: raw.id,
+    name: raw.name,
+    vendor: raw.vendor,
+    preview: raw.preview,
+    modelPickerCategory: raw.model_picker_category,
+    capabilities: {
+      supports: { vision: true, reasoningEffort: Array.isArray(raw.capabilities.supports.reasoning_effort) },
+      limits: { ...raw.capabilities.limits },
+    },
+    billing: {
+      multiplier: 1,
+      tokenPrices: prices.default ? {
+        batchSize: prices.batch_size,
+        ...toTyped(prices.default),
+        longContext: toTyped(prices.long_context),
+      } : undefined,
+    },
+    ...(Array.isArray(raw.capabilities.supports.reasoning_effort)
+      ? { supportedReasoningEfforts: raw.capabilities.supports.reasoning_effort, defaultReasoningEffort: 'medium' }
+      : {}),
+  };
+}
+
+test('typed listModels entries publish the same metadata contract as the worker does from raw entries', async () => {
+  const typed = RAW_FIXTURE.list.map(typedModelInfo);
+  const { deps, state } = makeDeps({ listModels: async () => typed });
+  const service = createCopilotModelDiscoveryService(deps);
+  const result = await service.refresh('boot');
+  assert.equal(result.ok, true);
+  assert.equal(result.models.length, 27);
+  const snapshot = state.catalogUpdates[0];
+  assert.equal(snapshot.source, 'server-discovery:boot');
+  // Byte-for-byte what the worker builds from the raw records.
+  const fromRaw = buildModelSnapshotFields(extractModelDescriptors(RAW_FIXTURE));
+  assert.deepEqual(snapshot.models, fromRaw.models);
+  assert.deepEqual(snapshot.contextLimitsByModel, fromRaw.contextLimitsByModel);
+  assert.deepEqual(snapshot.modelMetadataByModel, fromRaw.modelMetadataByModel);
+  assert.deepEqual(snapshot.modelMetadataByModel['gpt-5.4-mini'].supportedEfforts, ['none', 'low', 'medium', 'high', 'xhigh']);
+  assert.equal(snapshot.modelMetadataByModel['claude-haiku-4.5'].supportedEfforts, null);
+  assert.equal(snapshot.modelMetadataByModel['claude-haiku-4.5'].contextWindowTokens, 144_000);
+  assert.equal(snapshot.modelMetadataByModel['gpt-5-mini'].vendor, 'Azure OpenAI');
+});

@@ -50,6 +50,8 @@
  * alternative is sending the user's prompt to a model they explicitly
  * deselected. Configurable as `COPILOT_SDK_RELAY_MODEL_SWITCH_TIMEOUT_MS`.
  */
+import { supportedEffortsOf } from '../../shared/model-descriptors.mjs';
+
 export const DEFAULT_MODEL_SWITCH_TIMEOUT_MS = 10_000;
 
 export const MODEL_SWITCH_UNCONFIRMED_CODE = 'model-switch-unconfirmed';
@@ -68,23 +70,12 @@ export function normalizeRelayEffort(value) {
   return text;
 }
 
-/**
- * The effort levels a catalog entry advertises, tolerant of both shapes the
- * runtime speaks: the client-level `ModelInfo` (`supportedReasoningEfforts`)
- * and the session-level `rpc.model.list()` entry, which is the RAW CAPI
- * record carrying the list at `capabilities.supports.reasoning_effort`
- * (live-verified on runtime 1.0.83 — the typed field never appears there;
- * validating against it failed every effort-carrying turn, burn-in session
- * ed5febdd). `null` = unknown, and unknown must be PERMISSIVE: the runtime is
- * the authority on what it supports, this catalog is only a fast-fail.
- */
-export function supportedEffortsOf(entry) {
-  const typed = entry?.supportedReasoningEfforts;
-  if (Array.isArray(typed)) return typed.map((v) => String(v || '').trim().toLowerCase()).filter(Boolean);
-  const wire = entry?.capabilities?.supports?.reasoning_effort;
-  if (Array.isArray(wire)) return wire.map((v) => String(v || '').trim().toLowerCase()).filter(Boolean);
-  return null;
-}
+// The effort-list reader lives with the shared descriptor rules (the model
+// catalog snapshot publishes the same list), re-exported so existing callers
+// and tests keep their import. `null` = no parseable list, and unknown must be
+// PERMISSIVE here: the runtime is the authority on what it supports, this
+// catalog is only a fast-fail.
+export { supportedEffortsOf };
 
 /**
  * The terminal failure for a selection the runtime would not (or could not

@@ -3,11 +3,21 @@ import assert from 'node:assert/strict';
 
 import {
   isReasoningOffUnsupported,
+  MINIMAL_EFFORT_LABEL,
+  MINIMAL_EFFORT_OPTION_TITLE,
   reasoningEffortOptionLabel,
   reasoningEffortOptionTitle,
   ULTRACODE_EFFORT_LABEL,
   ULTRACODE_EFFORT_OPTION_TITLE,
 } from './reasoning-effort-labels.mjs';
+
+test('minimal is a labelled rung with a tooltip, styled like its neighbours', () => {
+  assert.equal(reasoningEffortOptionLabel('minimal'), MINIMAL_EFFORT_LABEL);
+  assert.equal(reasoningEffortOptionLabel('MINIMAL'), MINIMAL_EFFORT_LABEL);
+  assert.equal(MINIMAL_EFFORT_LABEL, 'minimal', 'lowercase like low/medium/high');
+  assert.equal(reasoningEffortOptionTitle('minimal'), MINIMAL_EFFORT_OPTION_TITLE);
+  assert.equal(reasoningEffortOptionLabel('minimal', { reasoningOffUnsupported: true }), MINIMAL_EFFORT_LABEL, 'only none is renamed by the off-unsupported rule');
+});
 
 const catalog = {
   reasoningOffUnsupportedByProvider: {

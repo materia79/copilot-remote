@@ -1,9 +1,15 @@
+// The families the Copilot catalog has been observed to serve. This is the
+// validator's baseline, not a whitelist of "models we like": an id the runtime
+// itself lists must pass, or the model silently vanishes from every picker
+// (grok-* and kimi-* did exactly that — 4 of 27 live catalog entries).
 const MODEL_ID_PREFIXES = [
   'gpt-',
   'chatgpt-',
   'claude-',
   'gemini-',
   'mai-',
+  'grok-',
+  'kimi-',
   'o1-',
   'o3-',
   'o4-',

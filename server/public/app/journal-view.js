@@ -47,9 +47,11 @@ import { shouldApplyConversationLoad } from './activity-replay-state.mjs';
 import { createInfiniteLoader } from './infinite-loader.js';
 import {
   buildNewConversationModelChoices,
+  newConversationContextTierState,
   reasoningChoicesForProviderModel,
   resolvePreferredReasoningEffort,
 } from './new-conversation-model-choice.mjs';
+import { buildCatalogModelOptions } from './model-selector-options.mjs';
 import { isReasoningOffUnsupported, reasoningEffortOptionLabel, reasoningEffortOptionTitle } from './reasoning-effort-labels.mjs';
 import {
   conversationProviderIndicatorKey,
@@ -640,6 +642,32 @@ function populateNewConversationSizeSelect(providerType = 'github', selectedMode
   if (status) status.textContent = 'Image size used for generated outputs in this chat.';
 }
 
+// Read-only: the composer chip is the only place a tier is chosen (see
+// newConversationContextTierState), so this just tells the user what the
+// picked model gives them before the chat exists.
+function populateNewConversationContextRow(providerType = 'github', selectedModel = '') {
+  const select = document.getElementById('new-conversation-context-select');
+  const row = document.getElementById('new-conversation-context-row');
+  if (!select || !row) return;
+  const { visible, options } = newConversationContextTierState(newConversationCatalogCache || {}, {
+    provider: normalizeNewConversationProviderType(providerType),
+    modelId: selectedModel,
+  });
+  select.innerHTML = '';
+  if (!visible) {
+    row.style.display = 'none';
+    return;
+  }
+  for (const tier of options) {
+    const option = document.createElement('option');
+    option.value = tier.value;
+    option.textContent = tier.label;
+    select.appendChild(option);
+  }
+  select.value = options[0].value;
+  row.style.display = 'block';
+}
+
 async function populateNewConversationReasoningSelect(selectedModel = '') {
   const select = document.getElementById('new-conversation-reasoning-select');
   const status = document.getElementById('new-conversation-reasoning-status');
@@ -727,29 +755,25 @@ async function populateNewConversationModelSelect(providerType = 'github') {
   const target = document.getElementById('new-conversation-model-select');
   if (!target) return false;
   target.innerHTML = '';
-  const source = document.getElementById('model-select');
-  const sourceLabelByValue = new Map(
-    Array.from(source?.options || []).map((option) => [
-      String(option.value || '').trim(),
-      String(option.textContent || option.value || '').trim(),
-    ]),
-  );
   const catalog = newConversationCatalogCache || await loadModelCatalog();
   if (!catalog || !Array.isArray(catalog.models)) return false;
   const normalizedProvider = normalizeNewConversationProviderType(providerType);
+  const eligibleModels = catalog.models
+    .map((modelId) => String(modelId || '').trim())
+    .filter((modelId) => modelMatchesNewConversationProvider(catalog, modelId, normalizedProvider))
+    .filter((modelId) => (
+      normalizedProvider !== 'openai-image' || isOpenAIImageModelId(modelId)
+    ));
+  // The same builder the composer's #model-select uses, on the same catalog,
+  // so the two pickers agree on order and wording by construction. The modal
+  // used to borrow labels from the composer, which is scoped to the OPEN
+  // conversation's provider and so knew nothing about the models of another.
+  const hasAuto = eligibleModels.some((modelId) => modelId.toLowerCase() === 'auto');
   const choices = buildNewConversationModelChoices(
-    catalog.models
-      .filter((modelId) => modelMatchesNewConversationProvider(catalog, modelId, normalizedProvider))
-      .filter((modelId) => (
-        normalizedProvider !== 'openai-image' || isOpenAIImageModelId(modelId)
-      ))
-      .map((modelId) => {
-        const value = String(modelId || '').trim();
-        return {
-          value,
-          label: sourceLabelByValue.get(value) || value,
-        };
-      }),
+    buildCatalogModelOptions(eligibleModels, {
+      metadataByModel: catalog.modelMetadataByModel || {},
+      annotateContextWindow: normalizedProvider !== 'claude',
+    }).filter((option) => hasAuto || option.value.toLowerCase() !== 'auto'),
   );
   for (const choice of choices) {
     const option = document.createElement('option');
@@ -767,6 +791,7 @@ async function populateNewConversationModelSelect(providerType = 'github') {
   updateNewConversationProviderHelp(normalizedProvider);
   syncNewConversationReasoningLabel(normalizedProvider);
   populateNewConversationSizeSelect(normalizedProvider, target.value);
+  populateNewConversationContextRow(normalizedProvider, target.value);
   await populateNewConversationReasoningSelect(target.value);
   return true;
 }
@@ -939,6 +964,7 @@ async function openNewConversationModelModal() {
     modelSelect.addEventListener('change', () => {
       const provider = String(document.getElementById('new-conversation-provider-select')?.value || '').trim();
       populateNewConversationSizeSelect(provider, modelSelect.value);
+      populateNewConversationContextRow(provider, modelSelect.value);
       void populateNewConversationReasoningSelect(modelSelect.value);
     });
   }

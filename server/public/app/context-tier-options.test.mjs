@@ -5,6 +5,7 @@ import { CLAUDE_LONG_CONTEXT_LIMIT_TOKENS } from '../../../shared/model-id.mjs';
 import {
   buildContextTierOptions,
   resolveContextTierValue,
+  tokenLabel,
 } from './context-tier-options.mjs';
 
 // The catalog the live app reports: opus ships as "[1m]" only, fable as both.
@@ -32,7 +33,70 @@ test('the browser mirror of the 1M limit matches shared/model-id.mjs', () => {
     metadata: {},
     claudeTiers: CLAUDE_TIERS,
   });
-  assert.equal(longTier.label, `${Math.round(CLAUDE_LONG_CONTEXT_LIMIT_TOKENS / 1000)}K`);
+  assert.equal(longTier.label, tokenLabel(CLAUDE_LONG_CONTEXT_LIMIT_TOKENS));
+  assert.equal(CLAUDE_LONG_CONTEXT_LIMIT_TOKENS, 1000000);
+});
+
+test('tokenLabel reads K under a million and a trimmed M above', () => {
+  assert.equal(tokenLabel(400000), '400K');
+  assert.equal(tokenLabel(144000), '144K');
+  assert.equal(tokenLabel(1000000), '1M');
+  assert.equal(tokenLabel(1050000), '1.05M');
+  assert.equal(tokenLabel(1100000), '1.1M');
+  assert.equal(tokenLabel(0), '—');
+  assert.equal(tokenLabel(null), '—');
+  assert.equal(tokenLabel('x'), '—');
+});
+
+test('the copilot default tier reads the real runtime window over the derived limit', () => {
+  // gpt-5.4-mini: the relay caps the derived default at the runtime's real
+  // window, so the chip shows the number the user recognises.
+  assert.deepEqual(
+    buildContextTierOptions({
+      modelId: 'gpt-5.4-mini',
+      providerType: 'github',
+      metadata: { defaultContextLimitTokens: 400000, contextWindowTokens: 400000 },
+    }),
+    [{ value: 'default', label: '400K' }],
+  );
+  // gpt-5.6-terra has TWO tiers: the default tier is a 400K pricing tier and
+  // long-context is the full 1.05M window. The chip is a tier selector, so the
+  // default option must carry the tier's own limit — labelling it with the
+  // window would render both options as "1.05M".
+  assert.deepEqual(
+    buildContextTierOptions({
+      modelId: 'gpt-5.6-terra',
+      providerType: 'github',
+      metadata: { defaultContextLimitTokens: 400000, contextWindowTokens: 1050000, longContextLimitTokens: 1050000 },
+    }),
+    [
+      { value: 'default', label: '400K' },
+      { value: 'long_context', label: '1.05M' },
+    ],
+  );
+  // No derived default in the metadata: the real window is the fallback.
+  assert.deepEqual(
+    buildContextTierOptions({
+      modelId: 'claude-haiku-4-5',
+      providerType: 'github',
+      metadata: { defaultContextLimitTokens: null, contextWindowTokens: 144000 },
+    }),
+    [{ value: 'default', label: '144K' }],
+  );
+});
+
+test('the long-context tier still comes from longContextLimitTokens', () => {
+  assert.deepEqual(
+    buildContextTierOptions({
+      modelId: 'claude-opus-5',
+      providerType: 'github',
+      metadata: { defaultContextLimitTokens: 200000, contextWindowTokens: 264000, longContextLimitTokens: 1000000 },
+    }),
+    [
+      { value: 'default', label: '200K' },
+      { value: 'long_context', label: '1M' },
+    ],
+  );
 });
 
 test('a claude model shipped only as [1m] offers long context alone', () => {
@@ -43,7 +107,7 @@ test('a claude model shipped only as [1m] offers long context alone', () => {
       metadata: COPILOT_OPUS_METADATA,
       claudeTiers: CLAUDE_TIERS,
     }),
-    [{ value: 'long_context', label: '1000K' }],
+    [{ value: 'long_context', label: '1M' }],
   );
 });
 
@@ -57,7 +121,7 @@ test('a claude model shipped as both ids offers both tiers', () => {
     }),
     [
       { value: 'default', label: '—' },
-      { value: 'long_context', label: '1000K' },
+      { value: 'long_context', label: '1M' },
     ],
   );
 });
@@ -104,7 +168,7 @@ test('claude tiers are matched case-insensitively', () => {
       metadata: {},
       claudeTiers: CLAUDE_TIERS,
     }),
-    [{ value: 'long_context', label: '1000K' }],
+    [{ value: 'long_context', label: '1M' }],
   );
 });
 
@@ -118,7 +182,7 @@ test('the same model id under copilot keeps the copilot windows', () => {
     }),
     [
       { value: 'default', label: '264K' },
-      { value: 'long_context', label: '1000K' },
+      { value: 'long_context', label: '1M' },
     ],
   );
 });
@@ -136,7 +200,7 @@ test('providers other than claude ignore the claude tier map', () => {
       }),
       [
         { value: 'default', label: '264K' },
-        { value: 'long_context', label: '1000K' },
+        { value: 'long_context', label: '1M' },
       ],
       providerType,
     );
@@ -160,7 +224,7 @@ test('a claude model missing from the tier map falls back to metadata', () => {
     }),
     [
       { value: 'default', label: '264K' },
-      { value: 'long_context', label: '1000K' },
+      { value: 'long_context', label: '1M' },
     ],
   );
 });

@@ -66,6 +66,59 @@ test('with nothing usable the first non-off tier is chosen', () => {
   assert.equal(resolveComposerReasoningEffort({ supportedEfforts: [] }), '');
 });
 
+test('a dropped rung clamps to the highest supported level below it', () => {
+  const miniLadder = ['none', 'low', 'medium', 'high', 'xhigh'];
+  // gpt-5.6-terra@max → gpt-5.4-mini (no max): xhigh, not the floor.
+  assert.equal(resolveComposerReasoningEffort({
+    storedEffort: 'max',
+    currentEffort: 'max',
+    supportedEfforts: miniLadder,
+  }), 'xhigh');
+  assert.equal(resolveComposerReasoningEffort({
+    preferredEffort: 'xhigh',
+    supportedEfforts: ['minimal', 'low', 'medium', 'high'],
+  }), 'high');
+  // 'none' never counts as "below": high → gemini's minimal/low/medium/high keeps high,
+  // and low on a model whose ladder is none+medium+high goes UP to medium.
+  assert.equal(resolveComposerReasoningEffort({
+    preferredEffort: 'low',
+    supportedEfforts: ['none', 'medium', 'high'],
+  }), 'medium');
+  // A remembered 'minimal' on a model whose floor is low lands on low.
+  assert.equal(resolveComposerReasoningEffort({
+    preferredEffort: 'minimal',
+    supportedEfforts: ['none', 'low', 'medium', 'high', 'xhigh'],
+  }), 'low');
+  // 'minimal' is an ordinary rung when the model has it.
+  assert.equal(resolveComposerReasoningEffort({
+    preferredEffort: 'minimal',
+    supportedEfforts: ['minimal', 'low', 'medium', 'high'],
+  }), 'minimal');
+  assert.equal(resolveComposerReasoningEffort({
+    preferredEffort: 'none',
+    supportedEfforts: ['minimal', 'low', 'medium', 'high'],
+  }), 'minimal', 'a remembered off-switch on a model without one takes the floor');
+  assert.equal(resolveComposerReasoningEffort({
+    preferredEffort: 'none',
+    supportedEfforts: ['none', 'low'],
+  }), 'none', 'exact matches still win, including none');
+  // Off-ladder values only ever match exactly.
+  assert.equal(resolveComposerReasoningEffort({
+    preferredEffort: 'hd',
+    supportedEfforts: ['low', 'medium', 'high'],
+  }), 'low');
+});
+
+test('the higher-priority candidate is clamped before a lower one is consulted', () => {
+  // Conversation says max (unsupported), the DOM still shows low: the
+  // conversation's own tier, clamped, beats what the last chat left behind.
+  assert.equal(resolveComposerReasoningEffort({
+    preferredEffort: 'max',
+    currentEffort: 'low',
+    supportedEfforts: ['none', 'low', 'medium', 'high', 'xhigh'],
+  }), 'xhigh');
+});
+
 test('ultracode follows a preference but is never the fallback tier', () => {
   const claudeLadder = ['none', 'low', 'medium', 'high', 'xhigh', 'max', 'ultracode'];
   assert.equal(resolveComposerReasoningEffort({

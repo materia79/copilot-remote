@@ -124,10 +124,14 @@ import {
   resolveConversationComposerSelection,
 } from './conversation-preferences.mjs';
 import {
+  buildCatalogModelOptions,
+  catalogModelLabel,
   composerPlaceholderFor,
+  contextWindowSuffix,
   humanizeModelLabel,
+  modelMetadataFor,
   modelSelectorOptionsEqual,
-  normalizeModelSelectorOptions,
+  splitModelVariantId,
 } from './model-selector-options.mjs';
 import {
   buildContextTierOptions,
@@ -425,6 +429,8 @@ let modelVariantCatalogState = {
   variants: [],
   enabledVariantIds: [],
   reasoningByModel: {},
+  contextLimitsByModel: {},
+  modelMetadataByModel: {},
   source: null,
   refreshedAt: null,
   warning: null,
@@ -1077,23 +1083,12 @@ function syncQueueStatusMenuEntry(payload = null) {
 }
 
 
-function splitVariantId(modelVariantId = '') {
-  const value = String(modelVariantId || '').trim();
-  if (!value) return { baseModelId: '', reasoningEffort: null };
-  const match = value.match(/^(.*)-(none|low|medium|high|xhigh|max)$/i);
-  if (!match) return { baseModelId: value, reasoningEffort: null };
-  return {
-    baseModelId: String(match[1] || '').trim(),
-    reasoningEffort: String(match[2] || '').trim().toLowerCase(),
-  };
-}
-
+// Bare label (no window suffix) for places outside the option list, such as
+// the runtime-lock pin.
 function modelOptionLabel(modelVariantId = '') {
-  if (String(modelVariantId || '').trim().toLowerCase() === AUTO_MODEL_OPTION) return 'Auto';
-  const { baseModelId, reasoningEffort } = splitVariantId(modelVariantId);
-  if (!baseModelId) return modelVariantId;
-  const baseLabel = humanizeModelLabel(baseModelId);
-  return reasoningEffort ? `${baseLabel} (${reasoningEffort})` : baseLabel;
+  return catalogModelLabel(modelVariantId, modelCatalogState.modelMetadataByModel, {
+    autoValue: AUTO_MODEL_OPTION,
+  });
 }
 
 function normalizeReasoningEffortList(efforts = []) {
@@ -1333,7 +1328,7 @@ function syncComposerPlaceholder() {
   if (isSharedReaderMode()) return;
   if (imageEditTarget) return;
   const rawValue = String(document.getElementById('model-select')?.value || '');
-  const { baseModelId } = splitVariantId(rawValue);
+  const { baseModelId } = splitModelVariantId(rawValue);
   input.placeholder = composerPlaceholderFor({
     modelId: baseModelId || rawValue,
     providerType: normalizeModelSelectorProviderType(activeComposerProviderType()),
@@ -1387,10 +1382,19 @@ function modelVisibleForActiveProvider(modelId, activeProviderType, providersByM
   return !((hasOpenAIByok || hasClaude || hasCursor || hasGrok) && !hasNonExclusiveProvider);
 }
 
-function buildModelSelectorOptions(models = [], providersByModel = {}, activeProviderType = '') {
-  const normalizedOptions = normalizeModelSelectorOptions(models.length ? models : [FALLBACK_MODEL], {
+// metadataByModel is a parameter because the catalog refresh builds the next
+// option list before it commits nextState; reading modelCatalogState there
+// would label the new models with the old metadata.
+function buildModelSelectorOptions(
+  models = [],
+  providersByModel = {},
+  activeProviderType = '',
+  metadataByModel = modelCatalogState.modelMetadataByModel,
+) {
+  const normalizedOptions = buildCatalogModelOptions(models.length ? models : [FALLBACK_MODEL], {
     autoValue: AUTO_MODEL_OPTION,
-    labelFor: modelOptionLabel,
+    metadataByModel,
+    annotateContextWindow: normalizeModelSelectorProviderType(activeProviderType) !== 'claude',
   });
   return normalizedOptions.filter((option) => modelVisibleForActiveProvider(
     option.value,
@@ -1530,9 +1534,14 @@ function updateModelCatalogState(payload) {
     : [];
   const currentModel = String(payload?.currentModel || models[0] || '').trim();
   const defaultModel = String(payload?.defaultModel || models[0] || '').trim();
-  const normalizedModelOptions = normalizeModelSelectorOptions(models.length ? models : [FALLBACK_MODEL], {
+  const modelMetadataByModel = payload?.modelMetadataByModel && typeof payload.modelMetadataByModel === 'object'
+    ? payload.modelMetadataByModel
+    : {};
+  // Stored in catalog order so every consumer of modelCatalogState.models
+  // (composer, provider rescope, auto fallback) walks the same sequence.
+  const normalizedModelOptions = buildCatalogModelOptions(models.length ? models : [FALLBACK_MODEL], {
     autoValue: AUTO_MODEL_OPTION,
-    labelFor: modelOptionLabel,
+    metadataByModel: modelMetadataByModel,
   });
   const normalizedModels = normalizedModelOptions.map((option) => option.value);
 
@@ -1577,9 +1586,7 @@ function updateModelCatalogState(payload) {
       ]))
       : {},
     reasoningEfforts: normalizeReasoningEffortList(payload?.reasoningEfforts || []),
-    modelMetadataByModel: payload?.modelMetadataByModel && typeof payload.modelMetadataByModel === 'object'
-      ? payload.modelMetadataByModel
-      : {},
+    modelMetadataByModel,
     claudeContextTiersByModel: payload?.claudeContextTiersByModel && typeof payload.claudeContextTiersByModel === 'object'
       ? Object.fromEntries(Object.entries(payload.claudeContextTiersByModel).map(([modelId, tiers]) => [
         String(modelId || '').trim().toLowerCase(),
@@ -1598,6 +1605,7 @@ function updateModelCatalogState(payload) {
     normalizedModels,
     nextState.providersByModel,
     activeProviderType,
+    nextState.modelMetadataByModel,
   );
   const nextModels = nextOptions.map((option) => option.value);
   const currentOptions = Array.from(select.options)
@@ -1715,7 +1723,7 @@ function updateContextTierSelector(modelId) {
   const tierOptions = buildContextTierOptions({
     modelId,
     providerType: activeComposerProviderType(),
-    metadata: modelCatalogState.modelMetadataByModel?.[modelId] || {},
+    metadata: modelMetadataFor(modelId, modelCatalogState.modelMetadataByModel) || {},
     claudeTiers: modelCatalogState.claudeContextTiersByModel,
   });
   const current = select.value;
@@ -2161,6 +2169,10 @@ function applyModelVariantCatalogState(payload) {
       selectable: entry?.selectable !== false,
       enabled: !!entry?.enabled,
       sortOrder: Number.isFinite(Number(entry?.sortOrder)) ? Math.max(0, Math.trunc(Number(entry.sortOrder))) : 0,
+      contextLimitTokens: Number.isFinite(Number(entry?.contextLimitTokens)) && Number(entry.contextLimitTokens) > 0
+        ? Number(entry.contextLimitTokens)
+        : null,
+      pricing: entry?.pricing && typeof entry.pricing === 'object' ? entry.pricing : null,
     })).filter((entry) => entry.variantId && entry.baseModelId)
     : [];
   const canonicalizeId = (value) => String(value || '').trim().toLowerCase();
@@ -2185,6 +2197,8 @@ function applyModelVariantCatalogState(payload) {
       sortOrder: Math.min(existing.sortOrder, entry.sortOrder),
       label: existing.label || entry.label,
       provider: existing.provider || entry.provider,
+      contextLimitTokens: existing.contextLimitTokens ?? entry.contextLimitTokens,
+      pricing: existing.pricing || entry.pricing,
     });
   }
   const variants = Array.from(dedupedVariantsMap.values());
@@ -2200,6 +2214,15 @@ function applyModelVariantCatalogState(payload) {
         String(modelId || '').trim().toLowerCase(),
         normalizeReasoningEffortList(efforts),
       ]))
+      : {},
+    contextLimitsByModel: payload?.contextLimitsByModel && typeof payload.contextLimitsByModel === 'object'
+      ? Object.fromEntries(Object.entries(payload.contextLimitsByModel).map(([modelId, tokens]) => [
+        String(modelId || '').trim().toLowerCase(),
+        Number(tokens),
+      ]).filter(([modelId, tokens]) => modelId && Number.isFinite(tokens) && tokens > 0))
+      : {},
+    modelMetadataByModel: payload?.modelMetadataByModel && typeof payload.modelMetadataByModel === 'object'
+      ? payload.modelMetadataByModel
       : {},
     source: String(payload?.source || '').trim() || null,
     refreshedAt: payload?.refreshedAt || null,
@@ -2530,6 +2553,13 @@ function renderModelVariantCatalogBody() {
         ? { ...fallbackMeta, efforts: new Set(providerEfforts) }
         : fallbackMeta;
       const label = meta.label || humanizeModelLabel(baseModelId) || baseModelId;
+      const windowSuffix = contextWindowSuffix(
+        baseModelId,
+        modelVariantCatalogState.modelMetadataByModel || modelCatalogState.modelMetadataByModel,
+      );
+      const windowChip = windowSuffix
+        ? `<span class="model-reasoning-chip model-reasoning-chip-muted">${escHtml(windowSuffix.replace(/^ · /, ''))}</span>`
+        : '';
       const variantRowsHtml = variantRows.map((row) => {
         const selectable = row.selectable !== false;
         // SDK-provider rows (Claude/Cursor/Grok) carry their own enabled flag; only
@@ -2567,7 +2597,7 @@ function renderModelVariantCatalogBody() {
       return `
         <div class="model-base-group">
           <div class="model-base-header">
-            <div class="model-base-title">${escHtml(label)}</div>
+            <div class="model-base-title">${escHtml(label)}${windowChip ? ` ${windowChip}` : ''}</div>
             <div class="model-base-reasoning">
               <span class="model-base-reasoning-label">Reasoning</span>
               ${renderReasoningEffortChipRow(meta.efforts)}

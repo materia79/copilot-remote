@@ -69,6 +69,49 @@ export function resolveConversationComposerSelection({
   };
 }
 
+// Every effort rung any provider speaks, lowest first. 'ultracode' sits on top
+// but is a Claude mode rather than "more thinking", so it is never a clamp
+// target and a remembered ultracode does not degrade to xhigh (it falls
+// through to the next candidate — the existing "drops cleanly" rule).
+export const REASONING_EFFORT_LADDER = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultracode'];
+
+function normalizeEffortList(efforts = []) {
+  return (Array.isArray(efforts) ? efforts : [])
+    .map((effort) => String(effort || '').trim().toLowerCase())
+    .filter(Boolean);
+}
+
+/**
+ * Clamp rule, per candidate in priority order:
+ *   1. the candidate itself when the model supports it;
+ *   2. else the highest supported rung BELOW it, ignoring 'none'
+ *      (gpt-5.6-terra@max → gpt-5.4-mini lands on xhigh);
+ *   3. else the lowest supported rung ABOVE it, ignoring 'none'
+ *      (a remembered 'minimal' on a model whose floor is 'low' → low);
+ *   4. else the next candidate.
+ * With no candidate usable: the lowest non-'none' rung the model offers, or
+ * 'none' when that is all there is. Effort names off the ladder (image
+ * quality values, unknown providers) only ever match exactly.
+ */
+export function nearestSupportedReasoningEffort(candidates = [], supportedEfforts = []) {
+  const options = normalizeEffortList(supportedEfforts);
+  if (!options.length) return '';
+  const rungOf = (effort) => REASONING_EFFORT_LADDER.indexOf(effort);
+  const ranked = options
+    .filter((option) => option !== 'none' && rungOf(option) >= 0)
+    .sort((left, right) => rungOf(left) - rungOf(right));
+  for (const candidate of normalizeEffortList(candidates)) {
+    if (options.includes(candidate)) return candidate;
+    const rung = rungOf(candidate);
+    if (rung < 0 || candidate === 'ultracode') continue;
+    const below = ranked.filter((option) => rungOf(option) < rung);
+    if (below.length) return below[below.length - 1];
+    const above = ranked.find((option) => rungOf(option) > rung && option !== 'ultracode');
+    if (above) return above;
+  }
+  return options.find((option) => option !== 'none') || options[0];
+}
+
 // Priority: an explicit request (conversation preference, or the effort being
 // carried across a user model change) beats what the previous conversation left
 // in the DOM. Reversing those two is what let a New Chat "high" become "low".
@@ -78,14 +121,8 @@ export function resolveComposerReasoningEffort({
   currentEffort = '',
   supportedEfforts = [],
 } = {}) {
-  const options = (Array.isArray(supportedEfforts) ? supportedEfforts : [])
-    .map((effort) => String(effort || '').trim().toLowerCase())
-    .filter(Boolean);
-  if (!options.length) return '';
-  const candidates = [preferredEffort, storedEffort, currentEffort]
-    .map((effort) => String(effort || '').trim().toLowerCase())
-    .filter(Boolean);
-  const match = candidates.find((candidate) => options.includes(candidate));
-  if (match) return match;
-  return options.find((option) => option !== 'none') || options[0];
+  return nearestSupportedReasoningEffort(
+    [preferredEffort, storedEffort, currentEffort],
+    supportedEfforts,
+  );
 }

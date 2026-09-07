@@ -1,3 +1,7 @@
+import { nearestSupportedReasoningEffort } from './conversation-preferences.mjs';
+import { buildContextTierOptions, UNKNOWN_WINDOW_LABEL } from './context-tier-options.mjs';
+import { modelMetadataFor } from './model-selector-options.mjs';
+
 export function shouldPromptForNewConversationModel({ provider = '' } = {}) {
   const normalizedProvider = String(provider || '').trim().toLowerCase();
   return normalizedProvider === 'openai'
@@ -54,14 +58,30 @@ export function reasoningChoicesForProviderModel(catalog = {}, {
   return normalizeReasoningEfforts(catalog?.reasoningByModel?.[normalizedModelId] || []);
 }
 
+// Same clamp as the composer (nearestSupportedReasoningEffort) so a remembered
+// tier lands on the same rung whichever picker starts the chat.
 export function resolvePreferredReasoningEffort(efforts = [], preferredValues = []) {
-  const normalizedEfforts = normalizeReasoningEfforts(efforts);
-  if (!normalizedEfforts.length) return '';
-  const candidates = Array.isArray(preferredValues) ? preferredValues : [preferredValues];
-  for (const candidate of candidates) {
-    const value = String(candidate || '').trim().toLowerCase();
-    if (value && normalizedEfforts.includes(value)) return value;
-  }
-  const firstNonNone = normalizedEfforts.find((value) => value !== 'none');
-  return firstNonNone || normalizedEfforts[0];
+  return nearestSupportedReasoningEffort(
+    Array.isArray(preferredValues) ? preferredValues : [preferredValues],
+    normalizeReasoningEfforts(efforts),
+  );
+}
+
+/**
+ * The read-only context row of the New Chat modal. Only Copilot chats show it:
+ * the modal has no tier preference to persist (the composer's long_context
+ * choice is stored only as a Claude "[1m]" id), so it mirrors what the composer
+ * chip will read for the chosen model and hides when no window is known
+ * ("auto", stale metadata).
+ */
+export function newConversationContextTierState(catalog = {}, { provider = '', modelId = '' } = {}) {
+  const providerKey = normalizeProviderKey(provider);
+  if (providerKey !== 'github') return { visible: false, options: [] };
+  const options = buildContextTierOptions({
+    modelId,
+    providerType: providerKey,
+    metadata: modelMetadataFor(modelId, catalog?.modelMetadataByModel || {}) || {},
+  });
+  const known = options.filter((option) => option.label !== UNKNOWN_WINDOW_LABEL);
+  return { visible: known.length > 0, options: known };
 }

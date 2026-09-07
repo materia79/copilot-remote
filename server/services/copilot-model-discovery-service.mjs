@@ -18,7 +18,7 @@
 // is disposed in `finally` — a discovery must never leave a runtime process
 // behind — and `dispose()` follows the SDK-session-import pattern so a refresh
 // in flight at shutdown cannot hang the exit.
-import { extractModelDescriptors } from '../../shared/model-descriptors.mjs';
+import { buildModelSnapshotFields, extractModelDescriptors } from '../../shared/model-descriptors.mjs';
 
 /** Same budget the Claude model discovery races `supportedModels()` against. */
 export const DEFAULT_COPILOT_MODEL_DISCOVERY_TIMEOUT_MS = 20_000;
@@ -107,19 +107,10 @@ export function createCopilotModelDiscoveryService({
           logger.warn?.('[copilot-model-discovery] listModels returned no usable models');
           return { ok: false, models: [], error: 'Copilot model discovery returned no models' };
         }
-        const models = descriptors.map((entry) => entry.modelId);
-        const contextLimitsByModel = Object.fromEntries(
-          descriptors
-            .filter((entry) => entry.contextLimitTokens !== null)
-            .map((entry) => [entry.modelId, entry.contextLimitTokens]),
-        );
-        const modelMetadataByModel = Object.fromEntries(
-          descriptors.map((entry) => [entry.modelId, {
-            defaultContextLimitTokens: entry.contextLimitTokens,
-            longContextLimitTokens: entry.longContextLimitTokens,
-            pricing: entry.pricing,
-          }]),
-        );
+        // The typed client-level entries and the worker's raw session-level
+        // entries go through the same shared builder, so both publishers
+        // agree on every per-model metadata field.
+        const { models, contextLimitsByModel, modelMetadataByModel } = buildModelSnapshotFields(descriptors);
         // No currentModel/defaultModel: a session-less listModels cannot know
         // the active model, and updateModelCatalog keeps its existing pair
         // when the snapshot omits them.

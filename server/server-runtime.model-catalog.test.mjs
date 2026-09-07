@@ -5,7 +5,11 @@ import { fileURLToPath } from 'node:url';
 
 import { latestModelCatalogRefresh } from '../shared/model-catalog-freshness.mjs';
 
-const sourcePath = fileURLToPath(new URL('./server-runtime.mjs', import.meta.url));
+// The catalog moved out of server-runtime.mjs (which boots a server on import)
+// into a service testable against an in-memory database; the structural
+// guards below now read that module. Behavioural coverage lives in
+// services/model-variant-catalog-service.test.mjs.
+const sourcePath = fileURLToPath(new URL('./services/model-variant-catalog-service.mjs', import.meta.url));
 const source = fs.readFileSync(sourcePath, 'utf8');
 
 // ── Structural: touchModelSelectorState guard ────────────────────────────────
@@ -110,7 +114,12 @@ test('updateModelCatalog writes context limits via updateContextLimitForBase', (
 
 test('updateModelCatalog calls touchModelSelectorState when metadata received', () => {
   const startIdx = source.indexOf('function updateModelCatalog(');
-  const nextFnIdx = source.indexOf('\nfunction ', startIdx + 1);
+  // The service nests its functions in the factory, so the next sibling is
+  // indented (and may be async).
+  const nextFn = /\n  (?:async )?function /g;
+  nextFn.lastIndex = startIdx + 1;
+  const nextFnMatch = nextFn.exec(source);
+  const nextFnIdx = nextFnMatch ? nextFnMatch.index : -1;
   const updateFn = source.slice(startIdx, nextFnIdx > startIdx ? nextFnIdx : startIdx + 3000);
   assert.match(
     updateFn,

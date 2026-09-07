@@ -148,3 +148,21 @@ test('filterValidModelIds dedupes case and provider aliases', () => {
   ]);
   assert.deepEqual(result, ['gpt-5.4', 'claude-sonnet-4.6']);
 });
+
+test('isValidModelId accepts the xAI and Moonshot families the Copilot catalog serves', () => {
+  // grok-* and kimi-* are listed by the runtime; rejecting them dropped 4 of
+  // 27 live catalog entries from every picker.
+  assert.equal(isValidModelId('grok-4.6'), true);
+  assert.equal(isValidModelId('grok-4.5'), true);
+  assert.equal(isValidModelId('kimi-k3'), true);
+  assert.equal(isValidModelId('kimi-k2.7-code'), true);
+  assert.deepEqual(filterValidModelIds(['grok-4.6', 'kimi-k3', 'Grok-4.6']), ['grok-4.6', 'kimi-k3']);
+});
+
+test('isValidModelId accepts every id of the live raw catalog fixture', async () => {
+  const fs = await import('node:fs');
+  const fixture = JSON.parse(fs.readFileSync(new URL('./fixtures/copilot-catalog-raw-2026-09-07.json', import.meta.url), 'utf8'));
+  const rejected = fixture.list.map((entry) => entry.id).filter((id) => !isValidModelId(id));
+  assert.deepEqual(rejected, []);
+  assert.equal(fixture.list.length, 27);
+});

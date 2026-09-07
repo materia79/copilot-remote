@@ -79,7 +79,6 @@ import { createRelayCliLauncherService } from './services/relay-cli-launcher-ser
 import { createSessionWorkerRegistry } from './services/session-worker-registry-service.mjs';
 import { createSessionWorkerSupervisor } from './services/session-worker-supervisor-service.mjs';
 import { createSessionWorkerProcessInspector } from './services/session-worker-process-service.mjs';
-import { latestModelCatalogRefresh } from '../shared/model-catalog-freshness.mjs';
 import { applyClaudeProviderEnvironment, applyCopilotSdkProviderEnvironment, applyCursorProviderEnvironment, applyGrokProviderEnvironment, applyOpenAIProviderEnvironment, copilotSdkEngineUnavailableReason, killTmuxSession, launchSessionCli } from './services/session-worker-launch-service.mjs';
 import { createSshTunnelManager } from './services/ssh-tunnel-manager-service.mjs';
 import { createCloudflaredTunnelManager } from './services/cloudflared-tunnel-service.mjs';
@@ -133,7 +132,6 @@ import {
   mergeClaudeModelEfforts,
   mergeDiscoveredClaudeModels,
 } from '../shared/claude-model-catalog.mjs';
-import { humanizeModelLabel } from './public/app/model-selector-options.mjs';
 import { parseAutoCompactWindow } from '../shared/auto-compact-window.mjs';
 import { parseThinkingDisplay, parseThinkingEnabled } from '../shared/claude-thinking.mjs';
 import {
@@ -144,16 +142,13 @@ import {
 import { normalizeRelayThoughtList } from './public/app/relay-thoughts.mjs';
 import { capRelayActivityEntries } from './public/app/activity-replay-state.mjs';
 import {
-  canonicalizeModelId,
-  filterValidModelIds,
   isOpenAIModelId,
   isSafeClaudeModelId,
   isSafeCursorModelId,
   isSafeGrokModelId,
   isSafeProviderModelId,
-  isValidModelId,
 } from '../shared/model-id.mjs';
-import { selectModelIdsForVariantRefresh } from '../shared/model-refresh.mjs';
+import { createModelVariantCatalogService } from './services/model-variant-catalog-service.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
@@ -1589,8 +1584,6 @@ const CURATED_MODEL_IDS = [
   'claude-sonnet-4.6',
   'claude-haiku-4.5',
 ];
-const SUPPORTED_REASONING_EFFORTS = ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
-const REASONING_VARIANT_SUPPORTED_PREFIXES = ['gpt-', 'claude-'];
 
 let config = { ...DEFAULT_CONFIG };
 if (fs.existsSync(CONFIG_PATH)) {
@@ -1760,15 +1753,6 @@ function socketIoPath() {
 const remotePath = normalizeRemotePath(config.remotePath);
 const COOKIE_PATH = remotePath || '/';
 
-let modelCatalog = {
-  models: [DEFAULT_MODEL],
-  currentModel: DEFAULT_MODEL,
-  defaultModel: DEFAULT_MODEL,
-  source: 'bootstrap',
-  refreshedAt: null,
-  error: null,
-};
-let modelSelectorSql = null;
 
 const workspaceFileMetaCache = new Map();
 let workspaceFileWatcher = null;
@@ -2276,416 +2260,30 @@ function uniqueStringList(values) {
   return out;
 }
 
-function validatedModelIdList(values) {
-  return filterValidModelIds(uniqueStringList(values));
-}
+// The Copilot model catalog (snapshot state + model_variants rows) lives in
+// its own service so it can be tested against an in-memory database; the
+// runtime only wires it to its constants and the copilot CLI runner. It is
+// created BEFORE the database so the bootstrap catalog publish below keeps
+// its historical ordering; bindDatabase() attaches the statements later.
+const modelVariantCatalog = createModelVariantCatalogService({
+  defaultModel: DEFAULT_MODEL,
+  curatedModelIds: CURATED_MODEL_IDS,
+  autoModelSentinel: AUTO_MODEL_SENTINEL,
+  runCopilotCliCommand,
+});
+const {
+  SUPPORTED_REASONING_EFFORTS,
+  normalizeReasoningEffort,
+  buildModelVariantId,
+  getModelCatalogState,
+  updateModelCatalog,
+  listModelVariantRows,
+  getModelContextLimitTokens,
+  parseModelVariantSelection,
+  setEnabledModelVariants,
+  refreshModelVariantCatalogFromCli,
+} = modelVariantCatalog;
 
-function curatedModelList() {
-  return uniqueStringList(CURATED_MODEL_IDS);
-}
-
-function normalizeReasoningEffort(value) {
-  const text = String(value || '').trim().toLowerCase();
-  if (!text) return null;
-  return SUPPORTED_REASONING_EFFORTS.includes(text) ? text : null;
-}
-
-function isReasoningVariantEligibleModel(modelId) {
-  const normalized = String(modelId || '').trim().toLowerCase();
-  if (!normalized) return false;
-  return REASONING_VARIANT_SUPPORTED_PREFIXES.some((prefix) => normalized.startsWith(prefix));
-}
-
-function modelProviderForId(modelId) {
-  const text = String(modelId || '').trim().toLowerCase();
-  if (!text) return 'other';
-  if (
-    text.startsWith('gpt-')
-    || text.startsWith('o1-')
-    || text.startsWith('o3-')
-    || text.startsWith('codex-')
-    || text.startsWith('openai/')
-  ) return 'openai';
-  if (text.startsWith('claude-')) return 'anthropic';
-  if (text.startsWith('gemini-')) return 'google';
-  if (text.startsWith('mai-')) return 'microsoft';
-  return 'other';
-}
-
-// Single source of truth with the composer's labels: the server-built variant
-// labels are preferred by the client, so a second formatter here would drift
-// (it did — "Claude Sonnet 4.6" in the catalog modal vs "Sonnet 4.6" in the
-// composer). The module is pure browser-neutral ESM.
-function modelDisplayLabel(modelId) {
-  return humanizeModelLabel(modelId);
-}
-
-function buildModelVariantId(baseModelId, reasoningEffort = null) {
-  const base = String(baseModelId || '').trim();
-  if (!base) return '';
-  const effort = normalizeReasoningEffort(reasoningEffort);
-  if (!effort) return base;
-  return `${base}-${effort}`;
-}
-
-function parseModelVariantId(variantId = '', {
-  knownBaseModels = [],
-} = {}) {
-  const value = String(variantId || '').trim();
-  if (!value) return null;
-  const known = Array.isArray(knownBaseModels)
-    ? knownBaseModels.map((entry) => String(entry || '').trim()).filter(Boolean)
-    : [];
-  const orderedKnown = known.sort((a, b) => b.length - a.length);
-  for (const candidate of orderedKnown) {
-    if (!value.toLowerCase().startsWith(`${candidate.toLowerCase()}-`)) continue;
-    const suffix = value.slice(candidate.length + 1);
-    const effort = normalizeReasoningEffort(suffix);
-    if (effort) {
-      return {
-        variantId: buildModelVariantId(candidate, effort),
-        baseModelId: candidate,
-        reasoningEffort: effort,
-      };
-    }
-  }
-  const trailingEffortMatch = value.match(/^(.*?)-([a-z]+)$/i);
-  if (trailingEffortMatch) {
-    const effort = normalizeReasoningEffort(trailingEffortMatch[2]);
-    const maybeBase = String(trailingEffortMatch[1] || '').trim();
-    if (effort && maybeBase) {
-      return {
-        variantId: buildModelVariantId(maybeBase, effort),
-        baseModelId: maybeBase,
-        reasoningEffort: effort,
-      };
-    }
-  }
-  return {
-    variantId: value,
-    baseModelId: value,
-    reasoningEffort: null,
-  };
-}
-
-function normalizeModelVariantRow(row = {}) {
-  const rawBaseModelId = String(row?.base_model_id || row?.baseModelId || '').trim();
-  const baseModelId = canonicalizeModelId(rawBaseModelId) || rawBaseModelId;
-  const reasoningEffort = normalizeReasoningEffort(row?.reasoning_effort ?? row?.reasoningEffort);
-  const rawVariantId = String(row?.variant_id || row?.variantId || buildModelVariantId(baseModelId, reasoningEffort)).trim();
-  const parsed = parseModelVariantId(rawVariantId, { knownBaseModels: baseModelId ? [baseModelId] : [] });
-  const normalizedBaseModelId = canonicalizeModelId(parsed?.baseModelId || baseModelId) || baseModelId;
-  const normalizedReasoningEffort = normalizeReasoningEffort(parsed?.reasoningEffort || reasoningEffort);
-  const variantId = buildModelVariantId(normalizedBaseModelId, normalizedReasoningEffort);
-  const provider = String(row?.provider || row?.providerId || modelProviderForId(baseModelId)).trim() || 'other';
-  const label = String(row?.label || row?.displayName || modelDisplayLabel(normalizedBaseModelId)).trim() || normalizedBaseModelId;
-  const enabledValue = Number(row?.enabled);
-  const enabled = Number.isFinite(enabledValue) ? enabledValue === 1 : !!row?.enabled;
-  return {
-    variantId,
-    baseModelId: normalizedBaseModelId,
-    provider,
-    reasoningEffort: normalizedReasoningEffort,
-    label,
-    releaseStatus: String(row?.release_status || row?.releaseStatus || '').trim() || null,
-    contextLimitTokens: Number.isFinite(Number(row?.context_limit_tokens ?? row?.contextLimitTokens))
-      && Number(row?.context_limit_tokens ?? row?.contextLimitTokens) > 0
-      ? Math.round(Number(row?.context_limit_tokens ?? row?.contextLimitTokens))
-      : null,
-    longContextLimitTokens: Number.isFinite(Number(row?.long_context_limit_tokens ?? row?.longContextLimitTokens))
-      && Number(row?.long_context_limit_tokens ?? row?.longContextLimitTokens) > 0
-      ? Math.round(Number(row?.long_context_limit_tokens ?? row?.longContextLimitTokens))
-      : null,
-    pricing: (() => {
-      const value = row?.pricing_json ?? row?.pricing;
-      if (!value || typeof value === 'object') return value || null;
-      try { return JSON.parse(value); } catch { return null; }
-    })(),
-    enabled,
-    sortOrder: Number.isFinite(Number(row?.sort_order ?? row?.sortOrder))
-      ? Math.max(0, Math.trunc(Number(row?.sort_order ?? row?.sortOrder)))
-      : 0,
-    updatedAt: row?.updated_at || row?.updatedAt || null,
-  };
-}
-
-function buildModelVariantEntries(baseModels = [], {
-  defaultEnabled = true,
-  contextLimitsByModel = {},
-  modelMetadataByModel = {},
-} = {}) {
-  const models = uniqueStringList(baseModels);
-  const entries = [];
-  let sortOrder = 0;
-  for (const baseModelId of models) {
-    const provider = modelProviderForId(baseModelId);
-    const label = modelDisplayLabel(baseModelId);
-    const contextLimitTokens = Number(contextLimitsByModel?.[baseModelId]);
-    const normalizedContextLimitTokens = Number.isFinite(contextLimitTokens) && contextLimitTokens > 0
-      ? Math.round(contextLimitTokens)
-      : null;
-    const metadata = modelMetadataByModel?.[baseModelId] || {};
-    if (isReasoningVariantEligibleModel(baseModelId)) {
-      for (const effort of SUPPORTED_REASONING_EFFORTS) {
-        entries.push({
-          variantId: buildModelVariantId(baseModelId, effort),
-          baseModelId,
-          provider,
-          label,
-          reasoningEffort: effort,
-          releaseStatus: null,
-          contextLimitTokens: normalizedContextLimitTokens,
-          longContextLimitTokens: toNullableInt(metadata.longContextLimitTokens),
-          pricing: metadata.pricing || null,
-          enabled: defaultEnabled ? 1 : 0,
-          sortOrder: sortOrder++,
-        });
-      }
-      continue;
-    }
-    entries.push({
-      variantId: buildModelVariantId(baseModelId),
-      baseModelId,
-      provider,
-      label,
-      reasoningEffort: null,
-      releaseStatus: null,
-      contextLimitTokens: normalizedContextLimitTokens,
-      longContextLimitTokens: toNullableInt(metadata.longContextLimitTokens),
-      pricing: metadata.pricing || null,
-      enabled: defaultEnabled ? 1 : 0,
-      sortOrder: sortOrder++,
-    });
-  }
-
-  return entries;
-}
-
-function normalizeModelMetadataByModel(value = {}) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
-  const normalized = {};
-  for (const [rawModelId, rawMetadata] of Object.entries(value)) {
-    const modelId = canonicalizeModelId(rawModelId);
-    if (!isValidModelId(modelId) || !rawMetadata || typeof rawMetadata !== 'object') continue;
-    const defaultContextLimitTokens = toNullableInt(rawMetadata.defaultContextLimitTokens);
-    const longContextLimitTokens = toNullableInt(rawMetadata.longContextLimitTokens);
-    const pricing = rawMetadata.pricing && typeof rawMetadata.pricing === 'object' ? rawMetadata.pricing : null;
-    if (defaultContextLimitTokens === null && longContextLimitTokens === null && pricing === null) continue;
-    normalized[modelId] = { defaultContextLimitTokens, longContextLimitTokens, pricing };
-  }
-  return normalized;
-}
-
-function normalizeContextLimitsByModel(value = {}) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
-  const normalized = {};
-  for (const [rawModelId, rawLimit] of Object.entries(value)) {
-    const modelId = canonicalizeModelId(rawModelId);
-    const limit = Number(rawLimit);
-    if (!isValidModelId(modelId) || !Number.isFinite(limit) || limit <= 0) continue;
-    normalized[modelId] = Math.round(limit);
-  }
-  return normalized;
-}
-
-function hasValidReasoningByModel(reasoningByModel = {}) {
-  if (!reasoningByModel || typeof reasoningByModel !== 'object') return false;
-  const modelIds = Object.keys(reasoningByModel).filter((modelId) => modelId !== AUTO_MODEL_SENTINEL);
-  if (!modelIds.length) return false;
-  return modelIds.every((modelId) => {
-    const efforts = reasoningByModel[modelId];
-    return Array.isArray(efforts) && efforts.length > 0;
-  });
-}
-
-function getModelCatalogState() {
-  const selectorState = getModelVariantSelectorState();
-  const enabledRows = listEnabledModelVariantRows();
-  const modelRows = enabledRows.length ? enabledRows : listModelVariantRows().filter((row) => row.enabled);
-  const allRows = listModelVariantRows();
-  const reasoningByModel = {};
-  const contextLimitsByModel = {};
-  const modelMetadataByModel = {};
-  const models = [];
-  const seenModels = new Set();
-  for (const row of modelRows) {
-    const baseModelId = String(row?.baseModelId || '').trim();
-    if (!baseModelId) continue;
-    if (!seenModels.has(baseModelId)) {
-      seenModels.add(baseModelId);
-      models.push(baseModelId);
-    }
-    const effort = normalizeReasoningEffort(row?.reasoningEffort || 'none') || 'none';
-    const current = reasoningByModel[baseModelId] || [];
-    if (!current.includes(effort)) current.push(effort);
-    reasoningByModel[baseModelId] = current;
-    if (row.contextLimitTokens !== null && row.contextLimitTokens > 0) {
-      contextLimitsByModel[baseModelId] = row.contextLimitTokens;
-    }
-    if (!modelMetadataByModel[baseModelId]) {
-      modelMetadataByModel[baseModelId] = {
-        defaultContextLimitTokens: row.contextLimitTokens,
-        longContextLimitTokens: row.longContextLimitTokens,
-        pricing: row.pricing,
-      };
-    }
-  }
-  const knownModelIds = new Set(Object.keys(reasoningByModel));
-  for (const row of allRows) {
-    const baseModelId = String(row?.baseModelId || '').trim();
-    if (!baseModelId) continue;
-    knownModelIds.add(baseModelId);
-    const effort = normalizeReasoningEffort(row?.reasoningEffort || 'none') || 'none';
-    const current = reasoningByModel[baseModelId] || [];
-    if (!current.includes(effort)) current.push(effort);
-    reasoningByModel[baseModelId] = current;
-    if (row.contextLimitTokens !== null && row.contextLimitTokens > 0) {
-      contextLimitsByModel[baseModelId] = row.contextLimitTokens;
-    }
-    if (!modelMetadataByModel[baseModelId]) {
-      modelMetadataByModel[baseModelId] = {
-        defaultContextLimitTokens: row.contextLimitTokens,
-        longContextLimitTokens: row.longContextLimitTokens,
-        pricing: row.pricing,
-      };
-    }
-  }
-  for (const modelId of knownModelIds) {
-    const efforts = uniqueStringList(
-      (reasoningByModel[modelId] || [])
-        .map((value) => normalizeReasoningEffort(value))
-        .filter(Boolean),
-    );
-    reasoningByModel[modelId] = efforts;
-  }
-  const autoEfforts = uniqueStringList(
-    Object.entries(reasoningByModel)
-      .filter(([modelId]) => modelId !== AUTO_MODEL_SENTINEL)
-      .flatMap(([, list]) => Array.isArray(list) ? list : [])
-      .map((value) => normalizeReasoningEffort(value))
-      .filter(Boolean),
-  );
-  if (autoEfforts.length) {
-    reasoningByModel[AUTO_MODEL_SENTINEL] = autoEfforts;
-  } else {
-    delete reasoningByModel[AUTO_MODEL_SENTINEL];
-  }
-  const catalogModels = [AUTO_MODEL_SENTINEL, ...models.filter((value) => value.toLowerCase() !== AUTO_MODEL_SENTINEL)];
-  const currentResolved = parseModelVariantSelection(selectorState.currentModel);
-  const defaultResolved = parseModelVariantSelection(selectorState.defaultModel);
-  const currentModel = String(currentResolved?.baseModelId || selectorState.currentModel || '').trim() || catalogModels[0] || DEFAULT_MODEL;
-  const defaultModel = String(defaultResolved?.baseModelId || selectorState.defaultModel || '').trim() || currentModel || catalogModels[0] || DEFAULT_MODEL;
-  const reasoningMetadataValid = hasValidReasoningByModel(reasoningByModel);
-  const inMemoryRefresh = modelCatalog.refreshedAt || null;
-  const refreshedAt = latestModelCatalogRefresh(selectorState.refreshedAt, inMemoryRefresh);
-  const metadataError = !reasoningMetadataValid || !!selectorState.error || modelRows.length === 0;
-  const stale = metadataError;
-  const metadataValid = !metadataError;
-  const warning = selectorState.warning || null;
-  const reasoningEfforts = uniqueStringList(
-    Object.values(reasoningByModel)
-      .flatMap((list) => Array.isArray(list) ? list : [])
-      .map((value) => normalizeReasoningEffort(value))
-      .filter(Boolean),
-  );
-  return {
-    models: catalogModels,
-    currentModel,
-    defaultModel,
-    source: selectorState.source,
-    refreshedAt,
-    stale,
-    metadataValid,
-    reasoningMetadataValid,
-    warning,
-    error: selectorState.error,
-    reasoningByModel,
-    reasoningEfforts,
-    contextLimitsByModel,
-    modelMetadataByModel,
-  };
-}
-
-function touchModelSelectorState({
-  source = 'snapshot',
-  error = null,
-  refreshedAt = new Date().toISOString(),
-} = {}) {
-  if (!modelSelectorSql?.upsertSelectorState?.run) return;
-  const timestamp = latestModelCatalogRefresh(refreshedAt) || new Date().toISOString();
-  modelSelectorSql.upsertSelectorState.run(
-    String(source || 'snapshot').trim() || 'snapshot',
-    timestamp,
-    error ? String(error).trim().slice(0, 300) : null,
-    timestamp,
-  );
-}
-
-function updateModelCatalog(snapshot = {}) {
-  const incomingModels = validatedModelIdList(Array.isArray(snapshot.models) ? snapshot.models : []);
-  const incomingCurrentRaw = String(snapshot.currentModel || '').trim();
-  const incomingDefaultRaw = String(snapshot.defaultModel || '').trim();
-  const incomingCurrent = isValidModelId(incomingCurrentRaw) ? incomingCurrentRaw : '';
-  const incomingDefault = isValidModelId(incomingDefaultRaw) ? incomingDefaultRaw : '';
-  const contextLimitsByModel = normalizeContextLimitsByModel(snapshot.contextLimitsByModel);
-  const modelMetadataByModel = normalizeModelMetadataByModel(snapshot.modelMetadataByModel);
-  const receivedMetadata = incomingModels.length > 0 || Object.keys(contextLimitsByModel).length > 0 || Object.keys(modelMetadataByModel).length > 0;
-  const merged = validatedModelIdList([
-    ...curatedModelList(),
-    ...incomingModels,
-    incomingCurrent,
-    incomingDefault,
-    ...(Array.isArray(modelCatalog.models) ? modelCatalog.models : []),
-    modelCatalog.currentModel,
-    modelCatalog.defaultModel,
-  ]);
-  if (!merged.length) merged.push(DEFAULT_MODEL);
-  const currentModel = incomingCurrent || modelCatalog.currentModel || incomingDefault || merged[0] || DEFAULT_MODEL;
-  const defaultModel = incomingDefault || modelCatalog.defaultModel || currentModel || DEFAULT_MODEL;
-  const models = uniqueStringList([currentModel, defaultModel, ...merged]);
-
-  modelCatalog = {
-    models,
-    currentModel,
-    defaultModel,
-    source: String(snapshot.source || modelCatalog.source || 'unknown').trim() || 'unknown',
-    refreshedAt: receivedMetadata ? new Date().toISOString() : modelCatalog.refreshedAt,
-    error: snapshot.error ? String(snapshot.error).trim().slice(0, 300) : null,
-  };
-  if (modelSelectorSql?.upsertVariant?.run) {
-    const existingBaseIds = new Set(listModelVariantRows().map((r) => r.baseModelId));
-    const newBaseIds = models.filter((id) => !existingBaseIds.has(id));
-    if (newBaseIds.length) {
-      const newEntries = buildModelVariantEntries(newBaseIds, { defaultEnabled: false, contextLimitsByModel, modelMetadataByModel });
-      upsertModelVariantCatalogEntries(newEntries, {
-        source: String(modelCatalog.source || 'snapshot').trim() || 'snapshot',
-        error: modelCatalog.error || null,
-        preserveEnabled: true,
-      });
-    }
-    const nowIso = new Date().toISOString();
-    for (const [modelId, contextLimitTokens] of Object.entries(contextLimitsByModel)) {
-      modelSelectorSql.updateContextLimitForBase.run(contextLimitTokens, nowIso, modelId);
-    }
-    for (const [modelId, metadata] of Object.entries(modelMetadataByModel)) {
-      modelSelectorSql.updateModelMetadataForBase.run(
-        metadata.defaultContextLimitTokens,
-        metadata.longContextLimitTokens,
-        metadata.pricing ? JSON.stringify(metadata.pricing) : null,
-        nowIso,
-        modelId,
-      );
-    }
-  }
-  if (receivedMetadata && modelSelectorSql?.upsertSelectorState?.run) {
-    touchModelSelectorState({
-      source: modelCatalog.source,
-      error: modelCatalog.error,
-      refreshedAt: modelCatalog.refreshedAt,
-    });
-  }
-  return getModelCatalogState();
-}
 
 function getSupportedReasoningEffortsForModel(model = '') {
   const modelId = String(model || '').trim().toLowerCase();
@@ -2774,200 +2372,6 @@ function resolveRequestedModel(model) {
   };
 }
 
-function listModelVariantRows() {
-  if (!modelSelectorSql?.listVariants?.all) return [];
-  return modelSelectorSql.listVariants.all().map((row) => normalizeModelVariantRow(row));
-}
-
-function listEnabledModelVariantRows() {
-  if (!modelSelectorSql?.listEnabledVariants?.all) return [];
-  return modelSelectorSql.listEnabledVariants.all().map((row) => normalizeModelVariantRow(row));
-}
-
-function getModelContextLimitTokens(modelId = '') {
-  const normalizedModelId = canonicalizeModelId(modelId);
-  if (!normalizedModelId) return null;
-  const row = listModelVariantRows().find((entry) => entry.baseModelId === normalizedModelId
-    && entry.contextLimitTokens !== null
-    && entry.contextLimitTokens > 0);
-  return row?.contextLimitTokens || null;
-}
-
-function parseModelVariantSelection(value) {
-  const variantId = String(value || '').trim();
-  if (!variantId) return null;
-  const knownBaseModels = listModelVariantRows().map((row) => row.baseModelId);
-  const parsed = parseModelVariantId(variantId, { knownBaseModels });
-  if (!parsed) return null;
-  const match = listModelVariantRows().find((row) => row.variantId === parsed.variantId);
-  if (match) {
-    return {
-      variantId: match.variantId,
-      baseModelId: match.baseModelId,
-      reasoningEffort: match.reasoningEffort,
-      provider: match.provider,
-      label: match.label,
-    };
-  }
-  return parsed;
-}
-
-function getModelVariantSelectorState() {
-  const fallbackVariant = buildModelVariantId(DEFAULT_MODEL, isReasoningVariantEligibleModel(DEFAULT_MODEL) ? 'none' : null);
-  if (!modelSelectorSql?.listEnabledVariants?.all) {
-    const fallbackModels = buildModelVariantEntries(curatedModelList(), { defaultEnabled: true }).map((entry) => entry.variantId);
-    const models = fallbackModels.length ? fallbackModels : [fallbackVariant];
-    return {
-      models,
-      currentModel: models[0] || fallbackVariant,
-      defaultModel: models[0] || fallbackVariant,
-      source: 'bootstrap',
-      refreshedAt: null,
-      warning: null,
-      error: null,
-    };
-  }
-  const enabledRows = listEnabledModelVariantRows();
-  const selectorState = modelSelectorSql.getSelectorState.get() || null;
-  const enabledVariants = enabledRows.map((row) => row.variantId);
-  const models = enabledVariants.length ? enabledVariants : [fallbackVariant];
-  const warning = enabledVariants.length
-    ? null
-    : 'No model variants are enabled. Using fallback.';
-  return {
-    models,
-    currentModel: models[0] || fallbackVariant,
-    defaultModel: models[0] || fallbackVariant,
-    source: String(selectorState?.source || 'db').trim() || 'db',
-    refreshedAt: selectorState?.refreshed_at || null,
-    warning,
-    error: selectorState?.error ? String(selectorState.error) : null,
-  };
-}
-
-function upsertModelVariantCatalogEntries(entries = [], {
-  source = 'manual-refresh',
-  error = null,
-  preserveEnabled = true,
-} = {}) {
-  if (!modelSelectorSql?.upsertVariant?.run || !modelSelectorSql?.upsertSelectorState?.run) {
-    return getModelVariantSelectorState();
-  }
-  const normalizedEntries = Array.isArray(entries)
-    ? entries.map((entry) => normalizeModelVariantRow(entry)).filter((entry) => entry.variantId && entry.baseModelId)
-    : [];
-  const existingEnabled = new Map(
-    listModelVariantRows().map((row) => [row.variantId, row.enabled ? 1 : 0]),
-  );
-  const incomingIds = new Set(normalizedEntries.map((entry) => entry.variantId));
-  const incomingBaseIds = new Set(normalizedEntries.map((entry) => entry.baseModelId));
-  const nowIso = new Date().toISOString();
-  const tx = db.transaction(() => {
-    for (const entry of normalizedEntries) {
-      const enabled = preserveEnabled && existingEnabled.has(entry.variantId)
-        ? existingEnabled.get(entry.variantId)
-        : (entry.enabled ? 1 : 0);
-      modelSelectorSql.upsertVariant.run(
-        entry.variantId,
-        entry.baseModelId,
-        entry.provider || modelProviderForId(entry.baseModelId),
-        entry.label || modelDisplayLabel(entry.baseModelId),
-        entry.releaseStatus || null,
-        entry.reasoningEffort || null,
-        entry.contextLimitTokens || null,
-        entry.longContextLimitTokens || null,
-        entry.pricing ? JSON.stringify(entry.pricing) : null,
-        enabled,
-        entry.sortOrder,
-        nowIso,
-      );
-    }
-    for (const row of listModelVariantRows()) {
-      if (incomingIds.has(row.variantId)) continue;
-      const shouldMarkUnavailable = row.enabled || incomingBaseIds.has(row.baseModelId);
-      if (shouldMarkUnavailable) {
-        modelSelectorSql.upsertVariant.run(
-          row.variantId,
-          row.baseModelId,
-          row.provider || modelProviderForId(row.baseModelId),
-          row.label || modelDisplayLabel(row.baseModelId),
-          'unavailable',
-          row.reasoningEffort || null,
-          row.contextLimitTokens || null,
-          row.longContextLimitTokens || null,
-          row.pricing ? JSON.stringify(row.pricing) : null,
-          row.enabled ? 1 : 0,
-          row.sortOrder,
-          nowIso,
-        );
-        continue;
-      }
-      // Variants that are both disabled and fully absent from the incoming base set
-      // are no longer relevant; prune them so they do not linger as selectable.
-      modelSelectorSql.deleteVariant.run(row.variantId);
-    }
-    modelSelectorSql.upsertSelectorState.run(
-      String(source || 'manual-refresh').trim() || 'manual-refresh',
-      nowIso,
-      error ? String(error).trim().slice(0, 300) : null,
-      nowIso,
-    );
-  });
-  tx();
-  return getModelVariantSelectorState();
-}
-
-function setEnabledModelVariants(variantIds = []) {
-  if (!modelSelectorSql?.disableAllVariants?.run || !modelSelectorSql?.enableVariant?.run) {
-    return getModelVariantSelectorState();
-  }
-  const nextEnabled = new Set(
-    Array.isArray(variantIds) ? variantIds.map((value) => String(value || '').trim()).filter(Boolean) : [],
-  );
-  const existingRows = listModelVariantRows();
-  const nowIso = new Date().toISOString();
-  const tx = db.transaction(() => {
-    modelSelectorSql.disableAllVariants.run(nowIso);
-    for (const row of existingRows) {
-      if (!nextEnabled.has(row.variantId)) continue;
-      modelSelectorSql.enableVariant.run(nowIso, row.variantId);
-    }
-  });
-  tx();
-  return getModelVariantSelectorState();
-}
-
-function parseModelsFromHelpConfigOutput(text) {
-  const content = String(text || '');
-  if (!content) return [];
-  const sectionMatch = content.match(/`model`:[\s\S]*?(?=\n\s*`[a-zA-Z][^`]*`:\s|$)/);
-  const section = sectionMatch ? sectionMatch[0] : content;
-  const models = [];
-  const regex = /"([^"]+)"/g;
-  let match;
-  while ((match = regex.exec(section))) {
-    const candidate = String(match[1] || '').trim();
-    if (!candidate || candidate === 'auto') continue;
-    if (!isValidModelId(candidate)) continue;
-    models.push(candidate);
-  }
-  return validatedModelIdList(models);
-}
-
-function parseReasoningEffortsFromHelpOutput(text) {
-  const content = String(text || '');
-  if (!content) return SUPPORTED_REASONING_EFFORTS.slice();
-  const values = [];
-  const regex = /"([a-z]+)"/g;
-  let match;
-  while ((match = regex.exec(content))) {
-    const effort = normalizeReasoningEffort(match[1]);
-    if (effort) values.push(effort);
-  }
-  const unique = uniqueStringList(values);
-  return unique.length ? unique : SUPPORTED_REASONING_EFFORTS.slice();
-}
-
 function runCopilotCliCommand(args = [], timeoutMs = 30_000) {
   const commandArgs = Array.isArray(args) ? args.map((item) => String(item || '').trim()).filter(Boolean) : [];
   return new Promise((resolve, reject) => {
@@ -2996,73 +2400,6 @@ function runCopilotCliCommand(args = [], timeoutMs = 30_000) {
   });
 }
 
-async function refreshModelVariantCatalogFromCli() {
-  let source = 'rpc-snapshot';
-  let modelIds = [];
-  let reasoningEfforts = SUPPORTED_REASONING_EFFORTS.slice();
-  // All four publishers read the runtime's real model list, so any of their
-  // snapshots outranks the CLI help-text fallback below.
-  const hasAuthoritativeSnapshot = /^(web-relay-extension|standalone-relay|copilot-sdk-worker|server-discovery):/.test(String(modelCatalog.source || ''));
-  const refreshSelectionFromSnapshot = selectModelIdsForVariantRefresh({
-    snapshotModels: hasAuthoritativeSnapshot && Array.isArray(modelCatalog.models) ? modelCatalog.models : [],
-    currentModel: modelCatalog.currentModel,
-    defaultModel: modelCatalog.defaultModel,
-    helpModelIds: [],
-  });
-  source = refreshSelectionFromSnapshot.source;
-  modelIds = refreshSelectionFromSnapshot.modelIds;
-  const genericHelpText = await runCopilotCliCommand(['help']).catch(() => '');
-  reasoningEfforts = parseReasoningEffortsFromHelpOutput(genericHelpText);
-  if (!modelIds.length) {
-    const configHelpText = await runCopilotCliCommand(['help', 'config']);
-    const helpModelIds = parseModelsFromHelpConfigOutput(configHelpText);
-    const refreshSelectionFromHelp = selectModelIdsForVariantRefresh({
-      snapshotModels: [],
-      currentModel: '',
-      defaultModel: '',
-      helpModelIds,
-    });
-    source = refreshSelectionFromHelp.source;
-    modelIds = refreshSelectionFromHelp.modelIds;
-  }
-  const entries = [];
-  let sortOrder = 0;
-  for (const modelId of modelIds) {
-    const provider = modelProviderForId(modelId);
-    const label = modelDisplayLabel(modelId);
-    if (isReasoningVariantEligibleModel(modelId)) {
-      for (const effort of reasoningEfforts) {
-        entries.push({
-          variantId: buildModelVariantId(modelId, effort),
-          baseModelId: modelId,
-          provider,
-          label,
-          reasoningEffort: effort,
-          enabled: 0,
-          sortOrder: sortOrder++,
-        });
-      }
-      continue;
-    }
-    entries.push({
-      variantId: buildModelVariantId(modelId),
-      baseModelId: modelId,
-      provider,
-      label,
-      reasoningEffort: null,
-      enabled: 0,
-      sortOrder: sortOrder++,
-    });
-  }
-  if (!entries.length) {
-    throw new Error('No models found in snapshot/help model output');
-  }
-  return upsertModelVariantCatalogEntries(entries, {
-    source,
-    error: null,
-    preserveEnabled: true,
-  });
-}
 
 function normalizeRelayMode(mode) {
   const value = String(mode || '').trim().toLowerCase();
@@ -3198,154 +2535,7 @@ const imageOperationService = createImageOperationService({
   uuidv4,
 });
 
-modelSelectorSql = {
-  listVariants: db.prepare(`
-    SELECT variant_id, base_model_id, provider, label, release_status, reasoning_effort, context_limit_tokens, long_context_limit_tokens, pricing_json, enabled, sort_order, updated_at
-    FROM model_variants
-    ORDER BY provider ASC, sort_order ASC, variant_id ASC
-  `),
-  listEnabledVariants: db.prepare(`
-    SELECT variant_id, base_model_id, provider, label, release_status, reasoning_effort, context_limit_tokens, long_context_limit_tokens, pricing_json, enabled, sort_order, updated_at
-    FROM model_variants
-    WHERE enabled = 1
-    ORDER BY provider ASC, sort_order ASC, variant_id ASC
-  `),
-  upsertVariant: db.prepare(`
-    INSERT INTO model_variants (
-      variant_id, base_model_id, provider, label, release_status, reasoning_effort, context_limit_tokens, long_context_limit_tokens, pricing_json, enabled, sort_order, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(variant_id) DO UPDATE SET
-      base_model_id = excluded.base_model_id,
-      provider = excluded.provider,
-      label = excluded.label,
-      release_status = excluded.release_status,
-      reasoning_effort = excluded.reasoning_effort,
-      context_limit_tokens = COALESCE(excluded.context_limit_tokens, model_variants.context_limit_tokens),
-      long_context_limit_tokens = COALESCE(excluded.long_context_limit_tokens, model_variants.long_context_limit_tokens),
-      pricing_json = COALESCE(excluded.pricing_json, model_variants.pricing_json),
-      enabled = excluded.enabled,
-      sort_order = excluded.sort_order,
-      updated_at = excluded.updated_at
-  `),
-  updateContextLimitForBase: db.prepare(`
-    UPDATE model_variants
-    SET context_limit_tokens = ?, updated_at = ?
-    WHERE base_model_id = ?
-  `),
-  updateModelMetadataForBase: db.prepare(`
-    UPDATE model_variants
-    SET context_limit_tokens = COALESCE(?, context_limit_tokens),
-        long_context_limit_tokens = COALESCE(?, long_context_limit_tokens),
-        pricing_json = COALESCE(?, pricing_json),
-        updated_at = ?
-    WHERE base_model_id = ?
-  `),
-  disableAllVariants: db.prepare(`UPDATE model_variants SET enabled = 0, updated_at = ?`),
-  enableVariant: db.prepare(`UPDATE model_variants SET enabled = 1, updated_at = ? WHERE variant_id = ?`),
-  deleteVariant: db.prepare(`DELETE FROM model_variants WHERE variant_id = ?`),
-  getSelectorState: db.prepare(`SELECT source, refreshed_at, error, updated_at FROM model_selector_state WHERE id = 1 LIMIT 1`),
-  upsertSelectorState: db.prepare(`
-    INSERT INTO model_selector_state (id, source, refreshed_at, error, updated_at)
-    VALUES (1, ?, ?, ?, ?)
-    ON CONFLICT(id) DO UPDATE SET
-      source = excluded.source,
-      refreshed_at = excluded.refreshed_at,
-      error = excluded.error,
-      updated_at = excluded.updated_at
-  `),
-};
-
-{
-  const existingCount = Number(db.prepare(`SELECT COUNT(*) AS cnt FROM model_variants`).get()?.cnt || 0);
-  const normalizeLegacyVariantIdsTx = db.transaction(() => {
-    const rows = modelSelectorSql.listVariants.all();
-    const canonicalRows = new Map();
-    for (const rawRow of rows) {
-      const row = normalizeModelVariantRow(rawRow);
-      const canonicalBaseModelId = canonicalizeModelId(row.baseModelId);
-      if (!canonicalBaseModelId) continue;
-      const canonicalVariantId = buildModelVariantId(canonicalBaseModelId, row.reasoningEffort);
-      const existing = canonicalRows.get(canonicalVariantId);
-      if (!existing) {
-        canonicalRows.set(canonicalVariantId, {
-          variantId: canonicalVariantId,
-          baseModelId: canonicalBaseModelId,
-          provider: row.provider || modelProviderForId(canonicalBaseModelId),
-          label: row.label || modelDisplayLabel(canonicalBaseModelId),
-          releaseStatus: row.releaseStatus || null,
-          reasoningEffort: row.reasoningEffort || null,
-          enabled: row.enabled ? 1 : 0,
-          sortOrder: row.sortOrder,
-          updatedAt: row.updatedAt,
-        });
-        continue;
-      }
-      existing.enabled = existing.enabled || (row.enabled ? 1 : 0) ? 1 : 0;
-      if (existing.releaseStatus !== null && row.releaseStatus === null) {
-        existing.releaseStatus = null;
-      }
-      existing.sortOrder = Math.min(existing.sortOrder, row.sortOrder);
-      if (!existing.label && row.label) existing.label = row.label;
-    }
-
-    const nowIso = new Date().toISOString();
-    for (const entry of canonicalRows.values()) {
-      modelSelectorSql.upsertVariant.run(
-        entry.variantId,
-        entry.baseModelId,
-        entry.provider || modelProviderForId(entry.baseModelId),
-        entry.label || modelDisplayLabel(entry.baseModelId),
-        entry.releaseStatus || null,
-        entry.reasoningEffort || null,
-        entry.contextLimitTokens || null,
-        entry.longContextLimitTokens || null,
-        entry.pricing ? JSON.stringify(entry.pricing) : null,
-        entry.enabled ? 1 : 0,
-        entry.sortOrder,
-        nowIso,
-      );
-    }
-    for (const rawRow of rows) {
-      const rawVariantId = String(rawRow?.variant_id || '').trim();
-      const rawBaseModelId = String(rawRow?.base_model_id || '').trim();
-      const canonicalBaseModelId = canonicalizeModelId(rawBaseModelId);
-      if (!canonicalBaseModelId) continue;
-      const canonicalReasoningEffort = normalizeReasoningEffort(rawRow?.reasoning_effort);
-      const canonicalVariantId = buildModelVariantId(canonicalBaseModelId, canonicalReasoningEffort);
-      if (rawVariantId !== canonicalVariantId) {
-        modelSelectorSql.deleteVariant.run(rawVariantId);
-      }
-    }
-  });
-  if (existingCount === 0) {
-    const nowIso = new Date().toISOString();
-    const seedEntries = buildModelVariantEntries(curatedModelList(), { defaultEnabled: true });
-    const tx = db.transaction(() => {
-      for (const entry of seedEntries) {
-        modelSelectorSql.upsertVariant.run(
-          entry.variantId,
-          entry.baseModelId,
-          entry.provider,
-          entry.label,
-          entry.releaseStatus || null,
-          entry.reasoningEffort || null,
-          entry.contextLimitTokens || null,
-          entry.longContextLimitTokens || null,
-          entry.pricing ? JSON.stringify(entry.pricing) : null,
-          entry.enabled ? 1 : 0,
-          entry.sortOrder,
-          nowIso,
-        );
-      }
-      modelSelectorSql.upsertSelectorState.run('bootstrap-seed', nowIso, null, nowIso);
-    });
-    tx();
-  } else if (!modelSelectorSql.getSelectorState.get()) {
-    const nowIso = new Date().toISOString();
-    modelSelectorSql.upsertSelectorState.run('legacy', nowIso, null, nowIso);
-  }
-  normalizeLegacyVariantIdsTx();
-}
+modelVariantCatalog.bindDatabase(db);
 
 const deleteArchiveService = createDeleteArchiveService(db, null, { resolveSessionStateRoot });
 void deleteArchiveService.retryPendingDeletesOnStartup()

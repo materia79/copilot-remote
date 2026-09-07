@@ -88,7 +88,7 @@ import {
   withRelayContext,
 } from './copilot-prompt-context.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
-import { extractModelDescriptors } from '../../shared/model-descriptors.mjs';
+import { buildModelSnapshotFields, extractModelDescriptors } from '../../shared/model-descriptors.mjs';
 
 // How long the runtime may sit with no session activity before the worker
 // closes it. The worker process itself stays up and reconnects lazily on the
@@ -691,19 +691,11 @@ export function createCopilotSdkSessionRunner({
         // An empty list is the runtime refusing to answer, not an empty
         // catalog — publishing it would only blank the pickers' metadata.
         if (!descriptors.length) return;
-        const models = descriptors.map((entry) => entry.modelId);
-        const contextLimitsByModel = Object.fromEntries(
-          descriptors
-            .filter((entry) => entry.contextLimitTokens !== null)
-            .map((entry) => [entry.modelId, entry.contextLimitTokens]),
-        );
-        const modelMetadataByModel = Object.fromEntries(
-          descriptors.map((entry) => [entry.modelId, {
-            defaultContextLimitTokens: entry.contextLimitTokens,
-            longContextLimitTokens: entry.longContextLimitTokens,
-            pricing: entry.pricing,
-          }]),
-        );
+        // The shared builder decides every per-model metadata field (vendor,
+        // picker category, real context window, the runtime's own effort
+        // list, ...) so this raw-CAPI list and the discovery service's typed
+        // list publish identical metadata for the same model.
+        const { models, contextLimitsByModel, modelMetadataByModel } = buildModelSnapshotFields(descriptors);
         const currentModel = appliedModel() || defaultModel || null;
         const payload = {
           // Same field set the extension and the standalone relay publish;

@@ -13,10 +13,14 @@ test('extractModelDescriptors keeps context limits from model RPC descriptors', 
     ],
   });
 
+  // The shared descriptor now carries the full catalog metadata contract
+  // (null where the entry says nothing), and a tier budget is capped by the
+  // model's real window: 1084000+16000 cannot exceed a 1050000 window.
+  const bare = { displayName: null, vendor: null, pickerCategory: null, preview: false, contextWindowTokens: null, maxPromptTokens: null, supportedEfforts: null };
   assert.deepEqual(descriptors, [
-    { modelId: 'gpt-5.6-terra', contextLimitTokens: 328000, longContextLimitTokens: 1100000, pricing: { default: { input: 100, output: 600, cacheRead: 10, cacheWrite: 125, batchSize: 1000000 }, longContext: { input: 200, output: 1200, cacheRead: null, cacheWrite: null, batchSize: 1000000 } } },
-    { modelId: 'claude-sonnet-4.6', contextLimitTokens: 200000, longContextLimitTokens: null, pricing: { default: null, longContext: null } },
-    { modelId: 'gemini-3.5-flash', contextLimitTokens: null, longContextLimitTokens: null, pricing: { default: null, longContext: null } },
+    { modelId: 'gpt-5.6-terra', contextLimitTokens: 328000, longContextLimitTokens: 1050000, pricing: { default: { input: 100, output: 600, cacheRead: 10, cacheWrite: 125, batchSize: 1000000 }, longContext: { input: 200, output: 1200, cacheRead: null, cacheWrite: null, batchSize: 1000000 } }, ...bare, contextWindowTokens: 1050000 },
+    { modelId: 'claude-sonnet-4.6', contextLimitTokens: 200000, longContextLimitTokens: null, pricing: { default: null, longContext: null }, ...bare },
+    { modelId: 'gemini-3.5-flash', contextLimitTokens: null, longContextLimitTokens: null, pricing: { default: null, longContext: null }, ...bare },
   ]);
 });
 
@@ -71,7 +75,8 @@ test('createModelSwitchingService prefers models.list metadata over fallback ses
     {
       modelId: 'gpt-5.6-luna',
       contextLimitTokens: 328000,
-      longContextLimitTokens: 1100000,
+      // Capped by the 1050000 window the entry advertises.
+      longContextLimitTokens: 1050000,
       pricing: {
         default: { input: 100, output: 600, cacheRead: null, cacheWrite: null, batchSize: 1000000 },
         longContext: { input: 200, output: 1200, cacheRead: null, cacheWrite: null, batchSize: 1000000 },

@@ -242,6 +242,7 @@ export const SCHEMA_SQL = `
     context_limit_tokens INTEGER,
     long_context_limit_tokens INTEGER,
     pricing_json     TEXT,
+    metadata_json    TEXT,
     enabled          INTEGER NOT NULL DEFAULT 1,
     sort_order       INTEGER NOT NULL DEFAULT 0,
     updated_at       TEXT NOT NULL
@@ -961,5 +962,11 @@ if (modelVariantColumns.length && !modelVariantColumns.includes('long_context_li
 }
 if (modelVariantColumns.length && !modelVariantColumns.includes('pricing_json')) {
   db.exec(`ALTER TABLE model_variants ADD COLUMN pricing_json TEXT`);
+}
+// Per-model catalog metadata (vendor, picker category, real context window,
+// runtime-reported reasoning efforts, ...) persisted with the variant rows so a
+// restart serves it before the next worker/discovery snapshot arrives.
+if (modelVariantColumns.length && !modelVariantColumns.includes('metadata_json')) {
+  db.exec(`ALTER TABLE model_variants ADD COLUMN metadata_json TEXT`);
 }
 }

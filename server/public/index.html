@@ -2920,6 +2920,8 @@
   #new-conversation-provider-select,
   #new-conversation-model-select,
   #new-conversation-reasoning-select,
+  #new-conversation-context-select,
+  #new-conversation-size-select,
   #new-conversation-cwd-select,
   #new-conversation-cwd-manual {
     width: 100%;
@@ -5872,6 +5874,11 @@
       <label for="new-conversation-reasoning-select" style="display:block;margin-top:12px;">Reasoning effort</label>
       <select id="new-conversation-reasoning-select"></select>
       <div id="new-conversation-reasoning-status" style="margin-top:8px;font-size:0.78rem;color:var(--muted);">Choose the effort used when this conversation starts.</div>
+      <div id="new-conversation-context-row" style="display:none;">
+        <label for="new-conversation-context-select" style="display:block;margin-top:12px;">Context window</label>
+        <select id="new-conversation-context-select" disabled aria-readonly="true"></select>
+        <div id="new-conversation-context-status" style="margin-top:8px;font-size:0.78rem;color:var(--muted);">Context window of the selected model; the tier can be changed from the composer once the chat is open.</div>
+      </div>
       <div id="new-conversation-size-row" style="display:none;">
         <label for="new-conversation-size-select" style="display:block;margin-top:12px;">Size</label>
         <select id="new-conversation-size-select"></select>

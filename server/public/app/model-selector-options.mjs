@@ -1,3 +1,5 @@
+import { tokenLabel } from './context-tier-options.mjs';
+
 /**
  * The composer placeholder, decided by the MODEL FAMILY of the current
  * selection (Simon's rule: the hint names who answers, whatever runtime serves
@@ -73,9 +75,78 @@ export function humanizeModelLabel(modelId = '') {
   return text;
 }
 
+const VARIANT_EFFORT_SUFFIX = /^(.*)-(none|minimal|low|medium|high|xhigh|max)$/i;
+
+// "gpt-5-high" style ids carry the effort as a suffix; the label shows it in
+// parentheses and the metadata lookup uses the base id.
+export function splitModelVariantId(modelVariantId = '') {
+  const value = String(modelVariantId || '').trim();
+  if (!value) return { baseModelId: '', reasoningEffort: null };
+  const match = value.match(VARIANT_EFFORT_SUFFIX);
+  if (!match) return { baseModelId: value, reasoningEffort: null };
+  return {
+    baseModelId: String(match[1] || '').trim(),
+    reasoningEffort: String(match[2] || '').trim().toLowerCase(),
+  };
+}
+
+// Server catalogs key metadata by the id they publish; stored preferences and
+// variant ids may differ only in case.
+export function modelMetadataFor(modelId = '', metadataByModel = {}) {
+  const map = metadataByModel && typeof metadataByModel === 'object' ? metadataByModel : {};
+  const { baseModelId } = splitModelVariantId(modelId);
+  if (!baseModelId) return null;
+  const direct = map[baseModelId];
+  if (direct && typeof direct === 'object') return direct;
+  const lower = baseModelId.toLowerCase();
+  const key = Object.keys(map).find((candidate) => candidate.toLowerCase() === lower);
+  return key && map[key] && typeof map[key] === 'object' ? map[key] : null;
+}
+
+// Number(null) is 0, which would put every unindexed model first.
+function finiteIndexOrNull(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const index = Number(value);
+  return Number.isFinite(index) && index >= 0 ? index : null;
+}
+
+export function catalogOrderFor(modelId = '', metadataByModel = {}) {
+  return finiteIndexOrNull(modelMetadataFor(modelId, metadataByModel)?.catalogIndex);
+}
+
+// Runtime display name when the catalog has one ("GPT-5.4 mini"), otherwise
+// the compact humanized id; variant ids keep their "(effort)" tail.
+export function catalogModelLabel(modelId = '', metadataByModel = {}, { autoValue = 'auto' } = {}) {
+  const value = String(modelId || '').trim();
+  if (value.toLowerCase() === String(autoValue || 'auto').trim().toLowerCase()) return 'Auto';
+  const { baseModelId, reasoningEffort } = splitModelVariantId(value);
+  if (!baseModelId) return value;
+  const displayName = String(modelMetadataFor(value, metadataByModel)?.displayName || '').trim();
+  const baseLabel = displayName || humanizeModelLabel(baseModelId);
+  return reasoningEffort ? `${baseLabel} (${reasoningEffort})` : baseLabel;
+}
+
+export function contextWindowSuffix(modelId = '', metadataByModel = {}) {
+  const metadata = modelMetadataFor(modelId, metadataByModel);
+  if (!metadata) return '';
+  const real = Number(metadata.contextWindowTokens);
+  const tokens = Number.isFinite(real) && real > 0 ? real : Number(metadata.defaultContextLimitTokens);
+  return Number.isFinite(tokens) && tokens > 0 ? ` · ${tokenLabel(tokens)}` : '';
+}
+
+/**
+ * Auto first, then the server's catalog order where it supplies one
+ * (orderFor → finite index), then everything else alphabetically by bare
+ * label. Copilot's canonical order therefore wins for Copilot models while
+ * SDK-only catalogs (no index) keep the alphabetical list they always had.
+ * suffixFor is applied after sorting and after collision detection so the
+ * sort key and the "same label" check never see the window annotation.
+ */
 export function normalizeModelSelectorOptions(models = [], {
   autoValue = 'auto',
   labelFor = (modelId) => modelId,
+  orderFor = () => null,
+  suffixFor = () => '',
 } = {}) {
   const normalizedAuto = String(autoValue || 'auto').trim() || 'auto';
   const values = Array.from(new Set(
@@ -83,7 +154,10 @@ export function normalizeModelSelectorOptions(models = [], {
       .map((modelId) => String(modelId || '').trim())
       .filter(Boolean),
   )).filter((modelId) => modelId.toLowerCase() !== normalizedAuto.toLowerCase());
+  const orderOf = (modelId) => finiteIndexOrNull(orderFor(modelId)) ?? Number.POSITIVE_INFINITY;
   values.sort((left, right) => {
+    const indexOrder = orderOf(left) - orderOf(right);
+    if (indexOrder) return indexOrder;
     const labelOrder = String(labelFor(left) || left).localeCompare(
       String(labelFor(right) || right),
       undefined,
@@ -103,9 +177,33 @@ export function normalizeModelSelectorOptions(models = [], {
   for (const option of options) {
     labelCounts.set(option.label, (labelCounts.get(option.label) || 0) + 1);
   }
-  return options.map((option) => (
-    labelCounts.get(option.label) > 1 ? { ...option, label: option.value } : option
-  ));
+  return options.map((option) => {
+    const label = labelCounts.get(option.label) > 1 ? option.value : option.label;
+    const suffix = option.value === normalizedAuto ? '' : String(suffixFor(option.value) || '');
+    return { value: option.value, label: `${label}${suffix}` };
+  });
+}
+
+/**
+ * The one option list both pickers render (composer #model-select and the
+ * New Chat modal), so they cannot disagree on order or wording. Callers filter
+ * by provider afterwards; annotateContextWindow is off for Claude SDK
+ * conversations, whose window the merged metadata does not know (see
+ * buildContextTierOptions).
+ */
+export function buildCatalogModelOptions(models = [], {
+  autoValue = 'auto',
+  metadataByModel = {},
+  annotateContextWindow = true,
+} = {}) {
+  return normalizeModelSelectorOptions(models, {
+    autoValue,
+    labelFor: (modelId) => catalogModelLabel(modelId, metadataByModel, { autoValue }),
+    orderFor: (modelId) => catalogOrderFor(modelId, metadataByModel),
+    suffixFor: annotateContextWindow
+      ? (modelId) => contextWindowSuffix(modelId, metadataByModel)
+      : () => '',
+  });
 }
 
 export function modelSelectorOptionsEqual(currentOptions = [], nextOptions = []) {
