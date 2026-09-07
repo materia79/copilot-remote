@@ -152,6 +152,15 @@ let sendInFlight = false;
 const COMPOSER_DRAFT_DEBOUNCE_MS = 500;
 const draftSaveTimerByConversation = new Map();
 const draftSavePromiseByConversation = new Map();
+// Conversations whose draft an in-flight send owns. POST /api/message clears
+// draft_text in the same transaction that stores the message, so until that
+// commit the server still serves the text the composer was just emptied of.
+// Every refresh issued inside that window carries it — the 900ms live poll
+// stays armed for the whole queue wait, and other clients can broadcast their
+// own late save of it — and applying one re-types the queued message into the
+// composer while its bubble sits in the transcript. Nothing but the send may
+// speak for this conversation's draft until the send has cleared it.
+const sendOwnedDraftConversations = new Set();
 const activeTurnsByConversation = new Map();
 let conversationHistoryState = {
   conversationId: '',
@@ -441,6 +450,10 @@ function clearDraftTimerForConversation(conversationId) {
   draftSaveTimerByConversation.delete(id);
 }
 
+function isDraftOwnedByPendingSend(conversationId) {
+  return sendOwnedDraftConversations.has(String(conversationId || '').trim());
+}
+
 function upsertConversationDraftState(conversationId, {
   draftText = '',
   draftAttachments = undefined,
@@ -569,6 +582,8 @@ export function hydrateConversationDraft(conversationId, {
 } = {}) {
   const id = String(conversationId || '').trim();
   if (!id) return;
+  // A refresh in flight across a send predates the send's own clear.
+  if (isDraftOwnedByPendingSend(id)) return;
   const normalizedDraftText = String(draftText || '');
   const normalizedAttachments = Array.isArray(draftAttachments) ? draftAttachments : [];
   const existingMs = normalizeDraftTimestampMs(conversations[id]?.draftUpdatedAt);
@@ -610,6 +625,9 @@ export function applyIncomingConversationDraftUpdate({
   const id = String(conversationId || '').trim();
   if (!id || !conversations[id]) return;
   if (senderClientId && senderClientId === CLIENT_ID) return;
+  // Same window as above: a broadcast of the pre-send draft must not undo the
+  // clear the send is still persisting.
+  if (isDraftOwnedByPendingSend(id)) return;
   const incomingDraftText = String(draftText || '');
   const existingMs = normalizeDraftTimestampMs(conversations[id]?.draftUpdatedAt);
   const incomingMs = normalizeDraftTimestampMs(draftUpdatedAt);
@@ -2659,7 +2677,10 @@ export async function sendMessage() {
     return;
   }
   if (targetConversationId) {
+    // The send takes the draft over from here: the debounced save is dropped,
+    // and no refresh may re-apply the draft this send is about to clear.
     clearDraftTimerForConversation(targetConversationId);
+    sendOwnedDraftConversations.add(targetConversationId);
   }
 
   setSendInFlight(true);
@@ -2830,14 +2851,19 @@ export async function sendMessage() {
     }
     const persistedConversationId = String(r.conversationId || targetConversationId || '').trim();
     if (persistedConversationId) {
-      await scheduleConversationDraftSave({
+      const clearedDraft = await scheduleConversationDraftSave({
         conversationId: persistedConversationId,
         draftText: '',
         immediate: true,
       });
       upsertConversationDraftState(persistedConversationId, {
         draftText: '',
-        draftUpdatedAt: new Date().toISOString(),
+        // Prefer the server's version pointer (a 409 carries the one the send
+        // transaction wrote when it cleared the draft) over this client's
+        // clock: once the send releases the draft, every later refresh is
+        // judged stale against this value, and a skewed clock would either
+        // resurrect the sent text or freeze out a genuine remote draft.
+        draftUpdatedAt: clearedDraft?.draftUpdatedAt || new Date().toISOString(),
         draftUpdatedByClientId: CLIENT_ID,
       });
     }
@@ -2873,6 +2899,9 @@ export async function sendMessage() {
     alert(e.message || 'Failed to send message');
   } finally {
     setSendInFlight(false);
+    // Every exit path has settled the draft by now: cleared it (success),
+    // restored the composer text (offline/failure), or never touched it.
+    if (targetConversationId) sendOwnedDraftConversations.delete(targetConversationId);
   }
 }
 

@@ -1056,6 +1056,165 @@ test('stream blacklist: a mid-flow reset keeps live frames flowing, only complet
   view.removeThinking();
 });
 
+// ---------------------------------------------------------------------------
+// Bug 6 — the post-send draft echo. POST /api/message clears draft_text in the
+// same transaction that stores the message, so between the composer clear and
+// that commit the server still serves the pre-send draft. Every refresh issued
+// inside that window carries the sent text: the 900ms live poll (armed for the
+// whole queue wait by the pending user message) and cross-client draft socket
+// events. Applying one re-types the message the user just queued back into the
+// composer while its bubble stays in the transcript.
+// ---------------------------------------------------------------------------
+
+const PRE_SEND_DRAFT_AT = '2026-02-12T10:00:00.000Z';
+
+// Puts conversation `convId` in the reported state: a turn is already running
+// (the send button reads "Queue"), the composer holds `text`, and the server's
+// draft for it was last persisted at PRE_SEND_DRAFT_AT.
+function primeQueuedSend(convId, text) {
+  conversations[convId] = {
+    id: convId,
+    title: 'D',
+    draftText: text,
+    draftUpdatedAt: PRE_SEND_DRAFT_AT,
+  };
+  setCurrentConv(convId);
+  resetThinkingIndicatorStub();
+  messagesEl.innerHTML = '';
+  resetComposer(text);
+  const runningId = nextId('msg-running');
+  view.renderMessages([makeMessage(runningId)], false, { conversationId: convId });
+  view.applyConversationTurnStatus({ conversationId: convId, messageId: runningId, status: 'processing' });
+  return runningId;
+}
+
+function stubQueuedSendFetches(convId, postResult) {
+  fetchHandler = async (url) => {
+    if (url.includes(`/api/conversation/${convId}?`)) return validationPayload('sess-d', '/root-d', 'D');
+    if (url.includes('/api/message')) return postResult;
+    if (url.includes(`/api/conversation/${convId}/draft`)) {
+      return { ok: true, draftText: '', draftUpdatedAt: new Date().toISOString() };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+}
+
+test('draft echo: a live-poll refresh carrying the pre-send draft does not re-type the queued message into the composer', async () => {
+  const convId = nextId('conv-draft');
+  const runningId = primeQueuedSend(convId, 'queued while busy');
+  const post = deferred();
+  stubQueuedSendFetches(convId, post.promise);
+
+  const sendPromise = view.sendMessage();
+  await settle();
+  assert.equal(getById('msg-input').value, '', 'precondition: the send cleared the composer');
+
+  // The poll response was produced before POST /api/message committed, so it
+  // carries the pre-send text at the pre-send version — not older than what
+  // this client last knew, so the timestamp guard alone lets it through.
+  view.hydrateConversationDraft(convId, {
+    draftText: 'queued while busy',
+    draftAttachments: [],
+    draftUpdatedAt: PRE_SEND_DRAFT_AT,
+    draftUpdatedByClientId: null,
+  });
+
+  assert.equal(getById('msg-input').value, '', 'the stale draft is not re-typed into the composer');
+
+  post.resolve({ conversationId: convId, messageId: nextId('srv') });
+  await sendPromise;
+  assert.equal(getById('msg-input').value, '', 'the composer is still empty once the send lands');
+  assert.equal(conversations[convId].draftText, '', 'the cached draft is the cleared one');
+
+  // A refresh that started before the commit but only lands after the send let
+  // the draft go is caught by the version the send adopted from the server.
+  view.hydrateConversationDraft(convId, {
+    draftText: 'queued while busy',
+    draftAttachments: [],
+    draftUpdatedAt: PRE_SEND_DRAFT_AT,
+    draftUpdatedByClientId: null,
+  });
+  assert.equal(getById('msg-input').value, '', 'a late pre-send refresh is still rejected as stale');
+  view.applyConversationTurnStatus({ conversationId: convId, messageId: runningId, status: 'done' });
+});
+
+test('draft echo: a cross-client draft event carrying the pre-send draft is ignored while the send is in flight', async () => {
+  const convId = nextId('conv-draft');
+  const runningId = primeQueuedSend(convId, 'queued from the phone');
+  const post = deferred();
+  stubQueuedSendFetches(convId, post.promise);
+
+  const sendPromise = view.sendMessage();
+  await settle();
+  assert.equal(getById('msg-input').value, '', 'precondition: the send cleared the composer');
+
+  // Another device's debounced PUT of the same (pre-send) text lands late and
+  // is broadcast back here.
+  view.applyIncomingConversationDraftUpdate({
+    conversationId: convId,
+    draftText: 'queued from the phone',
+    draftAttachments: [],
+    draftUpdatedAt: PRE_SEND_DRAFT_AT,
+    senderClientId: 'other-device',
+  });
+
+  assert.equal(getById('msg-input').value, '', 'the stale broadcast is not re-typed into the composer');
+
+  post.resolve({ conversationId: convId, messageId: nextId('srv') });
+  await sendPromise;
+  assert.equal(getById('msg-input').value, '', 'the composer is still empty once the send lands');
+  view.applyConversationTurnStatus({ conversationId: convId, messageId: runningId, status: 'done' });
+});
+
+test('draft sync: a draft written on another device after the send still reaches the composer', async () => {
+  const convId = nextId('conv-draft');
+  const runningId = primeQueuedSend(convId, 'sent from here');
+  stubQueuedSendFetches(convId, { conversationId: convId, messageId: nextId('srv') });
+
+  await view.sendMessage();
+  assert.equal(getById('msg-input').value, '', 'precondition: the send cleared the composer');
+
+  const laterDraftAt = new Date(Date.now() + 60_000).toISOString();
+  view.applyIncomingConversationDraftUpdate({
+    conversationId: convId,
+    draftText: 'typed on the laptop',
+    draftAttachments: [],
+    draftUpdatedAt: laterDraftAt,
+    senderClientId: 'other-device',
+  });
+  assert.equal(getById('msg-input').value, 'typed on the laptop', 'cross-device draft sync still updates the composer');
+
+  // …and so does the refresh that carries it, which is how a device that
+  // missed the socket event catches up.
+  view.hydrateConversationDraft(convId, {
+    draftText: 'edited again on the laptop',
+    draftAttachments: [],
+    draftUpdatedAt: new Date(Date.now() + 120_000).toISOString(),
+    draftUpdatedByClientId: 'other-device',
+  });
+  assert.equal(getById('msg-input').value, 'edited again on the laptop', 'a later refresh still restores the newest draft');
+
+  view.applyConversationTurnStatus({ conversationId: convId, messageId: runningId, status: 'done' });
+  resetComposer('');
+});
+
+test('draft restore: opening a conversation with no send in flight still hydrates its saved draft', () => {
+  const convId = nextId('conv-draft');
+  conversations[convId] = { id: convId, title: 'D' };
+  setCurrentConv(convId);
+  resetComposer('');
+
+  view.hydrateConversationDraft(convId, {
+    draftText: 'half-written question',
+    draftAttachments: [],
+    draftUpdatedAt: PRE_SEND_DRAFT_AT,
+    draftUpdatedByClientId: 'other-device',
+  });
+
+  assert.equal(getById('msg-input').value, 'half-written question', 'the saved draft is restored on open');
+  resetComposer('');
+});
+
 test('renderMessages re-renders when only a message\'s workflowRuns change', () => {
   const convId = nextId('conv-wr');
   conversations[convId] = { id: convId, title: 'WR' };
