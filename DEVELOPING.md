@@ -73,6 +73,14 @@ recurring trap:
   (`cliOnline`, queue counts) and `GET /api/model-variants` — its `source` /
   `refreshedAt` show whether boot-time Copilot model discovery ran on the new
   process (`server-discovery:boot`).
+- **A restart is not a deploy for session workers.** Worker processes survive
+  relay restarts by design (resume-across-restart; idle shutdown closes only
+  their SDK runtime, never the process), so a live worker keeps executing the
+  code it loaded at spawn. After changing worker-side code, recycle affected
+  workers too — `POST /api/session-worker/<sdkSessionId>/kill` or
+  `tmux kill-session -t <sdk-session-id>` — and compare
+  `pgrep -af 'session-worker'` start times against the deploy time to find
+  stale ones.
 
 4. Start one fresh Copilot CLI session:
 
