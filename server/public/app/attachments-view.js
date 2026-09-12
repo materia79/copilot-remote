@@ -569,6 +569,51 @@ function updateFilePreviewUiState() {
   backBtn.disabled = filePreviewHistory.length === 0;
   const annotateBtn = document.getElementById('file-preview-annotate-btn');
   if (annotateBtn) annotateBtn.hidden = !filePreviewSupportsAnnotation();
+  const copyBtn = document.getElementById('file-preview-copy-btn');
+  if (copyBtn) copyBtn.hidden = payload?.kind !== 'image';
+}
+
+/**
+ * Copy the previewed image to the clipboard as PNG. Re-encoding through a
+ * canvas is deliberate: the source may be JPEG/WebP and the async Clipboard
+ * API only reliably accepts image/png. Same-origin sources (the drive and
+ * workspace file routes, data: URIs) keep the canvas clean; a cross-origin
+ * image taints it and lands in the failure note instead of throwing.
+ */
+export async function copyFilePreviewImage() {
+  const btn = document.getElementById('file-preview-copy-btn');
+  const img = document.querySelector('#file-preview-body .file-preview-image img');
+  const flash = (text) => {
+    if (!btn) return;
+    btn.textContent = text;
+    setTimeout(() => { btn.textContent = 'Copy'; }, 1600);
+  };
+  if (!img?.src) return;
+  try {
+    if (!navigator.clipboard?.write || typeof ClipboardItem === 'undefined') {
+      throw new Error('Clipboard image copy is not supported in this browser');
+    }
+    const blob = await new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => {
+        try {
+          const canvas = document.createElement('canvas');
+          canvas.width = image.naturalWidth || image.width;
+          canvas.height = image.naturalHeight || image.height;
+          canvas.getContext('2d').drawImage(image, 0, 0);
+          canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('Could not encode image'))), 'image/png');
+        } catch (error) {
+          reject(error);
+        }
+      };
+      image.onerror = () => reject(new Error('Could not load image'));
+      image.src = img.src;
+    });
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+    flash('Copied ✓');
+  } catch {
+    flash('Copy failed');
+  }
 }
 
 function snapshotFilePreviewState() {

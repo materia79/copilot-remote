@@ -121,6 +121,45 @@ export function driveFileHrefFromPath(rawPath) {
   return `${BASE}/api/drives/file?path=${encodeURIComponent(normalized)}`;
 }
 
+/**
+ * Recognize this app's own file-serving hrefs (the shapes
+ * driveFileHrefFromPath / workspaceFileHrefFromPath emit, which embedded
+ * message media points at after rewriting) and give back the original file
+ * path, so a click on an inline image can reopen it in the file viewer.
+ */
+export function parseAppFileHref(rawSrc) {
+  const value = String(rawSrc || '').trim();
+  if (!value) return null;
+  let parsed = null;
+  try {
+    parsed = new URL(value, window.location.origin);
+  } catch {
+    return null;
+  }
+  if (parsed.origin !== window.location.origin) return null;
+  const base = String(BASE || '');
+  const pathname = parsed.pathname || '';
+  const appPath = base && pathname.startsWith(base) ? pathname.slice(base.length) : pathname;
+  if (appPath === '/api/drives/file') {
+    const path = String(parsed.searchParams.get('path') || '').trim();
+    return path ? { kind: 'drive', path } : null;
+  }
+  if (appPath.startsWith('/api/files/')) {
+    const path = appPath.slice('/api/files/'.length)
+      .split('/')
+      .map((segment) => {
+        try {
+          return decodeURIComponent(segment);
+        } catch {
+          return segment;
+        }
+      })
+      .join('/');
+    return path ? { kind: 'workspace', path } : null;
+  }
+  return null;
+}
+
 export function drivePreviewApiPath(rawPath) {
   const normalized = normalizeDriveBrowserPath(rawPath);
   if (!normalized) return '';

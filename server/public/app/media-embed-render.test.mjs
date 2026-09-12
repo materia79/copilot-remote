@@ -118,3 +118,20 @@ test('post-insert rewriter now covers video and audio srcs', () => {
     '/api/drives/file?path=%2Fhome%2Fdev%2Fnote.mp3',
   );
 });
+
+test('parseAppFileHref recognizes own file hrefs and nothing else', async () => {
+  const { parseAppFileHref } = await import('./router.js');
+  assert.deepEqual(
+    parseAppFileHref('/api/drives/file?path=C%3A%2FUsers%2Fdev%2Fshot.png'),
+    { kind: 'drive', path: 'C:/Users/dev/shot.png' },
+  );
+  assert.deepEqual(
+    parseAppFileHref('/api/files/sub/dir%20x/shot.png?scope=abc'),
+    { kind: 'workspace', path: 'sub/dir x/shot.png' },
+  );
+  // Foreign origins, data URIs, and unrelated same-origin routes never match.
+  assert.equal(parseAppFileHref('https://example.com/api/drives/file?path=x.png'), null);
+  assert.equal(parseAppFileHref('data:image/png;base64,AAAA'), null);
+  assert.equal(parseAppFileHref('/api/previews'), null);
+  assert.equal(parseAppFileHref(''), null);
+});

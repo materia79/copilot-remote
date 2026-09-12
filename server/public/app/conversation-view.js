@@ -46,8 +46,8 @@ import {
 } from './store.js';
 import { sendMessage as sendMessageApi, cancelConversationTurn, cancelQueuedConversationTurn, cancelSubagentRun, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi, loadSharedConversation, updateConversationDraft as updateConversationDraftApi, updateMessageShareVisibility } from './api-client.js';
 import { enqueueOutboxRequest, registerOutboxSync } from './sync-outbox.mjs';
-import { linkifyWorkspaceMentionsInNode, renderMarkdownPreview, rewriteLocalAssetUrlsInNode } from './router.js';
-import { renderAttachmentMarkup, clearAttachments, uploadAttachments, setComposerAttachments, setRepoBrowserSessionInfo } from './attachments-view.js';
+import { linkifyWorkspaceMentionsInNode, parseAppFileHref, renderMarkdownPreview, rewriteLocalAssetUrlsInNode } from './router.js';
+import { renderAttachmentMarkup, clearAttachments, uploadAttachments, setComposerAttachments, setRepoBrowserSessionInfo, openDriveFilePreview, openWorkspaceFilePreview, openUploadedAttachmentViewer } from './attachments-view.js';
 import { buildWorkflowRunCard } from './background-tasks-view.mjs';
 import { parsePreviewCommand, runPreviewCommand } from './preview-command.mjs';
 import { buildTranscriptPreviewCard } from './preview-cards.mjs';
@@ -2332,10 +2332,37 @@ function handleBubbleActionClick(event) {
   }
 }
 
+// Clicking an inline-embedded image in a message bubble opens it in the file
+// viewer modal (zoom + Download + Copy), the same viewer the repo browser
+// uses. Attachment thumbnails keep their own handler; video/audio keep their
+// native controls untouched.
+function handleEmbeddedImageClick(event) {
+  const img = event.target.closest?.('.msg-bubble img');
+  if (!img || img.closest('.msg-attachment')) return;
+  if (IS_SHARED_VIEW) return; // the file routes are cookie-authed; shared viewers would only see a failed load
+  const src = String(img.getAttribute('src') || '').trim();
+  if (!src) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const target = parseAppFileHref(src);
+  if (target?.kind === 'drive') {
+    void openDriveFilePreview(target.path);
+    return;
+  }
+  if (target?.kind === 'workspace') {
+    void openWorkspaceFilePreview(target.path);
+    return;
+  }
+  // data: thumbnails and external http(s) images: show them directly.
+  const dataMime = /^data:(image\/[a-z0-9.+-]+)/i.exec(src)?.[1] || '';
+  openUploadedAttachmentViewer(img.getAttribute('alt') || 'image', src, dataMime || 'image/*');
+}
+
 export function initBubbleActionHandlers() {
   const messagesEl = document.getElementById('messages');
   if (!messagesEl) return;
   messagesEl.addEventListener('click', handleBubbleActionClick);
+  messagesEl.addEventListener('click', handleEmbeddedImageClick);
 }
 
 export function appendMessage(msg, scroll = true, msgId = null, force = false, insertAfterId = null, trackHistory = true) {

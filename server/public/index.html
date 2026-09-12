@@ -1249,6 +1249,12 @@
     max-width: 100%; min-width: 0; box-sizing: border-box;
     overflow-wrap: anywhere; word-break: break-word;
   }
+  /* Inline-embedded media (markdown images by absolute path) stays inside the
+     bubble and advertises click-to-open; attachment thumbnails override below. */
+  .msg-bubble img { max-width: 100%; height: auto; cursor: zoom-in; border-radius: 8px; }
+  .msg-bubble video { max-width: 100%; height: auto; border-radius: 8px; }
+  .msg-bubble audio { max-width: 100%; }
+  .msg-bubble .msg-attachment img { cursor: pointer; border-radius: initial; }
   .msg-bubble.msg-bubble-media-only {
     display: inline-flex;
     flex-direction: column;
@@ -5949,6 +5955,7 @@
       <button id="file-preview-mode-raw" class="file-preview-btn" onclick="setFilePreviewMode('raw')">Raw</button>
       <button id="file-preview-html-toggle" class="file-preview-btn" onclick="toggleFilePreviewHtml()">Show literal HTML</button>
       <a id="file-preview-open-raw" class="file-preview-btn" download>Download</a>
+      <button id="file-preview-copy-btn" class="file-preview-btn" type="button" onclick="copyFilePreviewImage()" hidden>Copy</button>
       <button id="file-preview-annotate-btn" class="file-preview-btn" type="button" onclick="openAnnotateEditorForPreview()" hidden>🖍️ Annotate</button>
       <span id="file-preview-warning" class="file-preview-warning">⚠ Safe layout HTML enabled; active content is blocked</span>
     </div>
