@@ -768,6 +768,26 @@ export function createCopilotSdkSessionRunner({
    * delivered turn (that is where the model calls `bash`) and SETTLE outside
    * one, which is the whole asymmetry this fix exists for.
    */
+  /**
+   * Mirror the live detached-shell set into the relay's background-tasks
+   * panel (REPLACE semantics, the same route the Claude worker publishes on),
+   * so a runaway `npm test` in a detached shell is visible as a card instead
+   * of only as tool rows. `stoppable: false` because the runtime exposes no
+   * host-side shell stop (`stop_bash` is a tool the MODEL calls) — see
+   * backgroundWorkHoldsRuntime. Advisory: a failed post never disturbs events.
+   */
+  function publishBackgroundShellTasks() {
+    const tasks = backgroundShells.live().map((shell) => ({
+      taskId: shell.shellId,
+      taskType: 'local_bash',
+      description: shell.description || 'Detached shell',
+      startedAt: shell.startedAt || null,
+      stoppable: false,
+    }));
+    api('POST', '/api/background-tasks', { conversationId: sdkSessionId, tasks })
+      .catch((error) => dbg('background task publish failed', error?.message || String(error)));
+  }
+
   function observeBackgroundShells(event) {
     let changed;
     try {
@@ -776,6 +796,7 @@ export function createCopilotSdkSessionRunner({
       dbg('background shell tracking failed', String(event?.type || ''), error?.message || String(error));
       return;
     }
+    if (changed.opened.length || changed.settled.length) publishBackgroundShellTasks();
     for (const shell of changed.opened) {
       dbg('detached shell started', shell.shellId, shell.description || '(no description)');
     }
@@ -1220,7 +1241,11 @@ export function createCopilotSdkSessionRunner({
     // them: the tracked set is state about a process that no longer exists and
     // must not pin the next one. The replay gate is reset for the same reason —
     // the next connection resumes and arms its own window.
-    backgroundShells.reset();
+    if (backgroundShells.size()) {
+      backgroundShells.reset();
+      // The shells died with the runtime; clear their panel cards too.
+      publishBackgroundShellTasks();
+    }
     replayGate.reset();
     continuationDueSince = 0;
     pendingActivities = [];
@@ -1268,13 +1293,16 @@ export function createCopilotSdkSessionRunner({
     }
     if (!backgroundShells.size()) return false;
     const capMs = Number(getBackgroundTaskTimeoutMs()) || 0;
+    let expiredAny = false;
     for (const shell of backgroundShells.expireOlderThan(capMs)) {
+      expiredAny = true;
       dbg(
         'background shell cap reached; it no longer holds the runtime open',
         shell.shellId,
         shell.description || '(no description)',
       );
     }
+    if (expiredAny) publishBackgroundShellTasks();
     return backgroundShells.size() > 0;
   }
 

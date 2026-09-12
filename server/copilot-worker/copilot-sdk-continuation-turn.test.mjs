@@ -787,3 +787,25 @@ test('a continuation that stalls fails its own row rather than holding it open',
   assert.equal(runner.isTurnActive(), false);
   await runner.dispose();
 });
+
+test('detached shells publish to the background-tasks panel as non-stoppable cards, and settle clears them', async () => {
+  const { stub, client, runner } = setup();
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+
+  // Opening the shell published the one-card set (runtime shells cannot be
+  // stopped from the host side, so the panel must not offer Stop).
+  const publishes = bodiesFor(stub, '/api/background-tasks');
+  assert.ok(publishes.length >= 1, 'shell open publishes the task set');
+  const openSet = publishes[publishes.length - 1];
+  assert.equal(openSet.tasks.length, 1);
+  assert.equal(openSet.tasks[0].taskType, 'local_bash');
+  assert.equal(openSet.tasks[0].stoppable, false);
+  assert.ok(openSet.tasks[0].taskId);
+
+  // The timer fires: the shell settles and the set empties.
+  fireTimer(client);
+  await waitFor(() => {
+    const all = bodiesFor(stub, '/api/background-tasks');
+    return all.length > publishes.length && all[all.length - 1].tasks.length === 0;
+  }, { label: 'settled shell clears the panel' });
+});

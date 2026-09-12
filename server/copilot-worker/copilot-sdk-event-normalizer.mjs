@@ -84,6 +84,26 @@ export function formatToolActivityText(toolName, input) {
 }
 
 /**
+ * The closing-message summary out of a task_complete TOOL call's arguments.
+ * Some model/runtime combinations (live-observed with gpt-5.3-codex) deliver
+ * task_complete only as `tool.execution_start` and never as the
+ * `session.task_complete` event — arguments may arrive as an object or as a
+ * JSON-encoded string.
+ */
+export function taskCompleteSummaryFromToolArguments(rawArguments) {
+  let args = rawArguments;
+  if (typeof args === 'string') {
+    try {
+      args = JSON.parse(args);
+    } catch {
+      return '';
+    }
+  }
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
+  return String(args.summary || '').trim();
+}
+
+/**
  * True when an event belongs to a SUBAGENT rather than the root agent.
  *
  * Every event interface in the SDK's generated schema carries the same
@@ -683,6 +703,21 @@ export function createCopilotEventNormalizer() {
         const toolCallId = String(data.toolCallId || '').trim();
         const toolName = String(data.toolName || '').trim() || 'tool';
         if (toolCallId) toolNames.set(toolCallId, toolName);
+        // task_complete is the agent's closing message wearing a tool call's
+        // clothes. gpt-5.3-codex (live, 2026-09-12) closes with ONLY this tool
+        // call — no session.task_complete event follows — and whatever text
+        // was mid-stream gets cut, so without adopting the summary here the
+        // reply renders as the truncated fragment. Same precedence as the
+        // event case below; no generic activity row, the summary IS the reply.
+        if (toolName === 'task_complete') {
+          const summary = taskCompleteSummaryFromToolArguments(data.arguments);
+          if (!summary) return [];
+          taskCompleteSummary = summary;
+          const text = finalText();
+          if (!shouldEmitStreamUpdate(text, lastEmittedStreamText)) return [];
+          lastEmittedStreamText = text;
+          return [{ channel: 'stream', payload: { text, done: false, subagentRunId: null } }];
+        }
         return [activityAction(formatToolActivityText(toolName, data.arguments))];
       }
       case 'tool.execution_complete': {

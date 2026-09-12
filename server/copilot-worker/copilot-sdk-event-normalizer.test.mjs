@@ -635,3 +635,51 @@ test('a long streamed answer composes in linear time, not quadratic', () => {
   assert.equal(text.split('\n\n').length, 40);
   assert.ok(text.endsWith('chunk 39 '));
 });
+
+// Live failure (gpt-5.3-codex, 2026-09-12, Windows relay): the runtime closed
+// the turn with ONLY a task_complete TOOL call — no session.task_complete
+// event — while the assistant's text stream had produced a single truncated
+// fragment. The reply rendered as "Cha…" and the real result sat in a generic
+// "Tool (task_complete)" activity row.
+test('a task_complete TOOL call alone becomes the reply and emits no activity row', () => {
+  const { actions } = run([
+    { type: 'user.message', data: {} },
+    { type: 'assistant.message', data: { messageId: 'm-1', content: 'Cha' } },
+    {
+      type: 'tool.execution_start',
+      data: { toolCallId: 'call-1', toolName: 'task_complete', arguments: { summary: '**Result:** 2 new commits; one test failing.' } },
+    },
+    { type: 'tool.execution_complete', data: { toolCallId: 'call-1', success: true } },
+    { type: 'session.idle', data: {} },
+  ]);
+  assert.equal(terminal(actions).text, '**Result:** 2 new commits; one test failing.');
+  const activityTexts = only(actions, 'activity').map((a) => a.payload.text);
+  assert.ok(!activityTexts.some((text) => text.includes('task_complete')), 'no generic tool row for the closing message');
+  const streams = only(actions, 'stream');
+  assert.equal(streams[streams.length - 1].payload.text, '**Result:** 2 new commits; one test failing.');
+});
+
+test('task_complete tool arguments arriving as a JSON string are still adopted', () => {
+  const { actions } = run([
+    { type: 'user.message', data: {} },
+    {
+      type: 'tool.execution_start',
+      data: { toolCallId: 'call-2', toolName: 'task_complete', arguments: '{"summary":"done via string args"}' },
+    },
+    { type: 'session.idle', data: {} },
+  ]);
+  assert.equal(terminal(actions).text, 'done via string args');
+});
+
+test('tool-call summary and a following session.task_complete event agree idempotently', () => {
+  const { actions } = run([
+    { type: 'user.message', data: {} },
+    {
+      type: 'tool.execution_start',
+      data: { toolCallId: 'call-3', toolName: 'task_complete', arguments: { summary: 'same summary' } },
+    },
+    { type: 'session.task_complete', data: { summary: 'same summary', success: true } },
+    { type: 'session.idle', data: {} },
+  ]);
+  assert.equal(terminal(actions).text, 'same summary');
+});

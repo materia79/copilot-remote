@@ -399,7 +399,7 @@ function renderTaskRow(conversationId, task) {
         <span class="bg-task-side-status">
           ${tokens ? `<span class="bg-task-tokens">${escHtml(tokens)}</span>` : ''}
           <span class="bg-task-elapsed">${escHtml(elapsed)}</span>
-          <button type="button" class="bg-task-stop" data-task-id="${escHtml(task.taskId)}" ${stopping ? 'disabled' : ''}>${stopping ? 'Stopping…' : 'Stop'}</button>
+          ${task.stoppable === false ? '' : `<button type="button" class="bg-task-stop" data-task-id="${escHtml(task.taskId)}" ${stopping ? 'disabled' : ''}>${stopping ? 'Stopping…' : 'Stop'}</button>`}
         </span>
       </span>
     </div>${treeHolder}`;

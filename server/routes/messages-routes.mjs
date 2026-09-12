@@ -6643,6 +6643,9 @@ export function registerMessagesRoutes(app, deps) {
         subagentType: String(task?.subagentType || '').trim().slice(0, 120) || null,
         model: String(task?.model || '').trim().slice(0, 120) || null,
         modelInherited: task?.modelInherited === true,
+        // Copilot detached shells cannot be stopped from the host side; the
+        // panel hides the Stop button for them. Absent/true = stoppable.
+        stoppable: task?.stoppable !== false,
         // Sanitized digest or undefined: JSON serialization (store broadcast,
         // conversation payload) drops the key entirely for flat rows.
         workflowProgress: sanitizeWorkflowProgress(task?.workflowProgress) || undefined,

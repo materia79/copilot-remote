@@ -423,3 +423,17 @@ test('the 2-line clamp rule covers the desc, detail, log, and agent-label classe
   assert.match(rule.body, /overflow-wrap:\s*anywhere/, 'clamped text breaks anywhere, no overflow');
   assert.doesNotMatch(rule.body, /white-space:\s*nowrap/, 'clamp replaces nowrap, not stacks on it');
 });
+
+test('a non-stoppable task (Copilot detached shell) renders without a Stop button', () => {
+  setBackgroundTasksConversation('conv-nostop');
+  setConversationBackgroundTasks('conv-nostop', [
+    { taskId: 'shell-1', taskType: 'local_bash', description: 'npm test (detached)', startedAt: Date.now(), stoppable: false },
+    { taskId: 'bash-2', taskType: 'local_bash', description: 'stoppable one', startedAt: Date.now() },
+  ]);
+
+  assert.match(listEl.innerHTML, /npm test \(detached\)/);
+  // Exactly one Stop button: the stoppable task's. The detached shell has none
+  // (the Copilot runtime offers no host-side shell stop).
+  assert.equal((listEl.innerHTML.match(/bg-task-stop/g) || []).length, 1);
+  assert.match(listEl.innerHTML, /data-task-id="bash-2"[^>]*>Stop</);
+});
