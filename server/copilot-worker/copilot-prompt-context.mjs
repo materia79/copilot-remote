@@ -25,6 +25,7 @@ import {
   applyPreviewInstructions,
   createPreviewInstructionsProvider,
 } from '../../shared/preview-instructions.mjs';
+import { applyMediaEmbedInstructions } from '../../shared/media-embed-instructions.mjs';
 import { buildModePrompt } from '../../shared/worker-runtime/prompt-context.mjs';
 import { loadRelayInstructionsFromFile } from '../../shared/worker-runtime/config-loader.mjs';
 
@@ -81,7 +82,7 @@ export function createCopilotPromptContextBuilder({
       const previewBlock = typeof getPreviewInstructions === 'function'
         ? await Promise.resolve().then(getPreviewInstructions).catch(() => '')
         : '';
-      instructions = applyPreviewInstructions(toolInstructions, previewBlock);
+      instructions = applyMediaEmbedInstructions(applyPreviewInstructions(toolInstructions, previewBlock));
     }
     const prefix = buildModePrompt(relayMode, instructions, { includeInstructions });
     return {

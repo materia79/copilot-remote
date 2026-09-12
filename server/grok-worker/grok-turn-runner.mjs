@@ -6,6 +6,7 @@ import {
 import { buildGrokContextUsage, resolveGrokContextWindow } from './grok-context-usage.mjs';
 import { extractGrokUsageFromPromptResult, normalizeGrokTurnUsage } from '../services/plan-usage-grok.mjs';
 import { createPreviewInstructionsProvider } from '../../shared/preview-instructions.mjs';
+import { renderMediaEmbedInstructionBlock } from '../../shared/media-embed-instructions.mjs';
 import { countPlanLikeLines } from '../../shared/plan-lines.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 
@@ -121,6 +122,7 @@ export function createGrokTurnRunner({
   // prefix like the mode nudge — once per worker, since the Grok session keeps
   // the history it was told in.
   let previewInstructionsSent = false;
+  let mediaInstructionsSent = false;
   // The user's max-turn-duration ceiling (0 = no limit), piggybacked on queue
   // deliveries; null means no delivery has told us yet and the ACP defaults
   // apply.
@@ -372,7 +374,8 @@ export function createGrokTurnRunner({
       : await Promise.resolve()
         .then(() => getPreviewInstructions?.())
         .catch(() => '');
-    const promptText = [previewBlock, modeNudge, userText].filter(Boolean).join('\n\n');
+    const mediaBlock = mediaInstructionsSent ? '' : renderMediaEmbedInstructionBlock();
+    const promptText = [previewBlock, mediaBlock, modeNudge, userText].filter(Boolean).join('\n\n');
     const pendingNudgedRelayMode = String(message.relayMode || 'agent').trim().toLowerCase();
 
     let turn = null;
@@ -411,6 +414,7 @@ export function createGrokTurnRunner({
           }
           lastNudgedRelayMode = pendingNudgedRelayMode;
           if (previewBlock) previewInstructionsSent = true;
+          if (mediaBlock) mediaInstructionsSent = true;
           break;
         } catch (error) {
           // A stale agent whose previous prompt never settled reports busy;

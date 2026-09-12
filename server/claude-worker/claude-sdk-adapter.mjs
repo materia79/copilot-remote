@@ -1,6 +1,7 @@
 import { createSdkMcpServer, query } from '@anthropic-ai/claude-agent-sdk';
 
 import { parseThinkingDisplay } from '../../shared/claude-thinking.mjs';
+import { MEDIA_EMBED_INSTRUCTION_TEXT } from '../../shared/media-embed-instructions.mjs';
 import { createPreviewToolDefinition } from './claude-preview-tool.mjs';
 
 // The name the in-process MCP server is registered under; it prefixes every
@@ -122,11 +123,15 @@ export function permissionModeForRelayMode(relayMode) {
 
 export function systemPromptForRelayMode(relayMode) {
   const mode = String(relayMode || 'agent').trim().toLowerCase();
-  const append = MODE_SYSTEM_PROMPT_APPEND[mode];
+  // The media-embed capability rides every session — unlike the mode nudges it
+  // is renderer knowledge the model cannot discover any other way.
+  const append = [MEDIA_EMBED_INSTRUCTION_TEXT, MODE_SYSTEM_PROMPT_APPEND[mode]]
+    .filter(Boolean)
+    .join('\n\n');
   return {
     type: 'preset',
     preset: 'claude_code',
-    ...(append ? { append } : {}),
+    append,
   };
 }
 

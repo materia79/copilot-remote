@@ -17,6 +17,7 @@ import {
   cursorSubagentRosterFingerprint,
 } from './cursor-subagent-roster.mjs';
 import { createAskUserBridge } from '../../shared/ask-user-bridge.mjs';
+import { renderMediaEmbedInstructionBlock } from '../../shared/media-embed-instructions.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 import { resolveFallbackContextLimitTokens } from '../../shared/context-window-fallbacks.mjs';
 import { countPlanLikeLines } from '../../shared/plan-lines.mjs';
@@ -142,6 +143,10 @@ export function createCursorTurnRunner({
   // Mirrors the Copilot extension's lastPromptedRelayMode: full mode
   // instructions ride on the first message of a mode and on mode changes only.
   let lastNudgedRelayMode = '';
+  // Like Grok's once-per-worker capability guidance: the Cursor SDK has no
+  // system-prompt seam either, so the media-embed hint rides the first prompt
+  // and the session's history keeps it known from then on.
+  let mediaGuidanceSent = false;
 
   const bridge = createAskUserBridge({
     api,
@@ -489,7 +494,10 @@ export function createCursorTurnRunner({
       await ensureAgentHandle(message, model);
       const userMessage = buildUserMessageImpl(message);
       const modeNudge = cursorModeNudge(message.relayMode, lastNudgedRelayMode);
-      if (modeNudge) userMessage.text = [modeNudge, userMessage.text].filter(Boolean).join('\n\n');
+      const mediaGuidance = mediaGuidanceSent ? '' : renderMediaEmbedInstructionBlock();
+      if (modeNudge || mediaGuidance) {
+        userMessage.text = [mediaGuidance, modeNudge, userMessage.text].filter(Boolean).join('\n\n');
+      }
       // Committed only once the send reached the transport (before the loop's
       // break below) — a turn that dies before delivery must re-inject the
       // nudge next time, or a mode change would be silently swallowed.
@@ -591,6 +599,7 @@ export function createCursorTurnRunner({
           // harmless duplicate, so under-committing is the safe direction.
           if (!aborted && !abortController.signal.aborted) {
             lastNudgedRelayMode = pendingNudgedRelayMode;
+            if (mediaGuidance) mediaGuidanceSent = true;
           }
           break;
         } catch (error) {

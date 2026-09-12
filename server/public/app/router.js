@@ -196,10 +196,10 @@ export function isSafePreviewUrl(url, allowDataImage = false) {
 }
 
 const PREVIEW_ALLOWED_TAGS = new Set([
-  'a', 'article', 'b', 'blockquote', 'br', 'code', 'del', 'details', 'div', 'em',
+  'a', 'article', 'audio', 'b', 'blockquote', 'br', 'code', 'del', 'details', 'div', 'em',
   'figcaption', 'figure', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'hr', 'i', 'img',
   'kbd', 'li', 'mark', 'ol', 'p', 'pre', 's', 'small', 'span', 'strong', 'sub',
-  'summary', 'sup', 'table', 'tbody', 'td', 'tfoot', 'th', 'thead', 'tr', 'u', 'ul',
+  'summary', 'sup', 'table', 'tbody', 'td', 'tfoot', 'th', 'thead', 'tr', 'u', 'ul', 'video',
 ]);
 const PREVIEW_GLOBAL_ATTRIBUTES = new Set(['dir', 'lang', 'title']);
 const PREVIEW_ALIGNMENT_VALUES = new Set(['left', 'center', 'right', 'justify']);
@@ -210,15 +210,24 @@ const PREVIEW_SPAN_VALUE = /^[1-9]\d{0,2}$/;
 function isAllowedPreviewAttribute(tagName, name, value) {
   if (PREVIEW_GLOBAL_ATTRIBUTES.has(name)) return true;
   if (name === 'href') return tagName === 'a' && isSafePreviewUrl(value, false);
-  if (name === 'src') return tagName === 'img' && isSafePreviewUrl(value, true);
+  if (name === 'src') {
+    if (tagName === 'img') return isSafePreviewUrl(value, true);
+    return (tagName === 'video' || tagName === 'audio') && isSafePreviewUrl(value, false);
+  }
   if (name === 'alt') return tagName === 'img';
+  if (name === 'controls' || name === 'muted' || name === 'loop') {
+    return (tagName === 'video' || tagName === 'audio') && value === '';
+  }
+  if (name === 'playsinline') return tagName === 'video' && value === '';
+  if (name === 'preload') return (tagName === 'video' || tagName === 'audio')
+    && ['none', 'metadata', 'auto'].includes(value.toLowerCase());
   if (name === 'target') return tagName === 'a' && value === '_blank';
   if (name === 'rel') return tagName === 'a';
   if (name === 'align') return ['div', 'p', 'table', 'td', 'th', 'tr'].includes(tagName)
     && PREVIEW_ALIGNMENT_VALUES.has(value.toLowerCase());
   if (name === 'valign') return ['td', 'th', 'tr'].includes(tagName)
     && PREVIEW_VERTICAL_ALIGNMENT_VALUES.has(value.toLowerCase());
-  if (name === 'width' || name === 'height') return ['img', 'table', 'td', 'th'].includes(tagName)
+  if (name === 'width' || name === 'height') return ['img', 'table', 'td', 'th', 'video'].includes(tagName)
     && PREVIEW_DIMENSION_VALUE.test(value);
   if (name === 'rowspan' || name === 'colspan') return ['td', 'th'].includes(tagName)
     && PREVIEW_SPAN_VALUE.test(value);
@@ -230,27 +239,88 @@ function isAllowedPreviewAttribute(tagName, name, value) {
   return false;
 }
 
+const EMBED_VIDEO_EXTENSIONS = new Set(['mp4', 'webm', 'm4v', 'mov']);
+const EMBED_AUDIO_EXTENSIONS = new Set(['mp3', 'm4a', 'ogg', 'opus', 'wav', 'flac']);
+
+// 'video' | 'audio' | '' for an already-safe embed src; drive/workspace hrefs
+// carry the real file path in their `path` query parameter.
+function mediaKindForEmbedSource(src) {
+  const value = String(src || '').trim();
+  if (!value || value.toLowerCase().startsWith('data:')) return '';
+  let candidate = value;
+  try {
+    const parsed = new URL(value, window.location.origin);
+    candidate = parsed.searchParams.get('path') || parsed.pathname;
+  } catch {}
+  const match = /\.([A-Za-z0-9]{1,5})$/.exec(String(candidate || '').trim());
+  const extension = match ? match[1].toLowerCase() : '';
+  if (EMBED_VIDEO_EXTENSIONS.has(extension)) return 'video';
+  if (EMBED_AUDIO_EXTENSIONS.has(extension)) return 'audio';
+  return '';
+}
+
+function convertImageToMediaElement(img, mediaTag, src) {
+  const media = document.createElement(mediaTag);
+  media.setAttribute('src', src);
+  media.setAttribute('controls', '');
+  media.setAttribute('preload', 'metadata');
+  const alt = String(img.getAttribute('alt') || '').trim();
+  if (alt) media.setAttribute('title', alt);
+  if (mediaTag === 'video') {
+    for (const dimension of ['width', 'height']) {
+      const value = String(img.getAttribute(dimension) || '').trim();
+      if (value) media.setAttribute(dimension, value);
+    }
+  }
+  img.replaceWith(media);
+  return media;
+}
+
 export function sanitizePreviewHtml(html) {
   const template = document.createElement('template');
   template.innerHTML = String(html || '');
   const nodes = Array.from(template.content.querySelectorAll('*'));
   for (const el of nodes) {
-    const tagName = String(el.tagName || '').toLowerCase();
+    let element = el;
+    let tagName = String(element.tagName || '').toLowerCase();
+    if (tagName === 'img' || tagName === 'video' || tagName === 'audio') {
+      // Bare local absolute paths (C:\...\shot.png, /home/user/shot.png) are
+      // resolved to the drive/workspace file route HERE, before the generic
+      // attribute filter would strip them — this is what lets agents embed
+      // media by plain path instead of a hand-encoded /api/drives/file URL.
+      const rawSrc = String(element.getAttribute('src') || '').trim();
+      // Only genuine local-path shapes may be resolved; anything else that
+      // fails the safe-URL check (javascript:, vbscript:, …) must simply die,
+      // not be laundered into a workspace href by the resolver.
+      const looksLocalAbsolute = /^[A-Za-z]:[\\/]/.test(rawSrc) || rawSrc.startsWith('\\');
+      const safeSrc = rawSrc && isSafePreviewUrl(rawSrc, tagName === 'img')
+        ? rawSrc
+        : (looksLocalAbsolute ? resolveLocalAssetUrl(rawSrc) : '');
+      if (safeSrc && safeSrc !== rawSrc) element.setAttribute('src', safeSrc);
+      else if (!safeSrc && rawSrc) element.removeAttribute('src');
+      if (tagName === 'img') {
+        const mediaTag = mediaKindForEmbedSource(safeSrc);
+        if (mediaTag) {
+          element = convertImageToMediaElement(element, mediaTag, safeSrc);
+          tagName = mediaTag;
+        }
+      }
+    }
     if (!PREVIEW_ALLOWED_TAGS.has(tagName)) {
-      el.replaceWith(document.createTextNode(el.textContent || ''));
+      element.replaceWith(document.createTextNode(element.textContent || ''));
       continue;
     }
-    const attrs = Array.from(el.attributes || []);
+    const attrs = Array.from(element.attributes || []);
     for (const attr of attrs) {
       const name = String(attr.name || '').toLowerCase();
       const value = String(attr.value || '').trim();
       if (!isAllowedPreviewAttribute(tagName, name, value)) {
-        el.removeAttribute(attr.name);
+        element.removeAttribute(attr.name);
       }
     }
     if (tagName === 'a') {
-      el.setAttribute('target', '_blank');
-      el.setAttribute('rel', 'noopener noreferrer');
+      element.setAttribute('target', '_blank');
+      element.setAttribute('rel', 'noopener noreferrer');
     }
   }
   return template.innerHTML;
@@ -616,7 +686,7 @@ export function rewriteLocalAssetUrlsInNode(root, options = {}) {
   if (!(root instanceof Element)) return;
   const preferDrive = options?.preferDrive === true;
   const rewriteAnchors = options?.rewriteAnchors !== false;
-  const images = Array.from(root.querySelectorAll('img[src]'));
+  const images = Array.from(root.querySelectorAll('img[src], video[src], audio[src]'));
   for (const img of images) {
     const rawSrc = img.getAttribute('src') || '';
     const nextSrc = resolveLocalAssetUrl(rawSrc, { preferDrive });

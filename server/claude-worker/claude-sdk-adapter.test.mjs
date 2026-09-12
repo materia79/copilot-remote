@@ -24,11 +24,13 @@ test('relay modes map to SDK permission modes', () => {
   assert.equal(permissionModeForRelayMode(''), 'default');
 });
 
-test('ask and autopilot get a system prompt append; plan and agent do not', () => {
-  assert.ok(systemPromptForRelayMode('ask').append);
-  assert.ok(systemPromptForRelayMode('autopilot').append);
-  assert.equal(systemPromptForRelayMode('plan').append, undefined);
-  assert.equal(systemPromptForRelayMode('agent').append, undefined);
+test('every mode teaches media embedding; ask and autopilot add their nudge on top', () => {
+  for (const mode of ['plan', 'agent', 'ask', 'autopilot']) {
+    assert.match(systemPromptForRelayMode(mode).append, /image, video, or audio clip inline/);
+  }
+  assert.match(systemPromptForRelayMode('ask').append, /Prioritize clarification questions/);
+  assert.match(systemPromptForRelayMode('autopilot').append, /Keep moving unless user input/);
+  assert.doesNotMatch(systemPromptForRelayMode('plan').append, /Prioritize clarification|Keep moving/);
   assert.equal(systemPromptForRelayMode('agent').preset, 'claude_code');
 });
 

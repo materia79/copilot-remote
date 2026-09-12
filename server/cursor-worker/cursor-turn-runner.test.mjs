@@ -796,7 +796,9 @@ test('ask/autopilot nudges ride on the message text and dedupe until the mode ch
     ], started),
   }));
   await runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'ask' } });
-  assert.match(started[0].message.text, /^\[Relay mode: ask\][\s\S]*hello$/);
+  // First delivered prompt of the worker also carries the one-time media-embed
+  // guidance, ahead of the mode nudge.
+  assert.match(started[0].message.text, /^## Embedding media in replies[\s\S]*\[Relay mode: ask\][\s\S]*hello$/);
   await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', relayMode: 'ask' } });
   assert.equal(started[1].message.text, 'hello', 'same mode must not re-inject');
   await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3', relayMode: 'agent' } });
@@ -927,11 +929,11 @@ test('a mode nudge swallowed by a failed turn is re-injected on the next attempt
     ], started),
   }));
   await runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'ask' } });
-  assert.match(started[0].message.text, /^\[Relay mode: ask\]/, 'first attempt carries the nudge');
+  assert.match(started[0].message.text, /^## Embedding media in replies[\s\S]*\[Relay mode: ask\]/, 'first attempt carries the guidance and the nudge');
   await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', relayMode: 'ask' } });
   assert.match(
     started[1].message.text,
-    /^\[Relay mode: ask\]/,
-    'the failed turn must not consume the mode change; the nudge is re-injected',
+    /^## Embedding media in replies[\s\S]*\[Relay mode: ask\]/,
+    'the failed turn must not consume the mode change; guidance and nudge are re-injected',
   );
 });

@@ -29,3 +29,10 @@ test('stripRelayPromptContext keeps normal user text untouched', () => {
   const output = stripRelayPromptContext('Just a plain user message', 'agent');
   assert.equal(output, 'Just a plain user message');
 });
+
+test('stripRelayPromptContext drops the injected media-embed guidance block verbatim', async () => {
+  const { renderMediaEmbedInstructionBlock } = await import('../../shared/media-embed-instructions.mjs');
+  const input = `${renderMediaEmbedInstructionBlock()}\n\n[Relay mode: agent] hello`;
+  const output = stripRelayPromptContext(input, 'agent');
+  assert.equal(output, 'hello');
+});

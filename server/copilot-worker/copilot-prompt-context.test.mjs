@@ -51,6 +51,7 @@ test('the heavy guidance rides along only when the relay mode changes', async ()
 
   const first = await buildCommitted(build, { relayMode: 'agent' });
   assert.match(first, /Use ask_user/);
+  assert.match(first, /Embedding media in replies/);
 
   // Same mode again: the marker stays, the instructions do not repeat.
   const second = await buildCommitted(build, { relayMode: 'agent' });
@@ -81,9 +82,11 @@ test('an uncommitted build does not count as prompted (failed-send retry)', asyn
   assert.equal(prefix, '[Relay mode: agent]');
 });
 
-test('the mode marker is always present, even with no guidance at all', async () => {
+test('the mode marker is always present, and media embedding is taught even with no tools doc', async () => {
   const build = createCopilotPromptContextBuilder({ toolInstructions: '', getPreviewInstructions: null });
-  assert.equal(await buildCommitted(build, { relayMode: 'autopilot' }), '[Relay mode: autopilot] Act directly on the request and use tools when needed. Keep moving unless user input is truly blocking. These instructions remain in effect until relay mode changes.');
+  const first = await buildCommitted(build, { relayMode: 'autopilot' });
+  assert.match(first, /^\[Relay mode: autopilot\] Act directly on the request and use tools when needed\./);
+  assert.match(first, /Embedding media in replies/);
   assert.equal(await buildCommitted(build, { relayMode: 'autopilot' }), '[Relay mode: autopilot]');
 });
 

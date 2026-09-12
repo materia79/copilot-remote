@@ -12,3 +12,19 @@ test('browser stripRelayPromptContext handles datetime and system reminder wrapp
   const output = stripRelayPromptContext(input, 'ask');
   assert.equal(output, 'Ask clarifying questions first');
 });
+
+test('browser stripRelayPromptContext drops a leading media-embed guidance block', () => {
+  const input = [
+    '## Embedding media in replies',
+    '',
+    'To show the user an image, video, or audio clip inline in a reply, write a markdown image whose target is the absolute path.',
+    '',
+    '[Relay mode: ask] Prioritize clarification questions before implementation work.',
+    '',
+    'hello',
+  ].join('\n');
+  const output = stripRelayPromptContext(input, 'ask');
+  assert.doesNotMatch(output, /Embedding media in replies/);
+  assert.doesNotMatch(output, /^\[Relay mode/);
+  assert.match(output, /hello$/);
+});

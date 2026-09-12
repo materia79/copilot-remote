@@ -421,14 +421,19 @@ test('an enabled preview lane prefixes the first Grok prompt with the instructio
   await runner.dispose();
 });
 
-test('a disabled preview lane leaves the Grok prompt untouched', async () => {
+test('a disabled preview lane omits the preview block; the media guidance still rides once', async () => {
   const api = createPreviewApi({ enabled: false, publicBaseUrl: '', previews: [] });
   const { runner, prompts } = createPromptCapturingRunner({ api, sdkSessionId: 'conv-preview-off' });
 
   await runner.handlePendingPayload({
     message: { id: 'msg-p2', conversationId: 'conv-preview-off', text: 'show me the app', relayMode: 'agent' },
   });
-  assert.equal(prompts[0], 'show me the app');
+  assert.doesNotMatch(prompts[0], /Preview servers/);
+  assert.match(prompts[0], /^## Embedding media in replies[\s\S]*show me the app$/);
+  await runner.handlePendingPayload({
+    message: { id: 'msg-p2b', conversationId: 'conv-preview-off', text: 'again', relayMode: 'agent' },
+  });
+  assert.equal(prompts[1], 'again');
   await runner.dispose();
 });
 
@@ -561,6 +566,9 @@ test('a preview lookup failure does not fail the Grok turn', async () => {
     message: { id: 'msg-p5', conversationId: 'conv-preview-fail', text: 'still works', relayMode: 'agent' },
   });
   assert.equal(ok, true);
-  assert.equal(prompts[0], 'still works');
+  // The failed lookup costs only the preview block; the media guidance and the
+  // user text still go through.
+  assert.doesNotMatch(prompts[0], /Preview servers/);
+  assert.match(prompts[0], /^## Embedding media in replies[\s\S]*still works$/);
   await runner.dispose();
 });

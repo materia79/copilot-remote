@@ -4,6 +4,8 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+import { renderMediaEmbedInstructionBlock } from '../../shared/media-embed-instructions.mjs';
+
 const DEFAULT_RELAY_TOOL_GUIDANCE = [
   '# Relay Tool Guidance',
   'For any user-facing question or clarification, use the ask_user tool so the web relay can render question cards and buttons. Never ask questions in plain assistant text.',
@@ -125,8 +127,18 @@ function stripAttachmentPromptArtifacts(text) {
     .trim();
 }
 
+// The once-per-worker media-embed guidance rides ahead of the mode marker on
+// the Cursor/Grok prompt paths, so it is dropped before the prefix-anchored
+// marker patterns run. Machine-injected verbatim, never user-authored.
+const MEDIA_EMBED_BLOCK_PATTERN = new RegExp(
+  whitespaceFlexiblePattern(renderMediaEmbedInstructionBlock()),
+  'gi',
+);
+
 export function stripRelayPromptContext(text, relayMode = '', attachments = []) {
-  const value = stripAttachmentPromptArtifacts(text);
+  const value = stripAttachmentPromptArtifacts(text)
+    .replace(MEDIA_EMBED_BLOCK_PATTERN, '')
+    .trim();
   if (!value) return '';
   const patterns = buildPromptPrefixPatterns(relayMode);
   for (const pattern of patterns) {

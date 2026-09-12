@@ -102,8 +102,16 @@ function stripAttachmentPromptArtifacts(text) {
     .trim();
 }
 
+// The once-per-worker media-embed guidance (shared/media-embed-instructions.mjs)
+// can precede the mode marker on the Cursor/Grok prompt paths. This module is
+// served to the browser and cannot import shared/, so the block is matched
+// structurally — the heading plus its single paragraph — rather than verbatim.
+const MEDIA_EMBED_BLOCK_PATTERN = /##\s*Embedding media in replies\s+[\s\S]*?(?=\n\s*\n|$)/gi;
+
 export function stripRelayPromptContext(text, relayMode = '') {
-  const value = stripAttachmentPromptArtifacts(text);
+  const value = stripAttachmentPromptArtifacts(text)
+    .replace(MEDIA_EMBED_BLOCK_PATTERN, '')
+    .trim();
   if (!value) return '';
   const patterns = buildPromptPrefixPatterns(relayMode);
   for (const pattern of patterns) {
